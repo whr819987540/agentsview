@@ -140,6 +140,25 @@ describe("filterDisplayItemsByTranscriptMode", () => {
     ).toEqual([0, 1, 2, 3]);
   });
 
+  it("keeps the inherited assistant response before a fork-boundary divider", () => {
+    const boundary = msg({
+      ordinal: -1,
+      role: "system",
+      content: "parent-session",
+      is_system: true,
+      source_subtype: "fork_boundary",
+    });
+    expect(
+      ordinalsOf([
+        userMsg(-4, "parent question"),
+        assistantMsg(-3, "parent progress"),
+        assistantMsg(-2, "parent answer"),
+        boundary,
+        userMsg(0, "fork question"),
+      ]),
+    ).toEqual([-4, -2, -1, 0]);
+  });
+
   it("can pick the last assistant that still has visible segments", () => {
     const items = buildDisplayItems([
       userMsg(0),

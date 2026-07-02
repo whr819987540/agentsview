@@ -25,15 +25,17 @@ export function filterDisplayItemsByTranscriptMode(
       continue;
     }
 
-    // Compact-boundary messages are rendered as dividers, not
-    // turns. Without this branch they'd be routed through the
-    // assistant path (their role is "assistant") and overwrite
-    // the previous pending response, so the real answer right
-    // before the boundary would disappear from focused mode.
-    // Treat them like a turn boundary: flush any pending
-    // assistant first so it lands chronologically before the
-    // divider, then push the divider itself.
-    if (item.message.is_compact_boundary) {
+    // Boundary messages are rendered as dividers, not turns.
+    // Without this branch they'd be routed through the assistant
+    // path and overwrite the previous pending response, so the
+    // real answer right before the boundary would disappear from
+    // focused mode. Treat them like a turn boundary: flush any
+    // pending assistant first so it lands chronologically before
+    // the divider, then push the divider itself.
+    if (
+      item.message.is_compact_boundary ||
+      item.message.source_subtype === "fork_boundary"
+    ) {
       if (pendingAssistant && !toolAfterPendingAssistant) {
         filtered.push(pendingAssistant);
       }
