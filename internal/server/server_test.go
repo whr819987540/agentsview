@@ -1732,10 +1732,10 @@ func TestGetSessionTree_MiddleSessionIncludesRootAndDescendants(t *testing.T) {
 
 	var resp struct {
 		Root struct {
-			Session       db.Session `json:"session"`
-			Children      []struct {
-				Session       db.Session `json:"session"`
-				Children      []struct {
+			Session  db.Session `json:"session"`
+			Children []struct {
+				Session  db.Session `json:"session"`
+				Children []struct {
 					Session db.Session `json:"session"`
 					IsLeaf  bool       `json:"is_leaf"`
 				} `json:"children"`
