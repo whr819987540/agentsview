@@ -86,10 +86,11 @@ type sessionFilterInput struct {
 }
 
 type messageListInput struct {
-	ID        string           `path:"id" required:"true" doc:"Session ID"`
-	Limit     int              `query:"limit" minimum:"0" doc:"Maximum number of messages"`
-	Direction messageDirection `query:"direction" enum:"asc,desc" doc:"Message ordering direction"`
-	From      optionalIntParam `query:"from" minimum:"0" doc:"Starting message ordinal"`
+	ID                 string           `path:"id" required:"true" doc:"Session ID"`
+	Limit              int              `query:"limit" minimum:"0" doc:"Maximum number of messages"`
+	Direction          messageDirection `query:"direction" enum:"asc,desc" doc:"Message ordering direction"`
+	From               optionalIntParam `query:"from" minimum:"0" doc:"Starting message ordinal"`
+	IncludeForkContext bool             `query:"include_fork_context" doc:"Include inherited parent context before fork sessions"`
 }
 
 type searchSessionInput struct {
@@ -405,8 +406,9 @@ func (s *Server) humaGetMessages(
 ) (*jsonOutput[*service.MessageList], error) {
 	limit := clampLimit(in.Limit, db.DefaultMessageLimit, db.MaxMessageLimit)
 	filter := service.MessageFilter{
-		Limit:     limit,
-		Direction: string(in.Direction),
+		Limit:              limit,
+		Direction:          string(in.Direction),
+		IncludeForkContext: in.IncludeForkContext,
 	}
 	if in.From.IsSet {
 		filter.From = &in.From.Value

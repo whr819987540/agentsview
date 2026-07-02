@@ -1,9 +1,9 @@
 import {
   SessionsService,
 } from "../api/generated/index";
+import { fetchSessionMessages } from "../api/messages.js";
 import type {
   Message,
-  MessagesResponse,
   Session,
 } from "../api/types.js";
 import {
@@ -18,10 +18,11 @@ const MESSAGE_PAGE_SIZE = 1000;
 const FULL_SESSION_MESSAGE_THRESHOLD = 3_000;
 
 interface FetchPageOptions {
-  from: number;
+  from?: number;
   limit: number;
   direction: "asc" | "desc";
   signal: AbortSignal;
+  includeForkContext?: boolean;
 }
 
 class MessagesStore {
@@ -44,6 +45,7 @@ class MessagesStore {
   private reloadSessionId: string | null = null;
   private pendingReload: boolean = false;
   private loadOlderPromise: Promise<void> | null = null;
+  private includeForkContext: boolean = false;
 
   async loadSession(id: string) {
     if (
@@ -62,6 +64,7 @@ class MessagesStore {
 
     try {
       let countHint: number | null = null;
+      let includeForkContext = false;
       try {
         configureGeneratedClient();
         const sess = await withAbort(
@@ -69,6 +72,8 @@ class MessagesStore {
           ac.signal,
         );
         countHint = sess.message_count ?? 0;
+        includeForkContext = sess.relationship_type === "fork";
+        this.includeForkContext = includeForkContext;
       } catch (err) {
         if (isAbortError(err)) return;
         console.warn(
@@ -78,6 +83,7 @@ class MessagesStore {
       }
 
       if (
+        !includeForkContext &&
         countHint !== null &&
         countHint > FULL_SESSION_MESSAGE_THRESHOLD
       ) {
@@ -86,7 +92,8 @@ class MessagesStore {
         await this.loadAllMessages(
           id,
           ac.signal,
-          countHint ?? undefined,
+          includeForkContext ? undefined : countHint ?? undefined,
+          includeForkContext,
         );
       }
     } catch (err) {
@@ -146,6 +153,7 @@ class MessagesStore {
     this.reloadSessionId = null;
     this.pendingReload = false;
     this.loadOlderPromise = null;
+    this.includeForkContext = false;
   }
 
   private async fetchPages(
@@ -156,16 +164,14 @@ class MessagesStore {
     let from = opts.from;
 
     for (;;) {
-      configureGeneratedClient();
-      const res = await withAbort(
-        SessionsService.getApiV1SessionsIdMessages({
-          id,
-          from,
-          limit: opts.limit,
-          direction: opts.direction,
-        }) as unknown as Promise<MessagesResponse>,
-        opts.signal,
-      );
+      const currentFrom = from;
+      const res = await fetchSessionMessages(id, {
+        from,
+        limit: opts.limit,
+        direction: opts.direction,
+        includeForkContext: opts.includeForkContext,
+        signal: opts.signal,
+      });
       if (res.messages.length === 0) break;
 
       loaded.push(...res.messages);
@@ -179,9 +185,10 @@ class MessagesStore {
           ? last.ordinal + 1
           : last.ordinal - 1;
       if (
-        opts.direction === "asc"
-          ? nextFrom <= from
-          : nextFrom >= from
+        currentFrom !== undefined &&
+        (opts.direction === "asc"
+          ? nextFrom <= currentFrom
+          : nextFrom >= currentFrom)
       ) {
         break;
       }
@@ -195,21 +202,20 @@ class MessagesStore {
     id: string,
     signal: AbortSignal,
     messageCountHint?: number,
+    includeForkContext = false,
   ) {
-    let from = 0;
+    let from: number | undefined = includeForkContext ? undefined : 0;
     let loaded: Message[] = [];
 
     for (;;) {
-      configureGeneratedClient();
-      const res = await withAbort(
-        SessionsService.getApiV1SessionsIdMessages({
-          id,
-          from,
-          limit: MESSAGE_PAGE_SIZE,
-          direction: "asc",
-        }) as unknown as Promise<MessagesResponse>,
+      const currentFrom = from;
+      const res = await fetchSessionMessages(id, {
+        from,
+        limit: MESSAGE_PAGE_SIZE,
+        direction: "asc",
+        includeForkContext,
         signal,
-      );
+      });
       if (res.messages.length === 0) break;
 
       loaded = [...loaded, ...res.messages];
@@ -225,7 +231,12 @@ class MessagesStore {
       const last = res.messages[res.messages.length - 1];
       if (!last) break;
       const nextFrom = last.ordinal + 1;
-      if (nextFrom <= from) break;
+      if (
+        currentFrom !== undefined &&
+        nextFrom <= currentFrom
+      ) {
+        break;
+      }
       from = nextFrom;
     }
 
@@ -240,15 +251,11 @@ class MessagesStore {
     id: string,
     signal: AbortSignal,
   ) {
-    configureGeneratedClient();
-    const firstRes = await withAbort(
-      SessionsService.getApiV1SessionsIdMessages({
-        id,
-        limit: MESSAGE_PAGE_SIZE,
-        direction: "desc",
-      }) as unknown as Promise<MessagesResponse>,
+    const firstRes = await fetchSessionMessages(id, {
+      limit: MESSAGE_PAGE_SIZE,
+      direction: "desc",
       signal,
-    );
+    });
 
     this.messages = [...firstRes.messages].reverse();
     const newest = this.messages[this.messages.length - 1];
@@ -268,6 +275,7 @@ class MessagesStore {
       limit: MESSAGE_PAGE_SIZE,
       direction: "asc",
       signal,
+      includeForkContext: this.includeForkContext,
     });
     if (pages.length > 0) {
       const updates = new Map(
@@ -321,16 +329,13 @@ class MessagesStore {
 
     this.loadingOlder = true;
     try {
-      configureGeneratedClient();
-      const res = await withAbort(
-        SessionsService.getApiV1SessionsIdMessages({
-          id,
-          from: oldest - 1,
-          limit: MESSAGE_PAGE_SIZE,
-          direction: "desc",
-        }) as unknown as Promise<MessagesResponse>,
+      const res = await fetchSessionMessages(id, {
+        from: oldest - 1,
+        limit: MESSAGE_PAGE_SIZE,
+        direction: "desc",
+        includeForkContext: this.includeForkContext,
         signal,
-      );
+      });
       if (this.sessionId !== id) return;
       if (res.messages.length === 0) {
         this.hasOlder = false;
@@ -390,16 +395,13 @@ class MessagesStore {
       const chunks: Message[][] = [];
 
       while (from >= 0) {
-        configureGeneratedClient();
-        const res = await withAbort(
-          SessionsService.getApiV1SessionsIdMessages({
-            id,
-            from,
-            limit: MESSAGE_PAGE_SIZE,
-            direction: "desc",
-          }) as unknown as Promise<MessagesResponse>,
+        const res = await fetchSessionMessages(id, {
+          from,
+          limit: MESSAGE_PAGE_SIZE,
+          direction: "desc",
+          includeForkContext: this.includeForkContext,
           signal,
-        );
+        });
         if (this.sessionId !== id) return;
         if (res.messages.length === 0) {
           this.hasOlder = false;
@@ -451,6 +453,7 @@ class MessagesStore {
         signal,
       );
       if (this.sessionId !== id) return;
+      this.includeForkContext = sess.relationship_type === "fork";
 
       const newCount = sess.message_count ?? 0;
       const oldCount = this.messageCount;
@@ -495,6 +498,7 @@ class MessagesStore {
       limit: MESSAGE_PAGE_SIZE,
       direction: "asc",
       signal,
+      includeForkContext: this.includeForkContext,
     });
     if (this.sessionId !== id || refreshed.length === 0) {
       return;
@@ -524,6 +528,7 @@ class MessagesStore {
     this.loading = true;
     try {
       if (
+        !this.includeForkContext &&
         messageCountHint !== undefined &&
         messageCountHint > FULL_SESSION_MESSAGE_THRESHOLD
       ) {
@@ -532,7 +537,8 @@ class MessagesStore {
         await this.loadAllMessages(
           id,
           signal,
-          messageCountHint,
+          this.includeForkContext ? undefined : messageCountHint,
+          this.includeForkContext,
         );
       }
     } finally {

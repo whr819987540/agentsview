@@ -308,6 +308,9 @@
   "compact_boundary_title": "上下文窗口在此處被壓縮",
   "compact_boundary_label": "上下文已壓縮",
   "compact_boundary_show_full_summary": "顯示完整摘要",
+  "fork_boundary_title": "分叉從此處開始",
+  "fork_boundary_label": "分叉開始",
+  "fork_boundary_note": "上方訊息是從父會話繼承的上下文。",
   "sidebar_session_count": [
     {
       "declarations": [

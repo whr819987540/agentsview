@@ -727,6 +727,178 @@ func TestDirectBackend_Messages_DescExplicitZeroFrom(t *testing.T) {
 	assert.Equal(t, 0, list.Messages[0].Ordinal)
 }
 
+func TestDirectBackend_Messages_IncludesForkContext(t *testing.T) {
+	t.Parallel()
+	svc, env := newDirectTestSvc(t)
+	ctx := context.Background()
+	parentID := "parent-session"
+	childID := "child-session"
+	childStarted := "2026-07-01T10:05:00Z"
+
+	dbtest.SeedSession(t, env.db, parentID, "p1",
+		dbtest.WithMessageCount(3))
+	dbtest.SeedSession(t, env.db, childID, "p1",
+		dbtest.WithMessageCount(1),
+		func(s *db.Session) {
+			s.ParentSessionID = &parentID
+			s.RelationshipType = "fork"
+			s.StartedAt = &childStarted
+		})
+	dbtest.SeedMessages(t, env.db,
+		db.Message{
+			SessionID:     parentID,
+			Ordinal:       0,
+			Role:          "user",
+			Content:       "parent before one",
+			ContentLength: len("parent before one"),
+			Timestamp:     "2026-07-01T10:00:00Z",
+		},
+		db.Message{
+			SessionID:     parentID,
+			Ordinal:       1,
+			Role:          "assistant",
+			Content:       "parent before two",
+			ContentLength: len("parent before two"),
+			Timestamp:     "2026-07-01T10:01:00Z",
+		},
+		db.Message{
+			SessionID:     parentID,
+			Ordinal:       2,
+			Role:          "user",
+			Content:       "parent after fork",
+			ContentLength: len("parent after fork"),
+			Timestamp:     "2026-07-01T10:10:00Z",
+		},
+		db.Message{
+			SessionID:     childID,
+			Ordinal:       0,
+			Role:          "user",
+			Content:       "child after fork",
+			ContentLength: len("child after fork"),
+			Timestamp:     "2026-07-01T10:05:00Z",
+		},
+	)
+
+	list, err := svc.Messages(ctx, childID, service.MessageFilter{
+		IncludeForkContext: true,
+		Limit:              10,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, list)
+	require.Len(t, list.Messages, 4)
+
+	assert.Equal(t, []int{-3, -2, -1, 0}, messageOrdinals(list.Messages))
+	assert.Equal(t, []string{
+		"parent before one",
+		"parent before two",
+		parentID,
+		"child after fork",
+	}, messageContents(list.Messages))
+	assert.Equal(t,
+		"fork_boundary",
+		list.Messages[2].SourceSubtype,
+	)
+	assert.True(t, list.Messages[2].IsSystem)
+	assert.NotContains(t, messageContents(list.Messages),
+		"parent after fork")
+
+	noContext, err := svc.Messages(ctx, childID, service.MessageFilter{
+		Limit: 10,
+	})
+	require.NoError(t, err)
+	require.Len(t, noContext.Messages, 1)
+	assert.Equal(t, "child after fork", noContext.Messages[0].Content)
+	assert.Equal(t, 0, noContext.Messages[0].Ordinal)
+}
+
+func TestDirectBackend_Messages_ForkContextPaginatesBySyntheticOrdinal(
+	t *testing.T,
+) {
+	t.Parallel()
+	svc, env := newDirectTestSvc(t)
+	ctx := context.Background()
+	parentID := "page-parent"
+	childID := "page-child"
+
+	dbtest.SeedSession(t, env.db, parentID, "p1",
+		dbtest.WithMessageCount(2))
+	dbtest.SeedSession(t, env.db, childID, "p1",
+		dbtest.WithMessageCount(1),
+		func(s *db.Session) {
+			s.ParentSessionID = &parentID
+			s.RelationshipType = "fork"
+		})
+	dbtest.SeedMessages(t, env.db,
+		db.Message{
+			SessionID:     parentID,
+			Ordinal:       0,
+			Role:          "user",
+			Content:       "parent 0",
+			ContentLength: len("parent 0"),
+		},
+		db.Message{
+			SessionID:     parentID,
+			Ordinal:       1,
+			Role:          "assistant",
+			Content:       "parent 1",
+			ContentLength: len("parent 1"),
+		},
+		db.Message{
+			SessionID:     childID,
+			Ordinal:       0,
+			Role:          "user",
+			Content:       "child 0",
+			ContentLength: len("child 0"),
+		},
+	)
+
+	first, err := svc.Messages(ctx, childID, service.MessageFilter{
+		IncludeForkContext: true,
+		Limit:              2,
+	})
+	require.NoError(t, err)
+	require.Len(t, first.Messages, 2)
+	assert.Equal(t, []int{-3, -2}, messageOrdinals(first.Messages))
+
+	nextFrom := first.Messages[len(first.Messages)-1].Ordinal + 1
+	second, err := svc.Messages(ctx, childID, service.MessageFilter{
+		IncludeForkContext: true,
+		From:               &nextFrom,
+		Limit:              2,
+	})
+	require.NoError(t, err)
+	require.Len(t, second.Messages, 2)
+	assert.Equal(t, []int{-1, 0}, messageOrdinals(second.Messages))
+	assert.Equal(t, "fork_boundary", second.Messages[0].SourceSubtype)
+	assert.Equal(t, "child 0", second.Messages[1].Content)
+
+	childFrom := 0
+	childOnly, err := svc.Messages(ctx, childID, service.MessageFilter{
+		IncludeForkContext: true,
+		From:               &childFrom,
+		Limit:              2,
+	})
+	require.NoError(t, err)
+	require.Len(t, childOnly.Messages, 1)
+	assert.Equal(t, "child 0", childOnly.Messages[0].Content)
+}
+
+func messageOrdinals(msgs []db.Message) []int {
+	out := make([]int, 0, len(msgs))
+	for _, msg := range msgs {
+		out = append(out, msg.Ordinal)
+	}
+	return out
+}
+
+func messageContents(msgs []db.Message) []string {
+	out := make([]string, 0, len(msgs))
+	for _, msg := range msgs {
+		out = append(out, msg.Content)
+	}
+	return out
+}
+
 // vsCopilotChatTraceLine builds one Visual Studio Copilot trace JSONL line
 // carrying a single user-prompt chat span for the given conversation.
 func vsCopilotChatTraceLine(conversationID, spanID, prompt string) string {

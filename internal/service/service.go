@@ -216,9 +216,10 @@ type ListFilter struct {
 // omitted From in descending mode means "start from the newest message";
 // an explicit 0 means "start at ordinal 0".
 type MessageFilter struct {
-	From      *int   `json:"from,omitempty"`
-	Limit     int    `json:"limit,omitempty"`
-	Direction string `json:"direction,omitempty"` // "asc" (default) or "desc"
+	From               *int   `json:"from,omitempty"`
+	Limit              int    `json:"limit,omitempty"`
+	Direction          string `json:"direction,omitempty"` // "asc" (default) or "desc"
+	IncludeForkContext bool   `json:"include_fork_context,omitempty"`
 }
 
 // MessageList mirrors {messages, count}.
