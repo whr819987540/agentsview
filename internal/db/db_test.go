@@ -821,9 +821,9 @@ func TestCurrentDataVersionGoalContextFiltering(t *testing.T) {
 		"Codex goal-context filtering requires a data version bump")
 }
 
-func TestCurrentDataVersionTranscriptFidelity(t *testing.T) {
-	assert.Equal(t, 57, CurrentDataVersion(),
-		"antigravity-cli transcript fidelity requires a data version bump")
+func TestCurrentDataVersionCodexForkParents(t *testing.T) {
+	assert.Equal(t, 58, CurrentDataVersion(),
+		"Codex fork parent relationships require a data version bump")
 }
 
 func TestInsertMessages_PreservesToolResultEvents(t *testing.T) {

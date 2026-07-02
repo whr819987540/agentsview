@@ -1016,6 +1016,28 @@
     }
   ],
   "session_vitals_now": "现在",
+  "session_tree_title": "会话树",
+  "session_tree_truncated": "部分树",
+  "session_tree_untitled": "未命名会话",
+  "session_tree_relationship_root": "根节点",
+  "session_tree_relationship_fork": "分叉",
+  "session_tree_relationship_subagent": "sub-agent",
+  "session_tree_relationship_continuation": "续接",
+  "session_tree_message_count": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=other": "{countLabel} 条消息"
+      }
+    }
+  ],
   "code_block_copy": "复制代码块",
   "code_block_copy_title": "复制代码",
   "common_copied": "已复制！",

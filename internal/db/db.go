@@ -29,6 +29,11 @@ import (
 // trigger a non-destructive re-sync (mtime reset + skip cache
 // clear) so existing session data is preserved.
 //
+// Bumped to 58: Codex forked sessions now persist
+// session_meta.payload.forked_from_id as parent_session_id with
+// relationship_type="fork". Existing Codex fork rows need re-parsing
+// so the session relationship tree can include native Codex forks.
+//
 // Bumped to 50: parser-derived text is sanitized for PostgreSQL
 // parity and fingerprints. Existing rows need re-parsing so stored
 // message/session shape, timestamps, roles, token counts, and content
@@ -241,6 +246,7 @@ import (
 // classification, so historical skill usage is backfilled on
 // re-parse.)
 //
+// (58: Codex fork parent relationships.)
 // (57: Antigravity-CLI transcript fidelity classification. Re-parsing
 // populates transcript_fidelity ("full"/"summary") on existing
 // Antigravity CLI rows so sessions built from summary transcripts are
@@ -265,7 +271,7 @@ import (
 // (51: Gemini cumulative-to-delta token reparse.)
 // (17: Codex <skill> template filtering.)
 // (16: <turn_aborted> system messages.)
-const dataVersion = 57
+const dataVersion = 58
 
 const tokenCoverageRepairStatsKey = "token_coverage_repair_v1"
 

@@ -6,6 +6,7 @@
   import StatusBar from "./lib/components/layout/StatusBar.svelte";
   import SessionList from "./lib/components/sidebar/SessionList.svelte";
   import MessageList from "./lib/components/content/MessageList.svelte";
+  import SessionRelationshipTree from "./lib/components/content/SessionRelationshipTree.svelte";
   import SessionVitals from "./lib/components/content/SessionVitals.svelte";
   import { sessionActivity } from "./lib/stores/sessionActivity.svelte.js";
   import { sessionTiming } from "./lib/stores/sessionTiming.svelte.js";
@@ -505,6 +506,7 @@
 
     {#snippet vitals()}
       {#if sessions.activeSessionId}
+        <SessionRelationshipTree sessionId={sessions.activeSessionId} />
         <SessionVitals sessionId={sessions.activeSessionId} />
       {/if}
     {/snippet}

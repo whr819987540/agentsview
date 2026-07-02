@@ -30,6 +30,7 @@ func (s *Server) registerSessionRoutes() {
 	get(s, group, "/sessions/{id}", "Get session", s.humaGetSession)
 	get(s, group, "/sessions/{id}/messages", "List session messages", s.humaGetMessages)
 	get(s, group, "/sessions/{id}/tool-calls", "List session tool calls", s.humaToolCalls)
+	get(s, group, "/sessions/{id}/tree", "Get session relationship tree", s.humaGetSessionTree)
 	get(s, group, "/sessions/{id}/children", "List child sessions", s.humaGetChildSessions)
 	get(s, group, "/sessions/{id}/activity", "Get session activity", s.humaGetSessionActivity)
 	get(s, group, "/sessions/{id}/timing", "Get session timing", s.humaSessionTiming)
@@ -103,6 +104,23 @@ type resolveSessionIDsInput struct {
 
 type resolveSessionIDsResponse struct {
 	IDs []string `json:"ids"`
+}
+
+const sessionTreeMaxNodes = 500
+
+type sessionTreeResponse struct {
+	Root            sessionTreeNode `json:"root"`
+	ActiveSessionID string          `json:"active_session_id"`
+	Truncated       bool            `json:"truncated"`
+}
+
+type sessionTreeNode struct {
+	Session       db.Session        `json:"session"`
+	Children      []sessionTreeNode `json:"children"`
+	Depth         int               `json:"depth"`
+	IsActive      bool              `json:"is_active"`
+	IsLeaf        bool              `json:"is_leaf"`
+	IsBranchStart bool              `json:"is_branch_start"`
 }
 
 func (in *sessionFilterInput) listFilter() (service.ListFilter, error) {
@@ -261,6 +279,124 @@ func (s *Server) humaGetChildSessions(
 		children = []db.Session{}
 	}
 	return &jsonOutput[[]db.Session]{Body: children}, nil
+}
+
+func (s *Server) humaGetSessionTree(
+	ctx context.Context,
+	in *idPathInput,
+) (*jsonOutput[sessionTreeResponse], error) {
+	active, err := s.db.GetSession(ctx, in.ID)
+	if err != nil {
+		return nil, serverError(err)
+	}
+	if active == nil {
+		return nil, apiError(http.StatusNotFound, "session not found")
+	}
+
+	root, truncated, err := s.sessionTreeRoot(ctx, active)
+	if err != nil {
+		return nil, serverError(err)
+	}
+	visited := map[string]bool{}
+	count := 0
+	node, buildTruncated, err := s.buildSessionTreeNode(
+		ctx, root, in.ID, 0, visited, &count,
+	)
+	if err != nil {
+		return nil, serverError(err)
+	}
+	truncated = truncated || buildTruncated
+
+	return &jsonOutput[sessionTreeResponse]{
+		Body: sessionTreeResponse{
+			Root:            node,
+			ActiveSessionID: in.ID,
+			Truncated:       truncated,
+		},
+	}, nil
+}
+
+func (s *Server) sessionTreeRoot(
+	ctx context.Context,
+	active *db.Session,
+) (*db.Session, bool, error) {
+	root := active
+	seen := map[string]bool{active.ID: true}
+	truncated := false
+
+	for root.ParentSessionID != nil && *root.ParentSessionID != "" {
+		parentID := *root.ParentSessionID
+		if seen[parentID] {
+			truncated = true
+			break
+		}
+		parent, err := s.db.GetSession(ctx, parentID)
+		if err != nil {
+			return nil, false, err
+		}
+		if parent == nil {
+			break
+		}
+		root = parent
+		seen[root.ID] = true
+	}
+
+	return root, truncated, nil
+}
+
+func (s *Server) buildSessionTreeNode(
+	ctx context.Context,
+	session *db.Session,
+	activeID string,
+	depth int,
+	visited map[string]bool,
+	count *int,
+) (sessionTreeNode, bool, error) {
+	(*count)++
+	visited[session.ID] = true
+
+	node := sessionTreeNode{
+		Session:  *session,
+		Depth:    depth,
+		IsActive: session.ID == activeID,
+		Children: []sessionTreeNode{},
+	}
+	if *count >= sessionTreeMaxNodes {
+		node.IsLeaf = true
+		return node, true, nil
+	}
+
+	children, err := s.db.GetChildSessions(ctx, session.ID)
+	if err != nil {
+		return sessionTreeNode{}, false, err
+	}
+
+	truncated := false
+	for _, child := range children {
+		if visited[child.ID] {
+			truncated = true
+			continue
+		}
+		if *count >= sessionTreeMaxNodes {
+			truncated = true
+			break
+		}
+		childCopy := child
+		childNode, childTruncated, err := s.buildSessionTreeNode(
+			ctx, &childCopy, activeID, depth+1, visited, count,
+		)
+		if err != nil {
+			return sessionTreeNode{}, false, err
+		}
+		if childTruncated {
+			truncated = true
+		}
+		node.Children = append(node.Children, childNode)
+	}
+
+	node.IsLeaf = len(node.Children) == 0
+	node.IsBranchStart = len(node.Children) > 1
+	return node, truncated, nil
 }
 
 func (s *Server) humaGetMessages(
