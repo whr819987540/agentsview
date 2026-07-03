@@ -29,6 +29,13 @@ import (
 // trigger a non-destructive re-sync (mtime reset + skip cache
 // clear) so existing session data is preserved.
 //
+// Bumped to 58: persisted message/result content sanitization now
+// covers tool_calls.result_content and tool_result_events.content,
+// and Codex forked sessions now persist session_meta.payload.forked_from_id
+// as parent_session_id with relationship_type="fork". Existing rows
+// need re-parsing so sanitized content is stored and the session
+// relationship tree can include native Codex forks.
+//
 // Bumped to 50: parser-derived text is sanitized for PostgreSQL
 // parity and fingerprints. Existing rows need re-parsing so stored
 // message/session shape, timestamps, roles, token counts, and content
@@ -246,6 +253,7 @@ import (
 // need re-parsing so NUL/control bytes accepted by SQLite are stripped before
 // they can poison DuckDB mirrors.)
 //
+// (58: Codex fork parent relationships.)
 // (57: Antigravity-CLI transcript fidelity classification. Re-parsing
 // populates transcript_fidelity ("full"/"summary") on existing
 // Antigravity CLI rows so sessions built from summary transcripts are

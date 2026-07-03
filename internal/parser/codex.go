@@ -61,6 +61,7 @@ type codexSessionBuilder struct {
 	startedAt                time.Time
 	endedAt                  time.Time
 	sessionID                string
+	forkedFromID             string
 	cwd                      string // session working dir from meta
 	project                  string
 	ordinal                  int
@@ -248,6 +249,11 @@ func (b *codexSessionBuilder) handleSessionMeta(
 	payload gjson.Result, envelopeTS time.Time,
 ) (skip bool) {
 	b.sessionID = payload.Get("id").Str
+	if forkedFromID := strings.TrimSpace(
+		payload.Get("forked_from_id").Str,
+	); forkedFromID != "" {
+		b.forkedFromID = codexPrefixedSessionID(forkedFromID)
+	}
 
 	if cwd := payload.Get("cwd").Str; cwd != "" {
 		b.cwd = cwd
@@ -696,14 +702,18 @@ func (b *codexSessionBuilder) flushPendingAgentResults() {
 }
 
 func codexSubagentSessionID(agentID string) string {
-	agentID = strings.TrimSpace(agentID)
-	if agentID == "" {
+	return codexPrefixedSessionID(agentID)
+}
+
+func codexPrefixedSessionID(id string) string {
+	id = strings.TrimSpace(id)
+	if id == "" {
 		return ""
 	}
-	if strings.HasPrefix(agentID, "codex:") {
-		return agentID
+	if strings.HasPrefix(id, "codex:") {
+		return id
 	}
-	return "codex:" + agentID
+	return "codex:" + id
 }
 
 func (b *codexSessionBuilder) normalizeOrdinals() {
@@ -1378,6 +1388,7 @@ func (p *codexProvider) parseSession(
 		Project:           b.project,
 		Machine:           machine,
 		Agent:             AgentCodex,
+		ParentSessionID:   b.forkedFromID,
 		Cwd:               b.cwd,
 		FirstMessage:      b.firstMessage,
 		SessionName:       LookupCodexThreadName(path, b.sessionID),
@@ -1391,6 +1402,9 @@ func (p *codexProvider) parseSession(
 			Size:  info.Size(),
 			Mtime: mtime,
 		},
+	}
+	if b.forkedFromID != "" {
+		sess.RelationshipType = RelFork
 	}
 
 	accumulateMessageTokenUsage(sess, b.messages)

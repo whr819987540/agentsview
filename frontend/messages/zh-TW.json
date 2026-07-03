@@ -338,6 +338,9 @@
   "compact_boundary_title": "上下文窗口在此處被壓縮",
   "compact_boundary_label": "上下文已壓縮",
   "compact_boundary_show_full_summary": "顯示完整摘要",
+  "fork_boundary_title": "分叉從此處開始",
+  "fork_boundary_label": "分叉開始",
+  "fork_boundary_note": "上方訊息是從父會話繼承的上下文。",
   "sidebar_session_count": [
     {
       "declarations": [
@@ -1047,6 +1050,28 @@
     }
   ],
   "session_vitals_now": "現在",
+  "session_tree_title": "會話樹",
+  "session_tree_truncated": "部分樹",
+  "session_tree_untitled": "未命名會話",
+  "session_tree_relationship_root": "根節點",
+  "session_tree_relationship_fork": "分叉",
+  "session_tree_relationship_subagent": "sub-agent",
+  "session_tree_relationship_continuation": "續接",
+  "session_tree_message_count": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=other": "{countLabel} 則消息"
+      }
+    }
+  ],
   "code_block_copy": "複製代碼塊",
   "code_block_copy_title": "複製代碼",
   "common_copied": "已複製！",

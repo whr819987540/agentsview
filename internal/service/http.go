@@ -173,6 +173,9 @@ func (b *httpBackend) Messages(
 	if f.Direction != "" {
 		q.Set("direction", f.Direction)
 	}
+	if f.IncludeForkContext {
+		q.Set("include_fork_context", "true")
+	}
 	path := "/api/v1/sessions/" + url.PathEscape(id) +
 		"/messages?" + q.Encode()
 	var out MessageList

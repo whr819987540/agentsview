@@ -8,6 +8,7 @@
   import { createVirtualizer } from "../../virtual/createVirtualizer.svelte.js";
   import MessageContent from "./MessageContent.svelte";
   import CompactBoundaryDivider from "./CompactBoundaryDivider.svelte";
+  import ForkBoundaryDivider from "./ForkBoundaryDivider.svelte";
   import SystemBoundaryCard from "../system/SystemBoundaryCard.svelte";
   import ToolCallGroup from "./ToolCallGroup.svelte";
   import type { Message } from "../../api/types.js";
@@ -579,6 +580,8 @@
               />
             {:else if item.message.is_compact_boundary}
               <CompactBoundaryDivider message={item.message} />
+            {:else if item.message.is_system && item.message.source_subtype === 'fork_boundary'}
+              <ForkBoundaryDivider message={item.message} />
             {:else if item.message.is_system && item.message.source_subtype && item.message.source_subtype !== 'compact_boundary'}
               <SystemBoundaryCard
                 subtype={item.message.source_subtype}

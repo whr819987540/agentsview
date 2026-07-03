@@ -1307,6 +1307,9 @@ func TestParseCodexSession_ForkedSessionSkipsReplayedHistory(t *testing.T) {
 		// The fork keeps its own identity — the replayed parent
 		// session_meta must not overwrite the id.
 		assert.Equal(t, "codex:"+forkID, sess.ID)
+		require.NotEmpty(t, sess.ParentSessionID)
+		assert.Equal(t, "codex:parent-1", sess.ParentSessionID)
+		assert.Equal(t, RelFork, sess.RelationshipType)
 
 		require.Len(t, msgs, 2)
 		assert.Equal(t, "genuine question", msgs[0].Content)

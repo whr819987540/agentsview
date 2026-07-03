@@ -35,18 +35,31 @@ vi.mock('../api/runtime.js', () => ({
 vi.mock('../api/generated/index', () => ({
   SessionsService: {
     getApiV1SessionsId: vi.fn(({ id }) => api.getSession(id)),
-    getApiV1SessionsIdMessages: vi.fn((params) =>
-      api.getMessages(
-        params.id,
-        {
-          from: params.from,
-          limit: params.limit,
-          direction: params.direction,
-        },
-        { signal: new AbortController().signal },
-      )
-    ),
   },
+}));
+
+vi.mock('../api/messages.js', () => ({
+  fetchSessionMessages: vi.fn((
+    id: string,
+    opts: {
+      from?: number;
+      limit?: number;
+      direction?: 'asc' | 'desc';
+      includeForkContext?: boolean;
+      signal?: AbortSignal;
+    } = {},
+  ) =>
+    api.getMessages(
+      id,
+      {
+        from: opts.from,
+        limit: opts.limit,
+        direction: opts.direction,
+        includeForkContext: opts.includeForkContext,
+      },
+      { signal: opts.signal },
+    )
+  ),
 }));
 
 function createDeferred<T>() {
@@ -71,6 +84,7 @@ function generatedCancelError(): Error & { isCancelled: true } {
 function makeSession(
   id: string,
   messageCount: number,
+  overrides: Partial<Session> = {},
 ): Session {
   return {
     id,
@@ -86,6 +100,7 @@ function makeSession(
     peak_context_tokens: 0,
     is_automated: false,
     created_at: new Date(0).toISOString(),
+    ...overrides,
   };
 }
 
@@ -138,6 +153,57 @@ describe('MessagesStore', () => {
   beforeEach(() => {
     messages.clear();
     vi.clearAllMocks();
+  });
+
+  it('loads fork sessions with inherited context from the beginning', async () => {
+    const rows: Message[] = [
+      {
+        ...makeMessage(0),
+        id: 10,
+        session_id: 'parent',
+        ordinal: -2,
+        content: 'parent context',
+      },
+      {
+        ...makeMessage(0),
+        id: -1,
+        session_id: 'fork',
+        ordinal: -1,
+        role: 'system',
+        content: 'parent',
+        is_system: true,
+        source_subtype: 'fork_boundary',
+      },
+      {
+        ...makeMessage(0),
+        session_id: 'fork',
+        content: 'fork message',
+      },
+    ];
+    vi.mocked(api.getSession).mockResolvedValue(
+      makeSession('fork', 1, { relationship_type: 'fork' }),
+    );
+    vi.mocked(api.getMessages).mockResolvedValue(
+      makeMessagesResponse(rows),
+    );
+
+    await messages.loadSession('fork');
+
+    expect(messages.messages.map((m) => m.content)).toEqual([
+      'parent context',
+      'parent',
+      'fork message',
+    ]);
+    expect(vi.mocked(api.getMessages)).toHaveBeenCalledWith(
+      'fork',
+      {
+        from: undefined,
+        limit: 1000,
+        direction: 'asc',
+        includeForkContext: true,
+      },
+      expect.any(Object),
+    );
   });
 
   it('should clear reload state when loading a new session', async () => {

@@ -248,6 +248,9 @@ func (b *directBackend) Messages(
 	if limit > db.MaxMessageLimit {
 		limit = db.MaxMessageLimit
 	}
+	if f.IncludeForkContext {
+		return b.messagesWithForkContext(ctx, id, f, limit, asc)
+	}
 	// An omitted From means "newest" in descending mode and 0 in
 	// ascending mode. An explicit 0 is a real ordinal and must be
 	// honored in both directions.
@@ -263,6 +266,214 @@ func (b *directBackend) Messages(
 		return nil, err
 	}
 	return &MessageList{Messages: msgs, Count: len(msgs)}, nil
+}
+
+const forkBoundarySourceSubtype = "fork_boundary"
+
+func (b *directBackend) messagesWithForkContext(
+	ctx context.Context, id string, f MessageFilter, limit int, asc bool,
+) (*MessageList, error) {
+	msgs, err := b.buildForkContextMessages(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if len(msgs) == 0 {
+		return &MessageList{Messages: nil, Count: 0}, nil
+	}
+
+	start := 0
+	if f.From != nil {
+		start = findMessagePageStart(msgs, *f.From, asc)
+	} else if !asc {
+		start = len(msgs) - 1
+	}
+
+	out := make([]db.Message, 0, min(limit, len(msgs)))
+	if asc {
+		for i := start; i < len(msgs) && len(out) < limit; i++ {
+			out = append(out, msgs[i])
+		}
+	} else {
+		for i := start; i >= 0 && len(out) < limit; i-- {
+			out = append(out, msgs[i])
+		}
+	}
+	return &MessageList{Messages: out, Count: len(out)}, nil
+}
+
+func findMessagePageStart(
+	msgs []db.Message, from int, asc bool,
+) int {
+	if asc {
+		for i, m := range msgs {
+			if m.Ordinal >= from {
+				return i
+			}
+		}
+		return len(msgs)
+	}
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Ordinal <= from {
+			return i
+		}
+	}
+	return -1
+}
+
+func (b *directBackend) buildForkContextMessages(
+	ctx context.Context, id string,
+) ([]db.Message, error) {
+	current, err := b.db.GetSession(ctx, id)
+	if err != nil || current == nil {
+		return nil, err
+	}
+	currentMsgs, err := b.db.GetAllMessages(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if current.RelationshipType != "fork" ||
+		current.ParentSessionID == nil ||
+		*current.ParentSessionID == "" {
+		return currentMsgs, nil
+	}
+
+	boundary, hasBoundary := forkBoundaryTime(currentMsgs, current.StartedAt)
+	contextMsgs, err := b.forkAncestorMessages(
+		ctx,
+		*current.ParentSessionID,
+		boundary,
+		hasBoundary,
+		map[string]bool{id: true},
+	)
+	if err != nil {
+		return nil, err
+	}
+	if len(contextMsgs) == 0 {
+		return currentMsgs, nil
+	}
+
+	contextLen := len(contextMsgs)
+	for i := range contextMsgs {
+		contextMsgs[i].Ordinal = i - contextLen - 1
+	}
+	boundaryMsg := db.Message{
+		ID:                -1,
+		SessionID:         id,
+		Ordinal:           -1,
+		Role:              "system",
+		Timestamp:         boundaryTimestamp(boundary, current.StartedAt),
+		IsSystem:          true,
+		SourceSubtype:     forkBoundarySourceSubtype,
+		IsCompactBoundary: false,
+		Content:           *current.ParentSessionID,
+		ContentLength:     len(*current.ParentSessionID),
+		HasThinking:       false,
+		HasToolUse:        false,
+		HasContextTokens:  false,
+		HasOutputTokens:   false,
+		ContextTokens:     0,
+		OutputTokens:      0,
+		Model:             "",
+		ThinkingText:      "",
+	}
+	out := make([]db.Message, 0, len(contextMsgs)+1+len(currentMsgs))
+	out = append(out, contextMsgs...)
+	out = append(out, boundaryMsg)
+	out = append(out, currentMsgs...)
+	return out, nil
+}
+
+func (b *directBackend) forkAncestorMessages(
+	ctx context.Context,
+	sessionID string,
+	before time.Time,
+	hasBefore bool,
+	visited map[string]bool,
+) ([]db.Message, error) {
+	if visited[sessionID] {
+		return nil, nil
+	}
+	visited[sessionID] = true
+
+	session, err := b.db.GetSession(ctx, sessionID)
+	if err != nil || session == nil {
+		return nil, err
+	}
+	msgs, err := b.db.GetAllMessages(ctx, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	msgs = messagesBefore(msgs, before, hasBefore)
+
+	if session.RelationshipType != "fork" ||
+		session.ParentSessionID == nil ||
+		*session.ParentSessionID == "" {
+		return msgs, nil
+	}
+	parentBoundary, parentHasBoundary := forkBoundaryTime(msgs, session.StartedAt)
+	parentMsgs, err := b.forkAncestorMessages(
+		ctx,
+		*session.ParentSessionID,
+		parentBoundary,
+		parentHasBoundary,
+		visited,
+	)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]db.Message, 0, len(parentMsgs)+len(msgs))
+	out = append(out, parentMsgs...)
+	out = append(out, msgs...)
+	return out, nil
+}
+
+func forkBoundaryTime(msgs []db.Message, startedAt *string) (time.Time, bool) {
+	for _, m := range msgs {
+		if t, ok := parseMessageTimestamp(m.Timestamp); ok {
+			return t, true
+		}
+	}
+	if startedAt != nil {
+		return parseMessageTimestamp(*startedAt)
+	}
+	return time.Time{}, false
+}
+
+func messagesBefore(
+	msgs []db.Message, boundary time.Time, hasBoundary bool,
+) []db.Message {
+	if !hasBoundary {
+		return msgs
+	}
+	out := make([]db.Message, 0, len(msgs))
+	for _, m := range msgs {
+		t, ok := parseMessageTimestamp(m.Timestamp)
+		if !ok || t.Before(boundary) {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+func parseMessageTimestamp(raw string) (time.Time, bool) {
+	if raw == "" {
+		return time.Time{}, false
+	}
+	t, err := time.Parse(time.RFC3339Nano, raw)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return t, true
+}
+
+func boundaryTimestamp(boundary time.Time, fallback *string) string {
+	if !boundary.IsZero() {
+		return boundary.Format(time.RFC3339Nano)
+	}
+	if fallback != nil {
+		return *fallback
+	}
+	return ""
 }
 
 func (b *directBackend) ToolCalls(

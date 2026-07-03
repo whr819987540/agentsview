@@ -349,6 +349,9 @@
   "compact_boundary_title": "Context window compacted at this point",
   "compact_boundary_label": "Context compacted",
   "compact_boundary_show_full_summary": "Show full summary",
+  "fork_boundary_title": "Fork starts at this point",
+  "fork_boundary_label": "Fork starts",
+  "fork_boundary_note": "Messages above are inherited context from the parent session.",
   "sidebar_session_count": [
     {
       "declarations": [
@@ -1079,6 +1082,29 @@
     }
   ],
   "session_vitals_now": "now",
+  "session_tree_title": "Session tree",
+  "session_tree_truncated": "Partial tree",
+  "session_tree_untitled": "Untitled session",
+  "session_tree_relationship_root": "root",
+  "session_tree_relationship_fork": "fork",
+  "session_tree_relationship_subagent": "sub-agent",
+  "session_tree_relationship_continuation": "continued",
+  "session_tree_message_count": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "{countLabel} message",
+        "countPlural=other": "{countLabel} messages"
+      }
+    }
+  ],
   "code_block_copy": "Copy code block",
   "code_block_copy_title": "Copy code",
   "common_copied": "Copied!",

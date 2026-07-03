@@ -82,6 +82,21 @@ export interface SessionPage {
   total: number;
 }
 
+export interface SessionTreeNode {
+  session: Session;
+  children: SessionTreeNode[];
+  depth: number;
+  is_active: boolean;
+  is_leaf: boolean;
+  is_branch_start: boolean;
+}
+
+export interface SessionTreeResponse {
+  root: SessionTreeNode;
+  active_session_id: string;
+  truncated: boolean;
+}
+
 /** Skinny sidebar index row from GET /api/v1/sessions/sidebar-index. */
 export interface SidebarSessionIndexRow {
   id: string;

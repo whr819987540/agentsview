@@ -1745,6 +1745,158 @@ func TestGetChildSessions_Empty(t *testing.T) {
 	}
 }
 
+func TestGetSessionTree_MiddleSessionIncludesRootAndDescendants(t *testing.T) {
+	te := setup(t)
+	te.seedSession(t, "root", "my-app", 10)
+	te.seedSession(t, "middle", "my-app", 6, func(s *db.Session) {
+		s.ParentSessionID = new("root")
+		s.RelationshipType = "fork"
+		s.StartedAt = new("2025-01-15T10:05:00Z")
+	})
+	te.seedSession(t, "leaf-a", "my-app", 2, func(s *db.Session) {
+		s.ParentSessionID = new("middle")
+		s.RelationshipType = "subagent"
+		s.StartedAt = new("2025-01-15T10:10:00Z")
+	})
+	te.seedSession(t, "leaf-b", "my-app", 3, func(s *db.Session) {
+		s.ParentSessionID = new("middle")
+		s.RelationshipType = "continuation"
+		s.StartedAt = new("2025-01-15T10:15:00Z")
+	})
+
+	w := te.get(t, "/api/v1/sessions/middle/tree")
+	assertStatus(t, w, http.StatusOK)
+
+	var resp struct {
+		Root struct {
+			Session  db.Session `json:"session"`
+			Children []struct {
+				Session  db.Session `json:"session"`
+				Children []struct {
+					Session db.Session `json:"session"`
+					IsLeaf  bool       `json:"is_leaf"`
+				} `json:"children"`
+				IsActive      bool `json:"is_active"`
+				IsBranchStart bool `json:"is_branch_start"`
+			} `json:"children"`
+			IsBranchStart bool `json:"is_branch_start"`
+		} `json:"root"`
+		ActiveSessionID string `json:"active_session_id"`
+		Truncated       bool   `json:"truncated"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+
+	assert.Equal(t, "middle", resp.ActiveSessionID)
+	assert.False(t, resp.Truncated)
+	assert.Equal(t, "root", resp.Root.Session.ID)
+	require.Len(t, resp.Root.Children, 1)
+	middle := resp.Root.Children[0]
+	assert.Equal(t, "middle", middle.Session.ID)
+	assert.True(t, middle.IsActive)
+	assert.True(t, middle.IsBranchStart)
+	require.Len(t, middle.Children, 2)
+	assert.Equal(t, "leaf-a", middle.Children[0].Session.ID)
+	assert.True(t, middle.Children[0].IsLeaf)
+	assert.Equal(t, "leaf-b", middle.Children[1].Session.ID)
+	assert.True(t, middle.Children[1].IsLeaf)
+}
+
+func TestGetSessionTree_MissingParentUsesReachableSessionAsRoot(t *testing.T) {
+	te := setup(t)
+	te.seedSession(t, "orphan-child", "my-app", 4, func(s *db.Session) {
+		s.ParentSessionID = new("missing-parent")
+		s.RelationshipType = "fork"
+	})
+
+	w := te.get(t, "/api/v1/sessions/orphan-child/tree")
+	assertStatus(t, w, http.StatusOK)
+
+	var resp struct {
+		Root struct {
+			Session db.Session `json:"session"`
+			IsLeaf  bool       `json:"is_leaf"`
+		} `json:"root"`
+		Truncated bool `json:"truncated"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Equal(t, "orphan-child", resp.Root.Session.ID)
+	assert.True(t, resp.Root.IsLeaf)
+	assert.False(t, resp.Truncated)
+}
+
+func TestGetSessionTree_CycleProtection(t *testing.T) {
+	te := setup(t)
+	te.seedSession(t, "cycle-a", "my-app", 4, func(s *db.Session) {
+		s.ParentSessionID = new("cycle-b")
+		s.RelationshipType = "fork"
+	})
+	te.seedSession(t, "cycle-b", "my-app", 4, func(s *db.Session) {
+		s.ParentSessionID = new("cycle-a")
+		s.RelationshipType = "fork"
+	})
+
+	w := te.get(t, "/api/v1/sessions/cycle-a/tree")
+	assertStatus(t, w, http.StatusOK)
+
+	var resp struct {
+		Root struct {
+			Session  db.Session `json:"session"`
+			Children []struct {
+				Session  db.Session `json:"session"`
+				Children []struct {
+					Session db.Session `json:"session"`
+				} `json:"children"`
+			} `json:"children"`
+		} `json:"root"`
+		Truncated bool `json:"truncated"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+
+	assert.Equal(t, "cycle-b", resp.Root.Session.ID)
+	require.Len(t, resp.Root.Children, 1)
+	assert.Equal(t, "cycle-a", resp.Root.Children[0].Session.ID)
+	assert.Empty(t, resp.Root.Children[0].Children)
+	assert.True(t, resp.Truncated)
+}
+
+func TestGetSessionTree_TruncatesAtNodeLimit(t *testing.T) {
+	te := setup(t)
+	te.seedSession(t, "wide-root", "my-app", 4)
+	for i := 0; i < 505; i++ {
+		id := fmt.Sprintf("wide-child-%03d", i)
+		te.seedSession(t, id, "my-app", 1, func(s *db.Session) {
+			s.ParentSessionID = new("wide-root")
+			s.RelationshipType = "subagent"
+			started := fmt.Sprintf(
+				"2025-01-15T10:%02d:%02dZ", i/60, i%60,
+			)
+			s.StartedAt = &started
+		})
+	}
+
+	w := te.get(t, "/api/v1/sessions/wide-root/tree")
+	assertStatus(t, w, http.StatusOK)
+
+	var resp struct {
+		Root struct {
+			Session  db.Session `json:"session"`
+			Children []struct {
+				Session db.Session `json:"session"`
+			} `json:"children"`
+		} `json:"root"`
+		Truncated bool `json:"truncated"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+
+	assert.Equal(t, "wide-root", resp.Root.Session.ID)
+	assert.True(t, resp.Truncated)
+	assert.Len(t, resp.Root.Children, sessionTreeMaxNodesForTest()-1)
+}
+
+func sessionTreeMaxNodesForTest() int {
+	return 500
+}
+
 func TestGetMessages_AscDefault(t *testing.T) {
 	te := setup(t)
 	te.seedSession(t, "s1", "my-app", 10)
