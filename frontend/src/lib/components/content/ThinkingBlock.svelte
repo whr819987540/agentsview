@@ -2,6 +2,7 @@
   import { applyHighlight, escapeHTML } from "../../utils/highlight.js";
   import { ChevronRightIcon } from "../../icons.js";
   import { m } from "../../i18n/index.js";
+  import { ui } from "../../stores/ui.svelte.js";
 
   interface Props {
     content: string;
@@ -14,6 +15,7 @@
   let userOverride: boolean = $state(false);
   let searchExpanded: boolean = $state(false);
   let prevQuery: string = "";
+  let appliedBulkCommandId: number = $state(0);
 
   // Auto-expand when a search match exists in this block.
   // Only reset the user override when the query itself changes,
@@ -30,6 +32,15 @@
     }
   });
 
+  $effect(() => {
+    const command = ui.bulkCollapseCommand;
+    if (!command || command.id === appliedBulkCommandId) return;
+    appliedBulkCommandId = command.id;
+    if (!command.visibleBlocks.includes("thinking")) return;
+    userCollapsed = command.target === "collapsed";
+    userOverride = true;
+  });
+
   let collapsed = $derived(
     userOverride ? userCollapsed
       : searchExpanded ? false
@@ -40,6 +51,12 @@
 <div class="thinking-block">
   <button
     class="thinking-header"
+    title={collapsed
+      ? m.thinking_block_expand()
+      : m.thinking_block_collapse()}
+    aria-label={collapsed
+      ? m.thinking_block_expand()
+      : m.thinking_block_collapse()}
     onclick={() => { userCollapsed = !userCollapsed; userOverride = true; }}
   >
     <span class="thinking-chevron" class:open={!collapsed}>

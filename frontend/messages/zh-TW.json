@@ -212,6 +212,12 @@
   "session_find_close": "關閉查找欄",
   "message_list_empty": "選擇一個會話查看消息",
   "message_list_loading": "正在加載消息...",
+  "message_list_block_controls": "消息塊控件",
+  "message_list_collapse_visible_blocks": "摺疊可見塊",
+  "message_list_expand_visible_blocks": "展開可見塊",
+  "code_block_label": "代碼",
+  "code_block_collapse": "摺疊代碼塊",
+  "code_block_expand": "展開代碼塊",
   "code_block_copy_code_block": "複製代碼塊",
   "code_block_copied_code_block": "代碼塊已複製",
   "code_block_copy_code": "複製代碼",
@@ -227,6 +233,8 @@
   "message_content_pin_message": "固定消息",
   "message_content_unpinned": "已取消固定",
   "message_content_pinned": "已固定",
+  "message_content_collapse_text": "摺疊文本",
+  "message_content_expand_text": "展開文本",
   "message_content_running_duration": "運行中 {duration}+",
   "message_content_turn_summary": [
     {
@@ -319,6 +327,8 @@
   "tool_block_status_label": "狀態：",
   "tool_block_source_label": "來源：",
   "tool_block_agent_label": "agent：",
+  "tool_block_collapse": "摺疊工具塊",
+  "tool_block_expand": "展開工具塊",
   "tool_block_show_less": "收起",
   "tool_block_show_all_lines": [
     {
@@ -335,6 +345,8 @@
     }
   ],
   "thinking_block_label": "思考",
+  "thinking_block_collapse": "摺疊思考塊",
+  "thinking_block_expand": "展開思考塊",
   "compact_boundary_title": "上下文窗口在此處被壓縮",
   "compact_boundary_label": "上下文已壓縮",
   "compact_boundary_show_full_summary": "顯示完整摘要",

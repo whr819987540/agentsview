@@ -30,7 +30,7 @@
   import CodeBlock from "./CodeBlock.svelte";
   import SkillBlock from "./SkillBlock.svelte";
   import CopyButton from "../shared/CopyButton.svelte";
-  import { ui } from "../../stores/ui.svelte.js";
+  import { ui, type BlockType } from "../../stores/ui.svelte.js";
   import { pins } from "../../stores/pins.svelte.js";
   import { sessions } from "../../stores/sessions.svelte.js";
   import { sync } from "../../stores/sync.svelte.js";
@@ -38,7 +38,11 @@
   import { highlightCodeFences } from "../../utils/highlight-fences.js";
   import { renderMarkdown } from "../../utils/markdown.js";
   import { displayToolName } from "../../utils/toolDisplay.js";
-  import { CirclePlayIcon, PinIcon } from "../../icons.js";
+  import {
+    ChevronRightIcon,
+    CirclePlayIcon,
+    PinIcon,
+  } from "../../icons.js";
   import type { Session } from "../../api/types.js";
   import { m } from "../../i18n/index.js";
 
@@ -59,6 +63,11 @@
   }: Props = $props();
 
   let copied = $state(false);
+  let userTextCollapsed = $state(false);
+  let userTextOverride = $state(false);
+  let searchExpandedText = $state(false);
+  let prevTextQuery = $state("");
+  let appliedBulkCommandId = $state(0);
 
   let segments = $derived(
     enrichSegments(
@@ -171,6 +180,57 @@
   });
 
   let hasSearchQuery = $derived(highlightQuery.trim() !== "");
+  let textBlockType = $derived.by(
+    (): BlockType => isUser ? "user" : "assistant",
+  );
+
+  let textSegments = $derived(
+    segments.filter((segment) =>
+      segment.type === "text" || segment.type === "skill",
+    ),
+  );
+
+  let hasTextSegments = $derived(textSegments.length > 0);
+
+  let textPreview = $derived.by(() => {
+    for (const segment of textSegments) {
+      const firstLine = segment.content
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .find((line) => line.length > 0);
+      if (firstLine) return firstLine.slice(0, 160);
+    }
+    return "";
+  });
+
+  $effect(() => {
+    const q = highlightQuery;
+    const trimmed = q.trim();
+    searchExpandedText =
+      trimmed !== "" &&
+      textSegments.some((segment) =>
+        segment.content.toLowerCase().includes(trimmed.toLowerCase()),
+      );
+    if (q !== prevTextQuery) {
+      userTextOverride = false;
+      prevTextQuery = q;
+    }
+  });
+
+  $effect(() => {
+    const command = ui.bulkCollapseCommand;
+    if (!command || command.id === appliedBulkCommandId) return;
+    appliedBulkCommandId = command.id;
+    if (!command.visibleBlocks.includes(textBlockType)) return;
+    userTextCollapsed = command.target === "collapsed";
+    userTextOverride = true;
+  });
+
+  let textCollapsed = $derived(
+    userTextOverride ? userTextCollapsed
+      : searchExpandedText ? false
+      : userTextCollapsed,
+  );
 
   /** Whether the text (prose) segments for this role should render. */
   let showText = $derived(
@@ -397,6 +457,30 @@
     >
       <PinIcon size="14" strokeWidth="1.8" aria-hidden="true" />
     </button>
+    {#if hasTextSegments && showText}
+      <button
+        type="button"
+        class="pin-btn text-toggle-btn"
+        title={textCollapsed
+          ? m.message_content_expand_text()
+          : m.message_content_collapse_text()}
+        aria-label={textCollapsed
+          ? m.message_content_expand_text()
+          : m.message_content_collapse_text()}
+        onclick={() => {
+          userTextCollapsed = !userTextCollapsed;
+          userTextOverride = true;
+        }}
+      >
+        <span class="text-toggle-icon" class:open={!textCollapsed}>
+          <ChevronRightIcon
+            size="14"
+            strokeWidth="2.2"
+            aria-hidden="true"
+          />
+        </span>
+      </button>
+    {/if}
     {#if canForkFromMessage}
       <button
         type="button"
@@ -441,6 +525,9 @@
   </div>
 
   <div class="message-body">
+    {#if hasTextSegments && showText && textCollapsed && textPreview}
+      <div class="text-preview">{textPreview}</div>
+    {/if}
     {#each segments as segment}
       {#if segment.type === "thinking"}
         {#if hasSearchQuery || ui.isBlockVisible("thinking")}
@@ -464,11 +551,11 @@
           />
         {/if}
       {:else if segment.type === "skill"}
-        {#if showText}
+        {#if showText && !textCollapsed}
           <SkillBlock content={segment.content} name={segment.label} />
         {/if}
       {:else}
-        {#if showText}
+        {#if showText && !textCollapsed}
           <div
             class="text-content markdown"
             use:applyHighlight={{
@@ -666,6 +753,16 @@
     color: var(--accent-blue);
   }
 
+  .text-toggle-icon {
+    display: inline-flex;
+    align-items: center;
+    transition: transform 0.15s;
+  }
+
+  .text-toggle-icon.open {
+    transform: rotate(90deg);
+  }
+
   .pin-btn:active {
     transform: scale(0.92);
   }
@@ -694,6 +791,17 @@
     line-height: 1.7;
     color: var(--text-primary);
     word-wrap: break-word;
+  }
+
+  .text-preview {
+    font-size: 13px;
+    line-height: 1.5;
+    color: var(--text-muted);
+    font-family: var(--font-mono);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    padding: 2px 0;
   }
 
   .message-body {

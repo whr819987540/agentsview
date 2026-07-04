@@ -1,8 +1,9 @@
 // @vitest-environment jsdom
-import { describe, it, expect, afterEach, vi } from "vitest";
+import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
 import { mount, unmount, tick } from "svelte";
 import CodeBlock from "./CodeBlock.svelte";
 import { setLocale } from "../../i18n/index.js";
+import { ui } from "../../stores/ui.svelte.js";
 
 function marks(el: HTMLElement): string[] {
   return Array.from(el.querySelectorAll("mark.search-highlight")).map(
@@ -19,10 +20,21 @@ function styledSpans(el: HTMLElement): HTMLSpanElement[] {
 describe("CodeBlock syntax highlighting and search marks", () => {
   let component: ReturnType<typeof mount>;
 
+  beforeEach(() => {
+    ui.showAllBlocks();
+    ui.bulkCollapseCommand = null;
+    Object.defineProperty(document, "execCommand", {
+      value: vi.fn(() => true),
+      configurable: true,
+    });
+  });
+
   afterEach(() => {
     setLocale("en");
     if (component) unmount(component);
     document.body.innerHTML = "";
+    ui.showAllBlocks();
+    ui.bulkCollapseCommand = null;
   });
 
   it("renders copy labels in Simplified Chinese", async () => {
@@ -187,5 +199,46 @@ describe("CodeBlock syntax highlighting and search marks", () => {
 
     const markEls = document.body.querySelectorAll("mark.search-highlight");
     expect(markEls).toHaveLength(expectedCount);
+  });
+
+  it("collapses from a bulk command, preserves preview, and still copies", async () => {
+    const content = "const answer = 42;\nconsole.log(answer);";
+    ui.collapseVisibleBlocks();
+    component = mount(CodeBlock, {
+      target: document.body,
+      props: {
+        language: "typescript",
+        content,
+      },
+    });
+    await tick();
+
+    expect(document.querySelector(".code-content")).toBeNull();
+    expect(document.querySelector(".code-preview")?.textContent).toBe(
+      "const answer = 42;",
+    );
+
+    const copyButton = document.querySelector<HTMLButtonElement>(
+      "button.copy-btn",
+    );
+    expect(copyButton).not.toBeNull();
+    copyButton!.click();
+    await Promise.resolve();
+    await tick();
+
+    expect(copyButton!.getAttribute("aria-label")).toBe(
+      "Copied code block",
+    );
+
+    document
+      .querySelector<HTMLButtonElement>(
+        'button[aria-label="Expand code block"]',
+      )!
+      .click();
+    await tick();
+
+    expect(document.querySelector(".code-content")?.textContent).toContain(
+      "const answer = 42;",
+    );
   });
 });

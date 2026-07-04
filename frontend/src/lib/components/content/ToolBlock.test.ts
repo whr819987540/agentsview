@@ -1,10 +1,11 @@
 // @vitest-environment jsdom
 // ABOUTME: Unit tests for ToolBlock's output section behavior.
 // ABOUTME: Covers visibility, collapse/expand, and preview of result_content.
-import { describe, it, expect, vi, afterEach } from "vite-plus/test";
+import { describe, it, expect, vi, afterEach, beforeEach } from "vite-plus/test";
 import { mount, unmount, tick } from "svelte";
 import type { ToolCall } from "../../api/types.js";
 import { setLocale } from "../../i18n/index.js";
+import { ui } from "../../stores/ui.svelte.js";
 
 vi.mock("./SubagentInline.svelte", () => ({
   default: {},
@@ -16,10 +17,17 @@ import ToolBlock from "./ToolBlock.svelte";
 describe("ToolBlock output section", () => {
   let component: ReturnType<typeof mount>;
 
+  beforeEach(() => {
+    ui.showAllBlocks();
+    ui.bulkCollapseCommand = null;
+  });
+
   afterEach(() => {
     if (component) unmount(component);
     document.body.innerHTML = "";
     setLocale("en");
+    ui.showAllBlocks();
+    ui.bulkCollapseCommand = null;
   });
 
   it("does not render output-header when toolCall has no result_content", async () => {
@@ -268,6 +276,41 @@ describe("ToolBlock output section", () => {
     expect(historyEntries).toHaveLength(2);
     expect(historyEntries[0]!.textContent).toBe("First finished");
     expect(historyEntries[1]!.textContent).toBe("Second finished");
+  });
+
+  it("bulk expand opens the tool block plus output and history", async () => {
+    const toolCall: ToolCall = {
+      tool_name: "wait",
+      category: "Other",
+      result_content: "latest summary",
+      result_events: [
+        {
+          source: "wait_output",
+          status: "completed",
+          content: "Finished successfully",
+          content_length: 21,
+          agent_id: "agent-1",
+          event_index: 0,
+        },
+      ],
+    };
+
+    ui.expandVisibleBlocks();
+    component = mount(ToolBlock, {
+      target: document.body,
+      props: { content: "some input", toolCall },
+    });
+    await tick();
+
+    expect(document.querySelector(".tool-content")?.textContent).toContain(
+      "some input",
+    );
+    expect(document.querySelector(".output-content")?.textContent).toBe(
+      "latest summary",
+    );
+    expect(document.querySelector(".history-content")?.textContent).toBe(
+      "Finished successfully",
+    );
   });
 });
 

@@ -29,6 +29,14 @@ export type BlockType =
   | "tool"
   | "code";
 
+export type BulkCollapseTarget = "collapsed" | "expanded";
+
+export interface BulkCollapseCommand {
+  id: number;
+  target: BulkCollapseTarget;
+  visibleBlocks: BlockType[];
+}
+
 export const ALL_BLOCK_TYPES: BlockType[] = [
   "user",
   "assistant",
@@ -254,6 +262,8 @@ class UIStore {
 
   /** Set of block types currently visible. */
   visibleBlocks: Set<BlockType> = $state(readBlockFilters());
+  bulkCollapseCommand: BulkCollapseCommand | null = $state(null);
+  private nextBulkCollapseCommandId = 0;
 
   constructor() {
     $effect.root(() => {
@@ -464,6 +474,22 @@ class UIStore {
   showAllBlocks() {
     this.visibleBlocks = new Set(ALL_BLOCK_TYPES);
     this.persistBlockFilters();
+  }
+
+  collapseVisibleBlocks() {
+    this.issueBulkCollapseCommand("collapsed");
+  }
+
+  expandVisibleBlocks() {
+    this.issueBulkCollapseCommand("expanded");
+  }
+
+  private issueBulkCollapseCommand(target: BulkCollapseTarget) {
+    this.bulkCollapseCommand = {
+      id: ++this.nextBulkCollapseCommandId,
+      target,
+      visibleBlocks: [...this.visibleBlocks],
+    };
   }
 
   get hiddenBlockCount(): number {

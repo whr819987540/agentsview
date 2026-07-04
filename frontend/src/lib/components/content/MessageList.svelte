@@ -4,7 +4,11 @@
   import { messages } from "../../stores/messages.svelte.js";
   import { ui } from "../../stores/ui.svelte.js";
   import { sessions } from "../../stores/sessions.svelte.js";
-  import { MessageSquareIcon } from "../../icons.js";
+  import {
+    AlignJustifyIcon,
+    ListCollapseIcon,
+    MessageSquareIcon,
+  } from "../../icons.js";
   import { createVirtualizer } from "../../virtual/createVirtualizer.svelte.js";
   import MessageContent from "./MessageContent.svelte";
   import CompactBoundaryDivider from "./CompactBoundaryDivider.svelte";
@@ -541,6 +545,26 @@
   </div>
 {:else}
   <SessionFindBar />
+  <div class="bulk-controls" aria-label={m.message_list_block_controls()}>
+    <button
+      type="button"
+      class="bulk-btn"
+      title={m.message_list_collapse_visible_blocks()}
+      aria-label={m.message_list_collapse_visible_blocks()}
+      onclick={() => ui.collapseVisibleBlocks()}
+    >
+      <ListCollapseIcon size="15" strokeWidth="2" aria-hidden="true" />
+    </button>
+    <button
+      type="button"
+      class="bulk-btn"
+      title={m.message_list_expand_visible_blocks()}
+      aria-label={m.message_list_expand_visible_blocks()}
+      onclick={() => ui.expandVisibleBlocks()}
+    >
+      <AlignJustifyIcon size="15" strokeWidth="2" aria-hidden="true" />
+    </button>
+  </div>
   <div
     class="message-list-scroll layout-{effectiveLayout}"
     bind:this={containerRef}
@@ -609,6 +633,35 @@
     overflow-x: hidden;
     padding: 8px 0;
     overflow-anchor: none;
+  }
+
+  .bulk-controls {
+    display: flex;
+    justify-content: flex-end;
+    gap: 2px;
+    padding: 4px 12px 0;
+    flex-shrink: 0;
+  }
+
+  .bulk-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 26px;
+    height: 26px;
+    border: 1px solid transparent;
+    border-radius: var(--radius-sm, 4px);
+    background: transparent;
+    color: var(--text-muted);
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s, border-color 0.15s;
+  }
+
+  .bulk-btn:hover,
+  .bulk-btn:focus-visible {
+    background: var(--bg-surface-hover);
+    color: var(--text-secondary);
+    border-color: var(--border-muted);
   }
 
   .virtual-row {

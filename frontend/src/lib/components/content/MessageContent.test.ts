@@ -21,6 +21,16 @@ const syncState = vi.hoisted(() => ({
 const runtimeState = vi.hoisted(() => ({
   isRemote: false,
 }));
+const uiState = vi.hoisted(() => ({
+  bulkCollapseCommand: null as
+    | {
+      id: number;
+      target: "collapsed" | "expanded";
+      visibleBlocks: Array<"user" | "assistant" | "thinking" | "tool" | "code">;
+    }
+    | null,
+  isBlockVisible: () => true,
+}));
 
 vi.mock("../../stores/messages.svelte.js", () => ({
   messages: {
@@ -30,9 +40,7 @@ vi.mock("../../stores/messages.svelte.js", () => ({
 }));
 
 vi.mock("../../stores/ui.svelte.js", () => ({
-  ui: {
-    isBlockVisible: () => true,
-  },
+  ui: uiState,
 }));
 
 vi.mock("../../stores/pins.svelte.js", () => ({
@@ -116,6 +124,8 @@ afterEach(() => {
   sessionsState.activeSession = null;
   syncState.readOnly = false;
   runtimeState.isRemote = false;
+  uiState.bulkCollapseCommand = null;
+  uiState.isBlockVisible = () => true;
 });
 
 beforeEach(() => {
@@ -279,6 +289,71 @@ describe("MessageContent", () => {
     );
     expect(copyButton!.querySelector("svg")).not.toBeNull();
     expect(copyButton!.textContent?.trim()).toBe("");
+
+    unmount(component);
+  });
+
+  it("bulk-collapses assistant text to a first-line preview and allows manual restore", async () => {
+    uiState.bulkCollapseCommand = {
+      id: 1,
+      target: "collapsed",
+      visibleBlocks: ["assistant"],
+    };
+    const component = mount(MessageContent, {
+      target: document.body,
+      props: {
+        message: makeMessage({
+          content: "First visible line\nSecond visible line",
+          content_length: 36,
+        }),
+      },
+    });
+
+    await tick();
+
+    expect(document.querySelector(".text-content")).toBeNull();
+    expect(document.querySelector(".text-preview")?.textContent).toBe(
+      "First visible line",
+    );
+
+    document
+      .querySelector<HTMLButtonElement>(
+        'button[aria-label="Expand text"]',
+      )!
+      .click();
+    await tick();
+
+    expect(document.querySelector(".text-preview")).toBeNull();
+    expect(document.querySelector(".text-content")?.textContent).toContain(
+      "First visible line",
+    );
+
+    unmount(component);
+  });
+
+  it("ignores a bulk command whose snapshot excludes the message text type", async () => {
+    uiState.bulkCollapseCommand = {
+      id: 2,
+      target: "collapsed",
+      visibleBlocks: ["tool"],
+    };
+    const component = mount(MessageContent, {
+      target: document.body,
+      props: {
+        message: makeMessage({
+          role: "user",
+          content: "User text stays open",
+          content_length: 20,
+        }),
+      },
+    });
+
+    await tick();
+
+    expect(document.querySelector(".text-preview")).toBeNull();
+    expect(document.querySelector(".text-content")?.textContent).toContain(
+      "User text stays open",
+    );
 
     unmount(component);
   });

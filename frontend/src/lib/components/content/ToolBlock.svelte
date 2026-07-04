@@ -11,6 +11,7 @@
   import { applyHighlight, escapeHTML } from "../../utils/highlight.js";
   import { ChevronRightIcon } from "../../icons.js";
   import { summarizeToolCall } from "../../utils/tool-summary.js";
+  import { ui } from "../../stores/ui.svelte.js";
 
   interface Props {
     content: string;
@@ -49,6 +50,7 @@
   let searchExpandedOutput: boolean = $state(false);
   let searchExpandedHistory: boolean = $state(false);
   let prevQuery: string = "";
+  let appliedBulkCommandId: number = $state(0);
 
   // Auto-expand when a search match exists in input or output
   // content. Only reset user overrides when the query itself
@@ -99,6 +101,26 @@
       : searchExpandedHistory ? false
       : userHistoryCollapsed,
   );
+
+  $effect(() => {
+    const command = ui.bulkCollapseCommand;
+    if (!command || command.id === appliedBulkCommandId) return;
+    appliedBulkCommandId = command.id;
+    if (!command.visibleBlocks.includes("tool")) return;
+
+    const collapse = command.target === "collapsed";
+    userCollapsed = collapse;
+    userOverride = true;
+    if (collapse) {
+      contentFullyExpanded = false;
+      return;
+    }
+    contentFullyExpanded = true;
+    userOutputCollapsed = false;
+    userHistoryCollapsed = false;
+    userOutputOverride = true;
+    userHistoryOverride = true;
+  });
 
   let outputPreviewLine = $derived.by(() => {
     const rc = toolCall?.result_content;
@@ -264,6 +286,8 @@
 <div class="tool-block" class:in-group={inGroup}>
   <button
     class="tool-header"
+    title={collapsed ? m.tool_block_expand() : m.tool_block_collapse()}
+    aria-label={collapsed ? m.tool_block_expand() : m.tool_block_collapse()}
     onclick={() => {
       const sel = window.getSelection();
       if (sel && sel.toString().length > 0) return;

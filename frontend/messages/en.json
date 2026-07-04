@@ -217,6 +217,12 @@
   "session_find_close": "Close find bar",
   "message_list_empty": "Select a session to view messages",
   "message_list_loading": "Loading messages...",
+  "message_list_block_controls": "Message block controls",
+  "message_list_collapse_visible_blocks": "Collapse visible blocks",
+  "message_list_expand_visible_blocks": "Expand visible blocks",
+  "code_block_label": "Code",
+  "code_block_collapse": "Collapse code block",
+  "code_block_expand": "Expand code block",
   "code_block_copy_code_block": "Copy code block",
   "code_block_copied_code_block": "Copied code block",
   "code_block_copy_code": "Copy code",
@@ -232,6 +238,8 @@
   "message_content_pin_message": "Pin message",
   "message_content_unpinned": "Unpinned",
   "message_content_pinned": "Pinned",
+  "message_content_collapse_text": "Collapse text",
+  "message_content_expand_text": "Expand text",
   "message_content_running_duration": "running {duration}+",
   "message_content_turn_summary": [
     {
@@ -329,6 +337,8 @@
   "tool_block_status_label": "status:",
   "tool_block_source_label": "source:",
   "tool_block_agent_label": "agent:",
+  "tool_block_collapse": "Collapse tool block",
+  "tool_block_expand": "Expand tool block",
   "tool_block_show_less": "show less",
   "tool_block_show_all_lines": [
     {
@@ -346,6 +356,8 @@
     }
   ],
   "thinking_block_label": "Thinking",
+  "thinking_block_collapse": "Collapse thinking block",
+  "thinking_block_expand": "Expand thinking block",
   "compact_boundary_title": "Context window compacted at this point",
   "compact_boundary_label": "Context compacted",
   "compact_boundary_show_full_summary": "Show full summary",

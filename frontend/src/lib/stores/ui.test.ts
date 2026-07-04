@@ -12,7 +12,7 @@ import {
   SIDEBAR_WIDTH_MIN,
   SIDEBAR_WIDTH_STORAGE_MAX,
 } from "../components/layout/sidebar-width.js";
-import { ui } from "./ui.svelte.js";
+import { ALL_BLOCK_TYPES, ui } from "./ui.svelte.js";
 
 describe("UIStore", () => {
   beforeEach(() => {
@@ -21,8 +21,11 @@ describe("UIStore", () => {
     ui.publishSecret = false;
     ui.selectedOrdinal = null;
     ui.pendingScrollOrdinal = null;
+    ui.pendingScrollSession = null;
     ui.followLatest = false;
     ui.followLatestRequest = 0;
+    ui.visibleBlocks = new Set(ALL_BLOCK_TYPES);
+    ui.bulkCollapseCommand = null;
   });
 
   describe("activeModal", () => {
@@ -191,6 +194,45 @@ describe("UIStore", () => {
 
       expect(ui.followLatest).toBe(false);
       expect(ui.pendingScrollOrdinal).toBe(10);
+    });
+  });
+
+  describe("bulk collapse commands", () => {
+    it("increments command ids and snapshots currently visible blocks", () => {
+      ui.visibleBlocks = new Set(["user", "code"]);
+
+      ui.collapseVisibleBlocks();
+      const first = ui.bulkCollapseCommand;
+
+      expect(first).toEqual({
+        id: expect.any(Number),
+        target: "collapsed",
+        visibleBlocks: ["user", "code"],
+      });
+
+      ui.visibleBlocks = new Set(["assistant"]);
+      ui.expandVisibleBlocks();
+
+      expect(ui.bulkCollapseCommand).toEqual({
+        id: first!.id + 1,
+        target: "expanded",
+        visibleBlocks: ["assistant"],
+      });
+    });
+
+    it("does not persist bulk commands to block filter storage", async () => {
+      const setItem = vi.spyOn(Storage.prototype, "setItem");
+      setItem.mockClear();
+
+      ui.collapseVisibleBlocks();
+      await tick();
+
+      expect(setItem).not.toHaveBeenCalledWith(
+        "agentsview-block-filters",
+        expect.any(String),
+      );
+
+      setItem.mockRestore();
     });
   });
 
