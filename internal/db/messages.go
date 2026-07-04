@@ -125,6 +125,15 @@ type Message struct {
 	IsCompactBoundary bool            `json:"is_compact_boundary,omitempty"`
 }
 
+// InputOutlineMessage is the lightweight message shape used to build a
+// session input outline without hydrating full message bodies or tool calls.
+type InputOutlineMessage struct {
+	Ordinal       int
+	Timestamp     string
+	Content       string
+	SourceSubtype string
+}
+
 // TokenPresence reports whether context/output token fields were
 // present in stored message metadata. It preserves explicit flags,
 // falls back to non-zero numeric values for legacy rows, and inspects
@@ -200,6 +209,45 @@ func (db *DB) GetAllMessages(
 		return nil, err
 	}
 	return msgs, nil
+}
+
+// GetInputOutline returns real user-input messages for a session, ordered by
+// ordinal. It excludes persisted system rows and legacy user-role rows whose
+// content carries a known system prefix.
+func (db *DB) GetInputOutline(
+	ctx context.Context, sessionID string,
+) ([]InputOutlineMessage, error) {
+	rows, err := db.getReader().QueryContext(ctx, `
+		SELECT ordinal, COALESCE(timestamp, '') AS timestamp, content, source_subtype
+		FROM messages
+		WHERE session_id = ?
+			AND role = 'user'
+			AND is_system = 0
+			AND `+SystemPrefixSQL("content", "role")+`
+		ORDER BY ordinal ASC`, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("querying input outline: %w", err)
+	}
+	defer rows.Close()
+	items, err := scanInputOutlineMessages(rows)
+	if err != nil {
+		return nil, err
+	}
+	return items, rows.Err()
+}
+
+func scanInputOutlineMessages(rows *sql.Rows) ([]InputOutlineMessage, error) {
+	var items []InputOutlineMessage
+	for rows.Next() {
+		var item InputOutlineMessage
+		if err := rows.Scan(
+			&item.Ordinal, &item.Timestamp, &item.Content, &item.SourceSubtype,
+		); err != nil {
+			return nil, fmt.Errorf("scanning input outline: %w", err)
+		}
+		items = append(items, item)
+	}
+	return items, rows.Err()
 }
 
 // insertMessagesTx batch-inserts messages within an existing

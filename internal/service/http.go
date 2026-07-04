@@ -185,6 +185,25 @@ func (b *httpBackend) Messages(
 	return &out, nil
 }
 
+func (b *httpBackend) InputOutline(
+	ctx context.Context, id string, includeForkContext bool,
+) (*InputOutline, error) {
+	q := url.Values{}
+	if includeForkContext {
+		q.Set("include_fork_context", "true")
+	}
+	path := "/api/v1/sessions/" + url.PathEscape(id) +
+		"/input-outline"
+	if encoded := q.Encode(); encoded != "" {
+		path += "?" + encoded
+	}
+	var out InputOutline
+	if err := b.getJSON(ctx, path, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 func (b *httpBackend) ToolCalls(
 	ctx context.Context, id string,
 ) (*ToolCallList, error) {

@@ -17,6 +17,7 @@
   import ActivityLane from "./ActivityLane.svelte";
   import CallRow from "./CallRow.svelte";
   import CallGroup from "./CallGroup.svelte";
+  import SessionInputOutline from "./SessionInputOutline.svelte";
   import SubagentCalls from "./SubagentCalls.svelte";
   import { XIcon } from "../../icons.js";
 
@@ -243,6 +244,8 @@
       <XIcon size="12" strokeWidth="2.4" aria-hidden="true" />
     </button>
   </header>
+
+  <SessionInputOutline {sessionId} />
 
   {#if timing}
     <section class="v-section">

@@ -83,6 +83,44 @@ func openLargeSessionFixtureDB(t *testing.T, withFKPoison bool) *DB {
 	return d
 }
 
+func TestGetInputOutlineFiltersUserInputs(t *testing.T) {
+	t.Parallel()
+	d := testDB(t)
+	ctx := context.Background()
+	const sessionID = "outline-session"
+
+	insertSession(t, d, sessionID, "project")
+	msgs := []Message{
+		userMsg(sessionID, 4, "later user"),
+		asstMsg(sessionID, 1, "assistant response"),
+		userMsg(sessionID, 0, "first user"),
+		userMsg(sessionID, 2, "persisted system"),
+		userMsg(sessionID, 3, "This session is being continued from earlier"),
+		userMsg(sessionID, 5, "<bash-input>go test ./...</bash-input>"),
+	}
+	msgs[3].IsSystem = true
+	require.NoError(t, d.ReplaceSessionMessages(sessionID, msgs))
+
+	outline, err := d.GetInputOutline(ctx, sessionID)
+	require.NoError(t, err)
+	require.Len(t, outline, 3)
+
+	assert.Equal(t, []int{0, 4, 5}, []int{
+		outline[0].Ordinal,
+		outline[1].Ordinal,
+		outline[2].Ordinal,
+	})
+	assert.Equal(t, []string{
+		"first user",
+		"later user",
+		"<bash-input>go test ./...</bash-input>",
+	}, []string{
+		outline[0].Content,
+		outline[1].Content,
+		outline[2].Content,
+	})
+}
+
 func buildLargeSessionFixtureTemplate(
 	t *testing.T, withFKPoison bool,
 ) (string, string) {

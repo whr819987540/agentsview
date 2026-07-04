@@ -657,6 +657,69 @@ func TestGetMessagesIsSystemField(t *testing.T) {
 	assert.True(t, all[1].IsSystem)
 }
 
+func TestPGGetInputOutlineFiltersUserInputs(t *testing.T) {
+	pgURL := testPGURL(t)
+
+	const schema = "agentsview_input_outline_test"
+	pg, err := Open(pgURL, schema, true)
+	require.NoError(t, err, "Open")
+	defer pg.Close()
+
+	ctx := context.Background()
+	_, err = pg.Exec(`DROP SCHEMA IF EXISTS ` + schema + ` CASCADE`)
+	require.NoError(t, err, "drop schema")
+	require.NoError(t, EnsureSchema(ctx, pg, schema), "EnsureSchema")
+
+	_, err = pg.Exec(`
+		INSERT INTO sessions
+			(id, machine, project, agent, first_message,
+			 started_at, message_count, user_message_count)
+		VALUES
+			('outline-pg-001', 'test-machine', 'test-project', 'claude',
+			 'hello', '2026-03-16T10:00:00Z'::timestamptz, 6, 4)`)
+	require.NoError(t, err, "insert session")
+	_, err = pg.Exec(`
+		INSERT INTO messages
+			(session_id, ordinal, role, content, timestamp, content_length,
+			 is_system, source_subtype)
+		VALUES
+			('outline-pg-001', 4, 'user', 'later user',
+			 '2026-03-16T10:00:04Z'::timestamptz, 10, FALSE, ''),
+			('outline-pg-001', 1, 'assistant', 'assistant response',
+			 '2026-03-16T10:00:01Z'::timestamptz, 18, FALSE, ''),
+			('outline-pg-001', 0, 'user', 'first user',
+			 '2026-03-16T10:00:00Z'::timestamptz, 10, FALSE, ''),
+			('outline-pg-001', 2, 'user', 'persisted system',
+			 '2026-03-16T10:00:02Z'::timestamptz, 16, TRUE, ''),
+			('outline-pg-001', 3, 'user',
+			 'This session is being continued from earlier',
+			 '2026-03-16T10:00:03Z'::timestamptz, 44, FALSE, ''),
+			('outline-pg-001', 5, 'user',
+			 '<bash-input>go test ./...</bash-input>',
+			 '2026-03-16T10:00:05Z'::timestamptz, 39, FALSE, 'queued_command')`)
+	require.NoError(t, err, "insert messages")
+
+	store, err := NewStore(pgURL, schema, true)
+	require.NoError(t, err, "NewStore")
+	defer store.Close()
+
+	outline, err := store.GetInputOutline(ctx, "outline-pg-001")
+	require.NoError(t, err, "GetInputOutline")
+	require.Len(t, outline, 3)
+	assert.Equal(t, []int{0, 4, 5}, []int{
+		outline[0].Ordinal,
+		outline[1].Ordinal,
+		outline[2].Ordinal,
+	})
+	assert.Equal(t, []string{"first user", "later user",
+		"<bash-input>go test ./...</bash-input>"}, []string{
+		outline[0].Content,
+		outline[1].Content,
+		outline[2].Content,
+	})
+	assert.Equal(t, "queued_command", outline[2].SourceSubtype)
+}
+
 // TestGetMessagesToolCallFilePathAndCallIndex verifies the PG message
 // hydrator populates db.ToolCall.FilePath and CallIndex, mirroring the SQLite
 // round-trip coverage (db.TestResolveToolCallsDerivesPositionalCallIndex) so

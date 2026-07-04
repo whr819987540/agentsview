@@ -97,6 +97,41 @@ func (s *Store) GetAllMessages(
 	return msgs, nil
 }
 
+// GetInputOutline returns real user-input messages for a session, ordered by
+// ordinal, with the same system-message filtering used by search.
+func (s *Store) GetInputOutline(
+	ctx context.Context, sessionID string,
+) ([]db.InputOutlineMessage, error) {
+	rows, err := s.pg.QueryContext(ctx, `
+		SELECT ordinal, timestamp, content, source_subtype
+		FROM messages
+		WHERE session_id = $1
+			AND role = 'user'
+			AND is_system = FALSE
+			AND `+db.PostgresSystemPrefixSQL("content", "role")+`
+		ORDER BY ordinal ASC`, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("querying input outline: %w", err)
+	}
+	defer rows.Close()
+
+	var items []db.InputOutlineMessage
+	for rows.Next() {
+		var item db.InputOutlineMessage
+		var ts *time.Time
+		if err := rows.Scan(
+			&item.Ordinal, &ts, &item.Content, &item.SourceSubtype,
+		); err != nil {
+			return nil, fmt.Errorf("scanning input outline: %w", err)
+		}
+		if ts != nil {
+			item.Timestamp = FormatISO8601(*ts)
+		}
+		items = append(items, item)
+	}
+	return items, rows.Err()
+}
+
 // SearchSession performs ILIKE substring search within a single
 // session's messages, returning matching ordinals.
 func (s *Store) SearchSession(

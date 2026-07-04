@@ -1265,6 +1265,11 @@ type messageListResponse struct {
 	Count    int          `json:"count"`
 }
 
+type inputOutlineResponse struct {
+	Items []service.InputOutlineItem `json:"items"`
+	Count int                        `json:"count"`
+}
+
 type searchResponse struct {
 	Query   string            `json:"query"`
 	Results []db.SearchResult `json:"results"`
@@ -1915,6 +1920,45 @@ func TestGetMessages_AscDefault(t *testing.T) {
 	if first.Ordinal > last.Ordinal {
 		t.Fatal("expected ascending ordinal order")
 	}
+}
+
+func TestInputOutlineRoute(t *testing.T) {
+	te := setup(t)
+	te.seedSession(t, "outline-route", "my-app", 5)
+	te.seedMessages(t, "outline-route", 5, func(i int, m *db.Message) {
+		switch i {
+		case 0:
+			m.Role = "user"
+			m.Content = "  first   user prompt  "
+		case 1:
+			m.Role = "assistant"
+			m.Content = "assistant answer"
+		case 2:
+			m.Role = "user"
+			m.Content = "<bash-input>npm test</bash-input>"
+		case 3:
+			m.Role = "user"
+			m.Content = "This session is being continued from earlier"
+		case 4:
+			m.Role = "user"
+			m.IsSystem = true
+			m.Content = "system row"
+		}
+		m.ContentLength = len(m.Content)
+	})
+
+	w := te.get(t, "/api/v1/sessions/outline-route/input-outline")
+	assertStatus(t, w, http.StatusOK)
+
+	resp := decode[inputOutlineResponse](t, w)
+	require.Equal(t, 2, resp.Count)
+	require.Len(t, resp.Items, 2)
+	assert.Equal(t, 0, resp.Items[0].Ordinal)
+	assert.Equal(t, "first user prompt", resp.Items[0].Preview)
+	assert.False(t, resp.Items[0].IsShell)
+	assert.Equal(t, 2, resp.Items[1].Ordinal)
+	assert.Equal(t, "npm test", resp.Items[1].Preview)
+	assert.True(t, resp.Items[1].IsShell)
 }
 
 func TestGetMessages_DescDefault(t *testing.T) {

@@ -26,11 +26,19 @@ const mocks = vi.hoisted(() => {
 
   return {
     fetchSessionTiming: vi.fn().mockResolvedValue(timing),
+    fetchSessionInputOutline: vi.fn().mockResolvedValue({
+      items: [],
+      count: 0,
+    }),
   };
 });
 
 vi.mock("../../api/timing.js", () => ({
   fetchSessionTiming: mocks.fetchSessionTiming,
+}));
+
+vi.mock("../../api/inputOutline.js", () => ({
+  fetchSessionInputOutline: mocks.fetchSessionInputOutline,
 }));
 
 import { ui } from "../../stores/ui.svelte.js";

@@ -29,6 +29,7 @@ type SessionService interface {
 	FindSessionIDsByPartial(ctx context.Context, partial string, limit int) ([]string, error)
 	List(ctx context.Context, f ListFilter) (*SessionList, error)
 	Messages(ctx context.Context, id string, f MessageFilter) (*MessageList, error)
+	InputOutline(ctx context.Context, id string, includeForkContext bool) (*InputOutline, error)
 	ToolCalls(ctx context.Context, id string) (*ToolCallList, error)
 	Sync(ctx context.Context, in SyncInput) (*SessionDetail, error)
 	Watch(ctx context.Context, id string) (<-chan Event, error)
@@ -249,6 +250,21 @@ type MessageFilter struct {
 type MessageList struct {
 	Messages []db.Message `json:"messages"`
 	Count    int          `json:"count"`
+}
+
+// InputOutline is a deterministic outline of user-authored inputs in a
+// session. Preview text is normalized from the stored message content; it is
+// not generated or summarized.
+type InputOutline struct {
+	Items []InputOutlineItem `json:"items"`
+	Count int                `json:"count"`
+}
+
+type InputOutlineItem struct {
+	Ordinal   int    `json:"ordinal"`
+	Timestamp string `json:"timestamp,omitempty"`
+	Preview   string `json:"preview"`
+	IsShell   bool   `json:"is_shell"`
 }
 
 // ToolCall mirrors a flattened tool call with its enclosing message's

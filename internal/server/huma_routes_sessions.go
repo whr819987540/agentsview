@@ -29,6 +29,7 @@ func (s *Server) registerSessionRoutes() {
 	get(s, group, "/session-ids/resolve", "Resolve session IDs", s.humaResolveSessionIDs)
 	get(s, group, "/sessions/{id}", "Get session", s.humaGetSession)
 	get(s, group, "/sessions/{id}/messages", "List session messages", s.humaGetMessages)
+	get(s, group, "/sessions/{id}/input-outline", "List session input outline", s.humaInputOutline)
 	get(s, group, "/sessions/{id}/tool-calls", "List session tool calls", s.humaToolCalls)
 	get(s, group, "/sessions/{id}/tree", "Get session relationship tree", s.humaGetSessionTree)
 	get(s, group, "/sessions/{id}/children", "List child sessions", s.humaGetChildSessions)
@@ -92,6 +93,11 @@ type messageListInput struct {
 	Direction          messageDirection `query:"direction" enum:"asc,desc" doc:"Message ordering direction"`
 	From               optionalIntParam `query:"from" minimum:"0" doc:"Starting message ordinal"`
 	IncludeForkContext bool             `query:"include_fork_context" doc:"Include inherited parent context before fork sessions"`
+}
+
+type inputOutlineInput struct {
+	ID                 string `path:"id" required:"true" doc:"Session ID"`
+	IncludeForkContext bool   `query:"include_fork_context" doc:"Include inherited parent context before fork sessions"`
 }
 
 type searchSessionInput struct {
@@ -421,6 +427,17 @@ func (s *Server) humaGetMessages(
 		return nil, serverError(err)
 	}
 	return &jsonOutput[*service.MessageList]{Body: list}, nil
+}
+
+func (s *Server) humaInputOutline(
+	ctx context.Context,
+	in *inputOutlineInput,
+) (*jsonOutput[*service.InputOutline], error) {
+	outline, err := s.sessions.InputOutline(ctx, in.ID, in.IncludeForkContext)
+	if err != nil {
+		return nil, serverError(err)
+	}
+	return &jsonOutput[*service.InputOutline]{Body: outline}, nil
 }
 
 func (s *Server) humaToolCalls(

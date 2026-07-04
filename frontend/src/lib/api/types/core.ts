@@ -205,6 +205,18 @@ export interface MessagesResponse {
   count: number;
 }
 
+export interface InputOutlineItem {
+  ordinal: number;
+  timestamp?: string;
+  preview: string;
+  is_shell: boolean;
+}
+
+export interface InputOutlineResponse {
+  items: InputOutlineItem[];
+  count: number;
+}
+
 export interface SearchResponse {
   query: string;
   results: SearchResult[];

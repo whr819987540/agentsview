@@ -37,6 +37,7 @@ type Store interface {
 	// Messages.
 	GetMessages(ctx context.Context, sessionID string, from, limit int, asc bool) ([]Message, error)
 	GetAllMessages(ctx context.Context, sessionID string) ([]Message, error)
+	GetInputOutline(ctx context.Context, sessionID string) ([]InputOutlineMessage, error)
 	GetSessionActivity(ctx context.Context, sessionID string) (*SessionActivityResponse, error)
 
 	// Timing.

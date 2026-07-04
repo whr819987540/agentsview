@@ -236,6 +236,16 @@ func (s *mcpDaemonService) Messages(
 	return svc.Messages(ctx, id, f)
 }
 
+func (s *mcpDaemonService) InputOutline(
+	ctx context.Context, id string, includeForkContext bool,
+) (*service.InputOutline, error) {
+	svc, err := s.daemonService(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return svc.InputOutline(ctx, id, includeForkContext)
+}
+
 func (s *mcpDaemonService) ToolCalls(
 	ctx context.Context, id string,
 ) (*service.ToolCallList, error) {

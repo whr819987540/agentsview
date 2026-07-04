@@ -13,13 +13,16 @@ import type { OpenSessionResponse } from '../models/OpenSessionResponse';
 import type { OrdinalsResponse } from '../models/OrdinalsResponse';
 import type { PublishResponse } from '../models/PublishResponse';
 import type { RenameRequest } from '../models/RenameRequest';
+import type { ResolveSessionIDsResponse } from '../models/ResolveSessionIDsResponse';
 import type { ResumeRequest } from '../models/ResumeRequest';
 import type { ResumeResponse } from '../models/ResumeResponse';
+import type { ServiceInputOutline } from '../models/ServiceInputOutline';
 import type { ServiceMessageList } from '../models/ServiceMessageList';
 import type { ServiceSessionDetail } from '../models/ServiceSessionDetail';
 import type { ServiceSessionList } from '../models/ServiceSessionList';
 import type { ServiceToolCallList } from '../models/ServiceToolCallList';
 import type { SessionDirectoryResponse } from '../models/SessionDirectoryResponse';
+import type { SessionTreeResponse } from '../models/SessionTreeResponse';
 import type { SessionUsageResponse } from '../models/SessionUsageResponse';
 import type { TrashResponse } from '../models/TrashResponse';
 import type { UploadSessionResponse } from '../models/UploadSessionResponse';
@@ -42,6 +45,46 @@ export class SessionsService {
         403: `Forbidden`,
         404: `Not Found`,
         409: `Conflict`,
+        500: `Internal Server Error`,
+        501: `Not Implemented`,
+        502: `Bad Gateway`,
+        503: `Service Unavailable`,
+        504: `Gateway Timeout`,
+      },
+    });
+  }
+  /**
+   * Resolve session IDs
+   * @returns ResolveSessionIDsResponse OK
+   * @throws ApiError
+   */
+  public static getApiV1SessionIdsResolve({
+    partial,
+    limit,
+  }: {
+    /**
+     * Session ID substring
+     */
+    partial: string,
+    /**
+     * Maximum number of matching IDs
+     */
+    limit?: number,
+  }): CancelablePromise<ResolveSessionIDsResponse> {
+    return __request(OpenAPI, {
+      method: 'GET',
+      url: '/api/v1/session-ids/resolve',
+      query: {
+        'partial': partial,
+        'limit': limit,
+      },
+      errors: {
+        400: `Bad Request`,
+        401: `Unauthorized`,
+        403: `Forbidden`,
+        404: `Not Found`,
+        409: `Conflict`,
+        422: `Unprocessable Entity`,
         500: `Internal Server Error`,
         501: `Not Implemented`,
         502: `Bad Gateway`,
@@ -213,6 +256,36 @@ export class SessionsService {
         'order_by': orderBy,
         'descending': descending,
       },
+      errors: {
+        400: `Bad Request`,
+        401: `Unauthorized`,
+        403: `Forbidden`,
+        404: `Not Found`,
+        409: `Conflict`,
+        422: `Unprocessable Entity`,
+        500: `Internal Server Error`,
+        501: `Not Implemented`,
+        502: `Bad Gateway`,
+        503: `Service Unavailable`,
+        504: `Gateway Timeout`,
+      },
+    });
+  }
+  /**
+   * Batch delete sessions
+   * @returns void
+   * @throws ApiError
+   */
+  public static postApiV1SessionsBatchDelete({
+    requestBody,
+  }: {
+    requestBody: BatchDeleteInputBody,
+  }): CancelablePromise<void> {
+    return __request(OpenAPI, {
+      method: 'POST',
+      url: '/api/v1/sessions/batch-delete',
+      body: requestBody,
+      mediaType: 'application/json',
       errors: {
         400: `Bad Request`,
         401: `Unauthorized`,
@@ -657,6 +730,48 @@ export class SessionsService {
     });
   }
   /**
+   * List session input outline
+   * @returns ServiceInputOutline OK
+   * @throws ApiError
+   */
+  public static getApiV1SessionsIdInputOutline({
+    id,
+    includeForkContext,
+  }: {
+    /**
+     * Session ID
+     */
+    id: string,
+    /**
+     * Include inherited parent context before fork sessions
+     */
+    includeForkContext?: boolean,
+  }): CancelablePromise<ServiceInputOutline> {
+    return __request(OpenAPI, {
+      method: 'GET',
+      url: '/api/v1/sessions/{id}/input-outline',
+      path: {
+        'id': id,
+      },
+      query: {
+        'include_fork_context': includeForkContext,
+      },
+      errors: {
+        400: `Bad Request`,
+        401: `Unauthorized`,
+        403: `Forbidden`,
+        404: `Not Found`,
+        409: `Conflict`,
+        422: `Unprocessable Entity`,
+        500: `Internal Server Error`,
+        501: `Not Implemented`,
+        502: `Bad Gateway`,
+        503: `Service Unavailable`,
+        504: `Gateway Timeout`,
+      },
+    });
+  }
+  /**
    * Export session as Markdown
    * @returns string OK
    * @throws ApiError
@@ -708,6 +823,7 @@ export class SessionsService {
     limit,
     direction,
     from,
+    includeForkContext,
   }: {
     /**
      * Session ID
@@ -725,6 +841,10 @@ export class SessionsService {
      * Starting message ordinal
      */
     from?: number,
+    /**
+     * Include inherited parent context before fork sessions
+     */
+    includeForkContext?: boolean,
   }): CancelablePromise<ServiceMessageList> {
     return __request(OpenAPI, {
       method: 'GET',
@@ -736,6 +856,7 @@ export class SessionsService {
         'limit': limit,
         'direction': direction,
         'from': from,
+        'include_fork_context': includeForkContext,
       },
       errors: {
         400: `Bad Request`,
@@ -1087,6 +1208,40 @@ export class SessionsService {
     });
   }
   /**
+   * Get session relationship tree
+   * @returns SessionTreeResponse OK
+   * @throws ApiError
+   */
+  public static getApiV1SessionsIdTree({
+    id,
+  }: {
+    /**
+     * Session ID
+     */
+    id: string,
+  }): CancelablePromise<SessionTreeResponse> {
+    return __request(OpenAPI, {
+      method: 'GET',
+      url: '/api/v1/sessions/{id}/tree',
+      path: {
+        'id': id,
+      },
+      errors: {
+        400: `Bad Request`,
+        401: `Unauthorized`,
+        403: `Forbidden`,
+        404: `Not Found`,
+        409: `Conflict`,
+        422: `Unprocessable Entity`,
+        500: `Internal Server Error`,
+        501: `Not Implemented`,
+        502: `Bad Gateway`,
+        503: `Service Unavailable`,
+        504: `Gateway Timeout`,
+      },
+    });
+  }
+  /**
    * Get session usage
    * @returns SessionUsageResponse OK
    * @throws ApiError
@@ -1192,36 +1347,6 @@ export class SessionsService {
         403: `Forbidden`,
         404: `Not Found`,
         409: `Conflict`,
-        500: `Internal Server Error`,
-        501: `Not Implemented`,
-        502: `Bad Gateway`,
-        503: `Service Unavailable`,
-        504: `Gateway Timeout`,
-      },
-    });
-  }
-  /**
-   * Batch delete sessions
-   * @returns void
-   * @throws ApiError
-   */
-  public static postApiV1SessionsBatchDelete({
-    requestBody,
-  }: {
-    requestBody: BatchDeleteInputBody,
-  }): CancelablePromise<void> {
-    return __request(OpenAPI, {
-      method: 'POST',
-      url: '/api/v1/sessions/batch-delete',
-      body: requestBody,
-      mediaType: 'application/json',
-      errors: {
-        400: `Bad Request`,
-        401: `Unauthorized`,
-        403: `Forbidden`,
-        404: `Not Found`,
-        409: `Conflict`,
-        422: `Unprocessable Entity`,
         500: `Internal Server Error`,
         501: `Not Implemented`,
         502: `Bad Gateway`,

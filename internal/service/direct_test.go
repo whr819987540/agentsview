@@ -1222,6 +1222,147 @@ func TestDirectBackend_Messages_IncludesForkContext(t *testing.T) {
 	assert.Equal(t, 0, noContext.Messages[0].Ordinal)
 }
 
+func TestDirectBackend_InputOutlineNormalizesPreviews(t *testing.T) {
+	t.Parallel()
+	svc, env := newDirectTestSvc(t)
+	ctx := context.Background()
+	const sessionID = "outline-normal"
+
+	dbtest.SeedSession(t, env.db, sessionID, "p1",
+		dbtest.WithMessageCount(6))
+	long := "first " + strings.Repeat("word ", 60)
+	dbtest.SeedMessages(t, env.db,
+		db.Message{
+			SessionID:     sessionID,
+			Ordinal:       0,
+			Role:          "user",
+			Content:       "\n\t  first line   with   spaces\nsecond",
+			ContentLength: len("\n\t  first line   with   spaces\nsecond"),
+			Timestamp:     "2026-07-01T10:00:00Z",
+		},
+		db.Message{
+			SessionID:     sessionID,
+			Ordinal:       1,
+			Role:          "assistant",
+			Content:       "assistant",
+			ContentLength: len("assistant"),
+		},
+		db.Message{
+			SessionID:     sessionID,
+			Ordinal:       2,
+			Role:          "user",
+			Content:       "<bash-input>  go test ./...  </bash-input>\n<bash-stdout>ok</bash-stdout>",
+			ContentLength: len("<bash-input>  go test ./...  </bash-input>\n<bash-stdout>ok</bash-stdout>"),
+			Timestamp:     "2026-07-01T10:00:02Z",
+		},
+		db.Message{
+			SessionID:     sessionID,
+			Ordinal:       3,
+			Role:          "user",
+			Content:       "This session is being continued from older context",
+			ContentLength: len("This session is being continued from older context"),
+		},
+		db.Message{
+			SessionID:     sessionID,
+			Ordinal:       4,
+			Role:          "user",
+			IsSystem:      true,
+			Content:       "persisted system",
+			ContentLength: len("persisted system"),
+		},
+		db.Message{
+			SessionID:     sessionID,
+			Ordinal:       5,
+			Role:          "user",
+			Content:       long,
+			ContentLength: len(long),
+		},
+	)
+
+	outline, err := svc.InputOutline(ctx, sessionID, false)
+	require.NoError(t, err)
+	require.NotNil(t, outline)
+	require.Len(t, outline.Items, 3)
+	assert.Equal(t, 3, outline.Count)
+	assert.Equal(t, []int{0, 2, 5}, outlineOrdinals(outline.Items))
+	assert.Equal(t, "first line with spaces", outline.Items[0].Preview)
+	assert.False(t, outline.Items[0].IsShell)
+	assert.Equal(t, "go test ./...", outline.Items[1].Preview)
+	assert.True(t, outline.Items[1].IsShell)
+	assert.Len(t, []rune(outline.Items[2].Preview), 160)
+	assert.True(t, strings.HasSuffix(outline.Items[2].Preview, "..."))
+}
+
+func TestDirectBackend_InputOutlineUsesForkContextSyntheticOrdinals(
+	t *testing.T,
+) {
+	t.Parallel()
+	svc, env := newDirectTestSvc(t)
+	ctx := context.Background()
+	parentID := "outline-parent"
+	childID := "outline-child"
+	childStarted := "2026-07-01T10:05:00Z"
+
+	dbtest.SeedSession(t, env.db, parentID, "p1",
+		dbtest.WithMessageCount(3))
+	dbtest.SeedSession(t, env.db, childID, "p1",
+		dbtest.WithMessageCount(1),
+		func(s *db.Session) {
+			s.ParentSessionID = &parentID
+			s.RelationshipType = "fork"
+			s.StartedAt = &childStarted
+		})
+	dbtest.SeedMessages(t, env.db,
+		db.Message{
+			SessionID:     parentID,
+			Ordinal:       0,
+			Role:          "user",
+			Content:       "parent before fork",
+			ContentLength: len("parent before fork"),
+			Timestamp:     "2026-07-01T10:00:00Z",
+		},
+		db.Message{
+			SessionID:     parentID,
+			Ordinal:       1,
+			Role:          "assistant",
+			Content:       "parent answer",
+			ContentLength: len("parent answer"),
+			Timestamp:     "2026-07-01T10:01:00Z",
+		},
+		db.Message{
+			SessionID:     parentID,
+			Ordinal:       2,
+			Role:          "user",
+			Content:       "parent after fork",
+			ContentLength: len("parent after fork"),
+			Timestamp:     "2026-07-01T10:10:00Z",
+		},
+		db.Message{
+			SessionID:     childID,
+			Ordinal:       0,
+			Role:          "user",
+			Content:       "child input",
+			ContentLength: len("child input"),
+			Timestamp:     childStarted,
+		},
+	)
+
+	withContext, err := svc.InputOutline(ctx, childID, true)
+	require.NoError(t, err)
+	require.NotNil(t, withContext)
+	require.Len(t, withContext.Items, 2)
+	assert.Equal(t, []int{-3, 0}, outlineOrdinals(withContext.Items))
+	assert.Equal(t, []string{"parent before fork", "child input"},
+		outlinePreviews(withContext.Items))
+
+	withoutContext, err := svc.InputOutline(ctx, childID, false)
+	require.NoError(t, err)
+	require.NotNil(t, withoutContext)
+	require.Len(t, withoutContext.Items, 1)
+	assert.Equal(t, []int{0}, outlineOrdinals(withoutContext.Items))
+	assert.Equal(t, "child input", withoutContext.Items[0].Preview)
+}
+
 func TestDirectBackend_Messages_ForkContextPaginatesBySyntheticOrdinal(
 	t *testing.T,
 ) {
@@ -1306,6 +1447,22 @@ func messageContents(msgs []db.Message) []string {
 	out := make([]string, 0, len(msgs))
 	for _, msg := range msgs {
 		out = append(out, msg.Content)
+	}
+	return out
+}
+
+func outlineOrdinals(items []service.InputOutlineItem) []int {
+	out := make([]int, 0, len(items))
+	for _, item := range items {
+		out = append(out, item.Ordinal)
+	}
+	return out
+}
+
+func outlinePreviews(items []service.InputOutlineItem) []string {
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		out = append(out, item.Preview)
 	}
 	return out
 }
