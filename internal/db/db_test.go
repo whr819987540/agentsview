@@ -843,13 +843,8 @@ func TestCurrentDataVersionGoalContextFiltering(t *testing.T) {
 }
 
 func TestCurrentDataVersionResultContentNULSanitization(t *testing.T) {
-	assert.GreaterOrEqual(t, CurrentDataVersion(), 58,
+	assert.Equal(t, 58, CurrentDataVersion(),
 		"message/result content NUL sanitization requires a data version bump")
-}
-
-func TestCurrentDataVersionCodexThreadRollback(t *testing.T) {
-	assert.Equal(t, 59, CurrentDataVersion(),
-		"Codex thread rollback parsing requires a data version bump")
 }
 
 func TestInsertMessages_PreservesToolResultEvents(t *testing.T) {

@@ -262,13 +262,6 @@ import (
 // backfill. Re-parsing persists estimated usage events for existing
 // aggregate-only Kimi sessions and preserves explicit native event
 // model names instead of the proxy fallback.)
-// (59: Codex thread_rolled_back events are applied when parsing visible
-// messages and fork context. Existing Codex rows need re-parsing so
-// rolled-back turns disappear from normal session views and fork
-// inherited context.)
-// (58: Message content, thinking text, tool call inputs, tool result
-// content, and tool result events have NUL bytes sanitized before
-// persistence.)
 // (56: Codex goal-continuation context wrappers are filtered from
 // persisted messages and user_message_count. Existing Codex rows need
 // re-parsing so synthetic /goal continuation records are removed.)
@@ -285,7 +278,7 @@ import (
 // (51: Gemini cumulative-to-delta token reparse.)
 // (17: Codex <skill> template filtering.)
 // (16: <turn_aborted> system messages.)
-const dataVersion = 59
+const dataVersion = 58
 
 const tokenCoverageRepairStatsKey = "token_coverage_repair_v1"
 
