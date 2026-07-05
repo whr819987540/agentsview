@@ -1222,6 +1222,126 @@ func TestDirectBackend_Messages_IncludesForkContext(t *testing.T) {
 	assert.Equal(t, 0, noContext.Messages[0].Ordinal)
 }
 
+func TestDirectBackend_Messages_CodexForkContextUsesReplayRollback(
+	t *testing.T,
+) {
+	t.Parallel()
+	svc, env := newDirectTestSvc(t)
+	ctx := context.Background()
+	parentID := "codex:019f328a-9b2b-7592-bba5-49045a177ca9"
+	childID := "codex:019f329b-a65a-7a61-ae6d-9eea81fc4e18"
+	childStarted := "2026-07-05T14:08:36Z"
+	forkPath := filepath.Join(t.TempDir(), "fork.jsonl")
+	content := testjsonl.JoinJSONL(
+		testjsonl.CodexForkedSessionMetaJSON(
+			"019f329b-a65a-7a61-ae6d-9eea81fc4e18",
+			"019f328a-9b2b-7592-bba5-49045a177ca9",
+			"/tmp", "user", "2026-07-05T14:08:11Z",
+		),
+		testjsonl.CodexSessionMetaJSON(
+			"019f328a-9b2b-7592-bba5-49045a177ca9",
+			"/tmp", "user", "2026-07-05T14:08:11Z",
+		),
+		testjsonl.CodexTurnContextWithIDJSON(
+			"gpt-5.4",
+			"019f328a-bc2a-7da0-be48-a0a3024a6955",
+			"2026-07-05T14:08:11Z",
+		),
+		testjsonl.CodexMsgJSON("user", "first question", "2026-07-05T14:08:11Z"),
+		testjsonl.CodexMsgJSON("assistant", "first answer", "2026-07-05T14:08:11Z"),
+		testjsonl.CodexTurnContextWithIDJSON(
+			"gpt-5.4",
+			"019f3292-6545-7491-ac69-e0c24247958e",
+			"2026-07-05T14:08:11Z",
+		),
+		testjsonl.CodexMsgJSON("user", "rolled back parent question", "2026-07-05T14:08:11Z"),
+		testjsonl.CodexMsgJSON("assistant", "rolled back parent answer", "2026-07-05T14:08:11Z"),
+		testjsonl.CodexThreadRolledBackJSON("2026-07-05T14:08:12Z", 1),
+		testjsonl.CodexTurnContextWithIDJSON(
+			"gpt-5.5",
+			"019f329c-1116-71e3-8642-dd342794a025",
+			childStarted,
+		),
+		testjsonl.CodexMsgJSON("user", "child question", childStarted),
+	)
+	require.NoError(t, os.WriteFile(forkPath, []byte(content), 0o644))
+
+	dbtest.SeedSession(t, env.db, parentID, "p1",
+		dbtest.WithMessageCount(4),
+		func(s *db.Session) {
+			s.Agent = string(parser.AgentCodex)
+		})
+	dbtest.SeedSession(t, env.db, childID, "p1",
+		dbtest.WithMessageCount(1),
+		func(s *db.Session) {
+			s.Agent = string(parser.AgentCodex)
+			s.ParentSessionID = &parentID
+			s.RelationshipType = "fork"
+			s.StartedAt = &childStarted
+			s.FilePath = &forkPath
+		})
+	dbtest.SeedMessages(t, env.db,
+		db.Message{
+			SessionID:     parentID,
+			Ordinal:       0,
+			Role:          "user",
+			Content:       "first question",
+			ContentLength: len("first question"),
+			Timestamp:     "2026-07-05T13:49:40Z",
+		},
+		db.Message{
+			SessionID:     parentID,
+			Ordinal:       1,
+			Role:          "assistant",
+			Content:       "first answer",
+			ContentLength: len("first answer"),
+			Timestamp:     "2026-07-05T13:49:58Z",
+		},
+		db.Message{
+			SessionID:     parentID,
+			Ordinal:       2,
+			Role:          "user",
+			Content:       "rolled back parent question",
+			ContentLength: len("rolled back parent question"),
+			Timestamp:     "2026-07-05T13:58:02Z",
+		},
+		db.Message{
+			SessionID:     parentID,
+			Ordinal:       3,
+			Role:          "assistant",
+			Content:       "rolled back parent answer",
+			ContentLength: len("rolled back parent answer"),
+			Timestamp:     "2026-07-05T13:58:19Z",
+		},
+		db.Message{
+			SessionID:     childID,
+			Ordinal:       0,
+			Role:          "user",
+			Content:       "child question",
+			ContentLength: len("child question"),
+			Timestamp:     childStarted,
+		},
+	)
+
+	list, err := svc.Messages(ctx, childID, service.MessageFilter{
+		IncludeForkContext: true,
+		Limit:              10,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, list)
+	require.Len(t, list.Messages, 4)
+	assert.Equal(t, []string{
+		"first question",
+		"first answer",
+		parentID,
+		"child question",
+	}, messageContents(list.Messages))
+	assert.NotContains(t, messageContents(list.Messages),
+		"rolled back parent question")
+	assert.Equal(t, []int{-3, -2, -1, 0},
+		messageOrdinals(list.Messages))
+}
+
 func TestDirectBackend_InputOutlineNormalizesPreviews(t *testing.T) {
 	t.Parallel()
 	svc, env := newDirectTestSvc(t)

@@ -146,15 +146,30 @@ func (g *codexForkGate) suppresses(lineType string, payload gjson.Result) bool {
 	if lineType != codexTypeTurnContext {
 		return true
 	}
-	tid := payload.Get("turn_id").Str
-	if tid == "" {
-		return true // pre-turn_id parent history
+	replay, ok := g.replayedTurnContext(payload)
+	if !ok {
+		g.active = false
+		return false
 	}
-	if ms := uuidV7Millis(tid); ms != 0 && ms < g.createdMs {
+	if replay {
 		return true
 	}
 	g.active = false
 	return false
+}
+
+func (g codexForkGate) replayedTurnContext(
+	payload gjson.Result,
+) (replayed bool, ok bool) {
+	tid := payload.Get("turn_id").Str
+	if tid == "" {
+		return true, true // pre-turn_id parent history
+	}
+	ms := uuidV7Millis(tid)
+	if ms == 0 {
+		return false, false
+	}
+	return ms < g.createdMs, true
 }
 
 // uuidV7Millis extracts the millisecond timestamp embedded in a
@@ -169,6 +184,76 @@ func uuidV7Millis(id string) int64 {
 		return 0
 	}
 	return ms
+}
+
+// CodexForkReplayMessages returns the parent-history messages that remain
+// visible after applying thread_rolled_back events in the replayed prefix of a
+// forked Codex rollout. The bool is false when the file is not a forked Codex
+// rollout or when the replay/genuine boundary cannot be identified safely.
+func CodexForkReplayMessages(
+	path string,
+) ([]ParsedMessage, bool, error) {
+	b := newCodexSessionBuilder(false)
+	var sawForkMeta bool
+	var usable = true
+	var done bool
+
+	_, err := readJSONLFrom(path, 0, func(line string) {
+		if done || !usable {
+			return
+		}
+		lineType := gjson.Get(line, "type").Str
+		payload := gjson.Get(line, "payload")
+		ts := parseTimestamp(gjson.Get(line, "timestamp").Str)
+
+		if lineType == codexTypeSessionMeta {
+			if sawForkMeta {
+				return
+			}
+			if payload.Get("forked_from_id").Str == "" {
+				usable = false
+				return
+			}
+			sawForkMeta = true
+			b.handleSessionMeta(payload, ts)
+			if !b.forkGate.active {
+				usable = false
+			}
+			return
+		}
+
+		if !sawForkMeta || !b.forkGate.active {
+			done = true
+			return
+		}
+
+		switch lineType {
+		case codexTypeTurnContext:
+			replayed, ok := b.forkGate.replayedTurnContext(payload)
+			if !ok {
+				usable = false
+				return
+			}
+			if !replayed {
+				done = true
+				return
+			}
+			b.currentModel = payload.Get("model").Str
+		case codexTypeResponseItem:
+			b.handleResponseItem(payload, ts)
+		case codexTypeEventMsg:
+			if payload.Get("type").Str == "thread_rolled_back" {
+				b.handleThreadRolledBack(payload)
+			}
+		}
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	if !sawForkMeta || !usable {
+		return nil, false, nil
+	}
+	return b.messages, true, nil
 }
 
 type codexToolCallRef struct {
@@ -354,6 +439,57 @@ func (b *codexSessionBuilder) handleEventMsg(payload gjson.Result) {
 		b.handleTokenCountEvent(payload)
 	case "collab_agent_spawn_end":
 		b.handleCollabAgentSpawnEnd(payload)
+	case "thread_rolled_back":
+		b.handleThreadRolledBack(payload)
+	}
+}
+
+func (b *codexSessionBuilder) handleThreadRolledBack(
+	payload gjson.Result,
+) {
+	n := int(payload.Get("num_turns").Int())
+	if n <= 0 {
+		return
+	}
+	for range n {
+		cut := -1
+		for i := len(b.messages) - 1; i >= 0; i-- {
+			if b.messages[i].Role == RoleUser {
+				cut = i
+				break
+			}
+		}
+		if cut < 0 {
+			break
+		}
+		b.messages = b.messages[:cut]
+	}
+	b.recomputeConversationState()
+	b.lastTokenUsageRaw = ""
+	b.unattachedTokenUsage = false
+}
+
+func (b *codexSessionBuilder) recomputeConversationState() {
+	b.ordinal = 0
+	if len(b.messages) > 0 {
+		b.ordinal = b.messages[len(b.messages)-1].Ordinal + 1
+	}
+	b.firstMessage = ""
+	b.firstUserContent = ""
+	b.sawUserTurnAfterFirst = false
+	b.mayReplayFirstUserPrompt = false
+	for _, msg := range b.messages {
+		if msg.Role != RoleUser || strings.TrimSpace(msg.Content) == "" {
+			continue
+		}
+		if b.firstUserContent == "" {
+			b.firstUserContent = msg.Content
+			b.firstMessage = truncate(
+				strings.ReplaceAll(msg.Content, "\n", " "), 300,
+			)
+			continue
+		}
+		b.sawUserTurnAfterFirst = true
 	}
 }
 
@@ -1811,8 +1947,12 @@ func isCodexSubagentNotification(content string) bool {
 func codexIncrementalNeedsFullParse(line string) bool {
 	switch gjson.Get(line, "type").Str {
 	case codexTypeEventMsg:
-		return gjson.Get(line, "payload.type").Str ==
-			"collab_agent_spawn_end"
+		switch gjson.Get(line, "payload.type").Str {
+		case "collab_agent_spawn_end", "thread_rolled_back":
+			return true
+		default:
+			return false
+		}
 	case codexTypeResponseItem:
 	default:
 		return false

@@ -348,6 +348,11 @@ func (b *directBackend) buildForkContextMessages(
 	if err != nil {
 		return nil, err
 	}
+	if replay, ok := b.codexForkReplayMessages(ctx, *current); ok {
+		contextMsgs = truncateForkContextToReplay(
+			contextMsgs, replay,
+		)
+	}
 	if len(contextMsgs) == 0 {
 		return currentMsgs, nil
 	}
@@ -381,6 +386,46 @@ func (b *directBackend) buildForkContextMessages(
 	out = append(out, boundaryMsg)
 	out = append(out, currentMsgs...)
 	return out, nil
+}
+
+func (b *directBackend) codexForkReplayMessages(
+	ctx context.Context, current db.Session,
+) ([]parser.ParsedMessage, bool) {
+	if current.Agent != string(parser.AgentCodex) {
+		return nil, false
+	}
+	var full *db.Session
+	var err error
+	if b.local != nil {
+		full, err = b.local.GetSessionFull(ctx, current.ID)
+		if err == nil && full != nil {
+			current = *full
+		}
+	}
+	if current.FilePath == nil || *current.FilePath == "" {
+		return nil, false
+	}
+	msgs, ok, err := parser.CodexForkReplayMessages(*current.FilePath)
+	if err != nil || !ok {
+		return nil, false
+	}
+	return msgs, true
+}
+
+func truncateForkContextToReplay(
+	contextMsgs []db.Message,
+	replay []parser.ParsedMessage,
+) []db.Message {
+	if len(replay) > len(contextMsgs) {
+		return contextMsgs
+	}
+	for i, replayMsg := range replay {
+		if contextMsgs[i].Role != string(replayMsg.Role) ||
+			contextMsgs[i].Content != replayMsg.Content {
+			return contextMsgs
+		}
+	}
+	return contextMsgs[:len(replay)]
 }
 
 func (b *directBackend) forkAncestorMessages(

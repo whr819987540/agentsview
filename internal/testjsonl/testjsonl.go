@@ -344,6 +344,20 @@ func CodexTokenCountJSON(
 	return mustMarshal(m)
 }
 
+// CodexThreadRolledBackJSON returns a Codex event_msg that rolls back
+// the last n turns in the visible thread.
+func CodexThreadRolledBackJSON(timestamp string, numTurns int) string {
+	m := map[string]any{
+		"type":      "event_msg",
+		"timestamp": timestamp,
+		"payload": map[string]any{
+			"type":      "thread_rolled_back",
+			"num_turns": numTurns,
+		},
+	}
+	return mustMarshal(m)
+}
+
 // ClaudeEntryJSON returns a Claude JSONL entry with uuid and
 // parentUuid fields.
 func ClaudeEntryJSON(

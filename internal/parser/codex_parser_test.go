@@ -104,6 +104,22 @@ func assertToolResultEvents(
 	}
 }
 
+func parsedMessageContents(msgs []ParsedMessage) []string {
+	out := make([]string, 0, len(msgs))
+	for _, msg := range msgs {
+		out = append(out, msg.Content)
+	}
+	return out
+}
+
+func parsedMessageOrdinals(msgs []ParsedMessage) []int {
+	out := make([]int, 0, len(msgs))
+	for _, msg := range msgs {
+		out = append(out, msg.Ordinal)
+	}
+	return out
+}
+
 func TestParseCodexSession_Basic(t *testing.T) {
 	content := loadFixture(t, "codex/standard_session.jsonl")
 	sess, msgs := runCodexParserTest(t, "test.jsonl", content, false)
@@ -1388,6 +1404,86 @@ func TestParseCodexSession_ForkedSessionSkipsReplayedHistory(t *testing.T) {
 		require.Len(t, msgs, 2)
 		assert.Equal(t, 500, sess.TotalOutputTokens)
 	})
+}
+
+func TestParseCodexSession_AppliesThreadRollback(t *testing.T) {
+	const (
+		ts2 = "2024-01-01T10:00:02Z"
+		ts3 = "2024-01-01T10:00:03Z"
+		ts4 = "2024-01-01T10:00:04Z"
+	)
+	content := testjsonl.JoinJSONL(
+		testjsonl.CodexSessionMetaJSON("rollback-1", "/tmp", "user", tsEarly),
+		testjsonl.CodexTurnContextWithIDJSON("gpt-5.4", testUUIDv7(1_000, 1), tsEarly),
+		testjsonl.CodexMsgJSON("user", "first question", tsEarly),
+		testjsonl.CodexMsgJSON("assistant", "first answer", tsEarlyS1),
+		testjsonl.CodexTurnContextWithIDJSON("gpt-5.4", testUUIDv7(2_000, 2), ts2),
+		testjsonl.CodexMsgJSON("user", "rolled back question", ts2),
+		testjsonl.CodexMsgJSON("assistant", "rolled back answer", ts3),
+		testjsonl.CodexThreadRolledBackJSON(ts3, 1),
+		testjsonl.CodexTurnContextWithIDJSON("gpt-5.4", testUUIDv7(3_000, 3), ts4),
+		testjsonl.CodexMsgJSON("user", "replacement question", ts4),
+		testjsonl.CodexMsgJSON("assistant", "replacement answer", tsEarlyS5),
+	)
+
+	sess, msgs := runCodexParserTest(t, "rollback.jsonl", content, false)
+	require.NotNil(t, sess)
+	require.Len(t, msgs, 4)
+	assert.Equal(t, []string{
+		"first question",
+		"first answer",
+		"replacement question",
+		"replacement answer",
+	}, parsedMessageContents(msgs))
+	assert.Equal(t, []int{0, 1, 2, 3}, parsedMessageOrdinals(msgs))
+	assert.Equal(t, 2, sess.UserMessageCount)
+}
+
+func TestCodexForkReplayMessagesAppliesRollbacks(t *testing.T) {
+	const (
+		ts2 = "2024-01-01T10:00:02Z"
+		ts3 = "2024-01-01T10:00:03Z"
+		ts4 = "2024-01-01T10:00:04Z"
+	)
+	forkCreatedMs := time.Date(2024, 1, 1, 10, 0, 0, 0, time.UTC).UnixMilli()
+	forkID := testUUIDv7(forkCreatedMs, 1)
+	firstTurn := testUUIDv7(forkCreatedMs-3600_000, 2)
+	rolledBackTurn := testUUIDv7(forkCreatedMs-1800_000, 3)
+	replacementTurn := testUUIDv7(forkCreatedMs-900_000, 4)
+	genuineTurn := testUUIDv7(forkCreatedMs+1000, 5)
+
+	content := testjsonl.JoinJSONL(
+		testjsonl.CodexForkedSessionMetaJSON(forkID, "parent-1", "/tmp", "user", tsEarly),
+		testjsonl.CodexSessionMetaJSON("parent-1", "/tmp", "user", tsEarly),
+		testjsonl.CodexTurnContextWithIDJSON("gpt-5.4", firstTurn, tsEarly),
+		testjsonl.CodexMsgJSON("user", "first question", tsEarly),
+		testjsonl.CodexMsgJSON("assistant", "first answer", tsEarlyS1),
+		testjsonl.CodexTurnContextWithIDJSON("gpt-5.4", rolledBackTurn, ts2),
+		testjsonl.CodexMsgJSON("user", "rolled back question", ts2),
+		testjsonl.CodexMsgJSON("assistant", "rolled back answer", ts3),
+		testjsonl.CodexThreadRolledBackJSON(ts3, 1),
+		testjsonl.CodexTurnContextWithIDJSON("gpt-5.4", replacementTurn, ts4),
+		testjsonl.CodexMsgJSON("user", "replacement question", ts4),
+		testjsonl.CodexMsgJSON("assistant", "replacement answer", tsEarlyS5),
+		testjsonl.CodexThreadRolledBackJSON(tsEarlyS5, 1),
+		testjsonl.CodexTurnContextWithIDJSON("gpt-5.5", genuineTurn, tsLate),
+		testjsonl.CodexMsgJSON("user", "fork question", tsLate),
+	)
+	path := createTestFile(t, "fork-replay.jsonl", content)
+
+	msgs, ok, err := CodexForkReplayMessages(path)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Len(t, msgs, 2)
+	assert.Equal(t, []string{
+		"first question",
+		"first answer",
+	}, parsedMessageContents(msgs))
+}
+
+func TestCodexIncrementalNeedsFullParseForThreadRollback(t *testing.T) {
+	line := testjsonl.CodexThreadRolledBackJSON(tsEarly, 1)
+	assert.True(t, codexIncrementalNeedsFullParse(line))
 }
 
 // TestParseCodexSessionFrom_ForkReplaySpansOffset covers the
