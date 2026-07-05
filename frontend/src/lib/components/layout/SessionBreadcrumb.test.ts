@@ -17,6 +17,7 @@ import {
   SessionsService,
 } from "../../api/generated/index";
 import { messages } from "../../stores/messages.svelte.js";
+import { ui } from "../../stores/ui.svelte.js";
 import { setLocale } from "../../i18n/index.js";
 
 vi.mock("../../api/client.js", () => ({
@@ -169,6 +170,8 @@ beforeEach(() => {
 
 afterEach(() => {
   setLocale("en");
+  ui.showAllBlocks();
+  ui.bulkCollapseCommand = null;
   document.body.innerHTML = "";
 });
 
@@ -216,6 +219,15 @@ describe("SessionBreadcrumb", () => {
     expect(linkButton?.getAttribute("aria-label")).toBe("复制会话链接");
     expect(linkButton?.getAttribute("title")).toBe("复制会话链接");
 
+    const actionButtons = Array.from(
+      document.querySelectorAll<HTMLButtonElement>(
+        ".actions-wrapper > button",
+      ),
+    );
+    expect(actionButtons[0]?.getAttribute("aria-label")).toBe("折叠可见块");
+    expect(actionButtons[1]?.getAttribute("aria-label")).toBe("展开可见块");
+    expect(actionButtons[2]).toBe(linkButton);
+
     const findButton = document.querySelector<HTMLButtonElement>(
       ".find-btn",
     );
@@ -246,6 +258,48 @@ describe("SessionBreadcrumb", () => {
 
     expect(document.body.textContent).toContain("重命名");
     expect(document.body.textContent).toContain("删除");
+
+    unmount(component);
+  });
+
+  it("issues bulk collapse and expand commands from breadcrumb controls", async () => {
+    ui.visibleBlocks = new Set(["user", "tool"]);
+    const component = mount(SessionBreadcrumb, {
+      target: document.body,
+      props: {
+        session: makeSession("claude"),
+        onBack: () => {},
+      },
+    });
+
+    await tick();
+
+    document
+      .querySelector<HTMLButtonElement>(
+        'button[aria-label="Collapse visible blocks"]',
+      )!
+      .click();
+    await tick();
+
+    expect(ui.bulkCollapseCommand).toMatchObject({
+      target: "collapsed",
+      visibleBlocks: ["user", "tool"],
+    });
+    const collapseId = ui.bulkCollapseCommand!.id;
+
+    ui.visibleBlocks = new Set(["assistant"]);
+    document
+      .querySelector<HTMLButtonElement>(
+        'button[aria-label="Expand visible blocks"]',
+      )!
+      .click();
+    await tick();
+
+    expect(ui.bulkCollapseCommand).toEqual({
+      id: collapseId + 1,
+      target: "expanded",
+      visibleBlocks: ["assistant"],
+    });
 
     unmount(component);
   });

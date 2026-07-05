@@ -135,39 +135,6 @@ describe("MessageList follow cancellation", () => {
     expect(document.body.textContent).toContain("正在加载消息...");
   });
 
-  it("issues bulk collapse and expand commands from the toolbar", async () => {
-    ui.visibleBlocks = new Set(["user", "tool"]);
-    component = mount(MessageList, { target: document.body });
-    await tick();
-
-    document
-      .querySelector<HTMLButtonElement>(
-        'button[aria-label="Collapse visible blocks"]',
-      )!
-      .click();
-    await tick();
-
-    expect(ui.bulkCollapseCommand).toMatchObject({
-      target: "collapsed",
-      visibleBlocks: ["user", "tool"],
-    });
-    const collapseId = ui.bulkCollapseCommand!.id;
-
-    ui.visibleBlocks = new Set(["assistant"]);
-    document
-      .querySelector<HTMLButtonElement>(
-        'button[aria-label="Expand visible blocks"]',
-      )!
-      .click();
-    await tick();
-
-    expect(ui.bulkCollapseCommand).toEqual({
-      id: collapseId + 1,
-      target: "expanded",
-      visibleBlocks: ["assistant"],
-    });
-  });
-
   it("keeps delayed ordinal navigation alive after follow latest is disabled", async () => {
     const loaded = deferred<void>();
     const ensureSpy = vi

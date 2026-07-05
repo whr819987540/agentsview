@@ -9,7 +9,9 @@
     EllipsisVerticalIcon,
     FileTextIcon,
     FolderIcon,
+    AlignJustifyIcon,
     LinkIcon,
+    ListCollapseIcon,
     SearchIcon,
     SquareTerminalIcon,
   } from "../../icons.js";
@@ -735,6 +737,22 @@
       {/if}
       <div class="actions-wrapper">
         <button
+          class="bulk-block-btn"
+          title={m.message_list_collapse_visible_blocks()}
+          onclick={() => ui.collapseVisibleBlocks()}
+          aria-label={m.message_list_collapse_visible_blocks()}
+        >
+          <ListCollapseIcon size="13" strokeWidth="2" aria-hidden="true" />
+        </button>
+        <button
+          class="bulk-block-btn"
+          title={m.message_list_expand_visible_blocks()}
+          onclick={() => ui.expandVisibleBlocks()}
+          aria-label={m.message_list_expand_visible_blocks()}
+        >
+          <AlignJustifyIcon size="13" strokeWidth="2" aria-hidden="true" />
+        </button>
+        <button
           class="link-btn"
           class:link-btn--copied={copiedLinkId === session?.id}
           title={m.session_breadcrumb_copy_link_to_session()}
@@ -1108,6 +1126,7 @@
     gap: 2px;
   }
 
+  .bulk-block-btn,
   .link-btn {
     display: flex;
     align-items: center;
@@ -1121,6 +1140,11 @@
     cursor: pointer;
     transition: background 0.15s, color 0.15s;
     flex-shrink: 0;
+  }
+
+  .bulk-block-btn:hover {
+    background: var(--bg-surface-hover);
+    color: var(--text-secondary);
   }
 
   .link-btn:hover {
