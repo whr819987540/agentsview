@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onDestroy } from "svelte";
+  import { onDestroy, untrack } from "svelte";
   import type { Virtualizer } from "@tanstack/virtual-core";
   import { messages } from "../../stores/messages.svelte.js";
   import { ui } from "../../stores/ui.svelte.js";
@@ -30,6 +30,12 @@
     getLatestDisplayIndex,
     type ScrollAlign,
   } from "./message-scroll.js";
+  import {
+    findAnchorIndexAsc,
+    findFirstVisibleVirtualItem,
+    scrollMemory,
+    type ScrollAnchor,
+  } from "./scroll-memory.js";
   import { m } from "../../i18n/index.js";
 
   let containerRef: HTMLDivElement | undefined = $state(undefined);
@@ -39,6 +45,10 @@
   let followingScrollRaf: number | null = null;
   let followSettleTimer:
     | ReturnType<typeof setTimeout>
+    | null = null;
+  let activeRestoreRequest: number | null = null;
+  let restoreTarget:
+    | { sessionId: string; anchor: ScrollAnchor }
     | null = null;
 
   let baseMessages: Message[] = $derived.by(() =>
@@ -209,10 +219,43 @@
         publishVisibleTimestamp();
       }
 
+      recordScrollAnchor();
     });
   }
 
+  /** Remember the current viewport anchor so switching back to
+   *  this session can restore the reading position. */
+  function recordScrollAnchor() {
+    const sid = messages.sessionId;
+    const v = virtualizer.instance;
+    if (!sid || !v || messages.loading) return;
+    const scrollTop = v.scrollOffset ?? 0;
+    const vi = findFirstVisibleVirtualItem(
+      v.getVirtualItems(),
+      scrollTop,
+    );
+    if (!vi) return;
+    const item = itemAt(vi.index);
+    if (!item) return;
+    scrollMemory.remember(sid, {
+      ordinal: item.ordinals[0]!,
+      offsetPx: Math.max(0, scrollTop - vi.start),
+    });
+  }
+
+  function cancelRestoreWork() {
+    restoreTarget = null;
+    if (
+      activeRestoreRequest !== null &&
+      activeRestoreRequest === lastScrollRequest
+    ) {
+      lastScrollRequest += 1;
+    }
+    activeRestoreRequest = null;
+  }
+
   function handleManualScrollIntent() {
+    cancelRestoreWork();
     if (ui.followLatest) {
       cancelFollowLatestWork();
       ui.setFollowLatest(false);
@@ -301,6 +344,7 @@
     scrollRetries: number = 0,
     reqId: number = lastScrollRequest,
     align: ScrollAlign = "start",
+    offsetPx: number = 0,
   ) {
     if (reqId !== lastScrollRequest) return;
 
@@ -317,7 +361,7 @@
       requestAnimationFrame(() => {
         scrollToDisplayIndex(
           index, waitFrames + 1, 0, reqId,
-          align,
+          align, offsetPx,
         );
       });
       return;
@@ -334,7 +378,7 @@
       if (offsetAndAlign) {
         const [offset] = offsetAndAlign;
         v.scrollToOffset(
-          Math.round(offset),
+          Math.round(offset + offsetPx),
           { align: getAlignedOffsetScrollAlign(align) },
         );
       }
@@ -362,6 +406,7 @@
             scrollRetries + 1,
             reqId,
             align,
+            offsetPx,
           );
         });
       });
@@ -411,6 +456,96 @@
   export function scrollToOrdinal(ordinal: number) {
     void scrollToOrdinalInternal(ordinal);
   }
+
+  async function restoreScrollAnchor(anchor: ScrollAnchor) {
+    const reqId = ++lastScrollRequest;
+    activeFollowScrollRequest = null;
+    activeRestoreRequest = reqId;
+
+    let idxAsc = findAnchorIndexAsc(
+      displayItemsAsc,
+      anchor.ordinal,
+    );
+    const isExact =
+      displayItemsAsc[idxAsc]?.ordinals.includes(
+        anchor.ordinal,
+      ) ?? false;
+    if (!isExact && messages.hasOlder) {
+      await messages.ensureOrdinalLoaded(anchor.ordinal);
+      if (reqId !== lastScrollRequest) return;
+
+      // Let Svelte re-derive displayItemsAsc and the
+      // virtualizer update its count after loading.
+      await raf();
+      await raf();
+      if (reqId !== lastScrollRequest) return;
+
+      idxAsc = findAnchorIndexAsc(
+        displayItemsAsc,
+        anchor.ordinal,
+      );
+    }
+    if (idxAsc < 0) return;
+
+    const idx = ui.sortNewestFirst
+      ? displayItemsAsc.length - 1 - idxAsc
+      : idxAsc;
+    scrollToDisplayIndex(
+      idx,
+      0,
+      0,
+      reqId,
+      "start",
+      anchor.offsetPx,
+    );
+  }
+
+  // Arm position restore when entering a session that has a
+  // remembered anchor. Deep links and search navigation
+  // (pendingScrollOrdinal) and follow-latest win over restore.
+  $effect(() => {
+    const sid = messages.sessionId;
+    untrack(() => {
+      // Invalidate scroll work queued for the previous session
+      // so its retry loop cannot scroll the new session's list.
+      lastScrollRequest += 1;
+      activeRestoreRequest = null;
+      if (!sid) {
+        restoreTarget = null;
+        return;
+      }
+      if (restoreTarget?.sessionId === sid) return;
+      const anchor = scrollMemory.get(sid);
+      const pendingMatchesSession =
+        ui.pendingScrollOrdinal !== null &&
+        (ui.pendingScrollSession === null ||
+          ui.pendingScrollSession === sid);
+      restoreTarget =
+        anchor && !pendingMatchesSession && !ui.followLatest
+          ? { sessionId: sid, anchor }
+          : null;
+    });
+  });
+
+  // Restore the remembered position once messages have loaded.
+  $effect(() => {
+    const sid = messages.sessionId;
+    const loading = messages.loading;
+    const count = displayItemsAsc.length;
+    untrack(() => {
+      const target = restoreTarget;
+      if (!target || target.sessionId !== sid) return;
+      if (loading || count === 0) return;
+      restoreTarget = null;
+      if (
+        ui.followLatest ||
+        ui.pendingScrollOrdinal !== null
+      ) {
+        return;
+      }
+      void restoreScrollAnchor(target.anchor);
+    });
+  });
 
   function scrollToLatestInternal() {
     const reqId = ++lastScrollRequest;

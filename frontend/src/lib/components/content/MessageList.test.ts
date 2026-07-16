@@ -13,11 +13,19 @@ import { messages } from "../../stores/messages.svelte.js";
 import { sessions } from "../../stores/sessions.svelte.js";
 import { ui } from "../../stores/ui.svelte.js";
 import { setLocale } from "../../i18n/index.js";
+import { scrollMemory } from "./scroll-memory.js";
+
+interface VirtualRow {
+  key: string;
+  index: number;
+  start: number;
+  end: number;
+}
 
 const virtualizerMock = vi.hoisted(() => ({
   options: { count: 0 },
   scrollOffset: 0,
-  getVirtualItems: vi.fn(() => []),
+  getVirtualItems: vi.fn((): VirtualRow[] => []),
   getTotalSize: vi.fn(() => 120),
   measureElement: vi.fn(),
   scrollToIndex: vi.fn(),
@@ -165,5 +173,144 @@ describe("MessageList follow cancellation", () => {
     expect(virtualizerMock.scrollToIndex).toHaveBeenCalledWith(0, {
       align: "start",
     });
+  });
+});
+
+describe("MessageList scroll position memory", () => {
+  let component: ReturnType<typeof mount> | undefined;
+  let rafSpy: ReturnType<typeof vi.spyOn>;
+
+  const virtualRows = [
+    { key: "k0", index: 0, start: 0, end: 120 },
+    { key: "k1", index: 1, start: 120, end: 240 },
+  ];
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    virtualizerMock.getVirtualItems.mockImplementation(() => []);
+    virtualizerMock.getOffsetForIndex.mockImplementation(
+      () => undefined,
+    );
+    virtualizerMock.scrollOffset = 0;
+    scrollMemory.clear();
+    messages.clear();
+    sessions.activeSessionId = "s1";
+    messages.sessionId = "s1";
+    messages.messages = [makeMessage(0), makeMessage(1)];
+    messages.messageCount = 2;
+    messages.hasOlder = false;
+    messages.loading = false;
+    ui.followLatest = false;
+    ui.followLatestRequest = 0;
+    ui.sortNewestFirst = false;
+    ui.selectedOrdinal = null;
+    ui.pendingScrollOrdinal = null;
+    ui.pendingScrollSession = null;
+    rafSpy = vi
+      .spyOn(window, "requestAnimationFrame")
+      .mockImplementation((cb: FrameRequestCallback) => {
+        window.setTimeout(() => cb(performance.now()), 0);
+        return 1;
+      });
+  });
+
+  afterEach(() => {
+    if (component) {
+      unmount(component);
+      component = undefined;
+    }
+    rafSpy.mockRestore();
+    scrollMemory.clear();
+    messages.clear();
+    sessions.activeSessionId = null;
+    ui.followLatest = false;
+    ui.pendingScrollOrdinal = null;
+    ui.pendingScrollSession = null;
+    document.body.innerHTML = "";
+  });
+
+  it("records the viewport anchor on scroll", async () => {
+    virtualizerMock.getVirtualItems.mockImplementation(
+      () => virtualRows,
+    );
+    virtualizerMock.scrollOffset = 130;
+
+    component = mount(MessageList, { target: document.body });
+    await tick();
+
+    const container = document.querySelector(
+      ".message-list-scroll",
+    );
+    expect(container).not.toBeNull();
+    container!.dispatchEvent(new Event("scroll"));
+
+    await vi.waitFor(() => {
+      expect(scrollMemory.get("s1")).toEqual({
+        ordinal: 1,
+        offsetPx: 10,
+      });
+    });
+  });
+
+  it("restores the remembered position once messages are loaded", async () => {
+    scrollMemory.remember("s1", { ordinal: 1, offsetPx: 10 });
+    virtualizerMock.getVirtualItems.mockImplementation(
+      () => virtualRows,
+    );
+    virtualizerMock.getOffsetForIndex.mockImplementation(() => [
+      120,
+      "start",
+    ]);
+
+    component = mount(MessageList, { target: document.body });
+
+    await vi.waitFor(() => {
+      expect(virtualizerMock.scrollToOffset).toHaveBeenCalledWith(
+        130,
+        { align: "start" },
+      );
+    });
+  });
+
+  it("skips restore when a pending scroll targets the session", async () => {
+    scrollMemory.remember("s1", { ordinal: 1, offsetPx: 10 });
+    ui.pendingScrollOrdinal = 0;
+    ui.pendingScrollSession = "s1";
+    virtualizerMock.getVirtualItems.mockImplementation(
+      () => virtualRows,
+    );
+    virtualizerMock.getOffsetForIndex.mockImplementation(() => [
+      120,
+      "start",
+    ]);
+
+    component = mount(MessageList, { target: document.body });
+    await tick();
+    await new Promise((r) => setTimeout(r, 20));
+
+    expect(virtualizerMock.scrollToOffset).not.toHaveBeenCalled();
+    expect(virtualizerMock.scrollToIndex).not.toHaveBeenCalled();
+  });
+
+  it("skips restore when follow latest is enabled", async () => {
+    scrollMemory.remember("s1", { ordinal: 0, offsetPx: 55 });
+    ui.followLatest = true;
+    ui.followLatestRequest = 1;
+    virtualizerMock.getVirtualItems.mockImplementation(
+      () => virtualRows,
+    );
+    virtualizerMock.getOffsetForIndex.mockImplementation(() => [
+      120,
+      "start",
+    ]);
+
+    component = mount(MessageList, { target: document.body });
+    await tick();
+    await new Promise((r) => setTimeout(r, 20));
+
+    // Follow latest scrolls without the anchor's pixel offset.
+    expect(
+      virtualizerMock.scrollToOffset,
+    ).not.toHaveBeenCalledWith(175, expect.anything());
   });
 });
