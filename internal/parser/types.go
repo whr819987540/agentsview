@@ -808,15 +808,22 @@ type ParsedSession struct {
 	// format the token-block heuristic depends on. Set by both Antigravity
 	// parsers; false for every other agent.
 	GenMetadataWithoutUsage bool
-	MalformedLines          int
-	IsTruncated             bool
-	FirstMessage            string
-	SessionName             string
-	StartedAt               time.Time
-	EndedAt                 time.Time
-	MessageCount            int
-	UserMessageCount        int
-	File                    FileInfo
+	// ForkedDAG reports that this session came from a file whose
+	// uuid/parentUuid DAG contains fork points (rewinds/retries).
+	// Branch selection means a later parse can rewrite an
+	// already-stored message tail in place, so the sync write
+	// path must replace stored messages instead of assuming
+	// append-only growth.
+	ForkedDAG        bool
+	MalformedLines   int
+	IsTruncated      bool
+	FirstMessage     string
+	SessionName      string
+	StartedAt        time.Time
+	EndedAt          time.Time
+	MessageCount     int
+	UserMessageCount int
+	File             FileInfo
 
 	// TerminationStatus describes how the session appears to have
 	// ended. Empty string = unknown (parser did not classify, or

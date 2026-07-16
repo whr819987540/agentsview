@@ -164,7 +164,13 @@ func (p *claudeProvider) ParseIncremental(
 	)
 	if err != nil {
 		if IsIncrementalFullParseFallback(err) || errorsIsClaudeDAG(err) {
-			return IncrementalOutcome{ForceReplace: IsIncrementalFullParseFallback(err)},
+			// A DAG fork in appended lines means a rewind: the
+			// full parse follows the live branch, which can
+			// rewrite the main session's already-stored tail in
+			// place (same ordinals, different content). The
+			// write path must replace stored messages, not
+			// append, or the rewind is silently dropped.
+			return IncrementalOutcome{ForceReplace: true},
 				IncrementalNeedsFullParse, nil
 		}
 		return IncrementalOutcome{}, IncrementalNeedsFullParse, err

@@ -956,6 +956,17 @@ func parseDAG(
 		)
 	}
 
+	// Any fork point means branch selection: a later parse of this
+	// file can rewrite an already-stored message tail in place, so
+	// flag every resulting session for replace-on-write.
+	forkedDAG := false
+	for _, kids := range children {
+		if len(kids) > 1 {
+			forkedDAG = true
+			break
+		}
+	}
+
 	// subtreeMax[i] is the highest entry index reachable in the
 	// subtree rooted at entries[i]. Parents precede children in
 	// append-only session files, so a reverse scan sees every
@@ -1078,6 +1089,7 @@ func parseDAG(
 			Agent:            AgentClaude,
 			ParentSessionID:  pSID,
 			RelationshipType: relType,
+			ForkedDAG:        forkedDAG,
 			FirstMessage:     firstMsg,
 			StartedAt:        startedAt,
 			EndedAt:          endedAt,

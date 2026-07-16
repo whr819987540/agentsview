@@ -5765,6 +5765,59 @@ func TestSyncForkDetection(t *testing.T) {
 	})
 }
 
+func TestSyncRewindAfterInitialSyncReplacesMainTail(t *testing.T) {
+	env := setupTestEnv(t)
+
+	// A session synced BEFORE any rewind: linear chain a..l with
+	// 5 user turns.
+	base := testjsonl.NewSessionBuilder().
+		AddClaudeUserWithUUID("2024-01-01T10:00:00Z", "start", "a", "").
+		AddClaudeAssistantWithUUID("2024-01-01T10:00:01Z", "ok", "b", "a").
+		AddClaudeUserWithUUID("2024-01-01T10:00:02Z", "step2", "c", "b").
+		AddClaudeAssistantWithUUID("2024-01-01T10:00:03Z", "ok2", "d", "c").
+		AddClaudeUserWithUUID("2024-01-01T10:00:04Z", "step3", "e", "d").
+		AddClaudeAssistantWithUUID("2024-01-01T10:00:05Z", "ok3", "f", "e").
+		AddClaudeUserWithUUID("2024-01-01T10:00:06Z", "step4", "g", "f").
+		AddClaudeAssistantWithUUID("2024-01-01T10:00:07Z", "ok4", "h", "g").
+		AddClaudeUserWithUUID("2024-01-01T10:00:08Z", "step5", "k", "h").
+		AddClaudeAssistantWithUUID("2024-01-01T10:00:09Z", "ok5", "l", "k").
+		String()
+
+	path := env.writeClaudeSession(t, "proj", "rewind-live.jsonl", base)
+	env.engine.SyncAll(context.Background(), nil)
+	assertSessionMessageCount(t, env.db, "rewind-live", 10)
+
+	// The user rewinds back to b (esc+esc) and continues: Claude
+	// Code appends the live branch to the same file. The stored
+	// main session must be rewritten to the live branch (a,b,m,n)
+	// even though the ordinals overlap the already-stored rows,
+	// and the abandoned branch c..l (5 user turns) must appear as
+	// a fork session.
+	rewound := base + testjsonl.NewSessionBuilder().
+		AddClaudeUserWithUUID("2024-01-01T11:00:00Z", "fresh", "m", "b").
+		AddClaudeAssistantWithUUID("2024-01-01T11:00:01Z", "fresh-ok", "n", "m").
+		String()
+	require.NoError(t, os.WriteFile(path, []byte(rewound), 0o644),
+		"append rewound branch")
+
+	env.engine.SyncAll(context.Background(), nil)
+
+	msgs := fetchMessages(t, env.db, "rewind-live")
+	require.Len(t, msgs, 4, "main session must shrink to the live branch")
+	assert.Equal(t, "start", msgs[0].Content)
+	assert.Equal(t, "fresh", msgs[2].Content)
+	assert.Equal(t, "fresh-ok", msgs[3].Content)
+
+	forkMsgs := fetchMessages(t, env.db, "rewind-live-c")
+	require.Len(t, forkMsgs, 8, "abandoned branch preserved as fork")
+	assert.Equal(t, "step2", forkMsgs[0].Content)
+	assertSessionState(t, env.db, "rewind-live-c", func(sess *db.Session) {
+		require.NotNil(t, sess.ParentSessionID, "fork parent")
+		assert.Equal(t, "rewind-live", *sess.ParentSessionID, "fork parent id")
+		assert.Equal(t, "fork", sess.RelationshipType, "fork relationship_type")
+	})
+}
+
 func TestSyncSmallGapRetry(t *testing.T) {
 	env := setupTestEnv(t)
 

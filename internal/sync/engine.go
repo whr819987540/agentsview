@@ -4701,12 +4701,15 @@ func (e *Engine) tryProviderIncrementalAppend(
 			if outcome.ForceReplace {
 				// Signal the shared helper to fall back to a
 				// full parse that replaces stored messages.
+				// This covers DAG forks from rewinds too: the
+				// live-branch walk can rewrite the main
+				// session's already-stored tail in place.
 				return nil, time.Time{}, 0,
 					parser.ErrClaudeIncrementalNeedsFullParse
 			}
-			// A plain full-parse fallback (e.g. DAG detected):
-			// return a non-fallback error so the helper runs a
-			// normal full parse without forceReplace.
+			// A plain full-parse fallback: return a non-fallback
+			// error so the helper runs a normal full parse
+			// without forceReplace.
 			return nil, time.Time{}, 0, parser.ErrDAGDetected
 		case parser.IncrementalNoNewData:
 			return nil, time.Time{}, 0, nil
@@ -6493,7 +6496,11 @@ func (e *Engine) writeBatchBulk(
 func shouldReplaceFullParseMessages(
 	pw pendingWrite, forceReplace, stale bool,
 ) bool {
+	// A forked DAG (rewind/retry branches) means branch selection:
+	// this parse can rewrite an already-stored message tail at the
+	// same ordinals, which the append-only path would drop.
 	return forceReplace || pw.forceReplace || pw.needsRetry || stale ||
+		pw.sess.ForkedDAG ||
 		pw.sess.Agent == parser.AgentCowork ||
 		isOpenCodeFormatStorageAgent(pw.sess.Agent) ||
 		pw.sess.Agent == parser.AgentVSCopilot ||
