@@ -523,6 +523,61 @@ func TestForkDetection_ToolResultsDoNotInflateAbandonedBranch(t *testing.T) {
 	assertMessage(t, msgs[3], RoleAssistant, "sure")
 }
 
+// claudeForkedFromLine builds a replayed record as written by
+// Claude Code's /branch command: a copy of a parent-session entry
+// stamped with forkedFrom.
+func claudeForkedFromLine(
+	entryType, ts, uuid, parentUuid, parentSID, text string,
+) string {
+	return `{"type":"` + entryType + `","timestamp":"` + ts +
+		`","uuid":"` + uuid + `","parentUuid":"` + parentUuid +
+		`","sessionId":"branched","forkedFrom":{"sessionId":"` + parentSID +
+		`","messageUuid":"` + uuid +
+		`"},"message":{"content":[{"type":"text","text":"` + text + `"}]}}`
+}
+
+func TestForkDetection_BranchedSessionLinksToParent(t *testing.T) {
+	// A /branch session file: the parent's history is replayed at
+	// the top with forkedFrom stamps, then the genuine conversation
+	// follows (including a small in-file rewind whose parent chain
+	// crosses replayed uuids). The replayed prefix belongs to the
+	// parent session and must not be stored again; the session must
+	// link to its parent as a fork so the session tree shows the
+	// branch.
+	branchCmd := `{"type":"system","timestamp":"2024-01-01T11:00:00Z",` +
+		`"uuid":"bcmd","parentUuid":"p4",` +
+		`"content":"<command-name>/branch</command-name>"}`
+	content := testjsonl.NewSessionBuilder().
+		AddRaw(claudeForkedFromLine("user", "2024-01-01T10:00:00Z", "p1", "", "parent-sess", "old q1")).
+		AddRaw(claudeForkedFromLine("assistant", "2024-01-01T10:00:01Z", "p2", "p1", "parent-sess", "old a1")).
+		AddRaw(claudeForkedFromLine("user", "2024-01-01T10:00:02Z", "p3", "p2", "parent-sess", "old q2")).
+		AddRaw(claudeForkedFromLine("assistant", "2024-01-01T10:00:03Z", "p4", "p3", "parent-sess", "old a2")).
+		AddRaw(branchCmd).
+		AddClaudeUserWithUUID("2024-01-01T11:00:01Z", "branch q1", "g1", "bcmd").
+		AddClaudeAssistantWithUUID("2024-01-01T11:00:02Z", "branch a1", "g2", "g1").
+		// Small rewind inside the branched session.
+		AddClaudeUserWithUUID("2024-01-01T11:01:00Z", "branch q1 fixed", "g3", "bcmd").
+		AddClaudeAssistantWithUUID("2024-01-01T11:01:01Z", "branch a1 fixed", "g4", "g3").
+		String()
+
+	results := parseTestContent(t, "branched.jsonl", content, 1)
+
+	sess := results[0].Session
+	assert.Equal(t, "parent-sess", sess.ParentSessionID, "ParentSessionID")
+	assert.Equal(t, RelFork, sess.RelationshipType, "RelationshipType")
+	assert.Equal(t, "branch q1 fixed", sess.FirstMessage, "FirstMessage")
+	// Bounds come from the genuine region, not replayed timestamps.
+	assert.Equal(t, "2024-01-01T11:00:00Z", formatTime(sess.StartedAt), "StartedAt")
+
+	// Only the genuine live branch is stored: the replayed prefix
+	// is the parent's content and the rewound first attempt is
+	// retry noise.
+	msgs := results[0].Messages
+	assertMessageCount(t, len(msgs), 2)
+	assertMessage(t, msgs[0], RoleUser, "branch q1 fixed")
+	assertMessage(t, msgs[1], RoleAssistant, "branch a1 fixed")
+}
+
 func TestSessionBoundsDAGMainWidenedNotFork(t *testing.T) {
 	// DAG session with a trailing queue-operation after all
 	// messages. Main session's EndedAt should be widened;

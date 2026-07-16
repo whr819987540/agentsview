@@ -43,6 +43,13 @@ type dagEntry struct {
 	lineIndex  int
 	line       string
 	timestamp  time.Time
+	// replayed marks a record stamped with forkedFrom: a copy of
+	// parent-session history at the top of a /branch file. Replayed
+	// entries participate in the DAG (they keep the genuine tail
+	// connected to a single root) but are never extracted as
+	// messages and never count as user turns — the parent session
+	// already archives that content.
+	replayed bool
 }
 
 // claudeQueuedCommand is a user message Claude Code persisted as
@@ -100,6 +107,7 @@ func claudeParseWithExclusions(
 		lastLine        string
 		subagentMap     = map[string]string{}
 		parentOf        = map[string]string{}
+		forkedFromSID   string
 		globalStart     time.Time
 		globalEnd       time.Time
 	)
@@ -133,6 +141,42 @@ func claudeParseWithExclusions(
 			if _, seen := parentOf[u]; !seen {
 				parentOf[u] = gjson.Get(line, "parentUuid").Str
 			}
+		}
+
+		// /branch (and forked resumes) replay the parent session's
+		// history at the top of the new file, stamping each copied
+		// record with forkedFrom. Those records are the parent's
+		// content — already archived under the parent session — so
+		// they never surface as this session's messages; the
+		// sessions are linked via ParentSessionID instead. Replayed
+		// user/assistant records still join the DAG (marked
+		// replayed) so the genuine tail stays connected to a single
+		// root and rewinds inside the branched session resolve.
+		// Replayed timestamps are excluded from session bounds:
+		// they predate the fork.
+		if ff := gjson.Get(line, "forkedFrom"); ff.Exists() {
+			if forkedFromSID == "" {
+				forkedFromSID = ff.Get("sessionId").Str
+			}
+			if entryType == "user" || entryType == "assistant" {
+				uuid := gjson.Get(line, "uuid").Str
+				if uuid != "" {
+					hasAnyUUID = true
+				} else {
+					allHaveUUID = false
+				}
+				entries = append(entries, dagEntry{
+					uuid:       uuid,
+					parentUuid: gjson.Get(line, "parentUuid").Str,
+					entryType:  entryType,
+					lineIndex:  lineIndex,
+					line:       line,
+					timestamp:  extractTimestamp(line),
+					replayed:   true,
+				})
+				lineIndex++
+			}
+			continue
 		}
 
 		// Extract source version from first line that has it.
@@ -329,6 +373,16 @@ func claudeParseWithExclusions(
 	}
 	if parseErr != nil {
 		return nil, nil, parseErr
+	}
+
+	// Link a forked session (/branch) to the session it was forked
+	// from. The replayed prefix was dropped above; the relationship
+	// makes the session tree show the branch and lets the fork
+	// context view prepend the shared history from the parent.
+	if forkedFromSID != "" && forkedFromSID != sessionID &&
+		len(results) > 0 {
+		results[0].Session.ParentSessionID = forkedFromSID
+		results[0].Session.RelationshipType = RelFork
 	}
 
 	// Splice queued_command attachments into the main session
@@ -1704,7 +1758,7 @@ func countUserTurns(
 // same notion of a user turn that firstMessageAndUserCount uses
 // for user_message_count.
 func isRealClaudeUserTurn(e dagEntry) bool {
-	if e.entryType != "user" {
+	if e.entryType != "user" || e.replayed {
 		return false
 	}
 	if gjson.Get(e.line, "isMeta").Bool() ||
@@ -1743,6 +1797,12 @@ func extractMessages(entries []dagEntry) (
 	)
 
 	for _, e := range entries {
+		// Replayed /branch prefix entries belong to the parent
+		// session: no message, no timestamp contribution.
+		if e.replayed {
+			continue
+		}
+
 		if !e.timestamp.IsZero() {
 			if startedAt.IsZero() {
 				startedAt = e.timestamp

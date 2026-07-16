@@ -248,6 +248,13 @@ import (
 // classification, so historical skill usage is backfilled on
 // re-parse.)
 //
+// (61: Claude /branch (forkedFrom) session linkage. Branched session
+// files replay the parent's history with forkedFrom stamps; the
+// replayed prefix is no longer stored as the branched session's own
+// messages (the parent archives it) and the session links to its
+// parent as a fork, so the session tree shows the branch. Existing
+// branched rows need re-parsing to gain the relationship and shed
+// the duplicated prefix.)
 // (60: Claude fork threshold counts real user turns. tool_result
 // carriers, isMeta records, and system-classified texts no longer
 // inflate an abandoned rewind branch past forkThreshold, so quick
@@ -292,7 +299,7 @@ import (
 // (51: Gemini cumulative-to-delta token reparse.)
 // (17: Codex <skill> template filtering.)
 // (16: <turn_aborted> system messages.)
-const dataVersion = 60
+const dataVersion = 61
 
 const tokenCoverageRepairStatsKey = "token_coverage_repair_v1"
 
