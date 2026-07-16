@@ -99,6 +99,7 @@ func claudeParseWithExclusions(
 		malformedLines  int
 		lastLine        string
 		subagentMap     = map[string]string{}
+		parentOf        = map[string]string{}
 		globalStart     time.Time
 		globalEnd       time.Time
 	)
@@ -122,6 +123,17 @@ func claudeParseWithExclusions(
 		lastLineFailed = false
 
 		entryType := gjson.Get(line, "type").Str
+
+		// Record the uuid/parentUuid link of every record type.
+		// Claude Code threads the DAG through non-message records
+		// too (attachments, system entries), so fork detection
+		// must be able to resolve parent references across them,
+		// not just across user/assistant entries.
+		if u := gjson.Get(line, "uuid").Str; u != "" {
+			if _, seen := parentOf[u]; !seen {
+				parentOf[u] = gjson.Get(line, "parentUuid").Str
+			}
+		}
 
 		// Extract source version from first line that has it.
 		if sourceVersion == "" {
@@ -267,7 +279,10 @@ func claudeParseWithExclusions(
 	// snapshots and additive chunks for one response under the same
 	// provider message id. Keep final metadata/token usage while
 	// preserving distinct content blocks from the whole run.
-	entries = mergeClaudeAssistantMessageChunks(entries)
+	// chunkAlias maps each absorbed chunk uuid to the uuid of the
+	// merged entry so parent references into the middle of a run
+	// still resolve during DAG processing.
+	entries, chunkAlias := mergeClaudeAssistantMessageChunks(entries)
 
 	fileInfo := FileInfo{
 		Path:  path,
@@ -289,10 +304,18 @@ func claudeParseWithExclusions(
 		results  []ParseResult
 		parseErr error
 	)
-	// If all user/assistant entries have uuids, use DAG-aware processing.
+	// If all user/assistant entries have uuids and every parent
+	// reference resolves (possibly through non-message records),
+	// use DAG-aware processing.
+	resolvedParents, dagOK := []string(nil), false
 	if hasAnyUUID && allHaveUUID {
+		resolvedParents, dagOK = resolveClaudeDAGParents(
+			entries, parentOf, chunkAlias,
+		)
+	}
+	if dagOK {
 		results, parseErr = parseDAG(
-			entries, sessionID, project, machine,
+			entries, resolvedParents, sessionID, project, machine,
 			parentSessionID, fileInfo, subagentMap,
 			globalStart, globalEnd, meta,
 		)
@@ -845,36 +868,86 @@ func parseLinear(
 	return []ParseResult{{Session: sess, Messages: messages}}, nil
 }
 
-// parseDAG builds a parent->children adjacency map and walks the
-// tree to detect fork points. Large-gap forks produce separate
-// ParseResults; small-gap retries follow the latest branch.
+// resolveClaudeDAGParents maps each entry's parentUuid to its
+// nearest ancestor that is itself a user/assistant entry, walking
+// up through non-message records (attachments, system entries) and
+// through streaming chunks absorbed by message.id merging. Returns
+// ok=false when a parent reference cannot be resolved (dangling
+// uuid, cycle, or self-reference); callers must then fall back to
+// linear parsing to avoid dropping messages.
+func resolveClaudeDAGParents(
+	entries []dagEntry,
+	parentOf map[string]string,
+	chunkAlias map[string]string,
+) ([]string, bool) {
+	entryUUIDs := make(map[string]struct{}, len(entries))
+	for _, e := range entries {
+		entryUUIDs[e.uuid] = struct{}{}
+	}
+	resolved := make([]string, len(entries))
+	maxSteps := len(parentOf) + len(chunkAlias) + 1
+	for i, e := range entries {
+		p := e.parentUuid
+		steps := 0
+		for p != "" {
+			if a, ok := chunkAlias[p]; ok {
+				p = a
+			}
+			if _, ok := entryUUIDs[p]; ok {
+				break
+			}
+			next, ok := parentOf[p]
+			if !ok {
+				return nil, false
+			}
+			p = next
+			if steps++; steps > maxSteps {
+				return nil, false
+			}
+		}
+		if p == e.uuid {
+			return nil, false
+		}
+		resolved[i] = p
+	}
+	return resolved, true
+}
+
+// parseDAG builds a parent->children adjacency map from resolved
+// parent references and walks the tree. The main session follows
+// the live branch — at every fork point, the child whose subtree
+// contains the file's latest write. That mirrors what Claude Code
+// itself displays after a rewind (esc+esc): the conversation
+// continues from the rewind target and the abandoned branch is
+// hidden. Abandoned branches with enough user turns are preserved
+// as separate fork ParseResults; short ones are retry noise and
+// are dropped.
 func parseDAG(
 	entries []dagEntry,
+	resolvedParents []string,
 	sessionID, project, machine, parentSessionID string,
 	fileInfo FileInfo,
 	subagentMap map[string]string,
 	globalStart, globalEnd time.Time,
 	meta claudeSessionMeta,
 ) ([]ParseResult, error) {
-	// Build parent -> children ordered by line position and
-	// collect the set of all uuids for connectivity checks.
+	// Build parent -> children ordered by line position. Resolution
+	// already guarantees every non-empty resolved parent is an
+	// entry uuid.
 	children := make(map[string][]int, len(entries))
-	uuidSet := make(map[string]struct{}, len(entries))
 	var roots []int
-	for i, e := range entries {
-		if e.uuid != "" {
-			uuidSet[e.uuid] = struct{}{}
-		}
-		if e.parentUuid == "" {
+	for i := range entries {
+		p := resolvedParents[i]
+		if p == "" {
 			roots = append(roots, i)
 		} else {
-			children[e.parentUuid] = append(children[e.parentUuid], i)
+			children[p] = append(children[p], i)
 		}
 	}
 
-	// A well-formed DAG has exactly one root and all parentUuid
-	// references resolve to an existing entry's uuid. If not,
-	// fall back to linear parsing to avoid dropping messages.
+	// A well-formed DAG has exactly one root. If not, fall back
+	// to linear parsing to avoid dropping messages (for example
+	// legacy files with embedded sidechain trees).
 	if len(roots) != 1 {
 		return parseLinear(
 			entries, sessionID, project, machine,
@@ -882,16 +955,21 @@ func parseDAG(
 			globalStart, globalEnd, meta,
 		)
 	}
-	for _, e := range entries {
-		if e.parentUuid != "" {
-			if _, ok := uuidSet[e.parentUuid]; !ok {
-				return parseLinear(
-					entries, sessionID, project, machine,
-					parentSessionID, fileInfo, subagentMap,
-					globalStart, globalEnd, meta,
-				)
+
+	// subtreeMax[i] is the highest entry index reachable in the
+	// subtree rooted at entries[i]. Parents precede children in
+	// append-only session files, so a reverse scan sees every
+	// child before its parent; a forward reference (malformed
+	// input) is skipped and simply doesn't widen the subtree.
+	subtreeMax := make([]int, len(entries))
+	for i := len(entries) - 1; i >= 0; i-- {
+		m := i
+		for _, kid := range children[entries[i].uuid] {
+			if kid > i && subtreeMax[kid] > m {
+				m = subtreeMax[kid]
 			}
 		}
+		subtreeMax[i] = m
 	}
 
 	// Walk from the root, collecting branches.
@@ -903,9 +981,13 @@ func parseDAG(
 
 	var branches []branch
 
-	// walkBranch follows the DAG from a starting index, collecting
-	// all entries on the chosen path. At fork points, it either
-	// follows the latest child (small gap) or splits (large gap).
+	// walkBranch follows the live path from a starting index. At a
+	// fork point the live child is the one whose subtree contains
+	// the latest write: after a rewind Claude Code only appends to
+	// the new branch, so an abandoned branch can never contain the
+	// file's last entry. Each abandoned sibling is preserved as a
+	// fork branch when it carries more than forkThreshold user
+	// turns, and dropped as retry/rewind noise otherwise.
 	// ownerID is the session ID of the branch that owns this walk.
 	var walkBranch func(startIdx int, ownerID string) []int
 	var forkBranches []branch
@@ -916,38 +998,35 @@ func parseDAG(
 
 		for current >= 0 {
 			path = append(path, current)
-			uuid := entries[current].uuid
-			kids := children[uuid]
+			kids := children[entries[current].uuid]
 			if len(kids) == 0 {
 				break
 			}
-			if len(kids) == 1 {
-				current = kids[0]
-				continue
-			}
 
-			// Fork point: count user turns on first child's branch.
-			firstChildTurns := countUserTurns(entries, children, kids[0])
-			if firstChildTurns <= forkThreshold {
-				// Small-gap retry: follow the last child.
-				current = kids[len(kids)-1]
-			} else {
-				// Large-gap fork: follow first child on main,
-				// collect other children as fork branches.
-				for _, kid := range kids[1:] {
-					forkSID := sessionID + "-" +
-						entries[kid].uuid
-					forkPath := walkBranch(kid, forkSID)
-					forkBranches = append(
-						forkBranches,
-						branch{
-							indices:  forkPath,
-							parentID: ownerID,
-						},
-					)
+			live := kids[0]
+			for _, kid := range kids[1:] {
+				if subtreeMax[kid] > subtreeMax[live] {
+					live = kid
 				}
-				current = kids[0]
 			}
+			for _, kid := range kids {
+				if kid == live {
+					continue
+				}
+				if countUserTurns(entries, children, kid) <= forkThreshold {
+					continue
+				}
+				forkSID := sessionID + "-" + entries[kid].uuid
+				forkPath := walkBranch(kid, forkSID)
+				forkBranches = append(
+					forkBranches,
+					branch{
+						indices:  forkPath,
+						parentID: ownerID,
+					},
+				)
+			}
+			current = live
 		}
 
 		return path
@@ -1174,9 +1253,18 @@ func queuedCommandMessage(
 // both for cumulative streaming snapshots and for additive chunks of a
 // single response. The last entry owns metadata and token usage; the
 // merged message content keeps each distinct block in first-seen order.
-func mergeClaudeAssistantMessageChunks(entries []dagEntry) []dagEntry {
+//
+// The returned alias map records each absorbed chunk uuid -> the
+// merged entry's uuid. Chunks in a run parent each other, so the
+// merged entry adopts the first chunk's parentUuid and any later
+// entry whose parent points into the middle of the run must be
+// re-attached to the merged entry during DAG resolution.
+func mergeClaudeAssistantMessageChunks(
+	entries []dagEntry,
+) ([]dagEntry, map[string]string) {
+	alias := make(map[string]string)
 	if len(entries) <= 1 {
-		return entries
+		return entries, alias
 	}
 
 	result := make([]dagEntry, 0, len(entries))
@@ -1199,11 +1287,19 @@ func mergeClaudeAssistantMessageChunks(entries []dagEntry) []dagEntry {
 		if j == i+1 {
 			result = append(result, entries[i])
 		} else {
-			result = append(result, mergeClaudeAssistantRun(entries[i:j]))
+			merged := mergeClaudeAssistantRun(entries[i:j])
+			merged.parentUuid = entries[i].parentUuid
+			for _, absorbed := range entries[i:j] {
+				if absorbed.uuid != "" &&
+					absorbed.uuid != merged.uuid {
+					alias[absorbed.uuid] = merged.uuid
+				}
+			}
+			result = append(result, merged)
 		}
 		i = j - 1
 	}
-	return result
+	return result, alias
 }
 
 // mergeClaudeAssistantRun collapses one same-message.id assistant

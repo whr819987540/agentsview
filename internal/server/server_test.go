@@ -3743,7 +3743,8 @@ func TestUploadSession_MultiSessionConflictDoesNotPartiallyWrite(t *testing.T) {
 
 	const filename = "upload-multi-conflict.jsonl"
 	const mainID = "upload-multi-conflict"
-	const forkID = "upload-multi-conflict-i"
+	// The abandoned branch (c..l) becomes the derived fork session.
+	const forkID = "upload-multi-conflict-c"
 
 	require.NoError(t, te.db.UpsertSession(db.Session{
 		ID: forkID, Project: "myproj", Machine: "remote", Agent: "claude",

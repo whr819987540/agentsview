@@ -1,5 +1,5 @@
 // ABOUTME: Tests for DAG fork detection in Claude JSONL session files.
-// ABOUTME: Validates linear, large-gap fork, small-gap retry, and backward compat scenarios.
+// ABOUTME: Validates rewind live-branch selection, abandoned-branch preservation, and backward compat.
 package parser
 
 import (
@@ -41,24 +41,15 @@ func TestForkDetection_LinearSession(t *testing.T) {
 }
 
 func TestForkDetection_LargeGapFork(t *testing.T) {
-	// Main branch: a->b->c->d->e->f->g->h (4+ user turns after fork)
-	// Fork from b: i->j
-	// Fork point is at node b, which has children c (first) and i.
-	// First branch (c side) has user turns at c, e, g = 3 user turns,
-	// but we need >3, so add more.
+	// A rewind (esc+esc) past a substantial branch: the user ran
+	// 4 user turns (c,e,g,k), rewound back to b, and continued
+	// with i->j. The live conversation — what Claude Code itself
+	// displays — is a,b,i,j; the abandoned branch c..l has 4 user
+	// turns (> forkThreshold) and is preserved as a fork session.
 	//
-	// Let's make:
 	//   a(user) -> b(asst) -> c(user) -> d(asst) -> e(user) -> f(asst)
-	//                                    -> g(user) -> h(asst)
-	//                      -> i(user) -> j(asst)   [fork from b]
-	//
-	// User turns on first branch after fork point b: c, e, g = 3,
-	// need >3 so add one more pair.
-	//   a(user) -> b(asst) -> c(user) -> d(asst) -> e(user) -> f(asst)
-	//                                    -> g(user) -> h(asst) -> k(user) -> l(asst)
-	//                      -> i(user) -> j(asst)
-	//
-	// User turns on first branch from c onward: c, e, g, k = 4 > 3 = large gap.
+	//                         -> g(user) -> h(asst) -> k(user) -> l(asst)
+	//                      -> i(user) -> j(asst)   [live branch after rewind]
 	content := testjsonl.NewSessionBuilder().
 		AddClaudeUserWithUUID("2024-01-01T10:00:00Z", "hello", "a", "").
 		AddClaudeAssistantWithUUID("2024-01-01T10:00:01Z", "hi", "b", "a").
@@ -70,33 +61,35 @@ func TestForkDetection_LargeGapFork(t *testing.T) {
 		AddClaudeAssistantWithUUID("2024-01-01T10:00:07Z", "a3", "h", "g").
 		AddClaudeUserWithUUID("2024-01-01T10:00:08Z", "q4", "k", "h").
 		AddClaudeAssistantWithUUID("2024-01-01T10:00:09Z", "a4", "l", "k").
-		// Fork branch from b
+		// Live branch appended after the rewind
 		AddClaudeUserWithUUID("2024-01-01T10:01:00Z", "fork q1", "i", "b").
 		AddClaudeAssistantWithUUID("2024-01-01T10:01:01Z", "fork a1", "j", "i").
 		String()
 
 	results := parseTestContent(t, "fork.jsonl", content, 2)
 
-	// Main session: all entries on first branch (a,b,c,d,e,f,g,h,k,l)
+	// Main session: the live branch (a,b,i,j).
 	main := results[0]
 	assertSessionMeta(t, &main.Session, "fork", "proj", AgentClaude)
-	assertMessageCount(t, len(main.Messages), 10)
+	assertMessageCount(t, len(main.Messages), 4)
+	assertMessage(t, main.Messages[2], RoleUser, "fork q1")
+	assertMessage(t, main.Messages[3], RoleAssistant, "fork a1")
 	assert.Empty(t, main.Session.ParentSessionID, "main ParentSessionID")
 
-	// Fork session: entries on fork branch (i,j)
+	// Fork session: the abandoned branch (c..l).
 	fork := results[1]
-	assert.Equal(t, "fork-i", fork.Session.ID, "fork session ID")
-	assertMessageCount(t, len(fork.Messages), 2)
+	assert.Equal(t, "fork-c", fork.Session.ID, "fork session ID")
+	assertMessageCount(t, len(fork.Messages), 8)
 	assert.Equal(t, "fork", fork.Session.ParentSessionID, "fork ParentSessionID")
 	assert.Equal(t, RelFork, fork.Session.RelationshipType, "fork RelationshipType")
-	assert.Equal(t, "fork q1", fork.Session.FirstMessage, "fork FirstMessage")
+	assert.Equal(t, "q1", fork.Session.FirstMessage, "fork FirstMessage")
 }
 
 func TestForkDetection_SmallGapRetry(t *testing.T) {
-	// Main: a(user)->b(asst)->c(user)->d(asst) (1 user turn after fork = small gap)
-	// Retry from b: e(user)->f(asst)
-	// First branch from b has c,d — only 1 user turn (c). ≤3 = small gap.
-	// Should follow LAST child (e), so result is: a,b,e,f
+	// A quick rewind: the user asked c, rewound to b, and asked e
+	// instead. The abandoned branch c,d has only 1 user turn
+	// (<= forkThreshold), so it is dropped as retry noise and the
+	// session shows just the live path: a,b,e,f.
 	content := testjsonl.NewSessionBuilder().
 		AddClaudeUserWithUUID("2024-01-01T10:00:00Z", "hello", "a", "").
 		AddClaudeAssistantWithUUID("2024-01-01T10:00:01Z", "hi", "b", "a").
@@ -146,11 +139,11 @@ func TestForkDetection_MixedUUIDs(t *testing.T) {
 }
 
 func TestForkDetection_NestedFork(t *testing.T) {
-	// Main: a->b->c->d->e->f->g->h->k->l (5 user turns)
-	// Fork from b: m->n->o->p->q->r->s->t->u->v (5 user turns on fork branch)
-	//   Nested fork from n: w->x (fork within the fork branch)
-	// Fork from b has 5 user turns on first child path (m,o,q,s,u) > 3 = large gap
-	// Nested fork from n has 4 user turns on first child path (o,q,s,u) > 3 = large gap
+	// Two successive rewinds. The user ran c..l (5 user turns),
+	// rewound to b and ran m..v (5 user turns), then rewound again
+	// to n and continued with w,x. The live conversation is
+	// a,b,m,n,w,x; both abandoned branches are substantial
+	// (> forkThreshold user turns) and preserved as forks.
 	content := testjsonl.NewSessionBuilder().
 		AddClaudeUserWithUUID("2024-01-01T10:00:00Z", "start", "a", "").
 		AddClaudeAssistantWithUUID("2024-01-01T10:00:01Z", "ok", "b", "a").
@@ -179,29 +172,78 @@ func TestForkDetection_NestedFork(t *testing.T) {
 		AddClaudeAssistantWithUUID("2024-01-01T10:02:01Z", "n-ok", "x", "w").
 		String()
 
-	// Expect 3 results: main, nested fork from n, fork from b
-	// (depth-first: nested fork discovered during recursive walk of b's fork)
+	// Expect 3 results: the live path plus the two abandoned
+	// branches, discovered in walk order along the live path.
 	results := parseTestContent(t, "nested-fork.jsonl", content, 3)
 
-	// Main: a,b,c,d,e,f,g,h,k,l = 10 messages
-	assertMessageCount(t, len(results[0].Messages), 10)
+	// Main: the live path a,b,m,n,w,x = 6 messages.
+	main := results[0]
+	assertMessageCount(t, len(main.Messages), 6)
+	assertMessage(t, main.Messages[4], RoleUser, "nested")
+	assertMessage(t, main.Messages[5], RoleAssistant, "n-ok")
 
-	// Nested fork from n (discovered first during depth-first walk): w,x = 2 messages
-	nested := results[1]
-	assert.Equal(t, "nested-fork-w", nested.Session.ID, "nested ID")
-	assertMessageCount(t, len(nested.Messages), 2)
-	assert.Equal(t, RelFork, nested.Session.RelationshipType, "nested RelationshipType")
-	// Nested fork's parent should be the fork branch it split
-	// from, not the root session.
-	assert.Equal(t, "nested-fork-m", nested.Session.ParentSessionID, "nested ParentSessionID")
-
-	// Fork from b: m,n,o,p,q,r,s,tt,u,v = 10 messages
-	fork := results[2]
-	assert.Equal(t, "nested-fork-m", fork.Session.ID, "fork ID")
-	assertMessageCount(t, len(fork.Messages), 10)
+	// First rewind's abandoned branch: c..l = 8 messages.
+	fork := results[1]
+	assert.Equal(t, "nested-fork-c", fork.Session.ID, "fork ID")
+	assertMessageCount(t, len(fork.Messages), 8)
 	assert.Equal(t, RelFork, fork.Session.RelationshipType, "fork RelationshipType")
-	// Fork from b's parent should be the root session.
+	// Both fork points sit on the live path, so both abandoned
+	// branches parent to the root session.
 	assert.Equal(t, "nested-fork", fork.Session.ParentSessionID, "fork ParentSessionID")
+
+	// Second rewind's abandoned branch: o..v = 8 messages.
+	nested := results[2]
+	assert.Equal(t, "nested-fork-o", nested.Session.ID, "nested ID")
+	assertMessageCount(t, len(nested.Messages), 8)
+	assert.Equal(t, RelFork, nested.Session.RelationshipType, "nested RelationshipType")
+	assert.Equal(t, "nested-fork", nested.Session.ParentSessionID, "nested ParentSessionID")
+}
+
+func TestForkDetection_AbandonedBranchKeepsItsOwnLivePath(t *testing.T) {
+	// Rewind inside a branch that is later abandoned wholesale.
+	// The user ran c..h, rewound to d and continued with m..r
+	// (the branch's own live tail), then rewound all the way back
+	// to b and continued with y,z. The preserved fork session must
+	// show the abandoned branch as it looked when it was left:
+	// c,d,m..r — not the branch's own abandoned tail e..h (2 user
+	// turns <= forkThreshold, dropped as noise).
+	content := testjsonl.NewSessionBuilder().
+		AddClaudeUserWithUUID("2024-01-01T10:00:00Z", "start", "a", "").
+		AddClaudeAssistantWithUUID("2024-01-01T10:00:01Z", "ok", "b", "a").
+		AddClaudeUserWithUUID("2024-01-01T10:00:02Z", "q1", "c", "b").
+		AddClaudeAssistantWithUUID("2024-01-01T10:00:03Z", "a1", "d", "c").
+		AddClaudeUserWithUUID("2024-01-01T10:00:04Z", "old1", "e", "d").
+		AddClaudeAssistantWithUUID("2024-01-01T10:00:05Z", "old-a1", "f", "e").
+		AddClaudeUserWithUUID("2024-01-01T10:00:06Z", "old2", "g", "f").
+		AddClaudeAssistantWithUUID("2024-01-01T10:00:07Z", "old-a2", "h", "g").
+		// First rewind: back to d, continue inside the branch.
+		AddClaudeUserWithUUID("2024-01-01T10:01:00Z", "q2", "m", "d").
+		AddClaudeAssistantWithUUID("2024-01-01T10:01:01Z", "a2", "n", "m").
+		AddClaudeUserWithUUID("2024-01-01T10:01:02Z", "q3", "o", "n").
+		AddClaudeAssistantWithUUID("2024-01-01T10:01:03Z", "a3", "p", "o").
+		AddClaudeUserWithUUID("2024-01-01T10:01:04Z", "q4", "q", "p").
+		AddClaudeAssistantWithUUID("2024-01-01T10:01:05Z", "a4", "r", "q").
+		// Second rewind: all the way back to b.
+		AddClaudeUserWithUUID("2024-01-01T10:02:00Z", "fresh", "y", "b").
+		AddClaudeAssistantWithUUID("2024-01-01T10:02:01Z", "fresh-a", "z", "y").
+		String()
+
+	results := parseTestContent(t, "abandoned-live.jsonl", content, 2)
+
+	// Main: the live path a,b,y,z.
+	main := results[0]
+	assertMessageCount(t, len(main.Messages), 4)
+	assertMessage(t, main.Messages[2], RoleUser, "fresh")
+
+	// The abandoned branch keeps its own live path: c,d,m..r.
+	// Its internally-abandoned tail e..h is dropped.
+	fork := results[1]
+	assert.Equal(t, "abandoned-live-c", fork.Session.ID, "fork ID")
+	assertMessageCount(t, len(fork.Messages), 8)
+	assertMessage(t, fork.Messages[0], RoleUser, "q1")
+	assertMessage(t, fork.Messages[2], RoleUser, "q2")
+	assertMessage(t, fork.Messages[7], RoleAssistant, "a4")
+	assert.Equal(t, "abandoned-live", fork.Session.ParentSessionID, "fork ParentSessionID")
 }
 
 func TestForkDetection_MultipleRoots(t *testing.T) {
@@ -284,37 +326,22 @@ func TestSessionBoundsStartedAtFromLeadingEvent(t *testing.T) {
 }
 
 func TestForkDetection_NestedForkCountsFullSubtree(t *testing.T) {
-	// Regression test: when the first child at a fork point
-	// itself contains nested forks early in its chain, the
-	// old first-child-only countUserTurns would see only 1
-	// user turn (following first children that dead-end
-	// quickly) and treat the entire large branch as a small
-	// retry, discarding it.
-	//
-	// DAG:  root(a) -> b (fork point)
-	//   First child:  c -> d (fork) -> e -> f -> g -> h -> i -> j
-	//                          \-> d2 (retry, 1 entry)
-	//   Second child: z (1 entry, the "retry")
-	//
-	// The first child subtree has 5 user turns total (c,e,g,i
-	// plus d2). With first-child-only traversal, the path
-	// c->d->d2 sees only 1 user turn (c is user, d is asst,
-	// d2 is user but d2 is the SECOND child not the first) --
-	// actually c->d->(first child of d's fork)=e gives more.
-	// Let's build a clearer case: the first child at the fork
-	// is a dead-end assistant reply, so first-child traversal
-	// stops after 0 user turns.
+	// Regression test: countUserTurns must count the entire
+	// subtree of an abandoned branch, not just one child path.
+	// A first-child-only traversal would see 1 user turn here
+	// (c -> d -> e dead-ends) and drop the branch as retry
+	// noise instead of preserving it as a fork session.
 	//
 	// DAG:  root(a) -> b (fork)
-	//   First child:  c(user) -> d(asst, fork)
-	//                   d -> e(asst, dead-end first child)
+	//   Abandoned child: c(user) -> d(asst, fork)
+	//                   d -> e(asst, dead-end)
 	//                   d -> f(user) -> g(asst) -> h(user) ->
 	//                        i(asst) -> j(user) -> k(asst)
-	//   Second child: z(user, 1 msg)
+	//   Live child: z(user, appended after the rewind)
 	//
-	// Old countUserTurns for c: c(user,1) -> d(asst) ->
-	//   e(asst, no children) = 1 user turn <= 3 -> retry!
-	// New countUserTurns for c: 1+0+1+0+1+0+1+0 = 4 > 3
+	// First-child-only count for c: c(user,1) -> d(asst) ->
+	//   e(asst, no children) = 1 user turn <= 3 -> dropped!
+	// Full-subtree count for c: c,f,h,j = 4 > 3 -> preserved.
 	content := testjsonl.NewSessionBuilder().
 		AddClaudeUserWithUUID("2024-01-01T10:00:00Z", "start", "a", "").
 		AddClaudeAssistantWithUUID("2024-01-01T10:00:01Z", "ok", "b", "a").
@@ -334,23 +361,114 @@ func TestForkDetection_NestedForkCountsFullSubtree(t *testing.T) {
 		AddClaudeUserWithUUID("2024-01-01T10:01:00Z", "retry", "z", "b").
 		String()
 
-	// The first child subtree has 4 user turns (c,f,h,j) > 3,
-	// so it should be treated as a large-gap fork. We expect
-	// 2 results: main path (a,b,c,d,f,g,h,i,j,k = 10 msgs)
-	// and the fork (z = 1 msg).
+	// The abandoned subtree has 4 user turns (c,f,h,j) > 3, so it
+	// must be preserved as a fork session. We expect 2 results:
+	// the live path (a,b,z = 3 msgs) and the abandoned branch
+	// (c,d,f,g,h,i,j,k = 8 msgs — its dead-end "e" is dropped).
 	results := parseTestContent(t, "nested-fork-subtree.jsonl", content, 2)
 
-	// Main path should follow first child at b, then second
-	// child at d (the retry heuristic picks last child when
-	// first child has <= 3 user turns — here "e" is a dead
-	// end with 0 user turns so the nested fork follows "f").
 	main := results[0]
-	assert.GreaterOrEqual(t, main.Session.MessageCount, 8,
-		"main MessageCount (first child subtree should not be discarded)")
+	assertMessageCount(t, len(main.Messages), 3)
+	assertMessage(t, main.Messages[2], RoleUser, "retry")
 
-	// The trivial "retry" branch should be the fork.
 	fork := results[1]
-	assertMessage(t, fork.Messages[0], RoleUser, "retry")
+	assert.Equal(t, "nested-fork-subtree-c", fork.Session.ID, "fork ID")
+	assertMessageCount(t, len(fork.Messages), 8)
+	assertMessage(t, fork.Messages[0], RoleUser, "main1")
+	assert.Equal(t, RelFork, fork.Session.RelationshipType, "fork RelationshipType")
+}
+
+// claudeAttachmentLine builds a modern-format attachment record that
+// carries uuid/parentUuid and so participates in the session DAG.
+func claudeAttachmentLine(ts, uuid, parentUuid string) string {
+	return `{"type":"attachment","timestamp":"` + ts +
+		`","uuid":"` + uuid + `","parentUuid":"` + parentUuid +
+		`","attachment":{"type":"task_reminder"}}`
+}
+
+// claudeSystemLine builds a modern-format system record that carries
+// uuid/parentUuid and so participates in the session DAG.
+func claudeSystemLine(ts, uuid, parentUuid string) string {
+	return `{"type":"system","timestamp":"` + ts +
+		`","uuid":"` + uuid + `","parentUuid":"` + parentUuid +
+		`","content":"hook ran","subtype":"informational"}`
+}
+
+func TestForkDetection_RewindThroughNonMessageEntries(t *testing.T) {
+	// Claude Code 2.x threads the uuid/parentUuid chain through
+	// attachment and system records: assistant replies parent to
+	// the last attachment, not to the user message. A rewind fork
+	// must still be detected by resolving parent references
+	// through those non-message records instead of falling back
+	// to linear parsing (which would show both branches).
+	//
+	//   a(user) -> att1 -> att2 -> b(asst) -> sys1
+	//     sys1 -> c(user) -> att3 -> d(asst)   [abandoned by rewind]
+	//     sys1 -> e(user) -> att4 -> f(asst)   [live branch]
+	content := testjsonl.NewSessionBuilder().
+		AddClaudeUserWithUUID("2024-01-01T10:00:00Z", "hello", "a", "").
+		AddRaw(claudeAttachmentLine("2024-01-01T10:00:01Z", "att1", "a")).
+		AddRaw(claudeAttachmentLine("2024-01-01T10:00:02Z", "att2", "att1")).
+		AddClaudeAssistantWithUUID("2024-01-01T10:00:03Z", "hi", "b", "att2").
+		AddRaw(claudeSystemLine("2024-01-01T10:00:04Z", "sys1", "b")).
+		AddClaudeUserWithUUID("2024-01-01T10:00:05Z", "first try", "c", "sys1").
+		AddRaw(claudeAttachmentLine("2024-01-01T10:00:06Z", "att3", "c")).
+		AddClaudeAssistantWithUUID("2024-01-01T10:00:07Z", "first answer", "d", "att3").
+		// Rewind: new user input re-parents to sys1.
+		AddClaudeUserWithUUID("2024-01-01T10:01:00Z", "retry", "e", "sys1").
+		AddRaw(claudeAttachmentLine("2024-01-01T10:01:01Z", "att4", "e")).
+		AddClaudeAssistantWithUUID("2024-01-01T10:01:02Z", "retry answer", "f", "att4").
+		String()
+
+	results := parseTestContent(t, "modern-rewind.jsonl", content, 1)
+
+	// Only the live branch is shown: a,b,e,f. The abandoned
+	// branch c,d (1 user turn) is dropped.
+	assertMessageCount(t, len(results[0].Messages), 4)
+	assertMessage(t, results[0].Messages[0], RoleUser, "hello")
+	assertMessage(t, results[0].Messages[1], RoleAssistant, "hi")
+	assertMessage(t, results[0].Messages[2], RoleUser, "retry")
+	assertMessage(t, results[0].Messages[3], RoleAssistant, "retry answer")
+}
+
+func TestForkDetection_RewindWithChunkedAssistantRuns(t *testing.T) {
+	// Streamed assistant responses are written as several JSONL
+	// entries sharing one message.id, each parenting the previous
+	// chunk. Chunk merging absorbs all but one entry, so DAG
+	// resolution must follow parent references through absorbed
+	// chunk uuids (and the merged entry must adopt the run's
+	// incoming parent) or every chunked session degrades to
+	// linear parsing and a rewind shows both branches.
+	chunk := func(ts, uuid, parentUuid, mid, text string) string {
+		return `{"type":"assistant","timestamp":"` + ts +
+			`","uuid":"` + uuid + `","parentUuid":"` + parentUuid +
+			`","message":{"id":"` + mid +
+			`","content":[{"type":"text","text":"` + text + `"}]}}`
+	}
+	content := testjsonl.NewSessionBuilder().
+		AddClaudeUserWithUUID("2024-01-01T10:00:00Z", "hello", "a", "").
+		AddRaw(chunk("2024-01-01T10:00:01Z", "b1", "a", "msg_1", "part one")).
+		AddRaw(chunk("2024-01-01T10:00:02Z", "b2", "b1", "msg_1", "part two")).
+		AddClaudeUserWithUUID("2024-01-01T10:00:03Z", "first try", "c", "b2").
+		AddRaw(chunk("2024-01-01T10:00:04Z", "d1", "c", "msg_2", "old one")).
+		AddRaw(chunk("2024-01-01T10:00:05Z", "d2", "d1", "msg_2", "old two")).
+		// Rewind: new user input re-parents to the middle of the
+		// first assistant run (an absorbed chunk uuid).
+		AddClaudeUserWithUUID("2024-01-01T10:01:00Z", "retry", "e", "b1").
+		AddRaw(chunk("2024-01-01T10:01:01Z", "f1", "e", "msg_3", "new answer")).
+		String()
+
+	results := parseTestContent(t, "chunked-rewind.jsonl", content, 1)
+
+	// Live branch only: a, merged(b1,b2), e, f1. The abandoned
+	// branch c,d (1 user turn) is dropped.
+	msgs := results[0].Messages
+	assertMessageCount(t, len(msgs), 4)
+	assertMessage(t, msgs[0], RoleUser, "hello")
+	assertMessage(t, msgs[1], RoleAssistant, "part one")
+	assertMessage(t, msgs[1], RoleAssistant, "part two")
+	assertMessage(t, msgs[2], RoleUser, "retry")
+	assertMessage(t, msgs[3], RoleAssistant, "new answer")
 }
 
 func TestSessionBoundsDAGMainWidenedNotFork(t *testing.T) {
@@ -360,8 +478,8 @@ func TestSessionBoundsDAGMainWidenedNotFork(t *testing.T) {
 	queueLine := `{"type":"queue-operation","operation":"enqueue",` +
 		`"timestamp":"2024-01-01T12:00:00Z","content":"{}"}`
 
-	// Main: a->b->c->d->e->f->g->h->k->l (5 user turns)
-	// Fork from b: i->j
+	// Abandoned branch from b: c..l (5 user turns, preserved).
+	// Live branch after the rewind: i->j.
 	content := testjsonl.NewSessionBuilder().
 		AddClaudeUserWithUUID("2024-01-01T10:00:00Z", "hello", "a", "").
 		AddClaudeAssistantWithUUID("2024-01-01T10:00:01Z", "hi", "b", "a").
@@ -381,9 +499,11 @@ func TestSessionBoundsDAGMainWidenedNotFork(t *testing.T) {
 
 	results := parseTestContent(t, "dag-queue.jsonl", content, 2)
 
-	// Main session EndedAt should be widened to queue timestamp.
+	// Main session (live branch a,b,i,j) EndedAt should be widened
+	// to the queue timestamp.
 	assert.Equal(t, "2024-01-01T12:00:00Z", formatTime(results[0].Session.EndedAt), "main EndedAt")
 
-	// Fork session EndedAt should NOT be widened.
-	assert.Equal(t, "2024-01-01T10:01:01Z", formatTime(results[1].Session.EndedAt), "fork EndedAt")
+	// Fork session (abandoned branch c..l) EndedAt should NOT be
+	// widened.
+	assert.Equal(t, "2024-01-01T10:00:09Z", formatTime(results[1].Session.EndedAt), "fork EndedAt")
 }

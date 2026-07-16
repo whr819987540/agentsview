@@ -248,6 +248,14 @@ import (
 // classification, so historical skill usage is backfilled on
 // re-parse.)
 //
+// (59: Claude rewind (esc+esc) branch handling. DAG fork detection now
+// resolves parent references through non-message records (attachments,
+// system entries) and merged streaming chunks, and the main session
+// follows the live branch after a rewind instead of the abandoned one.
+// Existing Claude rows need re-parsing so rewound sessions stop showing
+// both branches; the resync also re-parses Codex rollouts recorded
+// before the thread_rolled_back fix whose stored rows still contain
+// rolled-back turns.)
 // (58: Persisted message/result content sanitization now covers
 // tool_calls.result_content and tool_result_events.content. Existing rows
 // need re-parsing so NUL/control bytes accepted by SQLite are stripped before
@@ -278,7 +286,7 @@ import (
 // (51: Gemini cumulative-to-delta token reparse.)
 // (17: Codex <skill> template filtering.)
 // (16: <turn_aborted> system messages.)
-const dataVersion = 58
+const dataVersion = 59
 
 const tokenCoverageRepairStatsKey = "token_coverage_repair_v1"
 

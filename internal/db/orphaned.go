@@ -148,10 +148,17 @@ func (d *DB) CopyOrphanedDataFromExcluding(
 	// the fork's id (#643), so the fork file's row was stored under
 	// the parent's identity with double-counted totals. That row is
 	// a stale duplicate of a live file, not an archive of a lost
-	// one. Scoped to Codex because it is strictly one session per
-	// file; SQLite-backed agents share a file_path across many
-	// sessions, where an id missing from the fresh parse can be a
-	// genuinely evicted chat that must survive as an orphan.
+	// one. Scoped to per-file agents; SQLite-backed agents share a
+	// file_path across many sessions, where an id missing from the
+	// fresh parse can be a genuinely evicted chat that must survive
+	// as an orphan.
+	//
+	// Claude/Cowork rows get the same treatment: a rewound session
+	// file yields one live session plus derived fork sessions whose
+	// "<session>-<uuid>" ids depend on parser semantics. When the
+	// file still exists and was reparsed, an old id the fresh parse
+	// no longer emits is a superseded branch row, not a lost
+	// archive; restoring it would duplicate the live conversation.
 	if _, err := conn.ExecContext(ctx, `
 		CREATE TEMP TABLE _orphaned_ids AS
 		SELECT id FROM old_db.sessions
@@ -163,8 +170,8 @@ func (d *DB) CopyOrphanedDataFromExcluding(
 			FROM old_db.sessions old_s
 			JOIN main.sessions new_s
 				ON new_s.file_path = old_s.file_path
-			WHERE old_s.agent = 'codex'
-			  AND new_s.agent = 'codex'
+			WHERE old_s.agent = new_s.agent
+			  AND old_s.agent IN ('codex', 'claude', 'cowork')
 		  )`,
 	); err != nil {
 		return 0, fmt.Errorf(

@@ -5734,9 +5734,9 @@ func TestSyncSingleSessionCursorNestedLayoutPreservesProject(
 func TestSyncForkDetection(t *testing.T) {
 	env := setupTestEnv(t)
 
-	// Main branch: a->b->c->d->e->f->g->h->k->l (5 user turns)
-	// Fork from b: i->j (1 user turn on fork branch)
-	// First branch from b has 4 user turns (c,e,g,k) > 3 = large gap
+	// Abandoned branch from b: c..l (5 user turns > forkThreshold,
+	// preserved as a fork session). Live branch after the rewind:
+	// i->j, which the main session follows.
 	content := testjsonl.NewSessionBuilder().
 		AddClaudeUserWithUUID("2024-01-01T10:00:00Z", "start", "a", "").
 		AddClaudeAssistantWithUUID("2024-01-01T10:00:01Z", "ok", "b", "a").
@@ -5755,10 +5755,10 @@ func TestSyncForkDetection(t *testing.T) {
 	env.writeClaudeSession(t, "test-proj", "parent-uuid.jsonl", content)
 	runSyncAndAssert(t, env.engine, sync.SyncStats{TotalSessions: 1, Synced: 2, Skipped: 0})
 
-	assertSessionMessageCount(t, env.db, "parent-uuid", 10)
-	assertSessionMessageCount(t, env.db, "parent-uuid-i", 2)
+	assertSessionMessageCount(t, env.db, "parent-uuid", 4)
+	assertSessionMessageCount(t, env.db, "parent-uuid-c", 8)
 
-	assertSessionState(t, env.db, "parent-uuid-i", func(sess *db.Session) {
+	assertSessionState(t, env.db, "parent-uuid-c", func(sess *db.Session) {
 		require.NotNil(t, sess.ParentSessionID, "fork parent = nil, want parent-uuid")
 		assert.Equal(t, "parent-uuid", *sess.ParentSessionID, "fork parent = %v, want parent-uuid", sess.ParentSessionID)
 		assert.Equal(t, "fork", sess.RelationshipType, "fork relationship_type = %q, want fork", sess.RelationshipType)
@@ -6194,11 +6194,12 @@ func TestResyncAllAbortsWithForkAndFailures(t *testing.T) {
 	}
 
 	// Initial sync: all 3 files parse fine.
-	// Fork file produces 2 sessions: "forked" (10 msgs)
-	// and "forked-i" (2 msgs).
+	// Fork file produces 2 sessions: "forked" (the live branch
+	// a,b,i,j = 4 msgs) and "forked-c" (the abandoned branch
+	// c..l = 8 msgs).
 	env.engine.SyncAll(context.Background(), nil)
-	assertSessionMessageCount(t, env.db, "forked", 10)
-	assertSessionMessageCount(t, env.db, "forked-i", 2)
+	assertSessionMessageCount(t, env.db, "forked", 4)
+	assertSessionMessageCount(t, env.db, "forked-c", 8)
 
 	// Make both normal files unreadable.
 	for _, name := range []string{"bad1.jsonl", "bad2.jsonl"} {
@@ -6223,8 +6224,8 @@ func TestResyncAllAbortsWithForkAndFailures(t *testing.T) {
 	assert.True(t, hasAbortWarning, "expected abort: Failed(2) > filesOK(1) "+"should trigger even though Failed == Synced")
 
 	// Original data preserved.
-	assertSessionMessageCount(t, env.db, "forked", 10)
-	assertSessionMessageCount(t, env.db, "forked-i", 2)
+	assertSessionMessageCount(t, env.db, "forked", 4)
+	assertSessionMessageCount(t, env.db, "forked-c", 8)
 }
 
 // TestResyncAllPostReopenAvailability verifies that reads and
@@ -7949,8 +7950,8 @@ func TestIncrementalSync_ClaudeForkSameSizeSameMtimeFileReplaceUsesFullParse(
 	)
 	env.engine.SyncAll(context.Background(), nil)
 
-	assertSessionMessageCount(t, env.db, "same-size-same-mtime-fork-replace", 10)
-	assertSessionMessageCount(t, env.db, "same-size-same-mtime-fork-replace-i", 2)
+	assertSessionMessageCount(t, env.db, "same-size-same-mtime-fork-replace", 4)
+	assertSessionMessageCount(t, env.db, "same-size-same-mtime-fork-replace-c", 8)
 	full, err := env.db.GetSessionFull(
 		context.Background(), "same-size-same-mtime-fork-replace",
 	)
@@ -7984,13 +7985,14 @@ func TestIncrementalSync_ClaudeForkSameSizeSameMtimeFileReplaceUsesFullParse(
 	env.engine.SyncPaths([]string{path})
 
 	msgs := fetchMessages(t, env.db, "same-size-same-mtime-fork-replace")
-	require.Len(t, msgs, 10)
+	require.Len(t, msgs, 4)
 	assert.Equal(t, "START", msgs[0].Content)
-	assert.Equal(t, "NO5", msgs[9].Content)
-	forkMsgs := fetchMessages(t, env.db, "same-size-same-mtime-fork-replace-i")
-	require.Len(t, forkMsgs, 2)
-	assert.Equal(t, "fork-other", forkMsgs[0].Content)
-	assert.Equal(t, "FORK-NO", forkMsgs[1].Content)
+	assert.Equal(t, "fork-other", msgs[2].Content)
+	assert.Equal(t, "FORK-NO", msgs[3].Content)
+	forkMsgs := fetchMessages(t, env.db, "same-size-same-mtime-fork-replace-c")
+	require.Len(t, forkMsgs, 8)
+	assert.Equal(t, "STEP2", forkMsgs[0].Content)
+	assert.Equal(t, "NO5", forkMsgs[7].Content)
 	full, err = env.db.GetSessionFull(
 		context.Background(), "same-size-same-mtime-fork-replace",
 	)
