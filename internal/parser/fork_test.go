@@ -471,6 +471,58 @@ func TestForkDetection_RewindWithChunkedAssistantRuns(t *testing.T) {
 	assertMessage(t, msgs[3], RoleAssistant, "new answer")
 }
 
+// claudeToolResultUserLine builds a user record whose content is a
+// single tool_result block — the carrier shape Claude Code writes
+// for tool outputs. type=user on disk, but not a conversation turn.
+func claudeToolResultUserLine(ts, uuid, parentUuid, toolUseID string) string {
+	return `{"type":"user","timestamp":"` + ts +
+		`","uuid":"` + uuid + `","parentUuid":"` + parentUuid +
+		`","message":{"content":[{"type":"tool_result","tool_use_id":"` +
+		toolUseID + `","content":"ok"}]}}`
+}
+
+func TestForkDetection_ToolResultsDoNotInflateAbandonedBranch(t *testing.T) {
+	// A typo-fix rewind over a tool-heavy turn (regression for a
+	// real session): the abandoned branch has just 2 real user
+	// prompts plus an interrupt notice, but 4 additional type=user
+	// records (tool_result carriers). Raw user-entry counting saw
+	// 7 > forkThreshold and preserved the branch as a fork
+	// session; real-turn counting must drop it as retry noise.
+	toolUse := func(ts, uuid, parentUuid, id string) string {
+		return `{"type":"assistant","timestamp":"` + ts +
+			`","uuid":"` + uuid + `","parentUuid":"` + parentUuid +
+			`","message":{"content":[{"type":"tool_use","id":"` + id +
+			`","name":"WebSearch","input":{}}]}}`
+	}
+	content := testjsonl.NewSessionBuilder().
+		AddClaudeUserWithUUID("2024-01-01T10:00:00Z", "hello", "a", "").
+		AddClaudeAssistantWithUUID("2024-01-01T10:00:01Z", "hi", "b", "a").
+		// Abandoned branch: typo'd prompt with tool activity.
+		AddClaudeUserWithUUID("2024-01-01T10:00:02Z", "tell me about the situwation", "c", "b").
+		AddRaw(toolUse("2024-01-01T10:00:03Z", "d", "c", "tu1")).
+		AddRaw(claudeToolResultUserLine("2024-01-01T10:00:04Z", "e", "d", "tu1")).
+		AddRaw(toolUse("2024-01-01T10:00:05Z", "f", "e", "tu2")).
+		AddRaw(claudeToolResultUserLine("2024-01-01T10:00:06Z", "g", "f", "tu2")).
+		AddClaudeUserWithUUID("2024-01-01T10:00:07Z", "[Request interrupted by user for tool use]", "h", "g").
+		AddClaudeUserWithUUID("2024-01-01T10:00:08Z", "the situation", "i", "h").
+		AddRaw(toolUse("2024-01-01T10:00:09Z", "j", "i", "tu3")).
+		AddRaw(claudeToolResultUserLine("2024-01-01T10:00:10Z", "k", "j", "tu3")).
+		AddRaw(toolUse("2024-01-01T10:00:11Z", "l", "k", "tu4")).
+		AddRaw(claudeToolResultUserLine("2024-01-01T10:00:12Z", "m", "l", "tu4")).
+		// Rewind: corrected prompt re-parents to b.
+		AddClaudeUserWithUUID("2024-01-01T10:01:00Z", "tell me about the situation", "y", "b").
+		AddClaudeAssistantWithUUID("2024-01-01T10:01:01Z", "sure", "z", "y").
+		String()
+
+	results := parseTestContent(t, "toolresult-rewind.jsonl", content, 1)
+
+	// Only the live branch remains: a,b,y,z.
+	msgs := results[0].Messages
+	assertMessageCount(t, len(msgs), 4)
+	assertMessage(t, msgs[2], RoleUser, "tell me about the situation")
+	assertMessage(t, msgs[3], RoleAssistant, "sure")
+}
+
 func TestSessionBoundsDAGMainWidenedNotFork(t *testing.T) {
 	// DAG session with a trailing queue-operation after all
 	// messages. Main session's EndedAt should be widened;

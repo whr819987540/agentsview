@@ -1668,11 +1668,19 @@ func pathWithinDir(path, dir string) bool {
 		rel != ".."
 }
 
-// countUserTurns counts all user entries reachable from a
-// starting index by traversing the entire subtree. Earlier
-// versions followed only the first child at each node, which
-// undercounted in sessions with many nested forks and caused
-// the fork heuristic to discard the main conversation branch.
+// countUserTurns counts real user turns reachable from a starting
+// index by traversing the entire subtree. Earlier versions followed
+// only the first child at each node, which undercounted in sessions
+// with many nested forks and caused the fork heuristic to discard
+// the main conversation branch.
+//
+// Only entries that would surface as real user messages count:
+// tool_result carriers, isMeta records, compact summaries, and
+// system-classified texts (interrupts, command stdout, caveats) are
+// all type=user on disk but are not conversation turns. Counting
+// them inflated abandoned rewind branches past forkThreshold, so a
+// quick typo-fix rewind over a tool-heavy turn was preserved as a
+// fork session instead of being dropped as retry noise.
 func countUserTurns(
 	entries []dagEntry,
 	children map[string][]int,
@@ -1683,12 +1691,42 @@ func countUserTurns(
 	for len(stack) > 0 {
 		current := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
-		if entries[current].entryType == "user" {
+		if isRealClaudeUserTurn(entries[current]) {
 			count++
 		}
 		stack = append(stack, children[entries[current].uuid]...)
 	}
 	return count
+}
+
+// isRealClaudeUserTurn reports whether a dagEntry would surface as
+// a real (non-system) user message with non-empty content — the
+// same notion of a user turn that firstMessageAndUserCount uses
+// for user_message_count.
+func isRealClaudeUserTurn(e dagEntry) bool {
+	if e.entryType != "user" {
+		return false
+	}
+	if gjson.Get(e.line, "isMeta").Bool() ||
+		gjson.Get(e.line, "isCompactSummary").Bool() {
+		return false
+	}
+	text, _, _, _, _, _ := ExtractTextContent(
+		gjson.Get(e.line, "message.content"),
+	)
+	if cmdText, ok := extractCommandText(text); ok {
+		text = cmdText
+	} else if isCommandEnvelope(text) {
+		return false
+	}
+	if strings.TrimSpace(text) == "" {
+		return false // tool_result carriers and empty entries
+	}
+	if classifyClaudeSystemMessage(text) != "" ||
+		isClaudeSystemMessage(text) {
+		return false
+	}
+	return true
 }
 
 // extractMessages converts dagEntries into ParsedMessages, applying

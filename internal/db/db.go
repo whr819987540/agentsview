@@ -248,6 +248,12 @@ import (
 // classification, so historical skill usage is backfilled on
 // re-parse.)
 //
+// (60: Claude fork threshold counts real user turns. tool_result
+// carriers, isMeta records, and system-classified texts no longer
+// inflate an abandoned rewind branch past forkThreshold, so quick
+// typo-fix rewinds over tool-heavy turns stop surfacing as fork
+// sessions in the session tree. Re-parsing purges fork rows created
+// by the inflated count.)
 // (59: Claude rewind (esc+esc) branch handling. DAG fork detection now
 // resolves parent references through non-message records (attachments,
 // system entries) and merged streaming chunks, and the main session
@@ -286,7 +292,7 @@ import (
 // (51: Gemini cumulative-to-delta token reparse.)
 // (17: Codex <skill> template filtering.)
 // (16: <turn_aborted> system messages.)
-const dataVersion = 59
+const dataVersion = 60
 
 const tokenCoverageRepairStatsKey = "token_coverage_repair_v1"
 
