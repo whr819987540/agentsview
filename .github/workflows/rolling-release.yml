@@ -1,0 +1,193 @@
+name: Rolling Release
+
+# Build directly-usable Linux and Windows binaries on every push to main
+# and publish them to a rolling "latest" prerelease. Tagged releases
+# (release.yml) remain the stable distribution channel.
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rolling-release
+  cancel-in-progress: true
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    # manylinux_2_28 keeps the glibc requirement low so the binary runs on
+    # older distributions, matching the tagged release builds.
+    container: quay.io/pypa/manylinux_2_28_x86_64@sha256:853663dc8253b62be437bb52a5caecffd020792af4442f55d927d22e0ea795ae
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Trust git checkout
+        shell: bash
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git status --short >/dev/null
+
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c  # v6.4.0
+        with:
+          go-version-file: go.mod
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
+        with:
+          node-version: "24"
+
+      - name: Build frontend
+        run: npm ci && npm run build
+        working-directory: frontend
+
+      - name: Embed frontend
+        shell: bash
+        run: |
+          rm -rf internal/web/dist
+          cp -r frontend/dist internal/web/dist
+
+      - name: Restore pricing snapshot
+        run: go run ./internal/pricing/cmd/litellm-snapshot -restore
+
+      - name: Build
+        shell: bash
+        env:
+          GOOS: linux
+          GOARCH: amd64
+          CGO_ENABLED: "1"
+        run: |
+          VERSION=$(git describe --tags --always)
+          COMMIT=${GITHUB_SHA::8}
+          BUILD_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          mkdir -p dist
+          LDFLAGS="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.buildDate=${BUILD_DATE}"
+          go build -tags fts5 -buildvcs=false -ldflags="$LDFLAGS" -trimpath \
+            -o dist/agentsview-linux-amd64 ./cmd/agentsview
+
+          # Smoke test (native build)
+          ./dist/agentsview-linux-amd64 --version
+
+          # Verify glibc compatibility
+          MAX_GLIBC="GLIBC_2.28"
+          HIGHEST=$(objdump -T dist/agentsview-linux-amd64 | grep -oP 'GLIBC_\d+\.\d+' | sort -t. -k1,1n -k2,2n | tail -1)
+          echo "Highest glibc symbol: $HIGHEST (max allowed: $MAX_GLIBC)"
+          if [ "$(printf '%s\n%s' "$MAX_GLIBC" "$HIGHEST" | sort -t. -k1,1n -k2,2n | tail -1)" != "$MAX_GLIBC" ]; then
+            echo "ERROR: Binary requires $HIGHEST but max allowed is $MAX_GLIBC"
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: rolling-linux-amd64
+          path: dist/agentsview-linux-amd64
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c  # v6.4.0
+        with:
+          go-version-file: go.mod
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
+        with:
+          node-version: "24"
+
+      - name: Build frontend
+        run: npm ci && npm run build
+        working-directory: frontend
+
+      - name: Embed frontend
+        shell: bash
+        run: |
+          rm -rf internal/web/dist
+          cp -r frontend/dist internal/web/dist
+
+      - name: Restore pricing snapshot
+        run: go run ./internal/pricing/cmd/litellm-snapshot -restore
+
+      - name: Setup MinGW
+        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884  # v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: mingw-w64-x86_64-gcc
+          path-type: inherit
+
+      - name: Build
+        shell: bash
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: "1"
+        run: |
+          VERSION=$(git describe --tags --always)
+          COMMIT=${GITHUB_SHA::8}
+          BUILD_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          mkdir -p dist
+          LDFLAGS="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.buildDate=${BUILD_DATE}"
+          go build -tags fts5 -ldflags="$LDFLAGS" -trimpath \
+            -o dist/agentsview-windows-amd64.exe ./cmd/agentsview
+
+          # Smoke test (native build)
+          ./dist/agentsview-windows-amd64.exe --version
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: rolling-windows-amd64
+          path: dist/agentsview-windows-amd64.exe
+
+  release:
+    needs: [build-linux, build-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd artifacts
+          sha256sum agentsview-linux-amd64 agentsview-windows-amd64.exe > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Publish rolling release
+        env:
+          # Passed through the environment so the commit message cannot
+          # inject shell syntax into the run script.
+          HEAD_COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          SHORT_SHA=${GITHUB_SHA::8}
+          SUBJECT=$(printf '%s\n' "$HEAD_COMMIT_MESSAGE" | head -1)
+
+          NOTES=$(printf 'Automated rolling build of `%s`.\n\n> %s\n\nStable download URLs:\n- https://github.com/%s/releases/download/latest/agentsview-linux-amd64\n- https://github.com/%s/releases/download/latest/agentsview-windows-amd64.exe\n' \
+            "$GITHUB_SHA" "$SUBJECT" "$GH_REPO" "$GH_REPO")
+
+          # Recreate the release so the "latest" tag moves to this commit.
+          gh release delete latest --yes --cleanup-tag || true
+          gh release create latest \
+            --prerelease \
+            --target "$GITHUB_SHA" \
+            --title "Rolling build ($SHORT_SHA)" \
+            --notes "$NOTES" \
+            artifacts/agentsview-linux-amd64 \
+            artifacts/agentsview-windows-amd64.exe \
+            artifacts/SHA256SUMS
