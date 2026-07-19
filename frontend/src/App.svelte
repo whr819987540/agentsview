@@ -67,7 +67,7 @@
 
   let messageListRef:
     | {
-        scrollToOrdinal: (o: number) => void;
+        scrollToOrdinal: (o: number, searchQuery?: string) => void;
         getDisplayItems: () => DisplayItem[];
         getNormalDisplayItems: () => DisplayItem[];
       }
@@ -92,6 +92,7 @@
         ui.clearSelection();
         ui.pendingScrollOrdinal = null;
         ui.pendingScrollSession = null;
+        ui.pendingSearchQuery = null;
       }
       if (id) {
         if (ui.isMobileViewport) {
@@ -139,6 +140,12 @@
     const thinkingVisible = ui.isBlockVisible("thinking");
     untrack(() => {
       if (ordinal === null || loading || !messageListRef) return;
+      if (
+        ui.pendingScrollSession !== null &&
+        ui.pendingScrollSession !== messages.sessionId
+      ) {
+        return;
+      }
 
       const items = messageListRef.getDisplayItems();
       const normalItems =
@@ -188,12 +195,16 @@
         }
       }
 
-      messageListRef.scrollToOrdinal(ordinal);
+      messageListRef.scrollToOrdinal(
+        ordinal,
+        ui.pendingSearchQuery ?? undefined,
+      );
       // Ensure highlight is set (the session-change effect
       // may have cleared it before this effect ran).
       ui.selectedOrdinal = ordinal;
       ui.pendingScrollOrdinal = null;
       ui.pendingScrollSession = null;
+      ui.pendingSearchQuery = null;
     });
   });
 
@@ -277,6 +288,7 @@
           if (msgParam === "last") {
             ui.pendingScrollOrdinal = -1;
             ui.pendingScrollSession = sid;
+            ui.pendingSearchQuery = null;
           } else {
             const ordinal = parseInt(msgParam, 10);
             if (Number.isFinite(ordinal)) {

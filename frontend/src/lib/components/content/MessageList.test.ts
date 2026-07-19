@@ -22,6 +22,24 @@ interface VirtualRow {
   end: number;
 }
 
+const searchMock = vi.hoisted(() => ({
+  isOpen: false,
+  query: "",
+  matches: [] as Array<{ ordinal: number; sessionId: string }>,
+  currentMatchIndex: -1,
+  loading: false,
+  currentOrdinal: null as number | null,
+  close: vi.fn(),
+  next: vi.fn(),
+  prev: vi.fn(),
+}));
+
+vi.mock("../../stores/inSessionSearch.svelte.js", () => ({
+  inSessionSearch: searchMock,
+}));
+
+const inSessionSearch = searchMock;
+
 const virtualizerMock = vi.hoisted(() => ({
   options: { count: 0 },
   scrollOffset: 0,
@@ -83,6 +101,10 @@ describe("MessageList follow cancellation", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    virtualizerMock.getVirtualItems.mockImplementation(() => []);
+    virtualizerMock.getOffsetForIndex.mockImplementation(
+      () => undefined,
+    );
     messages.clear();
     sessions.activeSessionId = "s1";
     messages.sessionId = "s1";
@@ -113,6 +135,11 @@ describe("MessageList follow cancellation", () => {
     messages.clear();
     sessions.activeSessionId = null;
     ui.followLatest = false;
+    inSessionSearch.isOpen = false;
+    inSessionSearch.query = "";
+    inSessionSearch.matches = [];
+    inSessionSearch.currentMatchIndex = -1;
+    inSessionSearch.currentOrdinal = null;
     ui.showAllBlocks();
     ui.bulkCollapseCommand = null;
     document.body.innerHTML = "";
@@ -141,6 +168,173 @@ describe("MessageList follow cancellation", () => {
     await tick();
 
     expect(document.body.textContent).toContain("正在加载消息...");
+  });
+
+  it("centers the exact current search mark in a long message", async () => {
+    const message = makeMessage(10);
+    message.content = "before needle after";
+    message.content_length = message.content.length;
+    messages.messages = [message];
+    messages.hasOlder = false;
+    ui.followLatest = false;
+    ui.followLatestRequest = 0;
+    virtualizerMock.getVirtualItems.mockImplementation(() => [
+      { key: "k10", index: 0, start: 0, end: 1200 },
+    ]);
+    virtualizerMock.getOffsetForIndex.mockImplementation(() => [
+      0,
+      "start",
+    ]);
+    inSessionSearch.isOpen = true;
+    inSessionSearch.query = "needle";
+    inSessionSearch.matches = [{ ordinal: 10, sessionId: "s1" }];
+    inSessionSearch.currentMatchIndex = 0;
+    inSessionSearch.currentOrdinal = 10;
+
+    component = mount(MessageList, { target: document.body });
+    await tick();
+
+    const container = document.querySelector(
+      ".message-list-scroll",
+    ) as HTMLElement;
+    const rectSpy = vi
+      .spyOn(HTMLElement.prototype, "getBoundingClientRect")
+      .mockImplementation(function (this: HTMLElement) {
+        const top = this.classList.contains(
+          "search-highlight--current",
+        )
+          ? 700
+          : this === container ? 100 : 0;
+        const height = this.classList.contains(
+          "search-highlight--current",
+        )
+          ? 20
+          : this === container ? 400 : 0;
+        return {
+          top,
+          bottom: top + height,
+          left: 0,
+          right: 800,
+          width: 800,
+          height,
+          x: 0,
+          y: top,
+          toJSON: () => ({}),
+        };
+      });
+    const scope = document.querySelector(
+      '[data-message-ordinals="10"]',
+    ) as HTMLElement;
+    const mark = document.createElement("mark");
+    mark.className =
+      "search-highlight search-highlight--current";
+    scope.appendChild(mark);
+    Object.defineProperties(container, {
+      clientHeight: { configurable: true, value: 400 },
+      scrollHeight: { configurable: true, value: 1200 },
+      scrollTop: { configurable: true, value: 0, writable: true },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    virtualizerMock.scrollToOffset.mockClear();
+
+    (
+      component as ReturnType<typeof mount> & {
+        scrollToOrdinal: (
+          ordinal: number,
+          searchQuery?: string,
+        ) => void;
+      }
+    ).scrollToOrdinal(10, "needle");
+
+    await vi.waitFor(() => {
+      expect(virtualizerMock.scrollToOffset).toHaveBeenCalledWith(
+        410,
+        { align: "start" },
+      );
+    });
+    rectSpy.mockRestore();
+  });
+
+  it("centers a match within a nested scrollable block", async () => {
+    messages.hasOlder = false;
+    virtualizerMock.getVirtualItems.mockImplementation(() => [
+      { key: "k10", index: 0, start: 0, end: 1200 },
+    ]);
+    virtualizerMock.getOffsetForIndex.mockImplementation(() => [
+      0,
+      "start",
+    ]);
+    inSessionSearch.isOpen = true;
+    inSessionSearch.query = "needle";
+    inSessionSearch.matches = [{ ordinal: 10, sessionId: "s1" }];
+    inSessionSearch.currentMatchIndex = 0;
+    inSessionSearch.currentOrdinal = 10;
+
+    component = mount(MessageList, { target: document.body });
+    await tick();
+
+    const container = document.querySelector(
+      ".message-list-scroll",
+    ) as HTMLElement;
+    const scope = document.querySelector(
+      '[data-message-ordinals="10"]',
+    ) as HTMLElement;
+    const nestedScroller = document.createElement("div");
+    nestedScroller.style.overflowY = "auto";
+    const mark = document.createElement("mark");
+    mark.className =
+      "search-highlight search-highlight--current";
+    nestedScroller.appendChild(mark);
+    scope.appendChild(nestedScroller);
+    Object.defineProperties(container, {
+      clientHeight: { configurable: true, value: 400 },
+      scrollHeight: { configurable: true, value: 1200 },
+      scrollTop: { configurable: true, value: 0, writable: true },
+    });
+    Object.defineProperties(nestedScroller, {
+      clientHeight: { configurable: true, value: 300 },
+      scrollHeight: { configurable: true, value: 900 },
+      scrollTop: { configurable: true, value: 0, writable: true },
+    });
+    const rectSpy = vi.spyOn(
+      HTMLElement.prototype,
+      "getBoundingClientRect",
+    ).mockImplementation(function (this: HTMLElement) {
+      const top = this === mark
+        ? 600
+        : this === nestedScroller ? 200
+        : this === container ? 100 : 0;
+      const height = this === mark
+        ? 20
+        : this === nestedScroller ? 300
+        : this === container ? 400 : 0;
+      return {
+        top,
+        bottom: top + height,
+        left: 0,
+        right: 800,
+        width: 800,
+        height,
+        x: 0,
+        y: top,
+        toJSON: () => ({}),
+      };
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    (
+      component as ReturnType<typeof mount> & {
+        scrollToOrdinal: (
+          ordinal: number,
+          searchQuery?: string,
+        ) => void;
+      }
+    ).scrollToOrdinal(10, "needle");
+
+    await vi.waitFor(() => {
+      expect(nestedScroller.scrollTop).toBe(260);
+    });
+    rectSpy.mockRestore();
   });
 
   it("keeps delayed ordinal navigation alive after follow latest is disabled", async () => {

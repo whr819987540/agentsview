@@ -42,6 +42,7 @@
   let scrollRaf: number | null = null;
   let lastScrollRequest = 0;
   let activeFollowScrollRequest: number | null = null;
+  let completedExactScrollRequest: number | null = null;
   let followingScrollRaf: number | null = null;
   let followSettleTimer:
     | ReturnType<typeof setTimeout>
@@ -255,6 +256,8 @@
   }
 
   function handleManualScrollIntent() {
+    lastScrollRequest += 1;
+    completedExactScrollRequest = null;
     cancelRestoreWork();
     if (ui.followLatest) {
       cancelFollowLatestWork();
@@ -306,6 +309,8 @@
   }
 
   onDestroy(() => {
+    lastScrollRequest += 1;
+    completedExactScrollRequest = null;
     if (scrollRaf !== null) {
       cancelAnimationFrame(scrollRaf);
       scrollRaf = null;
@@ -346,7 +351,12 @@
     align: ScrollAlign = "start",
     offsetPx: number = 0,
   ) {
-    if (reqId !== lastScrollRequest) return;
+    if (
+      reqId !== lastScrollRequest ||
+      completedExactScrollRequest === reqId
+    ) {
+      return;
+    }
 
     const v = virtualizer.instance;
     if (!v) return;
@@ -417,8 +427,94 @@
     return new Promise((r) => requestAnimationFrame(() => r()));
   }
 
-  async function scrollToOrdinalInternal(ordinal: number) {
+  function centerWithinNestedScrollers(
+    mark: HTMLElement,
+    scope: HTMLElement,
+  ) {
+    let ancestor = mark.parentElement;
+    while (
+      ancestor &&
+      ancestor !== containerRef &&
+      scope.contains(ancestor)
+    ) {
+      if (ancestor.scrollHeight > ancestor.clientHeight) {
+        const overflowY = getComputedStyle(ancestor).overflowY;
+        if (overflowY === "auto" || overflowY === "scroll") {
+          const ancestorRect = ancestor.getBoundingClientRect();
+          const markRect = mark.getBoundingClientRect();
+          const scale = ancestorRect.height / ancestor.clientHeight;
+          ancestor.scrollTop +=
+            ((markRect.top + markRect.bottom) / 2 -
+              (ancestorRect.top + ancestorRect.bottom) / 2) /
+            (scale || 1);
+        }
+      }
+      ancestor = ancestor.parentElement;
+    }
+  }
+
+  async function scrollToSearchHighlight(
+    ordinal: number,
+    query: string,
+    reqId: number,
+  ) {
+    for (let attempt = 0; attempt < 60; attempt++) {
+      await raf();
+      if (
+        reqId !== lastScrollRequest ||
+        inSessionSearch.currentOrdinal !== ordinal ||
+        inSessionSearch.query !== query
+      ) {
+        return;
+      }
+
+      const row = Array.from(
+        containerRef?.querySelectorAll<HTMLElement>(
+          ".virtual-row[data-message-ordinals]",
+        ) ?? [],
+      ).find((candidate) =>
+        candidate.dataset.messageOrdinals
+          ?.split(",")
+          .includes(String(ordinal)),
+      );
+      const scope = row?.querySelector<HTMLElement>(
+        `[data-message-ordinal="${ordinal}"]`,
+      ) ?? row;
+      const mark = scope?.querySelector<HTMLElement>(
+        "mark.search-highlight--current",
+      );
+      if (!containerRef || !mark || !scope) continue;
+
+      centerWithinNestedScrollers(mark, scope);
+      const containerRect = containerRef.getBoundingClientRect();
+      const markRect = mark.getBoundingClientRect();
+      const scale = containerRect.height / containerRef.clientHeight;
+      const markTop =
+        (markRect.top - containerRect.top) / (scale || 1) +
+        containerRef.scrollTop;
+      const centeredOffset =
+        markTop -
+        containerRef.clientHeight / 2 +
+        markRect.height / (2 * (scale || 1));
+      const maxOffset = Math.max(
+        0,
+        containerRef.scrollHeight - containerRef.clientHeight,
+      );
+      virtualizer.instance?.scrollToOffset(
+        Math.round(Math.min(maxOffset, Math.max(0, centeredOffset))),
+        { align: "start" },
+      );
+      completedExactScrollRequest = reqId;
+      return;
+    }
+  }
+
+  async function scrollToOrdinalInternal(
+    ordinal: number,
+    searchQuery: string | undefined = undefined,
+  ) {
     const reqId = ++lastScrollRequest;
+    completedExactScrollRequest = null;
     activeFollowScrollRequest = null;
 
     const idxAsc = displayItemsAsc.findIndex((item) =>
@@ -429,6 +525,9 @@
         ? displayItemsAsc.length - 1 - idxAsc
         : idxAsc;
       scrollToDisplayIndex(idx, 0, 0, reqId);
+      if (searchQuery) {
+        await scrollToSearchHighlight(ordinal, searchQuery, reqId);
+      }
       return;
     }
 
@@ -451,10 +550,16 @@
       ? displayItemsAsc.length - 1 - loadedIdxAsc
       : loadedIdxAsc;
     scrollToDisplayIndex(loadedIdx, 0, 0, reqId);
+    if (searchQuery) {
+      await scrollToSearchHighlight(ordinal, searchQuery, reqId);
+    }
   }
 
-  export function scrollToOrdinal(ordinal: number) {
-    void scrollToOrdinalInternal(ordinal);
+  export function scrollToOrdinal(
+    ordinal: number,
+    searchQuery: string | undefined = undefined,
+  ) {
+    void scrollToOrdinalInternal(ordinal, searchQuery);
   }
 
   async function restoreScrollAnchor(anchor: ScrollAnchor) {
@@ -698,6 +803,7 @@
             class:selected={ui.selectedOrdinal !== null &&
               item.ordinals.includes(ui.selectedOrdinal)}
             data-index={row.index}
+            data-message-ordinals={item.ordinals.join(",")}
             style="position: absolute; top: 0; left: 0; width: 100%; transform: translateY({row.start}px);"
             use:measureElement={virtualizer.instance}
             onclick={() => {
@@ -711,7 +817,7 @@
                 messages={item.messages}
                 timestamp={item.timestamp}
                 highlightQuery={highlightQuery}
-                isCurrentHighlight={item.ordinals.includes(inSessionSearch.currentOrdinal ?? -1)}
+                currentHighlightOrdinal={inSessionSearch.currentOrdinal}
               />
             {:else if item.message.is_compact_boundary}
               <CompactBoundaryDivider message={item.message} />

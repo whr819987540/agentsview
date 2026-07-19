@@ -2,16 +2,53 @@
   import { m } from "../../i18n/index.js";
   import { renderMarkdown } from "../../utils/markdown.js";
   import { highlightCodeFences } from "../../utils/highlight-fences.js";
+  import {
+    applyHighlight,
+    escapeHTML,
+  } from "../../utils/highlight.js";
   import { ChevronRightIcon } from "../../icons.js";
 
   interface Props {
     content: string;
     name?: string;
+    highlightQuery?: string;
+    isCurrentHighlight?: boolean;
   }
 
-  let { content, name }: Props = $props();
-  let collapsed: boolean = $state(true);
+  let {
+    content,
+    name,
+    highlightQuery = "",
+    isCurrentHighlight = false,
+  }: Props = $props();
+  let userCollapsed: boolean = $state(true);
+  let userOverride: boolean = $state(false);
+  let searchExpanded: boolean = $state(false);
+  let prevQuery: string = $state("");
 
+  $effect(() => {
+    const q = highlightQuery;
+    const trimmed = q.trim();
+    searchExpanded =
+      trimmed !== "" &&
+      `${skillLabel}\n${content}`
+        .toLowerCase()
+        .includes(trimmed.toLowerCase());
+    if (q !== prevQuery) {
+      userOverride = false;
+      prevQuery = q;
+    }
+  });
+
+  let collapsed = $derived(
+    userOverride ? userCollapsed
+      : searchExpanded ? false
+      : userCollapsed,
+  );
+
+  let skillLabel = $derived(
+    m.skill_block_label({ name: name ?? m.shared_unknown() }),
+  );
   let previewLine = $derived(
     content.split("\n")[0]?.slice(0, 80) ?? "",
   );
@@ -23,15 +60,21 @@
     onclick={() => {
       const sel = window.getSelection();
       if (sel && sel.toString().length > 0) return;
-      collapsed = !collapsed;
+      userCollapsed = !collapsed;
+      userOverride = true;
     }}
   >
     <span class="skill-chevron" class:open={!collapsed}>
       <ChevronRightIcon size="10" strokeWidth="2.4" aria-hidden="true" />
     </span>
-    <span class="skill-label">
-      {m.skill_block_label({ name: name ?? m.shared_unknown() })}
-    </span>
+    <span
+      class="skill-label"
+      use:applyHighlight={{
+        q: highlightQuery,
+        current: isCurrentHighlight,
+        content: skillLabel,
+      }}
+    >{@html escapeHTML(skillLabel)}</span>
     {#if collapsed && previewLine}
       <span class="skill-preview">{previewLine}</span>
     {/if}
@@ -39,7 +82,16 @@
   {#if !collapsed}
     <div
       class="skill-content markdown"
-      use:highlightCodeFences={{ content }}
+      use:applyHighlight={{
+        q: highlightQuery,
+        current: isCurrentHighlight,
+        content,
+      }}
+      use:highlightCodeFences={{
+        q: highlightQuery,
+        content,
+        current: isCurrentHighlight,
+      }}
     >
       {@html renderMarkdown(content)}
     </div>

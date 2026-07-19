@@ -22,6 +22,7 @@ describe("UIStore", () => {
     ui.selectedOrdinal = null;
     ui.pendingScrollOrdinal = null;
     ui.pendingScrollSession = null;
+    ui.pendingSearchQuery = null;
     ui.followLatest = false;
     ui.followLatestRequest = 0;
     ui.visibleBlocks = new Set(ALL_BLOCK_TYPES);
@@ -139,6 +140,17 @@ describe("UIStore", () => {
       ui.scrollToOrdinal(5, "sess-123");
       expect(ui.pendingScrollOrdinal).toBe(5);
       expect(ui.pendingScrollSession).toBe("sess-123");
+    });
+
+    it("should store an exact search query when provided", () => {
+      ui.scrollToOrdinal(5, "sess-123", "needle");
+      expect(ui.pendingSearchQuery).toBe("needle");
+    });
+
+    it("should clear a stale search query for ordinary navigation", () => {
+      ui.scrollToOrdinal(5, "sess-123", "needle");
+      ui.scrollToOrdinal(6, "sess-123");
+      expect(ui.pendingSearchQuery).toBeNull();
     });
 
     it("should allow clearing pending independently", () => {

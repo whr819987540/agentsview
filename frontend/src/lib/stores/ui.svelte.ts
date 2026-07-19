@@ -240,6 +240,7 @@ class UIStore {
   selectedOrdinal: number | null = $state(null);
   pendingScrollOrdinal: number | null = $state(null);
   pendingScrollSession: string | null = $state(null);
+  pendingSearchQuery: string | null = $state(null);
 
   zoomLevel: number = $state(readStoredZoom());
   fontScale: number = $state(readStoredFontScale());
@@ -553,13 +554,19 @@ class UIStore {
     this.selectedOrdinal = null;
     this.pendingScrollOrdinal = null;
     this.pendingScrollSession = null;
+    this.pendingSearchQuery = null;
   }
 
-  scrollToOrdinal(ordinal: number, sessionId?: string) {
+  scrollToOrdinal(
+    ordinal: number,
+    sessionId?: string,
+    searchQuery?: string,
+  ) {
     this.followLatest = false;
     this.selectedOrdinal = ordinal;
     this.pendingScrollOrdinal = ordinal;
     this.pendingScrollSession = sessionId ?? null;
+    this.pendingSearchQuery = searchQuery ?? null;
   }
 
   setFollowLatest(enabled: boolean) {
@@ -569,6 +576,7 @@ class UIStore {
       this.selectedOrdinal = null;
       this.pendingScrollOrdinal = null;
       this.pendingScrollSession = null;
+      this.pendingSearchQuery = null;
     }
   }
 

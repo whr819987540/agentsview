@@ -22,14 +22,14 @@
     messages: Message[];
     timestamp: string;
     highlightQuery?: string;
-    isCurrentHighlight?: boolean;
+    currentHighlightOrdinal?: number | null;
   }
 
   let {
     messages,
     timestamp,
     highlightQuery = "",
-    isCurrentHighlight = false,
+    currentHighlightOrdinal = null,
   }: Props = $props();
 
   let copied = $state(false);
@@ -144,6 +144,8 @@
     {#each messages as message (message.ordinal)}
       {@const calls = message.tool_calls ?? []}
       {@const turn = turnByMessage.get(message.id)}
+      {@const isCurrentHighlight = currentHighlightOrdinal === message.ordinal}
+      <div data-message-ordinal={message.ordinal}>
       {#if calls.length === 1}
         {@const soloCall = calls[0]!}
         <ToolBlock
@@ -182,6 +184,7 @@
           />
         {/each}
       {/if}
+      </div>
     {/each}
   </div>
 </div>

@@ -125,13 +125,13 @@ class InSessionSearchStore {
         } else {
           this.currentMatchIndex = found.length > 0 ? 0 : -1;
           if (found.length > 0) {
-            await this.scrollToMatch(found[0]!);
+            await this.scrollToMatch(found[0]!, q);
           }
         }
       } else {
         this.currentMatchIndex = found.length > 0 ? 0 : -1;
         if (found.length > 0) {
-          await this.scrollToMatch(found[0]!);
+          await this.scrollToMatch(found[0]!, q);
         }
       }
     } catch (err: unknown) {
@@ -145,9 +145,21 @@ class InSessionSearchStore {
     }
   }
 
-  private async scrollToMatch(match: SessionMatch) {
+  private async scrollToMatch(
+    match: SessionMatch,
+    query: string = this.query,
+  ) {
     await messages.ensureOrdinalLoaded(match.ordinal);
-    ui.scrollToOrdinal(match.ordinal, match.sessionId);
+    const current = this.matches[this.currentMatchIndex];
+    if (
+      match.sessionId !== messages.sessionId ||
+      query !== this.query ||
+      current?.sessionId !== match.sessionId ||
+      current.ordinal !== match.ordinal
+    ) {
+      return;
+    }
+    ui.scrollToOrdinal(match.ordinal, match.sessionId, query);
   }
 
   open() {

@@ -552,7 +552,12 @@
         {/if}
       {:else if segment.type === "skill"}
         {#if showText && !textCollapsed}
-          <SkillBlock content={segment.content} name={segment.label} />
+          <SkillBlock
+            content={segment.content}
+            name={segment.label}
+            highlightQuery={highlightQuery}
+            isCurrentHighlight={isCurrentHighlight}
+          />
         {/if}
       {:else}
         {#if showText && !textCollapsed}
