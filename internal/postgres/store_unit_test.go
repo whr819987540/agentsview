@@ -18,6 +18,61 @@ import (
 	"go.kenn.io/agentsview/internal/db"
 )
 
+// TestStoreHasSemanticFalse pins that the PostgreSQL store reports no
+// semantic search capability until it gets its own VectorSearcher seam.
+func TestStoreHasSemanticFalse(t *testing.T) {
+	s := &Store{}
+	assert.False(t, s.HasSemantic(), "PostgreSQL HasSemantic")
+}
+
+// TestStoreSearchContentSemanticModesUnavailable pins that "semantic" and
+// "hybrid" are rejected with db.ErrSemanticUnavailable before any query runs
+// -- a zero-value Store (no live *sql.DB) is enough to prove that.
+func TestStoreSearchContentSemanticModesUnavailable(t *testing.T) {
+	s := &Store{}
+	for _, mode := range []string{"semantic", "hybrid"} {
+		_, err := s.SearchContent(t.Context(),
+			db.ContentSearchFilter{Pattern: "x", Mode: mode})
+		require.Error(t, err, "mode %q", mode)
+		assert.ErrorIs(t, err, db.ErrSemanticUnavailable,
+			"mode %q: want ErrSemanticUnavailable, got %v", mode, err)
+	}
+}
+
+// TestStoreSearchContentSemanticInvalidInputReturns400Before501 pins backend
+// parity (AGENTS.md): an invalid semantic/hybrid request -- cursor pagination
+// or a non-messages source -- must return the same *db.SearchInputError
+// SQLite's ValidateSemanticFilter returns, not db.ErrSemanticUnavailable, even
+// though PostgreSQL has no VectorSearcher seam and would otherwise report the
+// capability gate for any request in these modes.
+func TestStoreSearchContentSemanticInvalidInputReturns400Before501(t *testing.T) {
+	s := &Store{}
+	cases := []struct {
+		name string
+		f    db.ContentSearchFilter
+	}{
+		{"cursor rejected", db.ContentSearchFilter{Pattern: "x", Cursor: 1}},
+		{"non-messages source rejected", db.ContentSearchFilter{
+			Pattern: "x", Sources: []string{"tool_input"},
+		}},
+	}
+	for _, mode := range []string{"semantic", "hybrid"} {
+		for _, tc := range cases {
+			t.Run(mode+"/"+tc.name, func(t *testing.T) {
+				f := tc.f
+				f.Mode = mode
+				_, err := s.SearchContent(t.Context(), f)
+				require.Error(t, err)
+				var inputErr *db.SearchInputError
+				require.ErrorAs(t, err, &inputErr,
+					"expected *db.SearchInputError, got %T: %v", err, err)
+				assert.NotErrorIs(t, err, db.ErrSemanticUnavailable,
+					"invalid input must not be masked as ErrSemanticUnavailable")
+			})
+		}
+	}
+}
+
 // TestStripFTSQuotes pins the de-quoting behavior the PostgreSQL Search path
 // relies on. The canonical implementation lives in the db package and is
 // shared with the SQLite and HTTP paths so the backends stay in parity.
@@ -107,7 +162,7 @@ func TestMapPGWriteErrorKeepsNonReadOnlyCause(t *testing.T) {
 	err := mapPGWriteError("writing test row", cause)
 
 	require.ErrorIs(t, err, cause)
-	assert.False(t, errors.Is(err, db.ErrReadOnly))
+	require.NotErrorIs(t, err, db.ErrReadOnly)
 	assert.Contains(t, err.Error(), "writing test row")
 }
 
@@ -128,7 +183,7 @@ func TestEmptyTrashExcludesSameRowsItDeletes(t *testing.T) {
 	}
 	store := &Store{pg: newEmptyTrashProbeDB(t, state)}
 
-	count, err := store.EmptyTrash()
+	count, err := store.EmptyTrash(t.Context())
 
 	require.NoError(t, err, "EmptyTrash")
 	assert.Equal(t, 1, count)
@@ -156,7 +211,7 @@ func TestDeleteSessionIfTrashedExcludesRecordedAliases(t *testing.T) {
 	}
 	store := &Store{pg: newEmptyTrashProbeDB(t, state)}
 
-	count, err := store.DeleteSessionIfTrashed("trashed")
+	count, err := store.DeleteSessionIfTrashed(t.Context(), "trashed")
 
 	require.NoError(t, err, "DeleteSessionIfTrashed")
 	assert.EqualValues(t, 1, count)
@@ -180,7 +235,7 @@ func TestDeleteSessionIfTrashedExcludesReverseAliasCanonical(t *testing.T) {
 	}
 	store := &Store{pg: newEmptyTrashProbeDB(t, state)}
 
-	count, err := store.DeleteSessionIfTrashed("vibe:session_trashed")
+	count, err := store.DeleteSessionIfTrashed(t.Context(), "vibe:session_trashed")
 
 	require.NoError(t, err, "DeleteSessionIfTrashed")
 	assert.EqualValues(t, 1, count)

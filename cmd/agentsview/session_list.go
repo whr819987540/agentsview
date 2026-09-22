@@ -3,7 +3,9 @@
 package main
 
 import (
-	"encoding/json"
+	"context"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"fmt"
 	"io"
 	"os"
@@ -16,14 +18,21 @@ import (
 	"go.kenn.io/agentsview/internal/service"
 )
 
+type sessionListDocument struct {
+	service.SessionList
+	MachineLabels service.MachineLabelCatalog `json:"machine_labels"`
+}
+
 func newSessionListCommand() *cobra.Command {
 	var (
 		project, excludeProject, machine, agent string
 		date, dateFrom, dateTo, activeSince     string
+		since                                   string
 		minMessages, maxMessages                int
 		minUserMessages                         int
 		includeOneShot                          bool
 		includeAutomated, includeChildren       bool
+		includeSource                           bool
 		outcome, healthGrade                    string
 		minToolFailures                         int
 		hasSecret                               bool
@@ -39,6 +48,12 @@ func newSessionListCommand() *cobra.Command {
 		Args:         cobra.NoArgs,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			resolvedActiveSince, err := resolveSinceFlag(since, activeSince)
+			if err != nil {
+				return err
+			}
+			activeSince = resolvedActiveSince
+
 			svc, cleanup, err := resolveService(cmd)
 			if err != nil {
 				return err
@@ -60,6 +75,7 @@ func newSessionListCommand() *cobra.Command {
 				IncludeOneShot:   includeOneShot,
 				IncludeAutomated: includeAutomated,
 				IncludeChildren:  includeChildren,
+				IncludeSource:    includeSource,
 				Outcome:          outcome,
 				HealthGrade:      healthGrade,
 				HasSecret:        hasSecret,
@@ -73,10 +89,12 @@ func newSessionListCommand() *cobra.Command {
 			// quick relaunch: push a now-15m active_since window to the
 			// service so the limit is applied after the filter, and let the
 			// default recent sort keep newest-first ordering. An explicit
-			// --active-since takes precedence so callers can widen or narrow
-			// the window.
+			// --active-since or --since takes precedence so callers can
+			// widen or narrow the window.
 			now := time.Now()
-			if (resume || active) && !cmd.Flags().Changed("active-since") {
+			if (resume || active) &&
+				!cmd.Flags().Changed("active-since") &&
+				!cmd.Flags().Changed("since") {
 				f.ActiveSince = now.Add(-resumeActiveWindow).
 					UTC().Format(time.RFC3339)
 			}
@@ -107,8 +125,32 @@ func newSessionListCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			notice, err := sessionListDefaultExclusionNotice(
+				cmd.Context(), svc, f, list.Total)
+			if err != nil {
+				return err
+			}
+			if notice != "" {
+				fmt.Fprintln(cmd.ErrOrStderr(), notice)
+			}
 			if outputFormat(cmd) == "json" {
-				return json.NewEncoder(cmd.OutOrStdout()).Encode(list)
+				keys := make(map[string]struct{}, len(list.Sessions))
+				for _, session := range list.Sessions {
+					keys[session.Machine] = struct{}{}
+				}
+				machineLabels := machineLabelsForKeys(machineLabelCatalog(
+					cmd.Context(), cmd.ErrOrStderr(),
+					func(ctx context.Context) (service.MachineLabelCatalog, error) {
+						return service.MachineLabels(ctx, svc)
+					},
+				), keys)
+				document := sessionListDocument{
+					SessionList:   *list,
+					MachineLabels: machineLabels,
+				}
+				return json.MarshalEncode(
+					jsontext.NewEncoder(cmd.OutOrStdout()), document,
+				)
 			}
 			home, _ := os.UserHomeDir()
 			return printSessionListHuman(
@@ -126,13 +168,15 @@ func newSessionListCommand() *cobra.Command {
 	flags.StringVar(&agent, "agent", "",
 		"Filter by agent (claude, codex, cursor, ...)")
 	flags.StringVar(&date, "date", "",
-		"Filter sessions started on YYYY-MM-DD")
+		"Filter sessions active on YYYY-MM-DD")
 	flags.StringVar(&dateFrom, "date-from", "",
-		"Filter sessions started on or after YYYY-MM-DD")
+		"Filter sessions active on or after YYYY-MM-DD")
 	flags.StringVar(&dateTo, "date-to", "",
-		"Filter sessions started on or before YYYY-MM-DD")
+		"Filter sessions active on or before YYYY-MM-DD")
 	flags.StringVar(&activeSince, "active-since", "",
 		"Filter sessions active since RFC3339 timestamp")
+	flags.StringVar(&since, "since", "",
+		"Only sessions active since a relative duration (12h, 14d, 2w, 3m = 3 months, 1y) or YYYY-MM-DD")
 	flags.IntVar(&minMessages, "min-messages", 0,
 		"Minimum total message count")
 	flags.IntVar(&maxMessages, "max-messages", 0,
@@ -145,6 +189,8 @@ func newSessionListCommand() *cobra.Command {
 		"Include automated sessions (excluded by default)")
 	flags.BoolVar(&includeChildren, "include-children", false,
 		"Include subagent/child sessions")
+	flags.BoolVar(&includeSource, "include-source", false,
+		"Include source file paths in JSON output")
 	flags.StringVar(&outcome, "outcome", "",
 		"Filter by outcome (comma-separated: success,failure,...)")
 	flags.StringVar(&healthGrade, "health-grade", "",
@@ -175,6 +221,89 @@ func newSessionListCommand() *cobra.Command {
 		"Alias for --resume")
 
 	return cmd
+}
+
+func sessionListDefaultExclusionNotice(
+	ctx context.Context,
+	svc service.SessionService,
+	f service.ListFilter,
+	visibleTotal int,
+) (string, error) {
+	if f.Cursor != "" || (f.IncludeOneShot && f.IncludeAutomated) {
+		return "", nil
+	}
+
+	hiddenOneShot := 0
+	if !f.IncludeOneShot {
+		withOneShot := sessionListCountFilter(f)
+		withOneShot.IncludeOneShot = true
+		withOneShot.IncludeAutomated = f.IncludeAutomated
+		list, err := svc.List(ctx, withOneShot)
+		if err != nil {
+			return "", fmt.Errorf(
+				"counting one-shot session exclusions: %w", err)
+		}
+		hiddenOneShot = hiddenSessionCount(list.Total, visibleTotal)
+	}
+
+	hiddenAutomated := 0
+	if !f.IncludeAutomated {
+		withAutomated := sessionListCountFilter(f)
+		withAutomated.IncludeOneShot = f.IncludeOneShot
+		withAutomated.IncludeAutomated = true
+		list, err := svc.List(ctx, withAutomated)
+		if err != nil {
+			return "", fmt.Errorf(
+				"counting automated session exclusions: %w", err)
+		}
+		hiddenAutomated = hiddenSessionCount(list.Total, visibleTotal)
+	}
+
+	hiddenTotal := hiddenOneShot + hiddenAutomated
+	if hiddenTotal == 0 {
+		return "", nil
+	}
+
+	var hiddenParts []string
+	var flagParts []string
+	if hiddenOneShot > 0 {
+		hiddenParts = append(hiddenParts,
+			fmt.Sprintf("%d one-shot", hiddenOneShot))
+		flagParts = append(flagParts, "--include-one-shot")
+	}
+	if hiddenAutomated > 0 {
+		hiddenParts = append(hiddenParts,
+			fmt.Sprintf("%d automated", hiddenAutomated))
+		flagParts = append(flagParts, "--include-automated")
+	}
+
+	return fmt.Sprintf(
+		"Excluded %d %s by default: %s. Use %s to include them.",
+		hiddenTotal,
+		pluralSession(hiddenTotal),
+		strings.Join(hiddenParts, ", "),
+		strings.Join(flagParts, " and/or "),
+	), nil
+}
+
+func sessionListCountFilter(f service.ListFilter) service.ListFilter {
+	f.Cursor = ""
+	f.Limit = 1
+	return f
+}
+
+func hiddenSessionCount(expandedTotal, visibleTotal int) int {
+	if expandedTotal <= visibleTotal {
+		return 0
+	}
+	return expandedTotal - visibleTotal
+}
+
+func pluralSession(n int) string {
+	if n == 1 {
+		return "session"
+	}
+	return "sessions"
 }
 
 // sessionNameWidth caps the NAME column so a long first message can't

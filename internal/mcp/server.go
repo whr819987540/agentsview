@@ -1,5 +1,5 @@
 // ABOUTME: Builds and serves the agentsview MCP server (stdio or
-// ABOUTME: StreamableHTTP) over the six read-only retrieval tools.
+// ABOUTME: StreamableHTTP) over the supported read-only retrieval tools.
 package mcp
 
 import (
@@ -8,10 +8,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"strings"
 	"time"
+
+	"go.kenn.io/agentsview/internal/mcpdiscovery"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -22,6 +25,7 @@ import (
 // to it in tests.
 const (
 	ToolSearchSessions     = "search_sessions"
+	ToolQueryRecall        = "query_recall"
 	ToolListSessions       = "list_sessions"
 	ToolGetSessionOverview = "get_session_overview"
 	ToolGetMessages        = "get_messages"
@@ -34,9 +38,11 @@ const (
 // tests can control the self-reference exclusion window (defaults to
 // time.Now).
 type ServeOptions struct {
-	Service service.SessionService
-	Version string
-	Now     func() time.Time
+	DiscoveryDirectory string
+	BackendURL         string
+	Service            service.SessionService
+	Version            string
+	Now                func() time.Time
 	// Token, when non-empty, requires every StreamableHTTP request to
 	// carry "Authorization: Bearer <Token>". It has no effect on stdio.
 	// The command layer sets it for non-loopback HTTP binds so the
@@ -44,8 +50,8 @@ type ServeOptions struct {
 	Token string
 }
 
-// newServer builds an MCP server with all six read-only tools
-// registered. Shared by the stdio and StreamableHTTP transports.
+// newServer builds an MCP server with the tools supported by its backing
+// service. Shared by the stdio and StreamableHTTP transports.
 func newServer(opts ServeOptions) *mcp.Server {
 	version := opts.Version
 	if version == "" {
@@ -55,7 +61,7 @@ func newServer(opts ServeOptions) *mcp.Server {
 		Name:    "agentsview",
 		Title:   "agentsview session history",
 		Version: version,
-	}, nil)
+	}, &mcp.ServerOptions{Instructions: "Use returned web_url values when linking to recorded sessions."})
 
 	t := &toolset{svc: opts.Service, now: opts.Now}
 	readOnly := &mcp.ToolAnnotations{ReadOnlyHint: true}
@@ -64,19 +70,36 @@ func newServer(opts ServeOptions) *mcp.Server {
 		Name: ToolSearchSessions,
 		Description: "Full-text search across all recorded AI agent sessions (Claude Code, Codex, Gemini, " +
 			"Antigravity, and others) from every project and machine. Returns ranked snippets with a " +
-			"match_ordinal usable with get_messages to read the surrounding conversation. Use this to " +
-			"answer questions like 'have I solved this before?' or to find prior work on a topic. " +
+			"match_ordinal usable with get_messages to read the surrounding conversation. For prior-work " +
+			"questions, prefer search_content with mode hybrid or semantic when a vector search index " +
+			"is configured. Use this tool for keyword search, with optional date_from/date_to bounds. " +
 			"Every term must appear (AND); wrap the query in double quotes for an exact phrase. " +
 			"Sessions active in the last 10 minutes (including the current conversation) are excluded " +
-			"unless include_active is set.",
+			"unless include_active is set. Set session_id to look up one raw UUID or full stored ID. " +
+			"That lookup returns one metadata row, includes active sessions, ignores other search " +
+			"arguments, and reports missing or ambiguous raw IDs as errors. Its snippet is empty and " +
+			"match_ordinal is 0; call get_messages with that anchor for the first message. " +
+			"Use get_session_overview for a known full ID when you need a message preview.",
 		Annotations: readOnly,
 	}, t.searchSessions)
+
+	if service.SupportsRecallQueries(opts.Service) {
+		mcp.AddTool(s, &mcp.Tool{
+			Name: ToolQueryRecall,
+			Description: "Search distilled knowledge extracted from prior sessions. " +
+				"Use lexical mode for exact terms, vector mode for semantic similarity, " +
+				"or hybrid mode to fuse both rankings. Returns recall entries with their " +
+				"source-session evidence and retrieval scores.",
+			Annotations: readOnly,
+		}, t.queryRecall)
+	}
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name: ToolListSessions,
 		Description: "List recorded agent sessions with filters (project, agent, machine, date range). " +
-			"Returns compact metadata rows, newest first. Use search_sessions instead when looking for " +
-			"specific content.",
+			"Returns compact metadata rows, newest first. For prior-work questions, prefer search_content " +
+			"with mode hybrid or semantic when a vector search index is configured; use search_sessions " +
+			"for keyword search.",
 		Annotations: readOnly,
 	}, t.listSessions)
 
@@ -89,21 +112,30 @@ func newServer(opts ServeOptions) *mcp.Server {
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name: ToolGetMessages,
-		Description: "Read a slice of one session's transcript, paginated by message ordinal. Defaults " +
-			"return only user and assistant messages, each truncated to 2000 characters; truncated " +
-			"messages are flagged so you can re-fetch with a higher max_chars_per_message. Each page " +
-			"reports how many scanned messages the role/system filter dropped as filtered, so across a " +
-			"full pagination sweep, returned plus filtered messages add up to the session's " +
-			"message_count (which counts all stored messages, system included).",
+		Description: "Read a slice of one session's transcript, either by linear pagination (from/direction/" +
+			"limit) or a symmetric window centered on an ordinal (around, with before/after sizing each " +
+			"side, default 5; mutually exclusive with from/direction). Defaults return only user and " +
+			"assistant messages, each truncated to 2000 characters; truncated messages are flagged so you " +
+			"can re-fetch with a higher max_chars_per_message. Each page reports how many scanned messages " +
+			"the role/system filter dropped as filtered, so across a full pagination sweep, returned plus " +
+			"filtered messages add up to the session's message_count (which counts all stored messages, " +
+			"system included).",
 		Annotations: readOnly,
 	}, t.getMessages)
 
 	mcp.AddTool(s, &mcp.Tool{
 		Name: ToolSearchContent,
-		Description: "Exact substring or regex search over raw session text, including tool inputs and results. " +
-			"Slower but more precise than search_sessions; use it for error messages, identifiers, or " +
-			"code fragments. Matches from the last 10 minutes (including the current conversation) are " +
-			"excluded unless include_active is set.",
+		Description: "Search raw session text, including tool inputs and results. When a vector search index is " +
+			"configured, prefer mode hybrid (semantic similarity plus keywords) or semantic for finding " +
+			"prior work and answering contextual questions, especially when the exact wording is unknown. " +
+			"If these modes report not available, use search_sessions for keywords or this tool with " +
+			"substring/regex for exact error messages, identifiers, and code fragments, or terms when every " +
+			"literal term must occur within one user/assistant exchange. " +
+			"The default mode remains substring. Set context to include N messages of " +
+			"surrounding conversation with each match. Matches from the last 10 minutes (including the " +
+			"current conversation) are excluded unless include_active is set; current_session_id replaces " +
+			"that heuristic with one exact exclusion. One-shot and automated " +
+			"sessions are excluded by default; set include_one_shot or include_automated to include them.",
 		Annotations: readOnly,
 	}, t.searchContent)
 
@@ -189,13 +221,25 @@ func isCleanStdioShutdown(err error) bool {
 // cancelled the HTTP server is shut down gracefully so in-flight tool
 // calls can finish. addr must already be validated as a safe bind
 // address (see the cmd layer's loopback guard).
-func ServeHTTP(ctx context.Context, opts ServeOptions, addr string) error {
+func ServeHTTP(ctx context.Context, opts ServeOptions, addr string) (result error) {
+	listener, err := (&net.ListenConfig{}).Listen(ctx, "tcp", addr)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = listener.Close() }()
+	if opts.DiscoveryDirectory != "" {
+		cleanup, err := mcpdiscovery.Publish(opts.DiscoveryDirectory, listener.Addr().String(), opts.Token, opts.BackendURL)
+		if err != nil {
+			return err
+		}
+		defer func() { result = errors.Join(result, cleanup()) }()
+	}
 	httpServer := &http.Server{Addr: addr, Handler: newHTTPHandler(opts)}
 	fmt.Fprintf(os.Stderr, "agentsview mcp: serving on %s\n", addr)
 
 	errCh := make(chan error, 1)
 	go func() {
-		err := httpServer.ListenAndServe()
+		err := httpServer.Serve(listener)
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 			return

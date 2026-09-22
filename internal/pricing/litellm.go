@@ -1,16 +1,26 @@
 package pricing
 
-import "go.kenn.io/agentsview/internal/pricing/catalog"
+import (
+	"context"
+
+	"go.kenn.io/agentsview/internal/pricing/catalog"
+)
 
 // ModelPricing holds per-model token pricing in cost per
 // million tokens. Separate from db.ModelPricing — the CLI
 // command converts between the two.
 type ModelPricing = catalog.ModelPricing
 
-// FetchLiteLLMPricing downloads the LiteLLM pricing JSON
-// and parses it into ModelPricing entries.
-func FetchLiteLLMPricing() ([]ModelPricing, error) {
-	return catalog.FetchLiteLLMPricing()
+// PricingBand is a complete rate tuple applied above an exclusive input-token
+// threshold.
+type PricingBand = catalog.PricingBand
+
+// FetchLiteLLMPricingContext downloads the LiteLLM pricing JSON and binds the
+// request lifetime to ctx.
+func FetchLiteLLMPricingContext(
+	ctx context.Context,
+) ([]ModelPricing, error) {
+	return catalog.FetchLiteLLMPricingContext(ctx)
 }
 
 // ParseLiteLLMPricing parses the LiteLLM JSON map into

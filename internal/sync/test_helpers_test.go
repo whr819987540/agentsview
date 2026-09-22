@@ -1,9 +1,8 @@
 package sync_test
 
 import (
-	"context"
 	"database/sql"
-	"encoding/json"
+	"encoding/json/v2"
 	"fmt"
 	"maps"
 	"os"
@@ -35,7 +34,7 @@ const (
 
 func assertSessionState(t *testing.T, database *db.DB, sessionID string, check func(*db.Session)) {
 	t.Helper()
-	sess, err := database.GetSession(context.Background(), sessionID)
+	sess, err := database.GetSession(t.Context(), sessionID)
 	require.NoError(t, err, "GetSession(%q)", sessionID)
 	require.NotNil(t, sess, "Session %q not found", sessionID)
 	if check != nil {
@@ -57,9 +56,19 @@ func assertSessionProject(t *testing.T, database *db.DB, sessionID string, want 
 	})
 }
 
+func assertSessionProjectAndCwd(
+	t *testing.T, database *db.DB, sessionID, wantProject, wantCwd string,
+) {
+	t.Helper()
+	assertSessionState(t, database, sessionID, func(sess *db.Session) {
+		assert.Equal(t, wantProject, sess.Project, "session %q project", sessionID)
+		assert.Equal(t, wantCwd, sess.Cwd, "session %q cwd", sessionID)
+	})
+}
+
 func runSyncAndAssert(t *testing.T, engine *sync.Engine, want sync.SyncStats) sync.SyncStats {
 	t.Helper()
-	stats := engine.SyncAll(context.Background(), nil)
+	stats := engine.SyncAll(t.Context(), nil)
 	diff := cmp.Diff(want, stats,
 		cmpopts.IgnoreUnexported(sync.SyncStats{}),
 	)
@@ -76,8 +85,8 @@ func (e *testEnv) assertResyncRoundTrip(
 	t.Helper()
 
 	// Clear mtime to force resync on next check.
-	err := e.db.Update(func(tx *sql.Tx) error {
-		_, err := tx.Exec(
+	err := e.db.Update(t.Context(), func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(t.Context(),
 			"UPDATE sessions SET file_mtime = NULL"+
 				" WHERE id = ?",
 			sessionID,
@@ -88,7 +97,7 @@ func (e *testEnv) assertResyncRoundTrip(
 
 	require.NoError(t, e.engine.SyncSingleSession(sessionID))
 
-	_, mtime, ok := e.db.GetSessionFileInfo(sessionID)
+	_, mtime, ok := e.db.GetSessionFileInfo(t.Context(), sessionID)
 	require.True(t, ok, "session file info not found")
 	assert.NotZero(t, mtime, "SyncSingleSession did not store mtime")
 
@@ -97,7 +106,7 @@ func (e *testEnv) assertResyncRoundTrip(
 
 func fetchMessages(t *testing.T, database *db.DB, sessionID string) []db.Message {
 	t.Helper()
-	msgs, err := database.GetAllMessages(context.Background(), sessionID)
+	msgs, err := database.GetAllMessages(t.Context(), sessionID)
 	require.NoError(t, err, "GetAllMessages(%q)", sessionID)
 	return msgs
 }
@@ -138,7 +147,7 @@ func assertToolCallCount(
 ) {
 	t.Helper()
 	var got int
-	err := database.Reader().QueryRow(
+	err := database.Reader().QueryRow(t.Context(),
 		"SELECT COUNT(*) FROM tool_calls"+
 			" WHERE session_id = ?",
 		sessionID,
@@ -154,19 +163,25 @@ func (e *testEnv) updateSessionProject(
 	t *testing.T, sessionID, project string,
 ) {
 	t.Helper()
+
 	sess, err := e.db.GetSessionFull(
-		context.Background(), sessionID,
+		t.Context(), sessionID,
 	)
 	require.NoError(t, err, "GetSessionFull")
 	require.NotNil(t, sess, "session %q not found", sessionID)
 	sess.Project = project
-	require.NoError(t, e.db.UpsertSession(*sess), "UpsertSession")
+	require.NoError(t, e.db.UpsertSession(t.Context(), *sess), "UpsertSession")
 }
 
 // openCodeTestDB manages an OpenCode SQLite database for tests.
+type openCodeTestExecer interface {
+	Exec(query string, args ...any) (sql.Result, error)
+}
+
 type openCodeTestDB struct {
 	path string
 	db   *sql.DB
+	exec openCodeTestExecer
 }
 
 type kiroSQLiteTestDB struct {
@@ -177,35 +192,41 @@ type kiroSQLiteTestDB struct {
 var (
 	openCodeLikeSchemaOnce  stdsync.Once
 	openCodeLikeSchemaBytes []byte
-	openCodeLikeSchemaErr   error
+	errOpenCodeLikeSchema   error
 
 	kiroSQLiteSchemaOnce  stdsync.Once
 	kiroSQLiteSchemaBytes []byte
-	kiroSQLiteSchemaErr   error
+	errKiroSQLiteSchema   error
 
 	antigravityCLISchemaOnce  stdsync.Once
 	antigravityCLISchemaBytes []byte
-	antigravityCLISchemaErr   error
+	errAntigravityCLISchema   error
 
 	piebaldSchemaOnce  stdsync.Once
 	piebaldSchemaBytes []byte
-	piebaldSchemaErr   error
+	errPiebaldSchema   error
 
 	shelleySchemaOnce  stdsync.Once
 	shelleySchemaBytes []byte
-	shelleySchemaErr   error
+	errShelleySchema   error
 
 	zedSchemaOnce  stdsync.Once
 	zedSchemaBytes []byte
-	zedSchemaErr   error
+	errZedSchema   error
 
 	kiroSQLiteFixtureCache stdsync.Map
 )
 
+// openCodeLikeSchema mirrors the production OpenCode container schema,
+// including the project/message/part time_updated columns. Those columns are
+// the per-session change signal (openCodeCompositeMtimeExpr); a fixture that
+// omitted them could not model shared-container freshness at all, which is how
+// the whole-container re-parse regression went unnoticed.
 const openCodeLikeSchema = `
 	CREATE TABLE project (
 		id TEXT PRIMARY KEY,
-		worktree TEXT NOT NULL
+		worktree TEXT NOT NULL,
+		time_updated INTEGER NOT NULL DEFAULT 0
 	);
 	CREATE TABLE session (
 		id TEXT PRIMARY KEY,
@@ -219,15 +240,21 @@ const openCodeLikeSchema = `
 		id TEXT PRIMARY KEY,
 		session_id TEXT NOT NULL,
 		data TEXT NOT NULL,
-		time_created INTEGER NOT NULL
+		time_created INTEGER NOT NULL,
+		time_updated INTEGER NOT NULL DEFAULT 0
 	);
 	CREATE TABLE part (
 		id TEXT PRIMARY KEY,
 		session_id TEXT NOT NULL,
 		message_id TEXT NOT NULL,
 		data TEXT NOT NULL,
-		time_created INTEGER NOT NULL
+		time_created INTEGER NOT NULL,
+		time_updated INTEGER NOT NULL DEFAULT 0
 	);
+	CREATE INDEX message_session_time_created_id_idx
+		ON message (session_id, time_created, id);
+	CREATE INDEX part_session_idx ON part (session_id);
+	CREATE INDEX part_message_id_id_idx ON part (message_id, id);
 `
 
 const kiroSQLiteSchema = `
@@ -264,7 +291,7 @@ func createOpenCodeLikeDB(
 	t.Helper()
 	copySQLiteSchemaTemplate(
 		t, path, label, &openCodeLikeSchemaOnce,
-		&openCodeLikeSchemaBytes, &openCodeLikeSchemaErr,
+		&openCodeLikeSchemaBytes, &errOpenCodeLikeSchema,
 		openCodeLikeSchema,
 	)
 	d, err := sql.Open("sqlite3", path)
@@ -278,13 +305,24 @@ func createKiroSQLiteDB(t *testing.T, dir string) *kiroSQLiteTestDB {
 	path := filepath.Join(dir, "data.sqlite3")
 	copySQLiteSchemaTemplate(
 		t, path, "kiro sqlite", &kiroSQLiteSchemaOnce,
-		&kiroSQLiteSchemaBytes, &kiroSQLiteSchemaErr,
+		&kiroSQLiteSchemaBytes, &errKiroSQLiteSchema,
 		kiroSQLiteSchema,
 	)
 	d, err := sql.Open("sqlite3", path)
 	require.NoError(t, err, "opening kiro sqlite test db")
-	t.Cleanup(func() { d.Close() })
-	return &kiroSQLiteTestDB{path: path, db: d}
+	fixture := &kiroSQLiteTestDB{path: path, db: d}
+	t.Cleanup(func() {
+		if fixture.db != nil {
+			_ = fixture.db.Close()
+		}
+	})
+	return fixture
+}
+
+func (k *kiroSQLiteTestDB) close(t *testing.T) {
+	t.Helper()
+	require.NoError(t, k.db.Close())
+	k.db = nil
 }
 
 func copySQLiteSchemaTemplate(
@@ -313,12 +351,7 @@ func sqliteSchemaTemplateBytes(
 ) []byte {
 	t.Helper()
 	once.Do(func() {
-		dir, err := os.MkdirTemp("", "agentsview-"+label+"-schema-*")
-		if err != nil {
-			*templateErr = fmt.Errorf("create %s schema template dir: %w", label, err)
-			return
-		}
-		defer os.RemoveAll(dir)
+		dir := t.TempDir()
 
 		path := filepath.Join(dir, "template.db")
 		d, err := sql.Open("sqlite3", path)
@@ -326,7 +359,7 @@ func sqliteSchemaTemplateBytes(
 			*templateErr = fmt.Errorf("open %s schema template: %w", label, err)
 			return
 		}
-		if _, err = d.Exec(schema); err != nil {
+		if _, err = d.ExecContext(t.Context(), schema); err != nil {
 			_ = d.Close()
 			*templateErr = fmt.Errorf("create %s schema template: %w", label, err)
 			return
@@ -365,7 +398,7 @@ func (ks *kiroSQLiteTestDB) addSession(
 	createdAt, updatedAt int64,
 ) {
 	t.Helper()
-	_, err := ks.db.Exec(
+	_, err := ks.db.ExecContext(t.Context(),
 		`INSERT INTO conversations_v2
 			(key, conversation_id, value, created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?)`,
@@ -378,7 +411,7 @@ func (ks *kiroSQLiteTestDB) updateSession(
 	t *testing.T, id, payload string, updatedAt int64,
 ) {
 	t.Helper()
-	_, err := ks.db.Exec(
+	_, err := ks.db.ExecContext(t.Context(),
 		`UPDATE conversations_v2
 		    SET value = ?, updated_at = ?
 		  WHERE conversation_id = ?`,
@@ -410,8 +443,25 @@ func writeLegacyKiroSession(
 
 func (oc *openCodeTestDB) mustExec(t *testing.T, msg, query string, args ...any) {
 	t.Helper()
-	_, err := oc.db.Exec(query, args...)
+	executor := oc.exec
+	if executor == nil {
+		executor = oc.db
+	}
+	_, err := executor.Exec(query, args...)
 	require.NoError(t, err, msg)
+}
+
+func (oc *openCodeTestDB) inTransaction(
+	t *testing.T,
+	seed func(*openCodeTestDB),
+) {
+	t.Helper()
+	tx, err := oc.db.BeginTx(t.Context(), nil)
+	require.NoError(t, err, "begin OpenCode seed transaction")
+	defer func() { _ = tx.Rollback() }()
+
+	seed(&openCodeTestDB{path: oc.path, db: oc.db, exec: tx})
+	require.NoError(t, tx.Commit(), "commit OpenCode seed transaction")
 }
 
 func (oc *openCodeTestDB) addProject(
@@ -419,8 +469,22 @@ func (oc *openCodeTestDB) addProject(
 ) {
 	t.Helper()
 	oc.mustExec(t, "insert project",
-		"INSERT INTO project (id, worktree) VALUES (?, ?)",
-		id, worktree,
+		"INSERT INTO project (id, worktree, time_updated) VALUES (?, ?, ?)",
+		id, worktree, 0,
+	)
+}
+
+// updateProjectWorktree renames a project's worktree and bumps its
+// time_updated, matching production OpenCode. The bump is what lets every
+// session in that project re-resolve its cwd/project without the container
+// stat acting as a blunt whole-archive invalidator.
+func (oc *openCodeTestDB) updateProjectWorktree(
+	t *testing.T, id, worktree string, timeUpdated int64,
+) {
+	t.Helper()
+	oc.mustExec(t, "update project worktree",
+		"UPDATE project SET worktree = ?, time_updated = ? WHERE id = ?",
+		worktree, timeUpdated, id,
 	)
 }
 
@@ -460,9 +524,9 @@ func (oc *openCodeTestDB) addMessage(
 	require.NoError(t, err, "marshal message")
 	oc.mustExec(t, "insert message",
 		`INSERT INTO message
-			(id, session_id, data, time_created)
-		 VALUES (?, ?, ?, ?)`,
-		id, sessionID, string(data), timeCreated,
+			(id, session_id, data, time_created, time_updated)
+		 VALUES (?, ?, ?, ?, ?)`,
+		id, sessionID, string(data), timeCreated, timeCreated,
 	)
 }
 
@@ -472,8 +536,11 @@ func (oc *openCodeTestDB) updateMessageData(
 	t.Helper()
 	raw, err := json.Marshal(data)
 	require.NoError(t, err, "marshal message update")
+	// Production OpenCode bumps time_updated on an in-place row edit; the
+	// per-session composite freshness signal depends on it.
 	oc.mustExec(t, "update message data",
-		"UPDATE message SET data = ? WHERE id = ?",
+		`UPDATE message SET data = ?, time_updated = time_updated + 1
+		 WHERE id = ?`,
 		string(raw), id,
 	)
 }
@@ -491,9 +558,9 @@ func (oc *openCodeTestDB) addTextPart(
 	require.NoError(t, err, "marshal text part")
 	oc.mustExec(t, "insert part",
 		`INSERT INTO part
-			(id, session_id, message_id, data, time_created)
-		 VALUES (?, ?, ?, ?, ?)`,
-		id, sessionID, messageID, string(data), timeCreated,
+			(id, session_id, message_id, data, time_created, time_updated)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		id, sessionID, messageID, string(data), timeCreated, timeCreated,
 	)
 }
 
@@ -512,9 +579,9 @@ func (oc *openCodeTestDB) addToolPart(
 	require.NoError(t, err, "marshal tool part")
 	oc.mustExec(t, "insert tool part",
 		`INSERT INTO part
-			(id, session_id, message_id, data, time_created)
-		 VALUES (?, ?, ?, ?, ?)`,
-		id, sessionID, messageID, string(data), timeCreated,
+			(id, session_id, message_id, data, time_created, time_updated)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		id, sessionID, messageID, string(data), timeCreated, timeCreated,
 	)
 }
 
@@ -551,8 +618,8 @@ func (oc *openCodeTestDB) replaceTextContent(
 	oc.deleteMessages(t, sessionID)
 	oc.deleteParts(t, sessionID)
 
-	umID := fmt.Sprintf("%s-msg-user-v2", sessionID)
-	amID := fmt.Sprintf("%s-msg-asst-v2", sessionID)
+	umID := sessionID + "-msg-user-v2"
+	amID := sessionID + "-msg-asst-v2"
 	oc.addMessage(t, umID, sessionID, "user", timeCreated)
 	oc.addMessage(
 		t, amID, sessionID, "assistant", timeCreated+1,
@@ -593,6 +660,7 @@ func (oc *openCodeStorageFixture) writeJSON(
 	t *testing.T, path string, data any,
 ) string {
 	t.Helper()
+
 	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755), "mkdir %s", filepath.Dir(path))
 	raw, err := json.Marshal(data)
 	require.NoError(t, err, "marshal %s", path)

@@ -1,23 +1,28 @@
 <script lang="ts">
+  import { Card } from "@kenn-io/kit-ui";
   import { formatDateTime, m } from "../../i18n/index.js";
   import type { Report } from "../../api/types.js";
+  import { formatMoney } from "../../money.js";
 
   let { report }: { report: Report } = $props();
-
-  function fmtCost(v: number): string {
-    return `$${v.toFixed(2)}`;
-  }
 
   function fmtInt(v: number): string {
     return v.toLocaleString();
   }
 
-  // Sessions card detail line: surface the automation split only when there
-  // are automated sessions, so the common all-interactive view stays clean,
-  // and keep the untimed count. interactive + automated == sessions.
+  // Subagents are separate from interactive and automated conversation counts.
   function sessionsSub(t: Report["totals"]): string {
     const parts: string[] = [];
-    if (t.automated_sessions > 0) {
+    if (t.subagent_sessions > 0) {
+      parts.push(
+        m.activity_session_kind_split({
+          interactive: fmtInt(t.interactive_sessions),
+          subagents: t.subagent_sessions,
+          subagentsLabel: fmtInt(t.subagent_sessions),
+          automated: fmtInt(t.automated_sessions),
+        }),
+      );
+    } else if (t.automated_sessions > 0) {
       parts.push(
         m.activity_interactive_automated_split({ interactive: fmtInt(t.interactive_sessions), automated: fmtInt(t.automated_sessions) }),
       );
@@ -38,9 +43,7 @@
     return `${h}h ${m}m`;
   }
 
-  // RFC3339 -> "HH:MM" in the viewer's local zone. The report's
-  // day window is already local-timezone-aligned server-side, so
-  // local formatting keeps the clock label consistent with it.
+  // Keep the clock label in the same timezone as the report and timeline.
   function fmtClock(ts: string | null): string {
     if (!ts) return "";
     const d = new Date(ts);
@@ -49,25 +52,26 @@
       hour: "2-digit",
       minute: "2-digit",
       hourCycle: "h23",
+      timeZone: report.timezone,
     });
   }
 
-  const peakAt = $derived(fmtClock(report.peak.at));
+  const peakAt = $derived(fmtClock(report.interactive_peak.at));
   const asOf = $derived(fmtClock(report.as_of));
 
-  interface Card {
+  interface SummaryCard {
     label: string;
     value: string;
     sub?: string;
     featured?: boolean;
   }
 
-  const cards = $derived.by((): Card[] => {
+  const cards = $derived.by((): SummaryCard[] => {
     const t = report.totals;
     return [
       {
-        label: m.activity_peak_concurrency(),
-        value: String(report.peak.agents),
+        label: m.activity_interactive_peak(),
+        value: fmtInt(report.interactive_peak.agents),
         sub: peakAt ? m.activity_at_time({ time: peakAt }) : "",
         featured: true,
       },
@@ -97,7 +101,7 @@
       },
       {
         label: m.activity_total_cost(),
-        value: fmtCost(t.cost),
+        value: formatMoney(t.cost),
       },
     ];
   });
@@ -105,13 +109,17 @@
 
 <div class="summary-cards">
   {#each cards as card}
-    <div class="card" class:featured={card.featured}>
+    <Card
+      level="default"
+      padding="none"
+      class={card.featured ? "card featured" : "card"}
+    >
       <span class="card-value">{card.value}</span>
       <span class="card-label">{card.label}</span>
       {#if card.sub}
         <span class="card-sub">{card.sub}</span>
       {/if}
-    </div>
+    </Card>
   {/each}
 </div>
 
@@ -126,19 +134,20 @@
     flex-wrap: wrap;
   }
 
-  .card {
+  .summary-cards :global(.card) {
     flex: 1;
     min-width: 110px;
     padding: 12px;
-    background: var(--bg-surface);
-    border: 1px solid var(--border-muted);
-    border-radius: var(--radius-md);
     display: flex;
     flex-direction: column;
     gap: 2px;
   }
 
-  .card.featured {
+  .summary-cards :global(.card > .kit-card__body) {
+    display: contents;
+  }
+
+  .summary-cards :global(.card.featured) {
     border-width: 2px;
     border-color: var(--accent-blue);
   }

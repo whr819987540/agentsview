@@ -4,9 +4,13 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
+
+	"go.kenn.io/agentsview/internal/money"
 )
 
 // CursorUsageEvent stores authoritative Cursor admin usage data.
@@ -20,16 +24,16 @@ type CursorUsageEvent struct {
 	OutputTokens     int
 	CacheWriteTokens int
 	CacheReadTokens  int
-	ChargedCents     float64
-	CursorTokenFee   float64
+	Charged          money.Money
+	CursorTokenFee   money.Money
 	UserID           string
 	UserEmail        string
 	IsHeadless       bool
 	DedupKey         string
 }
 
-func (db *DB) ensureCursorUsageEventsSchemaLocked(w *writerHandle) error {
-	if _, err := w.Exec(`
+func (db *DB) ensureCursorUsageEventsSchemaLocked(ctx context.Context, w *writerHandle) error {
+	if _, err := w.Exec(ctx, `
 		CREATE TABLE IF NOT EXISTS cursor_usage_events (
 			id INTEGER PRIMARY KEY,
 			occurred_at TEXT NOT NULL,
@@ -39,8 +43,8 @@ func (db *DB) ensureCursorUsageEventsSchemaLocked(w *writerHandle) error {
 			output_tokens INTEGER NOT NULL DEFAULT 0,
 			cache_write_tokens INTEGER NOT NULL DEFAULT 0,
 			cache_read_tokens INTEGER NOT NULL DEFAULT 0,
-			charged_cents REAL NOT NULL DEFAULT 0,
-			cursor_token_fee REAL NOT NULL DEFAULT 0,
+			charged_microdollars INTEGER NOT NULL DEFAULT 0,
+			cursor_token_fee_microdollars INTEGER NOT NULL DEFAULT 0,
 			user_id TEXT NOT NULL DEFAULT '',
 			user_email TEXT NOT NULL DEFAULT '',
 			is_headless INTEGER NOT NULL DEFAULT 0,
@@ -61,7 +65,7 @@ func (db *DB) ensureCursorUsageEventsSchemaLocked(w *writerHandle) error {
 
 // InsertCursorUsageEvents appends new Cursor usage rows and ignores
 // duplicates with the same stable fingerprint.
-func (db *DB) InsertCursorUsageEvents(
+func (db *DB) InsertCursorUsageEvents(ctx context.Context,
 	events []CursorUsageEvent,
 ) error {
 	if len(events) == 0 {
@@ -71,7 +75,7 @@ func (db *DB) InsertCursorUsageEvents(
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
-	tx, err := db.getWriter().Begin()
+	tx, err := db.getWriter().Begin(ctx)
 	if err != nil {
 		return fmt.Errorf("beginning cursor usage tx: %w", err)
 	}
@@ -79,16 +83,16 @@ func (db *DB) InsertCursorUsageEvents(
 
 	for _, ev := range events {
 		if ev.Model == "" {
-			return fmt.Errorf("cursor usage event model is required")
+			return errors.New("cursor usage event model is required")
 		}
 		if ev.OccurredAt == "" {
-			return fmt.Errorf("cursor usage event timestamp is required")
+			return errors.New("cursor usage event timestamp is required")
 		}
 		if ev.DedupKey == "" {
-			ev.DedupKey = cursorUsageEventDedupKey(ev)
+			ev.DedupKey = CursorUsageEventDedupKey(ev)
 		}
 		if ev.DedupKey == "" {
-			return fmt.Errorf("cursor usage event dedup key is required")
+			return errors.New("cursor usage event dedup key is required")
 		}
 
 		isHeadless := 0
@@ -96,18 +100,18 @@ func (db *DB) InsertCursorUsageEvents(
 			isHeadless = 1
 		}
 
-		if _, err := tx.Exec(`
+		if _, err := tx.ExecContext(ctx, `
 			INSERT OR IGNORE INTO cursor_usage_events (
 				occurred_at, model, kind,
 				input_tokens, output_tokens,
 				cache_write_tokens, cache_read_tokens,
-				charged_cents, cursor_token_fee,
+				charged_microdollars, cursor_token_fee_microdollars,
 				user_id, user_email, is_headless, dedup_key
 			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			ev.OccurredAt, SanitizeUTF8(ev.Model), SanitizeUTF8(ev.Kind),
 			ev.InputTokens, ev.OutputTokens,
 			ev.CacheWriteTokens, ev.CacheReadTokens,
-			ev.ChargedCents, ev.CursorTokenFee,
+			ev.Charged.Microdollars, ev.CursorTokenFee.Microdollars,
 			SanitizeUTF8(ev.UserID), SanitizeUTF8(ev.UserEmail),
 			isHeadless, ev.DedupKey,
 		); err != nil {
@@ -115,22 +119,28 @@ func (db *DB) InsertCursorUsageEvents(
 		}
 	}
 
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	db.notifyCursorUsage()
+	return nil
 }
 
-func cursorUsageEventDedupKey(ev CursorUsageEvent) string {
+// CursorUsageEventDedupKey returns the stable cross-backend identity for a
+// Cursor usage event.
+func CursorUsageEventDedupKey(ev CursorUsageEvent) string {
 	var b strings.Builder
 	b.Grow(256)
 	fmt.Fprintf(&b, "%s|%s|%s|%d|%d|%d|%d|%s|%s|%t|%s|%s",
-		ev.OccurredAt,
+		cursorUsageEventFingerprintTimestamp(ev.OccurredAt),
 		SanitizeUTF8(ev.Model),
 		SanitizeUTF8(ev.Kind),
 		ev.InputTokens,
 		ev.OutputTokens,
 		ev.CacheWriteTokens,
 		ev.CacheReadTokens,
-		strconv.FormatFloat(ev.ChargedCents, 'f', -1, 64),
-		strconv.FormatFloat(ev.CursorTokenFee, 'f', -1, 64),
+		formatMicrodollarsAsLegacyCents(ev.Charged.Microdollars),
+		formatMicrodollarsAsLegacyCents(ev.CursorTokenFee.Microdollars),
 		ev.IsHeadless,
 		SanitizeUTF8(ev.UserID),
 		SanitizeUTF8(ev.UserEmail),
@@ -139,20 +149,57 @@ func cursorUsageEventDedupKey(ev CursorUsageEvent) string {
 	return hex.EncodeToString(sum[:])
 }
 
+func cursorUsageEventFingerprintTimestamp(value string) string {
+	parsed, err := time.Parse(time.RFC3339Nano, value)
+	if err != nil {
+		return value
+	}
+	return parsed.UTC().Truncate(time.Microsecond).Format(time.RFC3339Nano)
+}
+
+// formatMicrodollarsAsLegacyCents preserves the canonical decimal text used by
+// the pre-microdollar Cursor fingerprint. Migrated rows are rekeyed after
+// quantization, so a newly fetched copy hashes the same representable value.
+func formatMicrodollarsAsLegacyCents(microdollars int64) string {
+	negative := microdollars < 0
+	magnitude := uint64(microdollars)
+	if negative {
+		magnitude = uint64(-(microdollars + 1)) + 1
+	}
+
+	whole := magnitude / 10_000
+	fraction := magnitude % 10_000
+	formatted := strconv.FormatUint(whole, 10)
+	if fraction != 0 {
+		fractional := strconv.FormatUint(fraction+10_000, 10)[1:]
+		formatted += "." + strings.TrimRight(fractional, "0")
+	}
+	if negative {
+		return "-" + formatted
+	}
+	return formatted
+}
+
+// GetCursorUsageEvents returns cursor usage rows with id greater than
+// sinceID, in (occurred_at, id) order. The table is append-only (no
+// updates or deletes), so its integer primary key grows monotonically and
+// sinceID acts as a high-water mark: pass 0 for the full history, or the
+// largest previously consumed ID to load only appended rows.
 func (db *DB) GetCursorUsageEvents(
-	ctx context.Context,
+	ctx context.Context, sinceID int64,
 ) ([]CursorUsageEvent, error) {
-	if !db.hasCursorUsageTable() {
+	if !db.hasCursorUsageTable(ctx) {
 		return nil, nil
 	}
 	rows, err := db.getReader().QueryContext(ctx, `
 		SELECT id, occurred_at, model, kind,
 			input_tokens, output_tokens,
 			cache_write_tokens, cache_read_tokens,
-			charged_cents, cursor_token_fee,
+			charged_microdollars, cursor_token_fee_microdollars,
 			user_id, user_email, is_headless, dedup_key
 		FROM cursor_usage_events
-		ORDER BY occurred_at, id`)
+		WHERE id > ?
+		ORDER BY occurred_at, id`, sinceID)
 	if err != nil {
 		return nil, fmt.Errorf("querying cursor usage events: %w", err)
 	}
@@ -166,7 +213,7 @@ func (db *DB) GetCursorUsageEvents(
 			&ev.ID, &ev.OccurredAt, &ev.Model, &ev.Kind,
 			&ev.InputTokens, &ev.OutputTokens,
 			&ev.CacheWriteTokens, &ev.CacheReadTokens,
-			&ev.ChargedCents, &ev.CursorTokenFee,
+			&ev.Charged, &ev.CursorTokenFee,
 			&ev.UserID, &ev.UserEmail, &isHeadless, &ev.DedupKey,
 		); err != nil {
 			return nil, fmt.Errorf("scanning cursor usage event: %w", err)
@@ -180,15 +227,15 @@ func (db *DB) GetCursorUsageEvents(
 	return out, nil
 }
 
-func (db *DB) CursorUsageEventFingerprint() (string, error) {
-	if !db.hasCursorUsageTable() {
+func (db *DB) CursorUsageEventFingerprint(ctx context.Context) (string, error) {
+	if !db.hasCursorUsageTable(ctx) {
 		return "", nil
 	}
-	rows, err := db.getReader().Query(`
+	rows, err := db.getReader().Query(ctx, `
 		SELECT occurred_at, model, kind,
 			input_tokens, output_tokens,
 			cache_write_tokens, cache_read_tokens,
-			charged_cents, cursor_token_fee,
+			charged_microdollars, cursor_token_fee_microdollars,
 			user_id, user_email, is_headless, dedup_key
 		FROM cursor_usage_events
 		ORDER BY occurred_at, id`)
@@ -205,7 +252,7 @@ func (db *DB) CursorUsageEventFingerprint() (string, error) {
 			&ev.OccurredAt, &ev.Model, &ev.Kind,
 			&ev.InputTokens, &ev.OutputTokens,
 			&ev.CacheWriteTokens, &ev.CacheReadTokens,
-			&ev.ChargedCents, &ev.CursorTokenFee,
+			&ev.Charged, &ev.CursorTokenFee,
 			&ev.UserID, &ev.UserEmail, &isHeadless, &ev.DedupKey,
 		); err != nil {
 			return "", fmt.Errorf("scanning cursor usage fingerprint: %w", err)
@@ -215,7 +262,7 @@ func (db *DB) CursorUsageEventFingerprint() (string, error) {
 		ev.UserID = SanitizeUTF8(ev.UserID)
 		ev.UserEmail = SanitizeUTF8(ev.UserEmail)
 		ev.DedupKey = SanitizeUTF8(ev.DedupKey)
-		fmt.Fprintf(&b, "%d:%s|%d:%s|%d:%s|%d|%d|%d|%d|%g|%g|%d:%s|%d:%s|%t|%d:%s;",
+		fmt.Fprintf(&b, "%d:%s|%d:%s|%d:%s|%d|%d|%d|%d|%d|%d|%d:%s|%d:%s|%t|%d:%s;",
 			len(ev.OccurredAt), ev.OccurredAt,
 			len(ev.Model), ev.Model,
 			len(ev.Kind), ev.Kind,
@@ -223,8 +270,8 @@ func (db *DB) CursorUsageEventFingerprint() (string, error) {
 			ev.OutputTokens,
 			ev.CacheWriteTokens,
 			ev.CacheReadTokens,
-			ev.ChargedCents,
-			ev.CursorTokenFee,
+			ev.Charged.Microdollars,
+			ev.CursorTokenFee.Microdollars,
 			len(ev.UserID), ev.UserID,
 			len(ev.UserEmail), ev.UserEmail,
 			isHeadless != 0,

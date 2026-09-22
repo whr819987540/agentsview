@@ -3,6 +3,8 @@ package parser
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"hash"
 	"io"
@@ -32,11 +34,9 @@ func (f geminiProviderFactory) Capabilities() Capabilities {
 func (f geminiProviderFactory) NewProvider(cfg ProviderConfig) Provider {
 	cfg = cfg.Clone()
 	return &geminiProvider{
-		ProviderBase: ProviderBase{
-			Def:    cloneAgentDef(f.def),
-			Caps:   geminiProviderCapabilities(),
-			Config: cfg,
-		},
+		Def:     cloneAgentDef(f.def),
+		Caps:    geminiProviderCapabilities(),
+		Config:  cfg,
 		sources: newGeminiSourceSet(cfg.Roots),
 	}
 }
@@ -50,6 +50,10 @@ func (p *geminiProvider) Discover(ctx context.Context) ([]SourceRef, error) {
 	return p.sources.Discover(ctx)
 }
 
+func (p *geminiProvider) DiscoverEach(ctx context.Context, yield func(SourceRef) error) error {
+	return p.sources.DiscoverEach(ctx, yield)
+}
+
 func (p *geminiProvider) WatchPlan(ctx context.Context) (WatchPlan, error) {
 	return p.sources.WatchPlan(ctx)
 }
@@ -59,6 +63,13 @@ func (p *geminiProvider) SourcesForChangedPath(
 	req ChangedPathRequest,
 ) ([]SourceRef, error) {
 	return p.sources.SourcesForChangedPath(ctx, req)
+}
+
+func (p *geminiProvider) SourceForReconciliation(
+	ctx context.Context,
+	path, project string,
+) (SourceRef, bool, error) {
+	return p.sources.SourceForReconciliation(ctx, path, project)
 }
 
 func (p *geminiProvider) FindSource(
@@ -85,11 +96,21 @@ func (p *geminiProvider) Parse(
 	}
 	path, ok := p.sources.pathFromSource(req.Source)
 	if !ok {
-		return ParseOutcome{}, fmt.Errorf("gemini source path unavailable")
+		return ParseOutcome{}, errors.New("gemini source path unavailable")
 	}
 	machine := firstNonEmptyJSONLString(req.Machine, p.Config.Machine)
 	sess, msgs, err := p.parseSession(path, req.Source.ProjectHint, machine)
 	if err != nil {
+		if errors.Is(err, errGeminiMissingSessionID) {
+			// A session-shaped file without Gemini's metadata record has no
+			// stable identity to archive. Treat the durable source shape as an
+			// unsupported skip so reconciliation can advance without claiming
+			// authority to retire previously archived sessions.
+			return ParseOutcome{
+				ResultSetComplete: true,
+				SkipReason:        SkipUnsupportedSource,
+			}, nil
+		}
 		return ParseOutcome{}, err
 	}
 	if sess == nil {
@@ -142,6 +163,84 @@ func (s geminiSourceSet) Discover(ctx context.Context) ([]SourceRef, error) {
 	return sources, nil
 }
 
+func (s geminiSourceSet) DiscoverEach(ctx context.Context, yield func(SourceRef) error) error {
+	for _, root := range s.roots {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		var projects *discoveryDiskMap
+		resolveProject := func(projectDir string) (string, error) {
+			if projects == nil {
+				var err error
+				projects, err = newGeminiDiscoveryMap(ctx)
+				if err != nil {
+					return "", err
+				}
+				if err := projects.loadGeminiConfig(ctx, root); err != nil {
+					closeErr := projects.close()
+					projects = nil
+					return "", errors.Join(err, closeErr)
+				}
+			}
+			project, _, err := projects.get(ctx, projectDir)
+			if err != nil {
+				return "", err
+			}
+			if project == "" {
+				if isHexHash(projectDir) {
+					project = "unknown"
+				} else {
+					project = NormalizeName(projectDir)
+				}
+			}
+			return project, nil
+		}
+		tmpDir := filepath.Join(root, "tmp")
+		err := streamDirectoryEntries(ctx, tmpDir, func(projectDir os.DirEntry) error {
+			isProjectDir, dirErr := streamingDirCandidateOrIncomplete(
+				AgentGemini, "Gemini project directory", projectDir, tmpDir,
+			)
+			if dirErr != nil {
+				return dirErr
+			}
+			if !isProjectDir {
+				return nil
+			}
+			project := ""
+			projectResolved := false
+			chatDir := filepath.Join(tmpDir, projectDir.Name(), geminiChatsDir)
+			return streamDirectoryEntries(ctx, chatDir, func(entry os.DirEntry) error {
+				if entry.IsDir() || !isGeminiSessionFilename(entry.Name()) {
+					return nil
+				}
+				if !projectResolved {
+					var err error
+					project, err = resolveProject(projectDir.Name())
+					if err != nil {
+						return err
+					}
+					projectResolved = true
+				}
+				path := filepath.Join(chatDir, entry.Name())
+				source, ok := s.sourceRefForPathWithProjectMap(
+					root, path, true, map[string]string{projectDir.Name(): project},
+				)
+				if ok {
+					return yield(source)
+				}
+				return nil
+			})
+		})
+		if projects != nil {
+			err = errors.Join(err, projects.close())
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s geminiSourceSet) discoverRoot(
 	ctx context.Context,
 	root string,
@@ -151,12 +250,16 @@ func (s geminiSourceSet) discoverRoot(
 	}
 	sources := make([]SourceRef, 0)
 	seen := make(map[string]struct{})
+	paths := s.discoverSessionPaths(root)
+	if len(paths) == 0 {
+		return nil, nil
+	}
 	// Build the project map once per root. It depends only on root, and
 	// BuildGeminiProjectMap re-reads and SHA-256-hashes projects.json on every
 	// call, so resolving it per source path made discovery scale with session
 	// count (the dominant cost on large archives).
 	projectMap := buildGeminiProjectMap(root)
-	for _, path := range s.discoverSessionPaths(root) {
+	for _, path := range paths {
 		source, ok := s.sourceRefForPathWithProjectMap(root, path, true, projectMap)
 		if !ok {
 			continue
@@ -348,7 +451,7 @@ func (s geminiSourceSet) Fingerprint(
 	}
 	root, path, ok := s.rootPathFromSource(source)
 	if !ok {
-		return SourceFingerprint{}, fmt.Errorf("gemini source path unavailable")
+		return SourceFingerprint{}, errors.New("gemini source path unavailable")
 	}
 	info, err := os.Stat(path)
 	if err != nil {
@@ -366,21 +469,45 @@ func (s geminiSourceSet) Fingerprint(
 	if err := addGeminiFingerprintPart(h, "session", path, info); err != nil {
 		return SourceFingerprint{}, err
 	}
-	for _, metadataPath := range geminiProjectMetadataPaths(root) {
-		metadataInfo, err := os.Stat(metadataPath)
-		if err != nil || metadataInfo.IsDir() {
-			continue
-		}
-		fingerprint.Size += metadataInfo.Size()
-		if mtime := metadataInfo.ModTime().UnixNano(); mtime > fingerprint.MTimeNS {
-			fingerprint.MTimeNS = mtime
-		}
-		if err := addGeminiFingerprintPart(h, "project", metadataPath, metadataInfo); err != nil {
-			return SourceFingerprint{}, err
-		}
+	if _, err := fmt.Fprintf(
+		h, "project\x00%s\x00",
+		s.resolvedProjectForFingerprint(root, path, source),
+	); err != nil {
+		return SourceFingerprint{}, err
 	}
-	fingerprint.Hash = fmt.Sprintf("%x", h.Sum(nil))
+	fingerprint.Hash = hex.EncodeToString(h.Sum(nil))
 	return fingerprint, nil
+}
+
+// geminiSessionDirHash extracts the tmp/<dirHash>/chats component that keys
+// the session's project resolution.
+func geminiSessionDirHash(root, path string) (string, bool) {
+	rel, ok := relUnder(filepath.Clean(root), filepath.Clean(path))
+	if !ok {
+		return "", false
+	}
+	parts := strings.Split(filepath.ToSlash(rel), "/")
+	if len(parts) != 4 || parts[0] != "tmp" || parts[2] != geminiChatsDir {
+		return "", false
+	}
+	return parts[1], true
+}
+
+// resolvedProjectForFingerprint returns the only metadata this session's
+// parse consumes: its resolved project name. Root-wide metadata files must
+// not leak into unrelated sessions' fingerprints (they used to
+// mass-invalidate the whole root on any edit).
+func (s geminiSourceSet) resolvedProjectForFingerprint(
+	root, path string, source SourceRef,
+) string {
+	if source.ProjectHint != "" {
+		return source.ProjectHint
+	}
+	dirHash, ok := geminiSessionDirHash(root, path)
+	if !ok {
+		return ""
+	}
+	return ResolveGeminiProject(dirHash, buildGeminiProjectMap(root))
 }
 
 func (s geminiSourceSet) pathFromSource(source SourceRef) (string, bool) {
@@ -410,6 +537,30 @@ func (s geminiSourceSet) rootPathFromSource(source SourceRef) (string, string, b
 
 func (s geminiSourceSet) sourceRef(root, path string) (SourceRef, bool) {
 	return s.sourceRefForPath(root, path, true)
+}
+
+// SourceForReconciliation rebuilds an exact source already admitted by
+// streaming discovery. The discovered project hint is authoritative here, so
+// rehydration must not rebuild root-wide Gemini project metadata per source.
+func (s geminiSourceSet) SourceForReconciliation(
+	ctx context.Context, path, project string,
+) (SourceRef, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return SourceRef{}, false, err
+	}
+	for _, root := range s.roots {
+		source, ok := s.sourceRefForPathWithProjectMap(
+			root, path, true, map[string]string{},
+		)
+		if !ok {
+			continue
+		}
+		if project != "" {
+			source.ProjectHint = project
+		}
+		return source, true, nil
+	}
+	return SourceRef{}, false, nil
 }
 
 func (s geminiSourceSet) sourceRefForPath(
@@ -461,11 +612,18 @@ func (s geminiSourceSet) sourceRefForPathWithProjectMap(
 // the project map once per root and tests can observe how often it runs.
 var buildGeminiProjectMap = BuildGeminiProjectMap
 
-func geminiProjectMetadataPaths(root string) []string {
-	return []string{
-		filepath.Join(root, "projects.json"),
-		filepath.Join(root, "trustedFolders.json"),
-	}
+// newGeminiDiscoveryMap indirects the disk-backed metadata map so tests can
+// verify that empty Gemini roots do not initialize it.
+var newGeminiDiscoveryMap = newDiscoveryDiskMapForContext
+
+// IsGeminiProjectMetadataFile reports whether path names one of the
+// root-level Gemini project-metadata files whose changes fan out to every
+// session under the root. The Gemini watch plan only emits these names from
+// the non-recursive root watch, so a basename check is sufficient for
+// callers without the root at hand.
+func IsGeminiProjectMetadataFile(path string) bool {
+	base := filepath.Base(path)
+	return base == "projects.json" || base == "trustedFolders.json"
 }
 
 func geminiProjectMetadataPath(root, path string) bool {
@@ -510,6 +668,7 @@ func geminiProviderCapabilities() Capabilities {
 	return Capabilities{
 		Source: SourceCapabilities{
 			DiscoverSources:      CapabilitySupported,
+			StreamingDiscovery:   CapabilitySupported,
 			WatchSources:         CapabilitySupported,
 			ClassifyChangedPath:  CapabilitySupported,
 			FindSource:           CapabilitySupported,
@@ -527,6 +686,9 @@ func geminiProviderCapabilities() Capabilities {
 			ToolResults:          CapabilitySupported,
 			PerMessageTokenUsage: CapabilitySupported,
 			Model:                CapabilitySupported,
+		},
+		Sync: ProviderSyncSemantics{
+			FingerprintHashRequiredForFreshness: true,
 		},
 	}
 }

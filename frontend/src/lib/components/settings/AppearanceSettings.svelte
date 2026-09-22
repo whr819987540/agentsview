@@ -1,13 +1,30 @@
 <script lang="ts">
+  import { Button, Checkbox, SegmentedControl, Typeahead } from "@kenn-io/kit-ui";
   import { m } from "../../i18n/index.js";
-  import SettingsSection from "./SettingsSection.svelte";
+  import { settings } from "../../stores/settings.svelte.js";
   import {
     ui,
     ALL_BLOCK_TYPES,
-    FONT_SCALE_STEPS,
+    ZOOM_STEPS,
     type BlockType,
     type MessageLayout,
   } from "../../stores/ui.svelte.js";
+  import {
+    isChartPalette,
+    type ChartPalette,
+  } from "../../utils/chartPalette.js";
+
+  const CHART_PALETTE_OPTIONS: { value: ChartPalette; label: string }[] =
+    $derived([
+      {
+        value: "agentsview",
+        label: m.appearance_chart_palette_agentsview(),
+      },
+      {
+        value: "matplotlib",
+        label: m.appearance_chart_palette_matplotlib(),
+      },
+    ]);
 
   const LAYOUT_OPTIONS: { value: MessageLayout; label: string }[] = $derived([
     { value: "default", label: m.appearance_layout_default() },
@@ -22,75 +39,100 @@
     thinking: m.header_transcript_blocks_thinking(),
     tool: m.header_transcript_blocks_tool(),
     code: m.header_transcript_blocks_code(),
+    system: m.header_transcript_blocks_system(),
   });
+
+  const ZOOM_OPTIONS = $derived(
+    ZOOM_STEPS.map((step) => ({
+      name: String(step),
+      label: `${step}%`,
+    })),
+  );
 </script>
 
-<SettingsSection
-  title={m.appearance_title()}
-  description={m.appearance_description()}
->
+<div class="appearance-settings">
   <div class="setting-row">
     <span class="setting-label">{m.appearance_theme()}</span>
-    <button class="setting-toggle" onclick={() => ui.toggleTheme()}>
+    <Button size="sm" onclick={() => ui.toggleTheme()}>
       {ui.theme === "light" ? m.appearance_light() : m.appearance_dark()}
-    </button>
+    </Button>
   </div>
 
   <div class="setting-row">
     <span class="setting-label">{m.appearance_high_contrast()}</span>
-    <button class="setting-toggle" onclick={() => ui.toggleHighContrast()}>
+    <Button size="sm" onclick={() => ui.toggleHighContrast()}>
       {ui.highContrast ? m.appearance_on() : m.appearance_off()}
-    </button>
+    </Button>
   </div>
 
-  <div class="setting-row">
+  <div class="setting-row option-row">
+    <span class="setting-label">{m.appearance_chart_palette()}</span>
+    <SegmentedControl
+      options={CHART_PALETTE_OPTIONS}
+      value={settings.chartPalette}
+      ariaLabel={m.appearance_chart_palette()}
+      disabled={settings.saving || settings.readOnly}
+      onchange={(value) => {
+        if (!isChartPalette(value)) return;
+        void settings.save({ chart_palette: value });
+      }}
+    />
+  </div>
+
+  <div class="setting-row option-row">
     <span class="setting-label">{m.appearance_message_layout()}</span>
-    <div class="setting-options">
-      {#each LAYOUT_OPTIONS as opt}
-        <button
-          class="option-btn"
-          class:active={ui.messageLayout === opt.value}
-          onclick={() => ui.setLayout(opt.value)}
-        >
-          {opt.label}
-        </button>
-      {/each}
-    </div>
+    <SegmentedControl
+      options={LAYOUT_OPTIONS}
+      value={ui.messageLayout}
+      ariaLabel={m.appearance_message_layout()}
+      onchange={(value) => ui.setLayout(value as MessageLayout)}
+    />
   </div>
 
   <div class="setting-row">
-    <span class="setting-label">{m.appearance_text_size()}</span>
-    <div class="setting-options">
-      {#each FONT_SCALE_STEPS as step}
-        <button
-          class="option-btn"
-          class:active={ui.fontScale === step}
-          onclick={() => ui.setFontScale(step)}
-        >
-          {step}%
-        </button>
-      {/each}
-    </div>
+    <span class="setting-label">{m.appearance_zoom()}</span>
+    <Typeahead
+      options={ZOOM_OPTIONS}
+      value={String(ui.zoomLevel)}
+      fallbackLabel="100%"
+      triggerPrefix={m.appearance_zoom()}
+      placeholder={m.appearance_zoom()}
+      title={m.appearance_zoom()}
+      emptyLabel={m.filter_dropdown_no_matches()}
+      onselect={(value) => ui.setZoomLevel(Number(value))}
+    />
+  </div>
+
+  <div class="setting-row">
+    <Checkbox
+      checked={ui.renderUnknownXmlBlocksAsPreformatted}
+      onchange={() => ui.toggleUnknownXmlBlocksAsPreformatted()}
+      ariaLabel={m.appearance_render_unknown_xml_blocks()}
+      label={m.appearance_render_unknown_xml_blocks()}
+    />
   </div>
 
   <div class="setting-row column">
     <span class="setting-label">{m.appearance_block_visibility()}</span>
     <div class="block-toggles">
       {#each ALL_BLOCK_TYPES as bt}
-        <label class="block-toggle">
-          <input
-            type="checkbox"
-            checked={ui.isBlockVisible(bt)}
-            onchange={() => ui.toggleBlock(bt)}
-          />
-          <span>{BLOCK_LABELS[bt]}</span>
-        </label>
+        <Checkbox
+          checked={ui.isBlockVisible(bt)}
+          onchange={() => ui.toggleBlock(bt)}
+          label={BLOCK_LABELS[bt]}
+        />
       {/each}
     </div>
   </div>
-</SettingsSection>
+</div>
 
 <style>
+  .appearance-settings {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-5);
+  }
+
   .setting-row {
     display: flex;
     align-items: center;
@@ -110,68 +152,30 @@
     white-space: nowrap;
   }
 
-  .setting-toggle {
-    height: 26px;
-    padding: 0 12px;
-    border-radius: var(--radius-sm);
-    font-size: 11px;
-    font-weight: 500;
-    color: var(--text-secondary);
-    background: var(--bg-inset);
-    border: 1px solid var(--border-muted);
-    cursor: pointer;
-    transition: background 0.12s;
-  }
-
-  .setting-toggle:hover {
-    background: var(--bg-surface-hover);
-  }
-
-  .setting-options {
-    display: flex;
-    gap: 4px;
-  }
-
-  .option-btn {
-    height: 26px;
-    padding: 0 10px;
-    border-radius: var(--radius-sm);
-    font-size: 11px;
-    font-weight: 500;
-    color: var(--text-muted);
-    background: var(--bg-inset);
-    border: 1px solid var(--border-muted);
-    cursor: pointer;
-    transition: all 0.12s;
-  }
-
-  .option-btn:hover {
-    color: var(--text-secondary);
-    background: var(--bg-surface-hover);
-  }
-
-  .option-btn.active {
-    color: var(--accent-blue);
-    background: color-mix(in srgb, var(--accent-blue) 10%, transparent);
-    border-color: var(--accent-blue);
-  }
-
   .block-toggles {
     display: flex;
     flex-wrap: wrap;
     gap: 8px;
   }
 
-  .block-toggle {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    font-size: 12px;
-    color: var(--text-secondary);
-    cursor: pointer;
-  }
+  @media (max-width: 640px) {
+    .setting-row.option-row {
+      flex-direction: column;
+      align-items: stretch;
+    }
 
-  .block-toggle input {
-    accent-color: var(--accent-blue);
+    .option-row .setting-label {
+      align-self: flex-start;
+    }
+
+    .option-row :global(.kit-segmented) {
+      width: 100%;
+    }
+
+    .option-row :global(.kit-segmented__btn) {
+      flex: 1;
+      min-width: 0;
+      padding-inline: 6px;
+    }
   }
 </style>

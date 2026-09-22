@@ -1,58 +1,49 @@
 <script lang="ts">
-  import { onDestroy, tick, untrack } from "svelte";
+  import { onDestroy } from "svelte";
   import { copyToClipboard } from "../../utils/clipboard.js";
-  import { applyHighlight, applyMarks, clearMarks, escapeHTML } from "../../utils/highlight.js";
+  import { searchBlock } from "../../search/session-block.svelte.js";
   import { highlightToHtml } from "../../utils/syntax-highlight.js";
-  import CopyButton from "../shared/CopyButton.svelte";
-  import { m } from "../../i18n/index.js";
+  import { CopyButton } from "@kenn-io/kit-ui";
   import { ChevronRightIcon } from "../../icons.js";
+  import { m } from "../../i18n/index.js";
+  import { searchCollapsed } from "../../search/component-state.js";
+  import { inSessionSearch } from "../../stores/inSessionSearch.svelte.js";
   import { ui } from "../../stores/ui.svelte.js";
 
   interface Props {
     content: string;
     language?: string;
-    highlightQuery?: string;
-    isCurrentHighlight?: boolean;
+    searchKey?: string;
   }
 
-  let { content, language, highlightQuery = "", isCurrentHighlight = false }: Props = $props();
+  let { content, language, searchKey }: Props = $props();
   let copied = $state(false);
   let copyTimer: ReturnType<typeof setTimeout> | undefined;
-  let userCollapsed = $state(false);
-  let userOverride = $state(false);
-  let searchExpanded = $state(false);
-  let prevQuery = $state("");
-  let appliedBulkCommandId = $state(0);
-
   let highlighted = $state<string | null>(null);
-  let preEl = $state<HTMLElement | undefined>(undefined);
 
-  $effect(() => {
-    const q = highlightQuery;
-    const trimmed = q.trim();
-    searchExpanded =
-      trimmed !== "" &&
-      content.toLowerCase().includes(trimmed.toLowerCase());
-    if (q !== prevQuery) {
-      userOverride = false;
-      prevQuery = q;
-    }
-  });
+  // Code blocks start expanded: unlike thinking/tool blocks they are
+  // usually the point of the message. They collapse to a one-line
+  // preview so the breadcrumb's bulk controls can fold a long
+  // transcript down to its prompts and answers.
+  let userCollapsed = $state(false);
+  let overrideSeq = $state(-1);
+  let collapsed = $derived(searchCollapsed(
+    userCollapsed, inSessionSearch.isCurrentBlock(searchKey),
+    inSessionSearch.navigationRevision, overrideSeq,
+  ));
 
+  // A bulk collapse/expand command from the breadcrumb controls acts
+  // like a manual toggle on every visible code block: it wins over
+  // search auto-reveal until the next search navigation.
+  let appliedBulkCommandId = $state(0);
   $effect(() => {
     const command = ui.bulkCollapseCommand;
     if (!command || command.id === appliedBulkCommandId) return;
     appliedBulkCommandId = command.id;
     if (!command.visibleBlocks.includes("code")) return;
     userCollapsed = command.target === "collapsed";
-    userOverride = true;
+    overrideSeq = inSessionSearch.navigationRevision;
   });
-
-  let collapsed = $derived(
-    userOverride ? userCollapsed
-      : searchExpanded ? false
-      : userCollapsed,
-  );
 
   let displayLanguage = $derived(language || m.code_block_label());
   let previewLine = $derived.by(() => {
@@ -64,62 +55,53 @@
   });
 
   $effect(() => {
+    const source = content;
+    const lang = language;
     highlighted = null;
-    if (!language) return;
-
-    const effectContent = content;
-    const effectLang = language;
+    if (!lang) return;
     let cancelled = false;
-
-    highlightToHtml(effectContent, effectLang).then(async (html) => {
-      if (cancelled) return;
-      highlighted = html;
-      // Flush the {@html} swap to the DOM before re-applying marks.
-      await tick();
-      if (cancelled) return;
-      // Read current prop values after the await — intentionally untracked
-      // because we are inside an async continuation, not during the sync
-      // reactive evaluation.
-      const q = untrack(() => highlightQuery);
-      const current = untrack(() => isCurrentHighlight);
-      const el = untrack(() => preEl);
-      if (el && q.trim()) {
-        clearMarks(el);
-        applyMarks(el, q, current);
-      }
+    void highlightToHtml(source, lang).then((html) => {
+      if (!cancelled) highlighted = html;
+    }).catch(() => {
+      // Keep the original text if the optional syntax highlighter fails.
     });
-
-    return () => {
-      cancelled = true;
-    };
+    return () => { cancelled = true; };
   });
 
+  // Keep copy controlled through the application's clipboard utility.
   async function handleCopy() {
     const ok = await copyToClipboard(content);
     if (!ok) return;
-
     clearTimeout(copyTimer);
     copied = true;
-    copyTimer = setTimeout(() => {
-      copied = false;
-    }, 1500);
+    copyTimer = setTimeout(() => { copied = false; }, 1500);
   }
 
-  onDestroy(() => {
-    clearTimeout(copyTimer);
-  });
+  onDestroy(() => { clearTimeout(copyTimer); });
 </script>
 
+<!-- kit-ui-check-ignore: controlled clipboard behavior and a search attachment on pre require the app-owned code block. -->
 <div class="code-block">
+  <CopyButton
+    class="code-copy"
+    revealOnHover
+    {copied}
+    ariaLabel={m.code_block_copy_code_block()}
+    copiedAriaLabel={m.code_block_copied_code_block()}
+    title={m.code_block_copy_code()}
+    copiedTitle={m.code_block_copied()}
+    onclick={handleCopy}
+  />
   <div class="code-header">
     <button
       type="button"
       class="code-toggle"
+      aria-expanded={!collapsed}
       title={collapsed ? m.code_block_expand() : m.code_block_collapse()}
       aria-label={collapsed ? m.code_block_expand() : m.code_block_collapse()}
       onclick={() => {
-        userCollapsed = !userCollapsed;
-        userOverride = true;
+        userCollapsed = !collapsed;
+        overrideSeq = inSessionSearch.navigationRevision;
       }}
     >
       <span class="code-chevron" class:open={!collapsed}>
@@ -130,97 +112,67 @@
         <span class="code-preview">{previewLine}</span>
       {/if}
     </button>
-    <CopyButton
-      class="code-copy"
-      {copied}
-      ariaLabel={m.code_block_copy_code_block()}
-      copiedAriaLabel={m.code_block_copied_code_block()}
-      title={m.code_block_copy_code()}
-      copiedTitle={m.code_block_copied()}
-      onclick={handleCopy}
-    />
   </div>
   {#if !collapsed}
-    <pre
-      class="code-content"
-      bind:this={preEl}
-      use:applyHighlight={{ q: highlightQuery, current: isCurrentHighlight, content }}
-    ><code>{@html highlighted ?? escapeHTML(content)}</code></pre>
+    <pre class="code-content" {@attach searchBlock(searchKey)}><code>{#if highlighted !== null}{@html highlighted}{:else}{content}{/if}</code></pre>
   {/if}
 </div>
 
 <style>
+  /* kit-ui-check-ignore: app-owned code block, see markup note above */
   .code-block {
+    position: relative;
     background: var(--code-bg);
     border-radius: var(--radius-md);
     margin: 4px 0;
     overflow: hidden;
   }
-
+  :global(.code-copy.kit-copy-btn) {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    z-index: 1;
+  }
+  /* kit-ui-check-ignore: app-owned code block, see markup note above */
+  .code-block:hover :global(.code-copy.kit-copy-btn) { opacity: 1; }
   .code-header {
-    display: flex;
-    align-items: center;
-    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+    border-bottom: 1px solid color-mix(in srgb, var(--code-text) 8%, transparent);
   }
-
-  .code-block:hover :global(.code-copy.copy-btn),
-  .code-header :global(.code-copy.copy-btn:focus-visible) {
-    opacity: 1;
-  }
-
   .code-toggle {
     display: flex;
     align-items: center;
     gap: 6px;
-    min-width: 0;
-    flex: 1;
+    width: 100%;
     padding: 4px 12px;
-    color: var(--code-text);
+    background: none;
+    border: none;
     text-align: left;
-    transition: background 0.1s;
+    cursor: pointer;
+    color: var(--code-text);
+    min-width: 0;
   }
-
-  .code-toggle:hover {
-    background: rgba(255, 255, 255, 0.04);
-  }
-
   .code-chevron {
     display: inline-flex;
     align-items: center;
-    color: var(--text-muted);
-    flex-shrink: 0;
+    opacity: 0.5;
     transition: transform 0.15s;
   }
-
-  .code-chevron.open {
-    transform: rotate(90deg);
-  }
-
+  .code-chevron.open { transform: rotate(90deg); }
   .code-lang {
     font-family: var(--font-mono);
     font-size: 11px;
     font-weight: 500;
-    color: var(--code-text);
     opacity: 0.5;
-    white-space: nowrap;
-    flex-shrink: 0;
   }
-
   .code-preview {
     font-family: var(--font-mono);
-    font-size: 12px;
-    color: var(--text-muted);
+    font-size: 11px;
+    opacity: 0.45;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
     min-width: 0;
   }
-
-  :global(.code-copy.copy-btn) {
-    opacity: 1;
-    margin-right: 4px;
-  }
-
   .code-content {
     padding: 12px 16px;
     font-family: var(--font-mono);
@@ -229,14 +181,8 @@
     color: var(--code-text);
     overflow-x: auto;
   }
-
-  .code-content code {
-    font-family: inherit;
-  }
-
-  @media (max-width: 767px) {
-    .code-content {
-      max-width: calc(100vw - 32px);
-    }
+  .code-content code { font-family: inherit; }
+  @media (max-width: 760px) {
+    .code-content { max-width: calc(100vw - 32px); }
   }
 </style>

@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { Card } from "@kenn-io/kit-ui";
   import { onMount, onDestroy, untrack } from "svelte";
   import RangePicker from "../shared/RangePicker.svelte";
   import {
@@ -15,26 +16,33 @@
   import VelocityMetrics from "./VelocityMetrics.svelte";
   import ToolUsage from "./ToolUsage.svelte";
   import TopSkills from "./TopSkills.svelte";
+  import SkillTrend from "./SkillTrend.svelte";
   import AgentComparison from "./AgentComparison.svelte";
   import SessionHealthSection from "./SessionHealthSection.svelte";
   import TopSessions from "./TopSessions.svelte";
   import ActiveFilters from "./ActiveFilters.svelte";
   import SessionFilterControl from "../filters/SessionFilterControl.svelte";
+  import SidebarToggleButton from "../layout/SidebarToggleButton.svelte";
   import FilterDropdown from "../usage/FilterDropdown.svelte";
-  import { analytics } from "../../stores/analytics.svelte.js";
+  import {
+    analytics,
+    ANALYTICS_DEFAULT_WINDOW_DAYS,
+  } from "../../stores/analytics.svelte.js";
+  import { analyticsPageDates } from "../../stores/analyticsPageDates.js";
   import {
     sessions,
     filtersToParams,
   } from "../../stores/sessions.svelte.js";
   import { events } from "../../stores/events.svelte.js";
+  import { starred } from "../../stores/starred.svelte.js";
   import { ui } from "../../stores/ui.svelte.js";
   import { sync } from "../../stores/sync.svelte.js";
   import { router } from "../../stores/router.svelte.js";
   import {
     yokedDates,
     panelDateState,
-    panelStateToRange,
-    rangeToSessionParams,
+    panelDateToSessionFilterParams,
+    rangeToPanelDate,
     sessionParamsToPanelDate,
     type PanelDateState,
   } from "../../stores/yokedDates.svelte.js";
@@ -42,6 +50,18 @@
   import { exportAnalyticsCSV } from "../../utils/csv-export.js";
   import RefreshControl from "../shared/RefreshControl.svelte";
   import { m } from "../../i18n/index.js";
+
+  interface Props {
+    suppressSessionDateRestore?: boolean;
+    suppressSessionDateRefresh?: boolean;
+    onSessionDateRestoreSuppressed?: () => void;
+  }
+
+  let {
+    suppressSessionDateRestore = false,
+    suppressSessionDateRefresh = false,
+    onSessionDateRestoreSuppressed,
+  }: Props = $props();
 
   const SESSION_ANALYTICS_WINDOW_PARAM = "window_days";
 
@@ -58,7 +78,10 @@
   );
 
   function applyRange(sel: RangeSelection) {
+    cancelInitialLoad();
+    userDateSelectionPending = true;
     if (sel.mode === "relative" && sel.days > 0) {
+      sessionDateIntentEstablished = true;
       analytics.setRollingWindow(sel.days);
       const state = panelDateState(analytics.from, analytics.to, {
         mode: "rolling",
@@ -70,6 +93,7 @@
       }
     } else {
       const range = resolveRange(sel, earliestSession);
+      sessionDateIntentEstablished = true;
       analytics.setDateRange(range.from, range.to);
       const state = panelDateState(range.from, range.to, {
         mode: "fixed",
@@ -137,12 +161,6 @@
     return JSON.stringify({ mode: "none" });
   }
 
-  function clearSessionDateFilters(): void {
-    sessions.filters.date = "";
-    sessions.filters.dateFrom = "";
-    sessions.filters.dateTo = "";
-  }
-
   function sessionDateFiltersAreClear(): boolean {
     return !sessions.filters.date &&
       !sessions.filters.dateFrom &&
@@ -164,19 +182,11 @@
     state: PanelDateState,
   ): boolean {
     const before = JSON.stringify(filtersToParams(sessions.filters));
-    clearSessionDateFilters();
-    const range = panelStateToRange(
-      state.mode === "rolling"
-        ? { ...state, mode: "fixed", windowDays: undefined }
-        : state,
-      Date.now(),
+    const params = panelDateToSessionFilterParams(state);
+    sessions.applyPanelDateFilters(
+      params,
+      state.mode === "rolling" ? state.windowDays ?? null : null,
     );
-    if (range) {
-      const params = rangeToSessionParams(range);
-      sessions.filters.date = params["date"] ?? "";
-      sessions.filters.dateFrom = params["date_from"] ?? "";
-      sessions.filters.dateTo = params["date_to"] ?? "";
-    }
     const after = JSON.stringify(filtersToParams(sessions.filters));
     return before !== after;
   }
@@ -184,11 +194,16 @@
   function writeSessionDateParams(state: PanelDateState): void {
     const sessionChanged = syncSessionFiltersForDateState(state);
     const params = filtersToParams(sessions.filters);
+    if (starred.filterOnly) params.starred = "true";
     delete params[SESSION_ANALYTICS_WINDOW_PARAM];
     if (state.mode === "rolling" && state.windowDays) {
       params[SESSION_ANALYTICS_WINDOW_PARAM] = String(state.windowDays);
     }
-    router.replaceParams(params);
+    if (router.isRootPath) {
+      router.navigateToSessions(params);
+    } else {
+      router.replaceParams(params);
+    }
     if (sessionChanged) sessions.load();
   }
 
@@ -228,7 +243,9 @@
   }
 
   function refreshAnalytics(): Promise<void> {
+    cancelInitialLoad();
     const refresh = analytics.fetchAll();
+    if (router.isRootPath || suppressSessionDateRefresh) return refresh;
     const state = currentAnalyticsPanelDate();
     if (state && !analyticsDateYokeIsClear()) {
       yokedDates.updateFromPanel(state);
@@ -237,12 +254,12 @@
     return refresh;
   }
 
-  function handleDateRangeChange(from: string, to: string) {
-    const state = panelDateState(from, to, { mode: "fixed" });
-    if (!state) return;
-    analytics.setDateRange(from, to);
-    yokedDates.updateFromPanel(state);
-    writeSessionDateParams(state);
+  function handleActivityRangeSelect(from: string, to: string) {
+    analytics.setActivitySelection(from, to);
+  }
+
+  function handleActivityRangeClear() {
+    analytics.clearActivitySelection();
   }
 
   function shortTz(tz: string): string {
@@ -300,6 +317,45 @@
   let analyticsDateUrlInitRan = $state(false);
   let analyticsDateUrlInitComplete = $state(false);
   let lastAnalyticsDateUrlSignature: string | null = $state(null);
+  let sessionDateIntentEstablished = false;
+  let userDateSelectionPending = false;
+  const INITIAL_LOAD_CEILING_MS = 2000;
+  let initialLoadTimer: ReturnType<typeof setTimeout> | undefined;
+  // Child mount effects run before the page's first-load effect.
+  let initialLoadDeferred = $state(sessions.loading);
+
+  function cancelInitialLoad() {
+    clearTimeout(initialLoadTimer);
+    initialLoadTimer = undefined;
+    initialLoadDeferred = false;
+  }
+
+  function releaseInitialLoad() {
+    if (!initialLoadDeferred) return;
+    cancelInitialLoad();
+    void analytics.fetchAll();
+  }
+
+  function startAnalyticsLoad(deferrable = false) {
+    cancelInitialLoad();
+    if (deferrable && sessions.loading) {
+      initialLoadDeferred = true;
+      initialLoadTimer = setTimeout(releaseInitialLoad, INITIAL_LOAD_CEILING_MS);
+    } else {
+      void analytics.fetchAll();
+    }
+  }
+
+  analytics.setFetchStartHandler(cancelInitialLoad);
+
+  $effect(() => {
+    if (initialLoadDeferred && !sessions.loading) {
+      untrack(() => {
+        clearTimeout(initialLoadTimer);
+        initialLoadTimer = setTimeout(releaseInitialLoad, 0);
+      });
+    }
+  });
 
   onMount(() => {
     // The URL-date effect owns the initial load so deep links and stored yoke
@@ -395,7 +451,7 @@
     }
 
     if (changed && analyticsDateUrlInitComplete) {
-      untrack(() => analytics.fetchAll());
+      untrack(() => startAnalyticsLoad());
     }
   });
 
@@ -405,6 +461,19 @@
     const earliestSession = sync.stats?.earliest_session ?? undefined;
     untrack(() => {
       if (route !== "sessions") return;
+      if (router.isRootPath) {
+        if (lastAnalyticsDateUrlSignature !== "root-landing") {
+          analytics.applyRollingWindow(
+            ANALYTICS_DEFAULT_WINDOW_DAYS,
+          );
+          startAnalyticsLoad(lastAnalyticsDateUrlSignature === null && !analyticsDateUrlInitRan);
+        }
+        lastAnalyticsDateUrlSignature = "root-landing";
+        analyticsDateUrlInitRan = false;
+        analyticsDateUrlInitComplete = false;
+        sessionDateIntentEstablished = false;
+        return;
+      }
 
       const fixedState = sessionParamsToPanelDate(params, {
         earliest: earliestSession,
@@ -422,6 +491,8 @@
       }
 
       const firstRun = !analyticsDateUrlInitRan;
+      const initialHydration = firstRun && !userDateSelectionPending;
+      userDateSelectionPending = false;
       const dateSignature = sessionAnalyticsDateUrlSignature(
         params,
         state,
@@ -432,7 +503,7 @@
       if (!state) {
         if (hasDateParams) {
           if (firstRun) {
-            analytics.fetchAll();
+            startAnalyticsLoad(initialHydration);
           }
           lastAnalyticsDateUrlSignature = dateSignature;
           analyticsDateUrlInitRan = true;
@@ -441,20 +512,31 @@
         }
         let changed = false;
         if (firstRun) {
-          const seed = yokedDates.seedForPanel();
-          state = seed
-            ? panelDateState(seed.from, seed.to, {
-                mode: seed.mode,
-                windowDays: seed.windowDays,
-              })
-            : null;
+          if (suppressSessionDateRestore) {
+            sessionDateIntentEstablished = false;
+            onSessionDateRestoreSuppressed?.();
+          } else {
+            const seed = yokedDates.seedForPanel();
+            const retained = seed
+              ? null
+              : analyticsPageDates.restoreWithIntent("sessions");
+            state = seed
+              ? rangeToPanelDate(seed)
+              : retained?.state ?? null;
+            sessionDateIntentEstablished = seed !== null ||
+              retained?.explicitDateIntent === true;
+          }
           if (state) {
             changed = applyAnalyticsPanelDate(state);
-            writeSessionDateParams(state);
+            if (sessionDateIntentEstablished) {
+              writeSessionDateParams(state);
+            }
           }
         } else if (dateChanged && sessionDateFiltersAreClear()) {
+          sessionDateIntentEstablished = false;
           yokedDates.clear();
         } else if (dateChanged) {
+          sessionDateIntentEstablished = true;
           state = rollingPanelDate(analytics.windowDays);
           if (state) {
             changed = applyAnalyticsPanelDate(state);
@@ -464,8 +546,8 @@
             if (sessionChanged) sessions.load();
           }
         }
-        if (changed || firstRun) {
-          analytics.fetchAll();
+        if (changed || initialHydration) {
+          startAnalyticsLoad(initialHydration);
         }
         lastAnalyticsDateUrlSignature = dateSignature;
         analyticsDateUrlInitRan = true;
@@ -476,12 +558,13 @@
       let changed = false;
       let sessionChanged = false;
       if (dateChanged) {
+        sessionDateIntentEstablished = true;
         changed = applyAnalyticsPanelDate(state);
         sessionChanged = syncSessionFiltersForDateState(state);
         yokedDates.updateFromPanel(state);
       }
-      if (changed || firstRun) {
-        analytics.fetchAll();
+      if (changed || initialHydration) {
+        startAnalyticsLoad(initialHydration);
       }
       if (sessionChanged && !firstRun) {
         sessions.load();
@@ -493,14 +576,29 @@
   });
 
   onDestroy(() => {
+    cancelInitialLoad();
+    analytics.setFetchStartHandler(undefined);
+    analytics.cancelInFlightReads();
+    const state = currentAnalyticsPanelDate();
+    if (state) {
+      analyticsPageDates.retain(
+        "sessions",
+        state,
+        sessionDateIntentEstablished,
+      );
+    }
     unsubEvents?.();
   });
 </script>
 
 <div class="analytics-page">
   <div class="analytics-toolbar">
-    {#if !ui.sidebarOpen}
-      <div class="toolbar-filter-anchor">
+    {#if !ui.isMobileViewport && !ui.sidebarOpen}
+      <div
+        class="toolbar-filter-anchor"
+        data-sidebar-focus-region="content"
+      >
+        <SidebarToggleButton placement="content" />
         <SessionFilterControl
           showDisplay={false}
           showStarred={false}
@@ -517,12 +615,14 @@
     />
     <RefreshControl
       lastUpdatedAt={analytics.lastUpdatedAt}
+      queryDurationMs={analytics.lastQueryDurationMs}
+      querySteps={analytics.lastQuerySteps}
       busy={analytics.isQuerying}
       onRefresh={refreshAnalytics}
       label={m.analytics_refresh()}
     />
     <FilterDropdown
-      label="Model"
+      label={m.analytics_model()}
       items={modelItems}
       excludedCsv={analytics.model}
       mode="include"
@@ -548,11 +648,11 @@
     <SummaryCards />
 
     <div class="chart-grid">
-      <div class="chart-panel wide">
+      <Card level="default" padding="none" class="chart-panel wide">
         <Heatmap />
-      </div>
+      </Card>
 
-      <div class="chart-panel">
+      <Card level="default" padding="none" class="chart-panel">
         <div class="chart-header">
           <h3 class="chart-title">
             {m.analytics_activity_by_day_hour()}
@@ -561,38 +661,46 @@
             </span>
           </h3>
         </div>
-        <ActivityTimeline onDateRangeChange={handleDateRangeChange} />
+        <ActivityTimeline
+          deferInitialFetch={initialLoadDeferred}
+          onRangeSelect={handleActivityRangeSelect}
+          onRangeClear={handleActivityRangeClear}
+        />
         <div class="chart-divider"></div>
         <HourOfWeekHeatmap />
-      </div>
+      </Card>
 
-      <div class="chart-panel">
+      <Card level="default" padding="none" class="chart-panel">
         <TopSessions />
-      </div>
+      </Card>
 
-      <div class="chart-panel wide">
+      <Card level="default" padding="none" class="chart-panel wide">
         <ProjectBreakdown />
-      </div>
+      </Card>
 
-      <div class="chart-panel">
+      <Card level="default" padding="none" class="chart-panel">
         <SessionShape />
-      </div>
+      </Card>
 
-      <div class="chart-panel">
+      <Card level="default" padding="none" class="chart-panel">
         <ToolUsage />
-      </div>
+      </Card>
 
-      <div class="chart-panel wide">
+      <Card level="default" padding="none" class="chart-panel wide">
         <TopSkills />
-      </div>
+      </Card>
 
-      <div class="chart-panel wide">
+      <Card level="default" padding="none" class="chart-panel wide">
+        <SkillTrend />
+      </Card>
+
+      <Card level="default" padding="none" class="chart-panel wide">
         <VelocityMetrics />
-      </div>
+      </Card>
 
-      <div class="chart-panel wide">
+      <Card level="default" padding="none" class="chart-panel wide">
         <AgentComparison />
-      </div>
+      </Card>
     </div>
 
     <SessionHealthSection />
@@ -686,19 +794,21 @@
     gap: 12px;
   }
 
-  .chart-panel {
-    background: var(--bg-surface);
-    border: 1px solid var(--border-muted);
-    border-radius: var(--radius-md);
+  .chart-grid :global(.chart-panel) {
     padding: 12px;
     min-height: 200px;
     min-width: 0;
-    overflow-x: hidden;
+    overflow: hidden;
     display: flex;
     flex-direction: column;
+    gap: 0;
   }
 
-  .chart-panel.wide {
+  .chart-grid :global(.chart-panel > .kit-card__body) {
+    display: contents;
+  }
+
+  .chart-grid :global(.chart-panel.wide) {
     grid-column: 1 / -1;
   }
 
@@ -728,7 +838,7 @@
     margin: 12px 0;
   }
 
-  @media (max-width: 800px) {
+  @media (max-width: 760px) {
     .chart-grid {
       grid-template-columns: 1fr;
     }

@@ -2,13 +2,20 @@ package parser
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 )
 
-var _ Provider = (*claudeProvider)(nil)
+var (
+	_ Provider                          = (*claudeProvider)(nil)
+	_ S3Provider                        = (*claudeProvider)(nil)
+	_ RawCaptureProvider                = (*claudeProvider)(nil)
+	_ RawCaptureSourceProvider          = (*claudeProvider)(nil)
+	_ StreamingRawCaptureSourceProvider = (*claudeProvider)(nil)
+)
 
 type claudeProviderFactory struct {
 	def AgentDef
@@ -29,11 +36,9 @@ func (f claudeProviderFactory) Capabilities() Capabilities {
 func (f claudeProviderFactory) NewProvider(cfg ProviderConfig) Provider {
 	cfg = cfg.Clone()
 	return &claudeProvider{
-		ProviderBase: ProviderBase{
-			Def:    cloneAgentDef(f.def),
-			Caps:   claudeProviderCapabilities(),
-			Config: cfg,
-		},
+		Def:     cloneAgentDef(f.def),
+		Caps:    claudeProviderCapabilities(),
+		Config:  cfg,
 		sources: newClaudeSourceSet(cfg.Roots),
 	}
 }
@@ -45,6 +50,56 @@ type claudeProvider struct {
 
 func (p *claudeProvider) Discover(ctx context.Context) ([]SourceRef, error) {
 	return p.sources.Discover(ctx)
+}
+
+func (p *claudeProvider) DiscoverEach(ctx context.Context, yield func(SourceRef) error) error {
+	return p.sources.DiscoverEach(ctx, yield)
+}
+
+func (p *claudeProvider) DiscoverRawCaptureSourcesEach(
+	ctx context.Context,
+	yield func(SourceRef) error,
+) (bool, error) {
+	ctx = withRawCaptureStreamingTraversal(ctx)
+	var incomplete error
+	for rootIndex, root := range p.sources.roots {
+		if err := ReportRawCaptureDiscoveryProgress(ctx); err != nil {
+			return false, err
+		}
+		if isS3URI(root) {
+			continue
+		}
+		err := p.sources.discoverEachRoot(ctx, root, func(source SourceRef) error {
+			for _, earlierRoot := range p.sources.roots[:rootIndex] {
+				earlier, ok := p.sources.sourceRefFromPath(
+					earlierRoot, source.DisplayPath,
+				)
+				if ok && earlier.Key == source.Key {
+					return nil
+				}
+			}
+			return yield(source)
+		})
+		if err == nil {
+			continue
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return false, ctxErr
+		}
+		rootErr, ok := rawCaptureIncompleteRootError(p.Def.Type, root, err)
+		if !ok {
+			return false, err
+		}
+		incomplete = errors.Join(incomplete, rootErr)
+	}
+	return incomplete == nil, incomplete
+}
+
+func (p *claudeProvider) RawCaptureSourcesForChangedPath(
+	ctx context.Context,
+	req ChangedPathRequest,
+) ([]SourceRef, error) {
+	return p.SourcesForChangedPath(ctx, req)
 }
 
 func (p *claudeProvider) WatchPlan(ctx context.Context) (WatchPlan, error) {
@@ -73,6 +128,86 @@ func (p *claudeProvider) Fingerprint(
 	return p.sources.Fingerprint(ctx, source)
 }
 
+func (p *claudeProvider) PlanRawCapture(
+	ctx context.Context,
+	source SourceRef,
+) (RawCapturePlan, error) {
+	if err := ctx.Err(); err != nil {
+		return RawCapturePlan{}, err
+	}
+	src, ok := source.Opaque.(claudeSource)
+	if !ok || src.Root == "" || src.Path == "" || isS3URI(src.Root) {
+		return RawCapturePlan{}, invalidRawCapturePlan("claude source is not a local discovered transcript")
+	}
+	rel, err := filepath.Rel(src.Root, src.Path)
+	if err != nil {
+		return RawCapturePlan{}, invalidRawCapturePlan(
+			"resolve claude source path: %s", rawCaptureFilesystemError(err),
+		)
+	}
+	entries := []RawCaptureEntry{{
+		Path:       filepath.ToSlash(rel),
+		LocalPath:  src.Path,
+		Appendable: true,
+	}}
+	// Background-fork lineage resolution reads sibling top-level project
+	// transcripts, so a project-level capture must carry them as appendable
+	// inputs. Provider ownership stays here: no hosted parser or classifier
+	// duplicates this set.
+	if claudeSourceIsProjectLevel(source, src.Path) {
+		siblings, err := claudeLineageCaptureSiblings(ctx, src.Path)
+		if err != nil {
+			return RawCapturePlan{}, err
+		}
+		for _, sibling := range siblings {
+			siblingRel, err := filepath.Rel(src.Root, sibling)
+			if err != nil {
+				return RawCapturePlan{}, invalidRawCapturePlan(
+					"resolve Claude lineage sibling: %s", rawCaptureFilesystemError(err),
+				)
+			}
+			entries = append(entries, RawCaptureEntry{
+				Path: filepath.ToSlash(siblingRel), LocalPath: sibling, Appendable: true,
+			})
+		}
+	}
+	sidecars, err := claudeLayoutSidecarFiles(ctx, src.Path)
+	if err != nil {
+		return RawCapturePlan{}, invalidRawCapturePlan(
+			"read Claude tool results: %s", rawCaptureFilesystemError(err),
+		)
+	}
+	for _, path := range sidecars {
+		rel, err := filepath.Rel(src.Root, path)
+		if err != nil {
+			return RawCapturePlan{}, invalidRawCapturePlan(
+				"resolve Claude tool result: %s", rawCaptureFilesystemError(err),
+			)
+		}
+		entries = append(entries, RawCaptureEntry{
+			Path: filepath.ToSlash(rel), LocalPath: path,
+		})
+	}
+	return RawCapturePlan{
+		ConfiguredRoot: src.Root,
+		CaptureRoot:    src.Root,
+		SourceKey:      source.Key,
+		Entries:        entries,
+	}, nil
+}
+
+// ComputeMultiFileStatHash implements parser.MultiFileStatHasher for the
+// Claude transcript. Tool-result companions are immutable and do not affect
+// the transcript freshness gate; raw capture enumerates them separately.
+// digest exists so stat-verified freshness persists in provider_freshness
+// across process restarts, sparing a fresh engine (daemon restart or a
+// one-shot CLI sync) the full-content hash that Fingerprint performs for
+// every unchanged transcript. The ctime term in the tuple preserves the
+// in-place-rewrite detection the content hash provided.
+func (p *claudeProvider) ComputeMultiFileStatHash(chatPath string) uint64 {
+	return fileStatTupleDigest(0xC1, chatPath)
+}
+
 func (p *claudeProvider) Parse(
 	ctx context.Context,
 	req ParseRequest,
@@ -82,11 +217,30 @@ func (p *claudeProvider) Parse(
 	}
 	path, ok := p.sources.pathFromSource(req.Source)
 	if !ok {
-		return ParseOutcome{}, fmt.Errorf("claude source path unavailable")
+		return ParseOutcome{}, errors.New("claude source path unavailable")
 	}
 	machine := firstNonEmptyJSONLString(req.Machine, p.Config.Machine)
 	project := claudeProviderProject(ctx, req.Source.ProjectHint, path)
-	results, excludedIDs, err := claudeParseWithExclusions(path, project, machine)
+	var persistedOutputPathResolver func(string) (string, bool)
+	if req.StoredPathResolver != nil {
+		// Stored companions can carry a canonical machine-qualified
+		// spelling (remote mirrors) or the raw recorded path (hosted raw
+		// materializations); try both before falling back to the on-disk
+		// layout, mirroring the shared Claude-layout provider contract.
+		persistedOutputPathResolver = func(path string) (string, bool) {
+			if local, ok := req.StoredPathResolver(path); ok {
+				return local, true
+			}
+			return req.StoredPathResolver(machine + ":" + path)
+		}
+	}
+	opts := claudeParseOptions{
+		ctx:                         ctx,
+		siblingLineage:              claudeSourceIsProjectLevel(req.Source, path),
+		persistedOutputPathResolver: persistedOutputPathResolver,
+		aiTitleFallback:             true,
+	}
+	results, excludedIDs, err := claudeParseFile(path, project, machine, opts)
 	if err != nil {
 		return ParseOutcome{}, err
 	}
@@ -129,7 +283,9 @@ func (p *claudeProvider) ParseUploadedTranscript(
 	path, project, machine string,
 ) ([]ParseResult, error) {
 	machine = firstNonEmptyJSONLString(machine, p.Config.Machine)
-	results, _, err := claudeParseWithExclusions(path, project, machine)
+	results, _, err := claudeParseFile(path, project, machine, claudeParseOptions{
+		uploadIdentity: true,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -147,7 +303,7 @@ func (p *claudeProvider) ParseIncremental(
 	path, ok := p.sources.pathFromSource(req.Source)
 	if !ok {
 		return IncrementalOutcome{}, IncrementalUnsupported,
-			fmt.Errorf("claude source path unavailable")
+			errors.New("claude source path unavailable")
 	}
 	if req.Offset > 0 && req.Fingerprint.Size < req.Offset {
 		return IncrementalOutcome{ForceReplace: true},
@@ -156,20 +312,29 @@ func (p *claudeProvider) ParseIncremental(
 	if req.Fingerprint.Size == req.Offset {
 		return IncrementalOutcome{}, IncrementalNoNewData, nil
 	}
-	newMsgs, endedAt, consumed, err := claudeParseSessionFrom(
+	newMsgs, links, endedAt, consumed, err := claudeParseSessionFrom(
 		path,
 		req.Offset,
-		req.StartOrdinal,
-		req.LastEntryUUID,
+		claudeIncrementalScan{
+			startOrdinal:  req.StartOrdinal,
+			lastEntryUUID: req.LastEntryUUID,
+			stored: claudeStoredIdentity{
+				agentLabel:  req.StoredAgentLabel,
+				entrypoint:  req.StoredEntrypoint,
+				sessionKind: req.StoredSessionKind,
+			},
+			storedLinearParse:         req.StoredClaudeLinearParse,
+			storedTailClaudeMessageID: req.StoredLastClaudeMessageID,
+			storedSessionName:         req.StoredSessionName,
+		},
 	)
 	if err != nil {
 		if IsIncrementalFullParseFallback(err) || errorsIsClaudeDAG(err) {
-			// A DAG fork in appended lines means a rewind: the
-			// full parse follows the live branch, which can
-			// rewrite the main session's already-stored tail in
-			// place (same ordinals, different content). The
-			// write path must replace stored messages, not
-			// append, or the rewind is silently dropped.
+			// Both fallbacks require a replacing write. Explicit
+			// fallbacks update already-stored rows; a detected DAG
+			// fork means the full parse may drop or re-branch stored
+			// messages (small-gap retries follow the latest child),
+			// which the append-only write path would silently retain.
 			return IncrementalOutcome{ForceReplace: true},
 				IncrementalNeedsFullParse, nil
 		}
@@ -179,6 +344,7 @@ func (p *claudeProvider) ParseIncremental(
 		if consumed > 0 {
 			return IncrementalOutcome{
 				SessionID:     req.SessionID,
+				SubagentLinks: links,
 				EndedAt:       endedAt,
 				ConsumedBytes: consumed,
 			}, IncrementalApplied, nil
@@ -189,6 +355,7 @@ func (p *claudeProvider) ParseIncremental(
 	return IncrementalOutcome{
 		SessionID:            req.SessionID,
 		Messages:             newMsgs,
+		SubagentLinks:        links,
 		EndedAt:              endedAt,
 		ConsumedBytes:        consumed,
 		MessageCount:         len(newMsgs),
@@ -205,12 +372,81 @@ type claudeSource struct {
 	Path string
 }
 
+// claudeSourceIsProjectLevel reports whether a discovered local source
+// is a top-level project transcript (root/<project>/<session>.jsonl).
+// Only those participate in background-fork sibling lineage: subagent
+// transcripts, materialized s3 objects, and uploads never do.
+func claudeSourceIsProjectLevel(source SourceRef, path string) bool {
+	var root string
+	switch src := source.Opaque.(type) {
+	case claudeSource:
+		root = src.Root
+	case *claudeSource:
+		if src == nil {
+			return false
+		}
+		root = src.Root
+	default:
+		return false
+	}
+	if root == "" {
+		return false
+	}
+	rel, err := filepath.Rel(filepath.Clean(root), filepath.Clean(path))
+	if err != nil {
+		return false
+	}
+	parts := strings.Split(rel, string(filepath.Separator))
+	return len(parts) == 2 && strings.HasSuffix(parts[1], ".jsonl") &&
+		!strings.HasPrefix(parts[1], "agent-")
+}
+
+// claudeLayoutSpec parameterizes claudeSourceSet over the agents that store
+// transcripts in Claude Code's projects layout
+// (<root>/<project>/<session>.jsonl with optional subagents/ trees and
+// per-session tool-results/ companion directories). Discovery, watch,
+// changed-path classification, find, and fingerprint plumbing are identical
+// across these agents; only the labels and the sidecar-freshness contract
+// differ. Parse semantics stay on each provider: Claude keeps incremental
+// appends and sibling lineage, while ICodeMate CLI relabels the shared DAG
+// parse onto its own agent and ID prefix.
+type claudeLayoutSpec struct {
+	agent         AgentType
+	dirLabel      string
+	debounceScope string
+	watchGlobs    []string
+	listFiles     func(string) []DiscoveredFile
+	// sidecarSources includes persisted tool-result companions in watch
+	// coverage, changed-path mapping, and source fingerprints. The Claude
+	// provider keeps this off: its stored fingerprints hash only the
+	// transcript, and switching to composite hashes would invalidate every
+	// archived Claude fingerprint and force a full reparse.
+	sidecarSources bool
+}
+
+func claudeLayoutSpecClaude() claudeLayoutSpec {
+	return claudeLayoutSpec{
+		agent:         AgentClaude,
+		dirLabel:      "Claude project directory",
+		debounceScope: "projects",
+		watchGlobs:    []string{"*.jsonl"},
+		listFiles:     ClaudeProjectSessionFiles,
+	}
+}
+
 type claudeSourceSet struct {
+	spec  claudeLayoutSpec
 	roots []string
 }
 
 func newClaudeSourceSet(roots []string) claudeSourceSet {
-	return claudeSourceSet{roots: cleanJSONLRoots(roots)}
+	return newClaudeLayoutSourceSet(claudeLayoutSpecClaude(), roots)
+}
+
+func newClaudeLayoutSourceSet(
+	spec claudeLayoutSpec, roots []string,
+) claudeSourceSet {
+	return claudeSourceSet{spec: spec, roots: cleanJSONLRoots(roots)}
 }
 
 func (s claudeSourceSet) Discover(ctx context.Context) ([]SourceRef, error) {
@@ -220,7 +456,7 @@ func (s claudeSourceSet) Discover(ctx context.Context) ([]SourceRef, error) {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		for _, file := range ClaudeProjectSessionFiles(root) {
+		for _, file := range s.spec.listFiles(root) {
 			source, ok := s.discoveredSourceRef(root, file)
 			if !ok {
 				continue
@@ -232,17 +468,96 @@ func (s claudeSourceSet) Discover(ctx context.Context) ([]SourceRef, error) {
 	return sources, nil
 }
 
-// discoveredSourceRef builds the SourceRef for one enumerated Claude session
-// file. Local files resolve through the regular file-backed source ref; s3://
-// objects (which ClaudeProjectSessionFiles enumerates via discoverClaudeS3)
-// carry their durable object metadata in the Opaque payload, because the
+func (s claudeSourceSet) DiscoverEach(
+	ctx context.Context, yield func(SourceRef) error,
+) error {
+	for _, root := range s.roots {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := s.discoverEachRoot(ctx, root, yield); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s claudeSourceSet) discoverEachRoot(
+	ctx context.Context,
+	root string,
+	yield func(SourceRef) error,
+) error {
+	if strings.HasPrefix(root, "s3://") {
+		for _, file := range s.spec.listFiles(root) {
+			source, ok := s.discoveredSourceRef(root, file)
+			if ok {
+				if err := yield(source); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+	return s.streamLocalRoot(ctx, root, yield)
+}
+
+func (s claudeSourceSet) streamLocalRoot(
+	ctx context.Context, root string, yield func(SourceRef) error,
+) error {
+	var incomplete error
+	err := streamDirectoryEntries(ctx, root, func(project os.DirEntry) error {
+		isProjectDir, dirErr := streamingDirCandidateOrIncomplete(
+			s.spec.agent, s.spec.dirLabel, project, root,
+		)
+		if dirErr != nil {
+			incomplete = errors.Join(incomplete, dirErr)
+			return nil
+		}
+		if !isProjectDir {
+			return nil
+		}
+		projectRoot := filepath.Join(root, project.Name())
+		err := streamDirectoryTreeRecursive(ctx, projectRoot, func(
+			path string, entry os.DirEntry,
+		) error {
+			if !strings.HasSuffix(entry.Name(), ".jsonl") {
+				return nil
+			}
+			source, ok := s.sourceRef(root, path)
+			if !ok {
+				return nil
+			}
+			return yield(source)
+		})
+		if err == nil {
+			return nil
+		}
+		if _, ok := discoveryYieldCause(err); ok {
+			return err
+		}
+		if ctx.Err() != nil {
+			return err
+		}
+		incomplete = errors.Join(incomplete, err)
+		return nil
+	})
+	if cause, ok := discoveryYieldCause(err); ok {
+		return cause
+	}
+	return errors.Join(incomplete, err)
+}
+
+// discoveredSourceRef builds the SourceRef for one enumerated session file.
+// Local files resolve through the regular file-backed source ref; s3://
+// objects (which spec.listFiles enumerates via the agent's S3 scanner) carry
+// their durable object metadata in the Opaque payload, because the
 // IsRegularFile gate that sourceRef applies to a local path would otherwise drop
 // every remote object.
 func (s claudeSourceSet) discoveredSourceRef(
 	root string, file DiscoveredFile,
 ) (SourceRef, bool) {
 	if strings.HasPrefix(file.Path, "s3://") {
-		return s3SourceRefFromDiscoveredFile(file), true
+		return s3SourceRefFromDiscoveredFile(root, file), true
 	}
 	return s.sourceRef(root, file.Path)
 }
@@ -250,11 +565,15 @@ func (s claudeSourceSet) discoveredSourceRef(
 func (s claudeSourceSet) WatchPlan(context.Context) (WatchPlan, error) {
 	roots := make([]WatchRoot, 0, len(s.roots))
 	for _, root := range s.roots {
+		if isS3URI(root) {
+			continue
+		}
 		roots = append(roots, WatchRoot{
 			Path:         root,
 			Recursive:    true,
-			IncludeGlobs: []string{"*.jsonl"},
-			DebounceKey:  string(AgentClaude) + ":projects:" + root,
+			IncludeGlobs: s.spec.watchGlobs,
+			DebounceKey: string(s.spec.agent) + ":" +
+				s.spec.debounceScope + ":" + root,
 		})
 	}
 	return WatchPlan{Roots: roots}, nil
@@ -281,6 +600,11 @@ func (s claudeSourceSet) SourcesForChangedPath(
 		if !s.hasRoot(root) {
 			return nil, nil
 		}
+		if s.spec.sidecarSources {
+			if sources, err := s.sourcesForToolResultPath(root, req.Path); err != nil || len(sources) > 0 {
+				return sources, err
+			}
+		}
 		source, ok := s.sourceForChangedPath(root, req.Path, allowMissing)
 		if !ok {
 			return nil, nil
@@ -288,6 +612,11 @@ func (s claudeSourceSet) SourcesForChangedPath(
 		return []SourceRef{source}, nil
 	}
 	for _, root := range s.roots {
+		if s.spec.sidecarSources {
+			if sources, err := s.sourcesForToolResultPath(root, req.Path); err != nil || len(sources) > 0 {
+				return sources, err
+			}
+		}
 		source, ok := s.sourceForChangedPath(root, req.Path, allowMissing)
 		if ok {
 			return []SourceRef{source}, nil
@@ -337,7 +666,9 @@ func (s claudeSourceSet) Fingerprint(
 	}
 	path, ok := s.pathFromSource(source)
 	if !ok {
-		return SourceFingerprint{}, fmt.Errorf("claude source path unavailable")
+		return SourceFingerprint{}, fmt.Errorf(
+			"%s source path unavailable", s.spec.agent,
+		)
 	}
 	info, err := os.Stat(path)
 	if err != nil {
@@ -346,15 +677,21 @@ func (s claudeSourceSet) Fingerprint(
 	if info.IsDir() {
 		return SourceFingerprint{}, fmt.Errorf("stat %s: source is a directory", path)
 	}
-	hash, err := hashJSONLSourceFile(path)
+	size, mtime := info.Size(), info.ModTime().UnixNano()
+	var hash string
+	if s.spec.sidecarSources {
+		hash, size, mtime, err = claudeLayoutCompositeFingerprint(ctx, path, info)
+	} else {
+		hash, err = hashJSONLSourceFileContext(ctx, path)
+	}
 	if err != nil {
 		return SourceFingerprint{}, err
 	}
 	inode, device := sourceFileIdentity(info)
 	return SourceFingerprint{
 		Key:     firstNonEmptyJSONLString(source.FingerprintKey, source.Key, path),
-		Size:    info.Size(),
-		MTimeNS: info.ModTime().UnixNano(),
+		Size:    size,
+		MTimeNS: mtime,
 		Inode:   inode,
 		Device:  device,
 		Hash:    hash,
@@ -421,7 +758,7 @@ func (s claudeSourceSet) sourceRefFromPath(root, path string) (SourceRef, bool) 
 		return SourceRef{}, false
 	}
 	return SourceRef{
-		Provider:       AgentClaude,
+		Provider:       s.spec.agent,
 		Key:            path,
 		DisplayPath:    path,
 		FingerprintKey: path,
@@ -501,7 +838,7 @@ func claudeProviderProject(ctx context.Context, projectHint, path string) string
 }
 
 func errorsIsClaudeDAG(err error) bool {
-	return err == ErrDAGDetected
+	return errors.Is(err, ErrDAGDetected)
 }
 
 func claudeProviderUserMessageCount(msgs []ParsedMessage) int {
@@ -535,6 +872,7 @@ func claudeProviderCapabilities() Capabilities {
 	return Capabilities{
 		Source: SourceCapabilities{
 			DiscoverSources:      CapabilitySupported,
+			StreamingDiscovery:   CapabilitySupported,
 			WatchSources:         CapabilitySupported,
 			ClassifyChangedPath:  CapabilitySupported,
 			FindSource:           CapabilitySupported,
@@ -544,6 +882,9 @@ func claudeProviderCapabilities() Capabilities {
 			PerSessionErrors:     CapabilityNotApplicable,
 			ExcludedSessions:     CapabilitySupported,
 			ForceReplaceOnParse:  CapabilitySupported,
+			VerifiedLocalStat:    CapabilitySupported,
+			MultiFileStatHash:    CapabilitySupported,
+			S3Discovery:          CapabilitySupported,
 		},
 		Content: ContentCapabilities{
 			FirstMessage:         CapabilitySupported,
@@ -560,6 +901,17 @@ func claudeProviderCapabilities() Capabilities {
 			MalformedLineCount:   CapabilitySupported,
 			Model:                CapabilitySupported,
 			StopReason:           CapabilitySupported,
+		},
+		Sync: ProviderSyncSemantics{
+			FingerprintHashInCacheKey:           true,
+			FingerprintHashRequiredForFreshness: true,
+			SkipCacheFreshWithoutStoredRow:      true,
+		},
+		RawCapture: RawCaptureCapabilities{
+			Support:  CapabilitySupported,
+			Shape:    RawCaptureShapeFiles,
+			Append:   RawCaptureAppendMany,
+			Snapshot: RawCaptureSnapshotNone,
 		},
 	}
 }

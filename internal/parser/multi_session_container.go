@@ -35,10 +35,93 @@ type multiSessionSource struct {
 // physical container and, for a member, its ID. ProjectHint is surfaced on the
 // SourceRef for providers that attribute a project at discovery time.
 type multiSessionMatch struct {
-	Path        string
-	Container   string
-	MemberID    string
-	ProjectHint string
+	Path                   string
+	Container              string
+	MemberID               string
+	ReconciliationIdentity string
+	ProjectHint            string
+	DiscoveryMTimeNS       int64
+}
+
+// classifySQLiteContainerPath maps a stored or changed path to its database
+// container and member, shared by every multi-session provider whose
+// sessions live in one shared SQLite database (Zed, Shelley, Omnigent).
+// dbRelPath is the container's path relative to a provider root (e.g.
+// "shelley.db", "threads/threads.db"); parseVirtual splits a virtual member
+// path into its physical container path and raw member ID. allowMissing
+// relaxes the regular-file requirement so a database delete (or its WAL/SHM
+// sibling) still classifies for tombstones. rejectShmSiblingEvents refuses to
+// resolve a bare "-shm" sibling event to the container; Omnigent and Cursor
+// IDE set it, because opening their own read connections updates that file's
+// mtime and would otherwise make every scan trigger the next one.
+func classifySQLiteContainerPath(
+	root, path, dbRelPath string,
+	allowMissing, rejectShmSiblingEvents bool,
+	parseVirtual func(path string) (dbPath, memberID string, ok bool),
+) (multiSessionMatch, bool) {
+	root = filepath.Clean(root)
+	path = filepath.Clean(path)
+	requireRegular := !allowMissing
+	if dbPath, memberID, ok := parseVirtual(path); ok {
+		if !sqliteContainerUnderRoot(root, dbPath, dbRelPath, requireRegular) {
+			return multiSessionMatch{}, false
+		}
+		return multiSessionMatch{
+			Path:      path,
+			Container: dbPath,
+			MemberID:  memberID,
+		}, true
+	}
+	if sqliteContainerUnderRoot(root, path, dbRelPath, requireRegular) {
+		return multiSessionMatch{Path: path, Container: path}, true
+	}
+	if allowMissing {
+		if dbPath, ok := sqliteContainerPathForEvent(
+			root, path, dbRelPath, rejectShmSiblingEvents,
+		); ok {
+			return multiSessionMatch{Path: dbPath, Container: dbPath}, true
+		}
+	}
+	return multiSessionMatch{}, false
+}
+
+// sqliteContainerUnderRoot reports whether dbPath is the provider's shared
+// database at its expected location under root.
+func sqliteContainerUnderRoot(
+	root, dbPath, dbRelPath string, requireRegular bool,
+) bool {
+	root = filepath.Clean(root)
+	dbPath = filepath.Clean(dbPath)
+	rel, ok := relUnder(root, dbPath)
+	if !ok || filepath.ToSlash(rel) != dbRelPath {
+		return false
+	}
+	return !requireRegular || IsRegularFile(dbPath)
+}
+
+// sqliteContainerPathForEvent resolves a changed-path event naming the
+// database file itself or a WAL/SHM/journal sibling to the container's
+// canonical path.
+func sqliteContainerPathForEvent(
+	root, path, dbRelPath string, rejectShmSiblingEvents bool,
+) (string, bool) {
+	root = filepath.Clean(root)
+	path = filepath.Clean(path)
+	if rejectShmSiblingEvents && strings.HasSuffix(path, "-shm") {
+		return "", false
+	}
+	rel, ok := relUnder(root, path)
+	if !ok {
+		return "", false
+	}
+	dbDir := filepath.ToSlash(filepath.Dir(dbRelPath))
+	dbBase := filepath.Base(dbRelPath)
+	if filepath.ToSlash(rel) == dbRelPath ||
+		(filepath.ToSlash(filepath.Dir(rel)) == dbDir &&
+			strings.HasPrefix(filepath.Base(rel), dbBase+"-")) {
+		return filepath.Join(root, filepath.FromSlash(dbRelPath)), true
+	}
+	return "", false
 }
 
 type multiSessionConfig struct {
@@ -50,6 +133,7 @@ type multiSessionConfig struct {
 	// discovery time rather than one source per container. Mutually exclusive
 	// with discoverContainers.
 	discoverSources func(root string) []multiSessionMatch
+	discoverEach    func(context.Context, string, func(multiSessionMatch) error) error
 	// watchRoots returns the provider WatchPlan roots for the configured roots.
 	watchRoots func(roots []string) []WatchRoot
 	// classifyPath maps a stored or changed path to its container/member.
@@ -57,23 +141,42 @@ type multiSessionConfig struct {
 	// such as a SQLite WAL file) still classifies for changed-path tombstones.
 	classifyPath func(root, path string, allowMissing bool) (multiSessionMatch, bool)
 	// findMember resolves a raw session ID to its member match under one root.
-	findMember func(root, rawID string) (multiSessionMatch, bool)
+	findMember func(ctx context.Context, root, rawID string) (multiSessionMatch, bool)
+	// reconciliationIdentity restores the stable SourceRef key for an exact
+	// member reconstructed from its stored path. Optional; positional sources
+	// use the reconciliation cache to avoid rescanning their container.
+	reconciliationIdentity func(context.Context, multiSessionMatch) (string, error)
+	// storedReconciliationIdentity derives the matching identity from a stored
+	// full session ID. It is paired with reconciliationIdentity so the engine
+	// does not need provider-specific identity policy.
+	storedReconciliationIdentity func(string) string
 	// storedPathFallback resolves a stored path that classifyPath could not
 	// match directly (for example a canonical remote-sync path that must be
 	// mapped back onto a local container). Optional.
 	storedPathFallback func(root, path string) (multiSessionMatch, bool)
 	// fingerprint returns the source freshness fingerprint (Size/MTime/Hash);
 	// the base supplies the Key.
-	fingerprint func(src multiSessionSource) (SourceFingerprint, error)
+	fingerprint        func(src multiSessionSource) (SourceFingerprint, error)
+	fingerprintContext func(context.Context, multiSessionSource) (SourceFingerprint, error)
+	// parseContainerOutcome optionally builds the full container outcome
+	// directly, for providers that need container-level completeness or
+	// no-session semantics beyond a flat []ParseResult.
+	parseContainerOutcome func(ctx context.Context, src multiSessionSource, req ParseRequest) (ParseOutcome, error)
 	// parseContainer parses every member of a container into one result each.
 	// The full ParseRequest is passed so a closure can read req.Machine and
 	// per-request hints such as req.Source.ProjectHint.
-	parseContainer func(src multiSessionSource, req ParseRequest) ([]ParseResult, error)
+	parseContainer        func(src multiSessionSource, req ParseRequest) ([]ParseResult, error)
+	parseContainerContext func(context.Context, multiSessionSource, ParseRequest) ([]ParseResult, error)
 	// parseMember parses a single member; a nil result is a clean no-session.
-	parseMember func(src multiSessionSource, req ParseRequest) (*ParseResult, error)
+	parseMember        func(src multiSessionSource, req ParseRequest) (*ParseResult, error)
+	parseMemberContext func(context.Context, multiSessionSource, ParseRequest) (*ParseResult, error)
 	// memberPresent reports whether a source still exists for RequireFreshSource
 	// lookups. Optional; the default treats every source as present.
-	memberPresent func(src multiSessionSource) bool
+	memberPresent func(ctx context.Context, src multiSessionSource) bool
+	// batchMemberPresence reports current membership for the stored members of one
+	// changed container during a single tombstone pass. Optional; when nil the
+	// base falls back to calling memberPresent per member.
+	batchMemberPresence func(ctx context.Context, container multiSessionSource, members []multiSessionSource) map[string]bool
 	// freshStoredMember reports whether a stored member source still resolves to
 	// the requested raw session ID under RequireFreshSource. Providers with
 	// positional member IDs (Aider's run index) set this so a stored path whose
@@ -88,6 +191,27 @@ type multiSessionConfig struct {
 
 type MultiSessionOption func(*multiSessionConfig)
 
+func multiSessionContainerSourceCapabilities(
+	compositeFingerprint CapabilitySupport,
+	storedSourceHints CapabilitySupport,
+) SourceCapabilities {
+	return SourceCapabilities{
+		DiscoverSources:       CapabilitySupported,
+		StreamingDiscovery:    CapabilitySupported,
+		WatchSources:          CapabilitySupported,
+		ClassifyChangedPath:   CapabilitySupported,
+		StoredSourceHints:     storedSourceHints,
+		FindSource:            CapabilitySupported,
+		CompositeFingerprint:  compositeFingerprint,
+		IncrementalAppend:     CapabilityNotApplicable,
+		MultiSessionSource:    CapabilitySupported,
+		SharedContainerSource: CapabilitySupported,
+		PerSessionErrors:      CapabilityNotApplicable,
+		ExcludedSessions:      CapabilityNotApplicable,
+		ForceReplaceOnParse:   CapabilitySupported,
+	}
+}
+
 func WithContainerDiscovery(fn func(root string) []string) MultiSessionOption {
 	return func(c *multiSessionConfig) { c.discoverContainers = fn }
 }
@@ -96,6 +220,12 @@ func WithSourceDiscovery(
 	fn func(root string) []multiSessionMatch,
 ) MultiSessionOption {
 	return func(c *multiSessionConfig) { c.discoverSources = fn }
+}
+
+func WithStreamingSourceDiscovery(
+	fn func(context.Context, string, func(multiSessionMatch) error) error,
+) MultiSessionOption {
+	return func(c *multiSessionConfig) { c.discoverEach = fn }
 }
 
 func WithWatchRoots(fn func(roots []string) []WatchRoot) MultiSessionOption {
@@ -109,9 +239,19 @@ func WithChangedPathClassifier(
 }
 
 func WithMemberLookup(
-	fn func(root, rawID string) (multiSessionMatch, bool),
+	fn func(ctx context.Context, root, rawID string) (multiSessionMatch, bool),
 ) MultiSessionOption {
 	return func(c *multiSessionConfig) { c.findMember = fn }
+}
+
+func WithReconciliationIdentity(
+	fn func(context.Context, multiSessionMatch) (string, error),
+	stored func(string) string,
+) MultiSessionOption {
+	return func(c *multiSessionConfig) {
+		c.reconciliationIdentity = fn
+		c.storedReconciliationIdentity = stored
+	}
 }
 
 func WithStoredPathFallback(
@@ -126,10 +266,28 @@ func WithFingerprint(
 	return func(c *multiSessionConfig) { c.fingerprint = fn }
 }
 
+func WithContextFingerprint(
+	fn func(context.Context, multiSessionSource) (SourceFingerprint, error),
+) MultiSessionOption {
+	return func(c *multiSessionConfig) { c.fingerprintContext = fn }
+}
+
 func WithContainerParse(
 	fn func(src multiSessionSource, req ParseRequest) ([]ParseResult, error),
 ) MultiSessionOption {
 	return func(c *multiSessionConfig) { c.parseContainer = fn }
+}
+
+func WithContextContainerParse(
+	fn func(context.Context, multiSessionSource, ParseRequest) ([]ParseResult, error),
+) MultiSessionOption {
+	return func(c *multiSessionConfig) { c.parseContainerContext = fn }
+}
+
+func WithContainerParseOutcome(
+	fn func(ctx context.Context, src multiSessionSource, req ParseRequest) (ParseOutcome, error),
+) MultiSessionOption {
+	return func(c *multiSessionConfig) { c.parseContainerOutcome = fn }
 }
 
 func WithMemberParse(
@@ -138,8 +296,20 @@ func WithMemberParse(
 	return func(c *multiSessionConfig) { c.parseMember = fn }
 }
 
-func WithMemberPresence(fn func(src multiSessionSource) bool) MultiSessionOption {
+func WithContextMemberParse(
+	fn func(context.Context, multiSessionSource, ParseRequest) (*ParseResult, error),
+) MultiSessionOption {
+	return func(c *multiSessionConfig) { c.parseMemberContext = fn }
+}
+
+func WithMemberPresence(fn func(ctx context.Context, src multiSessionSource) bool) MultiSessionOption {
 	return func(c *multiSessionConfig) { c.memberPresent = fn }
+}
+
+func WithBatchMemberPresence(
+	fn func(ctx context.Context, container multiSessionSource, members []multiSessionSource) map[string]bool,
+) MultiSessionOption {
+	return func(c *multiSessionConfig) { c.batchMemberPresence = fn }
 }
 
 func WithFreshStoredMember(
@@ -162,7 +332,7 @@ func NewMultiSessionContainerSourceSet(
 		opt(&cfg)
 	}
 	switch {
-	case cfg.discoverContainers == nil && cfg.discoverSources == nil:
+	case cfg.discoverContainers == nil && cfg.discoverSources == nil && cfg.discoverEach == nil:
 		panic("multi-session container: missing WithContainerDiscovery or WithSourceDiscovery")
 	case cfg.watchRoots == nil:
 		panic("multi-session container: missing WithWatchRoots")
@@ -170,11 +340,11 @@ func NewMultiSessionContainerSourceSet(
 		panic("multi-session container: missing WithChangedPathClassifier")
 	case cfg.findMember == nil:
 		panic("multi-session container: missing WithMemberLookup")
-	case cfg.fingerprint == nil:
+	case cfg.fingerprint == nil && cfg.fingerprintContext == nil:
 		panic("multi-session container: missing WithFingerprint")
-	case cfg.parseContainer == nil:
-		panic("multi-session container: missing WithContainerParse")
-	case cfg.parseMember == nil:
+	case cfg.parseContainer == nil && cfg.parseContainerContext == nil && cfg.parseContainerOutcome == nil:
+		panic("multi-session container: missing WithContainerParse or WithContainerParseOutcome")
+	case cfg.parseMember == nil && cfg.parseMemberContext == nil:
 		panic("multi-session container: missing WithMemberParse")
 	}
 	return multiSessionContainerSourceSet{
@@ -190,6 +360,34 @@ type multiSessionContainerSourceSet struct {
 	cfg   multiSessionConfig
 }
 
+// ReconciliationContainer maps a requested reconciliation root to the
+// physical container that atomically owns it: the container file itself, a
+// member's virtual spelling, or a sidecar event path (SQLite WAL/SHM). The
+// scope planner widens such a request to the container's whole virtual
+// membership; the generic descendant proof would name only the bare path,
+// which admits no "<container>#<member>" source and pages no member row — a
+// successful no-op over the sessions the caller asked about. Classification
+// runs with allowMissing so a deleted container still resolves and its
+// members remain reclaimable. Requests arrive absolutized, so a relative
+// configured root is also tried in its absolute spelling.
+func (s multiSessionContainerSourceSet) ReconciliationContainer(
+	requested string,
+) (string, bool) {
+	for _, root := range s.roots {
+		spellings := []string{root}
+		if abs := cleanReconciliationScopeRoot(root); abs != filepath.Clean(root) {
+			spellings = append(spellings, abs)
+		}
+		for _, spelling := range spellings {
+			if match, ok := s.cfg.classifyPath(spelling, requested, true); ok &&
+				match.Container != "" {
+				return match.Container, true
+			}
+		}
+	}
+	return "", false
+}
+
 func (s multiSessionContainerSourceSet) Discover(
 	ctx context.Context,
 ) ([]SourceRef, error) {
@@ -200,14 +398,43 @@ func (s multiSessionContainerSourceSet) Discover(
 			return nil, err
 		}
 		for _, match := range s.discoverMatches(root) {
-			if match.Path == "" {
-				continue
+			if match.Path != "" {
+				addJSONLSource(s.sourceRef(root, match), &sources, seen)
 			}
-			addJSONLSource(s.sourceRef(root, match), &sources, seen)
 		}
 	}
 	sortJSONLSources(sources)
 	return sources, nil
+}
+
+func (s multiSessionContainerSourceSet) DiscoverEach(
+	ctx context.Context, yield func(SourceRef) error,
+) error {
+	for _, root := range s.roots {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if s.cfg.discoverEach != nil {
+			if err := s.cfg.discoverEach(ctx, root, func(match multiSessionMatch) error {
+				if match.Path == "" {
+					return nil
+				}
+				return yield(s.sourceRef(root, match))
+			}); err != nil {
+				return err
+			}
+			continue
+		}
+		for _, match := range s.discoverMatches(root) {
+			if match.Path == "" {
+				continue
+			}
+			if err := yield(s.sourceRef(root, match)); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // discoverMatches yields the discovery matches for one root: either the
@@ -223,6 +450,10 @@ func (s multiSessionContainerSourceSet) discoverMatches(
 	out := make([]multiSessionMatch, 0, len(containers))
 	for _, container := range containers {
 		if container == "" {
+			continue
+		}
+		if match, ok := s.cfg.classifyPath(root, container, false); ok {
+			out = append(out, match)
 			continue
 		}
 		out = append(out, multiSessionMatch{Path: container, Container: container})
@@ -248,7 +479,7 @@ func (s multiSessionContainerSourceSet) SourcesForChangedPath(
 		if !ok {
 			continue
 		}
-		tombstones := s.changedPathTombstones(root, match, req.StoredSourcePaths)
+		tombstones := s.changedPathTombstones(ctx, root, match, req.StoredSourcePaths)
 		sources := make([]SourceRef, 0, 1+len(tombstones))
 		if req.EventKind != "remove" ||
 			len(tombstones) == 0 ||
@@ -261,6 +492,77 @@ func (s multiSessionContainerSourceSet) SourcesForChangedPath(
 	return nil, nil
 }
 
+func (s multiSessionContainerSourceSet) StoredSourceHintScopes(
+	req ChangedPathRequest,
+) []StoredSourceHintScope {
+	for _, root := range s.roots {
+		match, ok := s.cfg.classifyPath(root, req.Path, true)
+		if !ok || match.Container == "" {
+			continue
+		}
+		if match.MemberID != "" && match.Path != "" {
+			return []StoredSourceHintScope{{Path: match.Path}}
+		}
+		return []StoredSourceHintScope{{
+			Path: match.Container, IncludeVirtualMembers: true,
+		}}
+	}
+	return nil
+}
+
+func (s multiSessionContainerSourceSet) SourceForReconciliation(
+	ctx context.Context, path, project string,
+) (SourceRef, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return SourceRef{}, false, err
+	}
+	for _, root := range s.roots {
+		match, ok := s.cfg.classifyPath(root, path, false)
+		if !ok {
+			continue
+		}
+		if project != "" {
+			match.ProjectHint = project
+		}
+		if s.cfg.reconciliationIdentity != nil {
+			identity, err := s.cfg.reconciliationIdentity(ctx, match)
+			if err != nil {
+				return SourceRef{}, false, err
+			}
+			match.ReconciliationIdentity = identity
+		}
+		return s.sourceRef(root, match), true, nil
+	}
+	return SourceRef{}, false, nil
+}
+
+func (s multiSessionContainerSourceSet) PersistentArchiveSource(
+	path string, fullSessionID string,
+) (string, bool) {
+	def, ok := AgentByType(s.agent)
+	if !ok {
+		return "", false
+	}
+	rawSessionID := ProviderRawSessionIDFromFull(def, fullSessionID)
+	for _, root := range s.roots {
+		match, ok := s.cfg.classifyPath(root, path, true)
+		if ok && match.MemberID != "" && match.MemberID == rawSessionID &&
+			match.Container != "" {
+			return match.Container, true
+		}
+	}
+	return "", false
+}
+
+func (s multiSessionContainerSourceSet) ReconciliationMemberIdentity(
+	fullSessionID string,
+) string {
+	if s.cfg.storedReconciliationIdentity == nil {
+		return ""
+	}
+	return s.cfg.storedReconciliationIdentity(fullSessionID)
+}
+
 // changedPathTombstones emits a per-member source for every stored member that
 // belongs to the changed container, is no longer present, yet whose container
 // file still exists. The whole-container source re-writes the surviving
@@ -270,7 +572,7 @@ func (s multiSessionContainerSourceSet) SourcesForChangedPath(
 // tombstones, preserving the archive when the whole source file disappears; a
 // vanished one-file-per-member container emits the stored member tombstone so
 // the deleted row is force-replaced instead of lingering forever.
-func (s multiSessionContainerSourceSet) changedPathTombstones(
+func (s multiSessionContainerSourceSet) changedPathTombstones(ctx context.Context,
 	root string,
 	changed multiSessionMatch,
 	storedPaths []string,
@@ -281,6 +583,7 @@ func (s multiSessionContainerSourceSet) changedPathTombstones(
 	containerExists := IsRegularFile(changed.Container)
 	var tombstones []SourceRef
 	seen := make(map[string]struct{})
+	var members []multiSessionMatch
 	for _, stored := range storedPaths {
 		match, ok := s.cfg.classifyPath(root, stored, true)
 		if !ok || match.MemberID == "" {
@@ -293,7 +596,7 @@ func (s multiSessionContainerSourceSet) changedPathTombstones(
 			if !multiSessionMatchOwnsContainer(match) {
 				continue
 			}
-			if current, ok := s.cfg.findMember(root, match.MemberID); ok &&
+			if current, ok := s.cfg.findMember(ctx, root, match.MemberID); ok &&
 				!samePath(current.Container, match.Container) {
 				if _, dup := seen[current.Path]; dup {
 					continue
@@ -302,7 +605,18 @@ func (s multiSessionContainerSourceSet) changedPathTombstones(
 				tombstones = append(tombstones, s.sourceRef(root, current))
 				continue
 			}
-		} else if s.memberPresent(match.toSource(root)) {
+			if _, dup := seen[match.Path]; dup {
+				continue
+			}
+			seen[match.Path] = struct{}{}
+			tombstones = append(tombstones, s.sourceRef(root, match))
+			continue
+		}
+		members = append(members, match)
+	}
+	present := s.batchMemberPresence(ctx, changed.toSource(root), members)
+	for _, match := range members {
+		if s.memberPresentForTombstone(ctx, match.toSource(root), present) {
 			continue
 		}
 		if _, dup := seen[match.Path]; dup {
@@ -312,6 +626,32 @@ func (s multiSessionContainerSourceSet) changedPathTombstones(
 		tombstones = append(tombstones, s.sourceRef(root, match))
 	}
 	return tombstones
+}
+
+func (s multiSessionContainerSourceSet) batchMemberPresence(ctx context.Context,
+	container multiSessionSource,
+	members []multiSessionMatch,
+) map[string]bool {
+	if s.cfg.batchMemberPresence == nil || len(members) == 0 {
+		return nil
+	}
+	batch := make([]multiSessionSource, 0, len(members))
+	for _, member := range members {
+		batch = append(batch, member.toSource(container.Root))
+	}
+	return s.cfg.batchMemberPresence(ctx, container, batch)
+}
+
+func (s multiSessionContainerSourceSet) memberPresentForTombstone(ctx context.Context,
+	src multiSessionSource,
+	present map[string]bool,
+) bool {
+	if present != nil {
+		if ok, found := present[src.Path]; found {
+			return ok
+		}
+	}
+	return s.memberPresent(ctx, src)
 }
 
 func multiSessionMatchOwnsContainer(
@@ -337,7 +677,7 @@ func (s multiSessionContainerSourceSet) FindSource(
 				continue
 			}
 			memberSrc := match.toSource(root)
-			if req.RequireFreshSource && !s.memberPresent(memberSrc) {
+			if req.RequireFreshSource && !s.memberPresent(ctx, memberSrc) {
 				continue
 			}
 			if s.staleStoredMember(memberSrc, req) {
@@ -363,7 +703,7 @@ func (s multiSessionContainerSourceSet) FindSource(
 		if err := ctx.Err(); err != nil {
 			return SourceRef{}, false, err
 		}
-		if match, ok := s.cfg.findMember(root, req.RawSessionID); ok {
+		if match, ok := s.cfg.findMember(ctx, root, req.RawSessionID); ok {
 			return s.sourceRef(root, match), true, nil
 		}
 	}
@@ -381,7 +721,13 @@ func (s multiSessionContainerSourceSet) Fingerprint(
 	if !ok {
 		return SourceFingerprint{}, fmt.Errorf("%s source path unavailable", s.agent)
 	}
-	fingerprint, err := s.cfg.fingerprint(src)
+	var fingerprint SourceFingerprint
+	var err error
+	if s.cfg.fingerprintContext != nil {
+		fingerprint, err = s.cfg.fingerprintContext(ctx, src)
+	} else {
+		fingerprint, err = s.cfg.fingerprint(src)
+	}
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) &&
 			multiSessionSourceOwnsContainer(src) {
@@ -397,11 +743,17 @@ func (s multiSessionContainerSourceSet) Fingerprint(
 }
 
 func (s multiSessionContainerSourceSet) parse(
-	src multiSessionSource, req ParseRequest,
+	ctx context.Context, src multiSessionSource, req ParseRequest,
 ) (ParseOutcome, error) {
 	fingerprintHash := req.Fingerprint.Hash
 	if src.MemberID != "" {
-		result, err := s.cfg.parseMember(src, req)
+		var result *ParseResult
+		var err error
+		if s.cfg.parseMemberContext != nil {
+			result, err = s.cfg.parseMemberContext(ctx, src, req)
+		} else {
+			result, err = s.cfg.parseMember(src, req)
+		}
 		if err != nil {
 			return ParseOutcome{}, err
 		}
@@ -421,7 +773,26 @@ func (s multiSessionContainerSourceSet) parse(
 		}, nil
 	}
 
-	results, err := s.cfg.parseContainer(src, req)
+	if s.cfg.parseContainerOutcome != nil {
+		outcome, err := s.cfg.parseContainerOutcome(ctx, src, req)
+		if err != nil {
+			return ParseOutcome{}, err
+		}
+		if fingerprintHash != "" && s.cfg.stampContainerHash {
+			for i := range outcome.Results {
+				outcome.Results[i].Result.Session.File.Hash = fingerprintHash
+			}
+		}
+		return outcome, nil
+	}
+
+	var results []ParseResult
+	var err error
+	if s.cfg.parseContainerContext != nil {
+		results, err = s.cfg.parseContainerContext(ctx, src, req)
+	} else {
+		results, err = s.cfg.parseContainer(src, req)
+	}
 	if err != nil {
 		return ParseOutcome{}, err
 	}
@@ -443,6 +814,13 @@ func (s multiSessionContainerSourceSet) parse(
 		ResultSetComplete: true,
 		ForceReplace:      true,
 	}, nil
+}
+
+func unsupportedMultiSessionOutcome() ParseOutcome {
+	return ParseOutcome{
+		ResultSetComplete: true,
+		SkipReason:        SkipUnsupportedSource,
+	}
 }
 
 // skipOutcome builds the "no session" outcome for a container/member that
@@ -488,11 +866,11 @@ func multiSessionMemberOwnsContainer(memberID, container string) bool {
 		strings.EqualFold(memberID, base)
 }
 
-func (s multiSessionContainerSourceSet) memberPresent(src multiSessionSource) bool {
+func (s multiSessionContainerSourceSet) memberPresent(ctx context.Context, src multiSessionSource) bool {
 	if s.cfg.memberPresent == nil {
 		return true
 	}
-	return s.cfg.memberPresent(src)
+	return s.cfg.memberPresent(ctx, src)
 }
 
 // staleStoredMember reports whether a RequireFreshSource lookup must reject a
@@ -515,12 +893,14 @@ func (s multiSessionContainerSourceSet) sourceRef(
 	root string, match multiSessionMatch,
 ) SourceRef {
 	return SourceRef{
-		Provider:       s.agent,
-		Key:            match.Path,
-		DisplayPath:    match.Path,
-		FingerprintKey: match.Path,
-		ProjectHint:    match.ProjectHint,
-		Opaque:         match.toSource(root),
+		Provider:               s.agent,
+		Key:                    match.Path,
+		DisplayPath:            match.Path,
+		FingerprintKey:         match.Path,
+		ReconciliationIdentity: match.ReconciliationIdentity,
+		ProjectHint:            match.ProjectHint,
+		DiscoveryMTimeNS:       match.DiscoveryMTimeNS,
+		Opaque:                 match.toSource(root),
 	}
 }
 
@@ -576,7 +956,7 @@ func (s multiSessionContainerSourceSet) Parse(
 	if !ok {
 		return ParseOutcome{}, fmt.Errorf("%s source path unavailable", s.agent)
 	}
-	return s.parse(src, req)
+	return s.parse(ctx, src, req)
 }
 
 // NewMultiSessionProviderFactory builds a ProviderFactory for a multi-session

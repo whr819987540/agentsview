@@ -7,11 +7,15 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
 	"go.kenn.io/agentsview/internal/config"
+	"go.kenn.io/agentsview/internal/pathutil"
 	"go.kenn.io/agentsview/internal/service"
+	"go.kenn.io/agentsview/internal/servicehttp"
+	"go.kenn.io/agentsview/internal/timeutil"
 )
 
 func newSessionCommand() *cobra.Command {
@@ -68,7 +72,7 @@ func resolveService(
 		if err != nil {
 			return nil, nil, err
 		}
-		return service.NewHTTPBackend(remote, token, false),
+		return servicehttp.NewHTTPBackend(remote, token, false, ""),
 			func() {}, nil
 	}
 	cfg, err := config.LoadPFlags(cmd.Flags())
@@ -88,7 +92,28 @@ func resolveService(
 	if err != nil {
 		return nil, nil, err
 	}
-	return newService(cfg, tr)
+	return newService(cmd.Context(), cfg, tr)
+}
+
+// resolveSinceFlag validates the --since/--active-since pair shared by
+// `session list` and `session search`: setting both is an error, since they
+// describe the same active-window filter two different ways. When --since is
+// set, it resolves against the current time via timeutil.ParseSince and
+// returns the RFC3339 string to use as ActiveSince; otherwise activeSince
+// passes through unchanged.
+func resolveSinceFlag(since, activeSince string) (string, error) {
+	if since == "" {
+		return activeSince, nil
+	}
+	if activeSince != "" {
+		return "", errors.New(
+			"--since and --active-since are mutually exclusive")
+	}
+	t, err := timeutil.ParseSince(time.Now(), since)
+	if err != nil {
+		return "", err
+	}
+	return t.UTC().Format(time.RFC3339), nil
 }
 
 // resolveWritableService constructs a write-capable SessionService:
@@ -121,7 +146,7 @@ func resolveWritableServiceWithIntent(
 		if err != nil {
 			return nil, nil, err
 		}
-		return service.NewHTTPBackend(remote, token, false),
+		return servicehttp.NewHTTPBackend(remote, token, false, ""),
 			func() {}, nil
 	}
 	if pgReadRequested(cmd) {
@@ -160,7 +185,7 @@ func resolveWritableServiceWithIntent(
 				"is reachable and compatible, or stop it to write locally",
 		)
 	}
-	return syncService(cfg, tr)
+	return syncService(cmd.Context(), cfg, tr)
 }
 
 func resolvePGReadConfig(
@@ -196,6 +221,10 @@ func explicitServerToken(cmd *cobra.Command) (string, error) {
 	}
 	path, err := cmd.Flags().GetString("server-token-file")
 	if err == nil && strings.TrimSpace(path) != "" {
+		path, err = pathutil.ExpandHome(path)
+		if err != nil {
+			return "", fmt.Errorf("expanding --server-token-file: %w", err)
+		}
 		b, err := os.ReadFile(path)
 		if err != nil {
 			return "", fmt.Errorf("reading --server-token-file: %w", err)

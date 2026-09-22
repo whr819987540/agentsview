@@ -3,7 +3,9 @@ package insight
 import (
 	"bufio"
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -11,6 +13,8 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+
+	"go.kenn.io/agentsview/internal/stringutil"
 )
 
 // geminiInsightModel is the model passed to the gemini CLI
@@ -80,26 +84,8 @@ type AgentConfig struct {
 
 // GenerateOptions holds optional insight generation overrides.
 type GenerateOptions struct {
-	Agents map[string]AgentConfig
-}
-
-// Generate invokes an AI agent CLI to generate an insight.
-// The agent parameter selects which CLI to use (claude,
-// codex, gemini). The prompt is passed via stdin.
-func Generate(
-	ctx context.Context, agent, prompt string,
-) (Result, error) {
-	return GenerateStream(ctx, agent, prompt, nil)
-}
-
-// GenerateStream invokes an AI agent CLI to generate an
-// insight while optionally streaming process logs.
-func GenerateStream(
-	ctx context.Context, agent, prompt string, onLog LogFunc,
-) (Result, error) {
-	return GenerateStreamWithOptions(
-		ctx, agent, prompt, onLog, GenerateOptions{},
-	)
+	Agents   map[string]AgentConfig
+	Endpoint *EndpointConfig
 }
 
 // GenerateStreamWithOptions invokes an AI agent CLI to generate an
@@ -112,6 +98,9 @@ func GenerateStreamWithOptions(
 		return Result{}, fmt.Errorf(
 			"unsupported agent: %s", agent,
 		)
+	}
+	if opts.Endpoint != nil {
+		return generateEndpoint(ctx, *opts.Endpoint, prompt)
 	}
 
 	path, err := resolveAgentBinary(agent, opts)
@@ -177,10 +166,11 @@ func truncateLogLine(line string, maxBytes int) string {
 	if maxBytes <= 0 || len(line) <= maxBytes {
 		return line
 	}
-	omitted := len(line) - maxBytes
+	prefix := stringutil.SafeTruncate(line, maxBytes)
+	omitted := len(line) - len(prefix)
 	return fmt.Sprintf(
 		"%s... [truncated %d bytes]",
-		line[:maxBytes], omitted,
+		prefix, omitted,
 	)
 }
 
@@ -312,13 +302,13 @@ func generateClaude(
 // versions: {"result":"...","model":"..."}.
 func parseCLIResult(data []byte) (result, model string) {
 	// Try JSON array format (Claude Code v2+).
-	var events []json.RawMessage
+	var events []jsontext.Value
 	if json.Unmarshal(data, &events) == nil {
 		for _, raw := range events {
 			var ev struct {
-				Type       string                     `json:"type"`
-				Result     string                     `json:"result"`
-				ModelUsage map[string]json.RawMessage `json:"modelUsage"`
+				Type       string                    `json:"type"`
+				Result     string                    `json:"result"`
+				ModelUsage map[string]jsontext.Value `json:"modelUsage"`
 			}
 			if json.Unmarshal(raw, &ev) != nil {
 				continue
@@ -397,7 +387,7 @@ func generateCodex(
 	if waitErr := cmd.Wait(); waitErr != nil {
 		if parseErr != nil {
 			return Result{}, fmt.Errorf(
-				"codex failed: %w (parse: %v)\nstderr: %s",
+				"codex failed: %w (parse: %w)\nstderr: %s",
 				waitErr, parseErr, stderrText,
 			)
 		}
@@ -560,9 +550,7 @@ func generateCopilot(
 
 	content := strings.TrimSpace(string(stdoutBytes))
 	if content == "" {
-		return Result{}, fmt.Errorf(
-			"copilot returned empty result",
-		)
+		return Result{}, errors.New("copilot returned empty result")
 	}
 
 	return Result{
@@ -578,9 +566,7 @@ func generateGemini(
 	cfg AgentConfig,
 ) (Result, error) {
 	if strings.TrimSpace(cfg.Sandbox) == "" && !cfg.AllowUnsafe {
-		return Result{}, fmt.Errorf(
-			"gemini insights require an explicit sandbox or unsafe opt-in; set [agent.gemini].sandbox to a Gemini sandbox provider or [agent.gemini].allow_unsafe = true",
-		)
+		return Result{}, errors.New("gemini insights require an explicit sandbox or unsafe opt-in; set [agent.gemini].sandbox to a Gemini sandbox provider or [agent.gemini].allow_unsafe = true")
 	}
 	cmd := exec.CommandContext(
 		ctx, path,
@@ -626,7 +612,7 @@ func generateGemini(
 	if waitErr := cmd.Wait(); waitErr != nil {
 		if parseErr != nil {
 			return Result{}, fmt.Errorf(
-				"gemini failed: %w (parse: %v)\nstderr: %s",
+				"gemini failed: %w (parse: %w)\nstderr: %s",
 				waitErr, parseErr, stderrText,
 			)
 		}
@@ -816,7 +802,7 @@ func generateKiro(
 	}
 	content := strings.TrimSpace(strings.Join(lines, "\n"))
 	if content == "" {
-		return Result{}, fmt.Errorf("kiro returned empty result")
+		return Result{}, errors.New("kiro returned empty result")
 	}
 
 	return Result{

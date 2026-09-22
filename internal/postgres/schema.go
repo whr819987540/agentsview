@@ -11,12 +11,16 @@ import (
 
 	"github.com/jackc/pgx/v5/pgconn"
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/export"
 	"go.kenn.io/agentsview/internal/parser"
 )
 
-const tokenCoverageRepairMetadataKey = "token_coverage_repair_v1"
-const sourceCurationBackfillMetadataKey = "source_curation_baseline_backfill_v1"
-const tokenCoverageBackfillBatchSize = 1000
+const (
+	tokenCoverageRepairMetadataKey        = "token_coverage_repair_v1"
+	sourceCurationBackfillMetadataKey     = "source_curation_baseline_backfill_v1"
+	projectIdentityRemoteScrubMetadataKey = "git_remote_credentials_scrub_v1"
+	tokenCoverageBackfillBatchSize        = 1000
+)
 
 type columnMigration struct {
 	table  string
@@ -25,8 +29,104 @@ type columnMigration struct {
 	desc   string
 }
 
+// fallback_key remains in the installed signature so CREATE OR REPLACE can
+// upgrade existing databases; extraction is deliberately governed by
+// json_path for both valid and supported malformed values.
+const postgresUsageJSONHelperDDL = `
+CREATE OR REPLACE FUNCTION agentsview_json_integer(
+    raw_value TEXT, json_path TEXT[], fallback_key TEXT
+) RETURNS TEXT
+LANGUAGE PLpgSQL
+IMMUTABLE
+AS $function$
+DECLARE
+    parsed JSONB;
+    counter TEXT;
+    repaired TEXT;
+BEGIN
+    parsed := raw_value::JSONB;
+    counter := parsed #>> json_path;
+    IF counter ~ '^-?[0-9]+$' THEN
+        RETURN counter;
+    END IF;
+    RETURN NULL;
+EXCEPTION WHEN OTHERS THEN
+    BEGIN
+        repaired := raw_value || repeat('}', GREATEST(
+            length(raw_value) - length(replace(raw_value, '{', '')) -
+            (length(raw_value) - length(replace(raw_value, '}', ''))),
+            0));
+        parsed := repaired::JSONB;
+        counter := parsed #>> json_path;
+        IF counter ~ '^-?[0-9]+$' THEN
+            RETURN counter;
+        END IF;
+        RETURN NULL;
+    EXCEPTION WHEN OTHERS THEN
+        RETURN NULL;
+    END;
+END;
+$function$;`
+
+// cockroachUsageJSONHelperDDL avoids PL/pgSQL exception blocks, which older
+// CockroachDB releases reject. json_valid guards the JSONB cast; end-truncated
+// legacy objects are balanced before the exact requested path is extracted.
+const cockroachUsageJSONHelperDDL = `
+CREATE OR REPLACE FUNCTION agentsview_json_integer(
+    raw_value TEXT, json_path TEXT[], fallback_key TEXT
+) RETURNS TEXT
+LANGUAGE SQL
+IMMUTABLE
+AS $function$
+SELECT CASE
+    WHEN json_valid(candidate_value) THEN
+        CASE
+            WHEN (candidate_value::JSONB #>> json_path) ~ '^-?[0-9]+$'
+                THEN candidate_value::JSONB #>> json_path
+            ELSE NULL
+        END
+    ELSE NULL
+END
+FROM (
+    SELECT CASE
+        WHEN json_valid(raw_value) THEN raw_value
+        ELSE raw_value || repeat('}', GREATEST(
+            length(raw_value) - length(replace(raw_value, '{', '')) -
+            (length(raw_value) - length(replace(raw_value, '}', ''))),
+            0))
+        END AS candidate_value
+) repaired
+$function$;`
+
+const usageJSONHelperProbe = `
+SELECT
+    agentsview_json_integer(
+        '{"metadata":{"output_tokens":900},"output_tokens":"42"}',
+        ARRAY['output_tokens'], 'output_tokens'),
+    agentsview_json_integer(
+        '{"metadata":{"web_search_requests":9},"server_tool_use":{"web_search_requests":"2"}}',
+        ARRAY['server_tool_use', 'web_search_requests'],
+        'web_search_requests'),
+    agentsview_json_integer(
+        '{"output_tokens":"7"',
+        ARRAY['output_tokens'], 'output_tokens'),
+    agentsview_json_integer(
+        '{"metadata":{"output_tokens":900},"output_tokens":"42"',
+        ARRAY['output_tokens'], 'output_tokens'),
+    agentsview_json_integer(
+        '{"metadata":{"web_search_requests":9},"server_tool_use":{"web_search_requests":"2"',
+        ARRAY['server_tool_use', 'web_search_requests'],
+        'web_search_requests')`
+
 // coreDDL creates the tables and indexes. It uses unqualified
 // names because Open() sets search_path to the target schema.
+//
+// The sessions table deliberately omits SQLite's machine-local sync
+// bookkeeping cluster (next_ordinal, last_entry_uuid,
+// claude_linear_parse, last_write_incremental): parsers never run
+// against this read-side store, so mirroring those columns would be
+// inert plumbing. Their absence from push SQL and
+// sessionPushFingerprint is intentional.
 const coreDDL = `
 CREATE TABLE IF NOT EXISTS sync_metadata (
     key   TEXT PRIMARY KEY,
@@ -38,7 +138,11 @@ CREATE TABLE IF NOT EXISTS sessions (
     machine            TEXT NOT NULL,
     owner_marker       TEXT NOT NULL DEFAULT '',
     project            TEXT NOT NULL,
+    project_assigned   BOOLEAN NOT NULL DEFAULT FALSE,
     agent              TEXT NOT NULL,
+    agent_label        TEXT NOT NULL DEFAULT '',
+    entrypoint         TEXT NOT NULL DEFAULT '',
+    session_kind       TEXT NOT NULL DEFAULT '',
     first_message      TEXT,
     display_name       TEXT,
     source_display_name TEXT,
@@ -48,15 +152,18 @@ CREATE TABLE IF NOT EXISTS sessions (
     ended_at           TIMESTAMPTZ,
     deleted_at         TIMESTAMPTZ,
     source_deleted_at  TIMESTAMPTZ,
+    deletion_cause     TEXT,
     message_count      INT NOT NULL DEFAULT 0,
     user_message_count INT NOT NULL DEFAULT 0,
     parent_session_id  TEXT,
+    parser_parent_session_id TEXT,
     relationship_type  TEXT NOT NULL DEFAULT '',
     total_output_tokens INT NOT NULL DEFAULT 0,
     peak_context_tokens INT NOT NULL DEFAULT 0,
     has_total_output_tokens BOOLEAN NOT NULL DEFAULT FALSE,
     has_peak_context_tokens BOOLEAN NOT NULL DEFAULT FALSE,
     is_automated       BOOLEAN NOT NULL DEFAULT FALSE,
+    prompt_evidence_discarded BOOLEAN NOT NULL DEFAULT FALSE,
     tool_failure_signal_count INT NOT NULL DEFAULT 0,
     tool_retry_count          INT NOT NULL DEFAULT 0,
     edit_churn_count          INT NOT NULL DEFAULT 0,
@@ -80,6 +187,10 @@ CREATE TABLE IF NOT EXISTS sessions (
     no_code_context_count     INT NOT NULL DEFAULT 0,
     runaway_tool_loop_count   INT NOT NULL DEFAULT 0,
     termination_status        TEXT,
+    transcript_revision       TEXT NOT NULL DEFAULT '0',
+    source_archive_id          TEXT NOT NULL DEFAULT '',
+    source_database_generation TEXT NOT NULL DEFAULT '',
+    file_path                  TEXT,
     updated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
@@ -99,15 +210,18 @@ CREATE TABLE IF NOT EXISTS messages (
     content_length INT NOT NULL DEFAULT 0,
     is_system      BOOLEAN NOT NULL DEFAULT FALSE,
     model          TEXT NOT NULL DEFAULT '',
+    reasoning_effort TEXT NOT NULL DEFAULT '',
     token_usage    TEXT NOT NULL DEFAULT '',
     context_tokens INT NOT NULL DEFAULT 0,
     output_tokens  INT NOT NULL DEFAULT 0,
+    provider_id    TEXT NOT NULL DEFAULT '',
     has_context_tokens BOOLEAN NOT NULL DEFAULT FALSE,
     has_output_tokens  BOOLEAN NOT NULL DEFAULT FALSE,
     claude_message_id  TEXT NOT NULL DEFAULT '',
     claude_request_id  TEXT NOT NULL DEFAULT '',
     source_type        TEXT NOT NULL DEFAULT '',
     source_subtype     TEXT NOT NULL DEFAULT '',
+    prompt_source      TEXT NOT NULL DEFAULT '',
     source_uuid        TEXT NOT NULL DEFAULT '',
     source_parent_uuid TEXT NOT NULL DEFAULT '',
     is_sidechain       BOOLEAN NOT NULL DEFAULT FALSE,
@@ -120,18 +234,23 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS idx_messages_velocity
     ON messages (session_id, ordinal, role, timestamp, content_length);
 
+CREATE INDEX IF NOT EXISTS idx_messages_activity_timestamp
+    ON messages (timestamp, session_id, ordinal)
+    WHERE timestamp IS NOT NULL;
+
 CREATE TABLE IF NOT EXISTS usage_events (
     id BIGSERIAL PRIMARY KEY,
     session_id TEXT NOT NULL,
     message_ordinal INT,
     source TEXT NOT NULL,
     model TEXT NOT NULL,
+    provider_id TEXT NOT NULL DEFAULT '',
     input_tokens INT NOT NULL DEFAULT 0,
     output_tokens INT NOT NULL DEFAULT 0,
     cache_creation_input_tokens INT NOT NULL DEFAULT 0,
     cache_read_input_tokens INT NOT NULL DEFAULT 0,
     reasoning_tokens INT NOT NULL DEFAULT 0,
-    cost_usd DOUBLE PRECISION,
+    cost_microdollars BIGINT,
     cost_status TEXT NOT NULL DEFAULT '',
     cost_source TEXT NOT NULL DEFAULT '',
     occurred_at TIMESTAMPTZ,
@@ -159,8 +278,8 @@ CREATE TABLE IF NOT EXISTS cursor_usage_events (
     output_tokens INT NOT NULL DEFAULT 0,
     cache_write_tokens INT NOT NULL DEFAULT 0,
     cache_read_tokens INT NOT NULL DEFAULT 0,
-    charged_cents DOUBLE PRECISION NOT NULL DEFAULT 0,
-    cursor_token_fee DOUBLE PRECISION NOT NULL DEFAULT 0,
+    charged_microdollars BIGINT NOT NULL DEFAULT 0,
+    cursor_token_fee_microdollars BIGINT NOT NULL DEFAULT 0,
     user_id TEXT NOT NULL DEFAULT '',
     user_email TEXT NOT NULL DEFAULT '',
     is_headless BOOLEAN NOT NULL DEFAULT FALSE,
@@ -223,12 +342,173 @@ CREATE INDEX IF NOT EXISTS idx_pinned_source_uuid
 
 CREATE TABLE IF NOT EXISTS model_pricing (
     model_pattern TEXT PRIMARY KEY,
-    input_per_mtok DOUBLE PRECISION NOT NULL DEFAULT 0,
-    output_per_mtok DOUBLE PRECISION NOT NULL DEFAULT 0,
-    cache_creation_per_mtok DOUBLE PRECISION NOT NULL DEFAULT 0,
-    cache_read_per_mtok DOUBLE PRECISION NOT NULL DEFAULT 0,
+    input_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0,
+    output_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0,
+    cache_creation_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0,
+    cache_creation_1h_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0,
+    cache_read_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL DEFAULT ''
 );
+
+CREATE TABLE IF NOT EXISTS model_pricing_bands (
+    model_pattern TEXT NOT NULL
+        REFERENCES model_pricing(model_pattern) ON DELETE CASCADE,
+    above_input_tokens BIGINT NOT NULL,
+    input_microdollars_per_mtok BIGINT NOT NULL,
+    output_microdollars_per_mtok BIGINT NOT NULL,
+    cache_creation_microdollars_per_mtok BIGINT NOT NULL,
+    cache_creation_1h_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0,
+    cache_read_microdollars_per_mtok BIGINT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (model_pattern, above_input_tokens)
+);
+
+CREATE TABLE IF NOT EXISTS genai_pricing (
+    singleton SMALLINT PRIMARY KEY,
+    version TEXT NOT NULL,
+    source_ref TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL,
+    data_json BYTEA NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS source_archives (
+    source_archive_id   TEXT PRIMARY KEY,
+    source_archive_salt TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS source_project_identity_observations (
+    source_archive_id   TEXT NOT NULL DEFAULT '',
+    source_archive_salt TEXT NOT NULL DEFAULT '',
+    project            TEXT NOT NULL,
+    machine            TEXT NOT NULL,
+    root_path          TEXT NOT NULL DEFAULT '',
+    git_remote         TEXT NOT NULL DEFAULT '',
+    git_remote_name    TEXT NOT NULL DEFAULT '',
+    repository_path    TEXT NOT NULL DEFAULT '',
+    worktree_name      TEXT NOT NULL DEFAULT '',
+    worktree_root_path TEXT NOT NULL DEFAULT '',
+    worktree_relationship TEXT NOT NULL DEFAULT 'unknown',
+    checkout_state     TEXT NOT NULL DEFAULT 'unknown',
+    git_branch         TEXT NOT NULL DEFAULT '',
+    remote_resolution  TEXT NOT NULL DEFAULT 'unknown',
+    remote_candidate_count INT NOT NULL DEFAULT 0,
+    observed_at        TIMESTAMPTZ NOT NULL,
+    normalized_remote  TEXT NOT NULL DEFAULT '',
+    key_source         TEXT NOT NULL DEFAULT '',
+    key                TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (source_archive_id, project, machine, root_path, git_remote)
+);
+
+CREATE INDEX IF NOT EXISTS idx_source_project_identity_observations_project
+    ON source_project_identity_observations (project);
+
+CREATE TABLE IF NOT EXISTS source_project_identity_observation_scopes (
+    source_archive_id TEXT NOT NULL,
+    project           TEXT NOT NULL,
+    machine           TEXT NOT NULL,
+    root_path         TEXT NOT NULL DEFAULT '',
+    git_remote        TEXT NOT NULL DEFAULT '',
+    publication_scope TEXT NOT NULL,
+    PRIMARY KEY (
+        source_archive_id, project, machine, root_path, git_remote,
+        publication_scope
+    ),
+    FOREIGN KEY (
+        source_archive_id, project, machine, root_path, git_remote
+    ) REFERENCES source_project_identity_observations (
+        source_archive_id, project, machine, root_path, git_remote
+    ) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_source_project_identity_observation_scopes_scope
+    ON source_project_identity_observation_scopes (
+        source_archive_id, publication_scope
+    );
+
+CREATE TABLE IF NOT EXISTS source_session_project_identity_snapshots (
+    source_archive_id          TEXT NOT NULL,
+    source_database_generation TEXT NOT NULL,
+    source_session_id          TEXT NOT NULL,
+    project                    TEXT NOT NULL,
+    machine                    TEXT NOT NULL,
+    root_path                  TEXT NOT NULL DEFAULT '',
+    git_remote                 TEXT NOT NULL DEFAULT '',
+    git_remote_name            TEXT NOT NULL DEFAULT '',
+    repository_path            TEXT NOT NULL DEFAULT '',
+    worktree_name              TEXT NOT NULL DEFAULT '',
+    worktree_root_path         TEXT NOT NULL DEFAULT '',
+    worktree_relationship      TEXT NOT NULL DEFAULT 'unknown',
+    checkout_state             TEXT NOT NULL DEFAULT 'unknown',
+    git_branch                 TEXT NOT NULL DEFAULT '',
+    remote_resolution          TEXT NOT NULL DEFAULT 'unknown',
+    remote_candidate_count     INT NOT NULL DEFAULT 0,
+    observed_at                TIMESTAMPTZ NOT NULL,
+    normalized_remote          TEXT NOT NULL DEFAULT '',
+    key_source                 TEXT NOT NULL DEFAULT '',
+    key                        TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (
+        source_archive_id, source_database_generation, source_session_id
+    )
+);
+
+CREATE INDEX IF NOT EXISTS idx_source_session_project_identity_snapshots_project
+    ON source_session_project_identity_snapshots (
+        source_archive_id, project
+    );
+
+CREATE TABLE IF NOT EXISTS source_session_project_identity_snapshot_scopes (
+    source_archive_id          TEXT NOT NULL,
+    source_database_generation TEXT NOT NULL,
+    source_session_id          TEXT NOT NULL,
+    publication_scope          TEXT NOT NULL,
+    PRIMARY KEY (
+        source_archive_id, source_database_generation, source_session_id,
+        publication_scope
+    ),
+    FOREIGN KEY (
+        source_archive_id, source_database_generation, source_session_id
+    ) REFERENCES source_session_project_identity_snapshots (
+        source_archive_id, source_database_generation, source_session_id
+    ) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_source_session_project_identity_snapshot_scopes_scope
+    ON source_session_project_identity_snapshot_scopes (
+        source_archive_id, publication_scope
+    );
+
+CREATE TABLE IF NOT EXISTS source_worktree_project_mappings (
+    source_archive_id TEXT NOT NULL,
+    machine           TEXT NOT NULL,
+    path_prefix       TEXT NOT NULL,
+    layout            TEXT NOT NULL DEFAULT 'explicit',
+    project           TEXT NOT NULL DEFAULT '',
+    original_project  TEXT NOT NULL DEFAULT '',
+    enabled           BOOLEAN NOT NULL DEFAULT TRUE,
+    updated_at        TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (source_archive_id, machine, path_prefix)
+);
+
+CREATE TABLE IF NOT EXISTS source_worktree_project_mapping_scopes (
+    source_archive_id TEXT NOT NULL,
+    machine           TEXT NOT NULL,
+    path_prefix       TEXT NOT NULL,
+    publication_scope TEXT NOT NULL,
+    PRIMARY KEY (
+        source_archive_id, machine, path_prefix, publication_scope
+    ),
+    FOREIGN KEY (
+        source_archive_id, machine, path_prefix
+    ) REFERENCES source_worktree_project_mappings (
+        source_archive_id, machine, path_prefix
+    ) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_source_worktree_project_mapping_scopes_scope
+    ON source_worktree_project_mapping_scopes (
+        source_archive_id, publication_scope
+    );
 
 CREATE TABLE IF NOT EXISTS tool_calls (
     id                    BIGSERIAL PRIMARY KEY,
@@ -340,6 +620,284 @@ CREATE INDEX IF NOT EXISTS idx_insights_cache
     WHERE cache_key <> '';
 `
 
+func migrateMoneyColumnsPG(
+	ctx context.Context,
+	conn *sql.DB,
+	existingColumns map[string]map[string]bool,
+) error {
+	legacyColumns := []struct {
+		table  string
+		column string
+		max    string
+		ddl    string
+	}{
+		{"usage_events", "cost_usd", "9223372036854.775", `
+			ALTER TABLE usage_events
+			ALTER COLUMN cost_usd TYPE BIGINT
+			USING CASE WHEN cost_usd IS NULL THEN NULL
+			ELSE ROUND((cost_usd::NUMERIC) * 1000000)::BIGINT END;
+			ALTER TABLE usage_events RENAME COLUMN cost_usd TO cost_microdollars`},
+		{"cursor_usage_events", "charged_cents", "922337203685477.5", `
+			ALTER TABLE cursor_usage_events
+			ALTER COLUMN charged_cents TYPE BIGINT
+			USING ROUND((charged_cents::NUMERIC) * 10000)::BIGINT;
+			ALTER TABLE cursor_usage_events
+			RENAME COLUMN charged_cents TO charged_microdollars`},
+		{"cursor_usage_events", "cursor_token_fee", "922337203685477.5", `
+			ALTER TABLE cursor_usage_events
+			ALTER COLUMN cursor_token_fee TYPE BIGINT
+			USING ROUND((cursor_token_fee::NUMERIC) * 10000)::BIGINT;
+			ALTER TABLE cursor_usage_events
+			RENAME COLUMN cursor_token_fee TO cursor_token_fee_microdollars`},
+		{"model_pricing", "input_per_mtok", "9223372036854.775", `
+			ALTER TABLE model_pricing
+			ALTER COLUMN input_per_mtok TYPE BIGINT
+			USING ROUND((input_per_mtok::NUMERIC) * 1000000)::BIGINT;
+			ALTER TABLE model_pricing RENAME COLUMN input_per_mtok TO input_microdollars_per_mtok`},
+		{"model_pricing", "output_per_mtok", "9223372036854.775", `
+			ALTER TABLE model_pricing
+			ALTER COLUMN output_per_mtok TYPE BIGINT
+			USING ROUND((output_per_mtok::NUMERIC) * 1000000)::BIGINT;
+			ALTER TABLE model_pricing RENAME COLUMN output_per_mtok TO output_microdollars_per_mtok`},
+		{"model_pricing", "cache_creation_per_mtok", "9223372036854.775", `
+			ALTER TABLE model_pricing
+			ALTER COLUMN cache_creation_per_mtok TYPE BIGINT
+			USING ROUND((cache_creation_per_mtok::NUMERIC) * 1000000)::BIGINT;
+			ALTER TABLE model_pricing RENAME COLUMN cache_creation_per_mtok TO cache_creation_microdollars_per_mtok`},
+		{"model_pricing", "cache_read_per_mtok", "9223372036854.775", `
+			ALTER TABLE model_pricing
+			ALTER COLUMN cache_read_per_mtok TYPE BIGINT
+			USING ROUND((cache_read_per_mtok::NUMERIC) * 1000000)::BIGINT;
+			ALTER TABLE model_pricing RENAME COLUMN cache_read_per_mtok TO cache_read_microdollars_per_mtok`},
+	}
+
+	needsMigration := false
+	for _, migration := range legacyColumns {
+		if existingColumns[migration.table][migration.column] {
+			needsMigration = true
+			break
+		}
+	}
+	if !needsMigration {
+		return nil
+	}
+
+	tx, err := conn.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("beginning PG microdollar migration: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(
+		hashtext(current_database()), hashtext(current_schema())
+	)`); err != nil {
+		return fmt.Errorf("locking PG microdollar migration: %w", err)
+	}
+	existingColumns, err = loadExistingColumns(
+		ctx, tx, nil,
+		"usage_events", "cursor_usage_events", "model_pricing",
+		"model_pricing_bands",
+	)
+	if err != nil {
+		return err
+	}
+
+	pending := make([]struct {
+		table  string
+		column string
+		max    string
+		ddl    string
+	}, 0, len(legacyColumns))
+	migrateCursorKeys := false
+	for _, migration := range legacyColumns {
+		if !existingColumns[migration.table][migration.column] {
+			continue
+		}
+		pending = append(pending, migration)
+		if migration.table == "cursor_usage_events" {
+			migrateCursorKeys = true
+		}
+	}
+	if len(pending) == 0 {
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("committing PG microdollar migration: %w", err)
+		}
+		return nil
+	}
+	for _, migration := range pending {
+		query := fmt.Sprintf(`SELECT EXISTS (
+			SELECT 1 FROM %s WHERE %s IS NOT NULL
+			AND NOT (%s >= 0 AND %s <= %s)
+		)`, migration.table, migration.column,
+			migration.column, migration.column, migration.max)
+		var invalid bool
+		if err := tx.QueryRowContext(ctx, query).Scan(&invalid); err != nil {
+			return fmt.Errorf("validating PG money column %s.%s: %w",
+				migration.table, migration.column, err)
+		}
+		if invalid {
+			return fmt.Errorf("PG money column %s.%s contains a negative, non-finite, or out-of-range value",
+				migration.table, migration.column)
+		}
+		if _, err := tx.ExecContext(ctx, migration.ddl); err != nil {
+			return fmt.Errorf("migrating PG money column %s.%s: %w",
+				migration.table, migration.column, err)
+		}
+	}
+	if migrateCursorKeys {
+		if err := rekeyMigratedCursorUsageEventsPG(ctx, tx); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing PG microdollar migration: %w", err)
+	}
+	return nil
+}
+
+func rekeyMigratedCursorUsageEventsPG(ctx context.Context, tx *sql.Tx) error {
+	type keyUpdate struct {
+		id  int64
+		key string
+	}
+	if _, err := tx.ExecContext(ctx,
+		`DROP INDEX IF EXISTS idx_cursor_usage_events_dedup`); err != nil {
+		return fmt.Errorf("dropping migrated PG cursor usage index: %w", err)
+	}
+	var lastID int64
+	for {
+		updates, err := func() ([]keyUpdate, error) {
+			rows, err := tx.QueryContext(ctx, `
+			SELECT id, occurred_at, model, kind,
+				input_tokens, output_tokens, cache_write_tokens, cache_read_tokens,
+				charged_microdollars, cursor_token_fee_microdollars,
+				user_id, user_email, is_headless
+			FROM cursor_usage_events
+			WHERE id > $1
+			ORDER BY id
+			LIMIT 1000`, lastID)
+			if err != nil {
+				return nil, fmt.Errorf("querying migrated PG cursor usage keys: %w", err)
+			}
+			defer rows.Close()
+			updates := make([]keyUpdate, 0, 1000)
+			for rows.Next() {
+				var id int64
+				var occurredAt time.Time
+				var ev db.CursorUsageEvent
+				if err := rows.Scan(
+					&id, &occurredAt, &ev.Model, &ev.Kind,
+					&ev.InputTokens, &ev.OutputTokens,
+					&ev.CacheWriteTokens, &ev.CacheReadTokens,
+					&ev.Charged.Microdollars, &ev.CursorTokenFee.Microdollars,
+					&ev.UserID, &ev.UserEmail, &ev.IsHeadless,
+				); err != nil {
+					rows.Close()
+					return nil, fmt.Errorf("scanning migrated PG cursor usage key: %w", err)
+				}
+				ev.OccurredAt = occurredAt.UTC().Format(time.RFC3339Nano)
+				updates = append(updates, keyUpdate{
+					id: id, key: db.CursorUsageEventDedupKey(ev),
+				})
+			}
+			if err := rows.Err(); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("iterating migrated PG cursor usage keys: %w", err)
+			}
+			if err := rows.Close(); err != nil {
+				return nil, fmt.Errorf("closing migrated PG cursor usage keys: %w", err)
+			}
+			return updates, nil
+		}()
+		if err != nil {
+			return err
+		}
+		if len(updates) == 0 {
+			break
+		}
+		for _, update := range updates {
+			if _, err := tx.ExecContext(ctx,
+				`UPDATE cursor_usage_events SET dedup_key = $1 WHERE id = $2`,
+				update.key, update.id,
+			); err != nil {
+				return fmt.Errorf("updating migrated PG cursor usage key: %w", err)
+			}
+		}
+		lastID = updates[len(updates)-1].id
+	}
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM cursor_usage_events
+		WHERE id IN (
+			SELECT id FROM (
+				SELECT id, ROW_NUMBER() OVER (
+					PARTITION BY dedup_key ORDER BY id
+				) AS dedup_rank
+				FROM cursor_usage_events
+				WHERE dedup_key != ''
+			) ranked
+			WHERE dedup_rank > 1
+		);
+		CREATE UNIQUE INDEX idx_cursor_usage_events_dedup
+			ON cursor_usage_events (dedup_key)
+			WHERE dedup_key != ''`); err != nil {
+		return fmt.Errorf("deduplicating migrated PG cursor usage keys: %w", err)
+	}
+	return nil
+}
+
+func probeUsageJSONHelper(ctx context.Context, db *sql.DB) error {
+	var outputTokens, webSearchRequests, malformedOutput string
+	var malformedScopedOutput, malformedScopedWebSearch string
+	if err := db.QueryRowContext(ctx, usageJSONHelperProbe).Scan(
+		&outputTokens, &webSearchRequests, &malformedOutput,
+		&malformedScopedOutput, &malformedScopedWebSearch,
+	); err != nil {
+		return err
+	}
+	if outputTokens != "42" || webSearchRequests != "2" ||
+		malformedOutput != "7" || malformedScopedOutput != "42" ||
+		malformedScopedWebSearch != "2" {
+		return fmt.Errorf(
+			"unexpected extraction results: output=%q web_search=%q "+
+				"malformed=%q malformed_scoped_output=%q "+
+				"malformed_scoped_web_search=%q",
+			outputTokens, webSearchRequests, malformedOutput,
+			malformedScopedOutput, malformedScopedWebSearch,
+		)
+	}
+	return nil
+}
+
+func ensureUsageJSONHelper(ctx context.Context, db *sql.DB) error {
+	_, primaryErr := db.ExecContext(ctx, postgresUsageJSONHelperDDL)
+	if primaryErr == nil {
+		primaryErr = probeUsageJSONHelper(ctx, db)
+		if primaryErr == nil {
+			return nil
+		}
+	}
+
+	if _, err := db.ExecContext(ctx, cockroachUsageJSONHelperDDL); err != nil {
+		return fmt.Errorf(
+			"creating usage JSON helper: PL/pgSQL implementation failed: %v; "+
+				"SQL fallback failed: %w",
+			primaryErr, err,
+		)
+	}
+	if err := probeUsageJSONHelper(ctx, db); err != nil {
+		return fmt.Errorf(
+			"validating Cockroach-compatible usage JSON helper "+
+				"after PL/pgSQL implementation failed (%v): %w",
+			primaryErr, err,
+		)
+	}
+	log.Printf(
+		"pg schema: using Cockroach-compatible SQL usage JSON helper "+
+			"after PL/pgSQL probe failed: %v",
+		primaryErr,
+	)
+	return nil
+}
+
 // EnsureSchema creates the schema (if needed), then runs
 // idempotent CREATE TABLE / ALTER TABLE statements. The schema
 // parameter is the unquoted schema name (e.g. "agentsview").
@@ -371,13 +929,44 @@ func EnsureSchema(
 	if _, err := db.ExecContext(ctx, coreDDL); err != nil {
 		return fmt.Errorf("creating pg tables: %w", err)
 	}
+	if err := ensureRawIngestSchemaPG(ctx, db); err != nil {
+		return err
+	}
 	log.Printf(
 		"pg schema: core DDL step completed in %s",
+		time.Since(step).Round(time.Millisecond),
+	)
+	step = time.Now()
+	if err := ensureUsageJSONHelper(ctx, db); err != nil {
+		return err
+	}
+	log.Printf(
+		"pg schema: usage JSON helper step completed in %s",
 		time.Since(step).Round(time.Millisecond),
 	)
 
 	// Idempotent column additions for forward compatibility.
 	alters := []columnMigration{
+		{
+			"model_pricing", "cache_creation_1h_microdollars_per_mtok",
+			`cache_creation_1h_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0`,
+			"adding model_pricing.cache_creation_1h_microdollars_per_mtok",
+		},
+		{
+			"model_pricing_bands", "cache_creation_1h_microdollars_per_mtok",
+			`cache_creation_1h_microdollars_per_mtok BIGINT NOT NULL DEFAULT 0`,
+			"adding model_pricing_bands.cache_creation_1h_microdollars_per_mtok",
+		},
+		{
+			"sessions", "project_assigned",
+			`project_assigned BOOLEAN NOT NULL DEFAULT FALSE`,
+			"adding sessions.project_assigned",
+		},
+		{
+			"sessions", "transcript_revision",
+			`transcript_revision TEXT NOT NULL DEFAULT '0'`,
+			"adding sessions.transcript_revision",
+		},
 		{
 			"sessions", "owner_marker",
 			`owner_marker TEXT NOT NULL DEFAULT ''`,
@@ -402,6 +991,16 @@ func EnsureSchema(
 			"sessions", "source_deleted_at",
 			`source_deleted_at TIMESTAMPTZ`,
 			"adding sessions.source_deleted_at",
+		},
+		{
+			"sessions", "deletion_cause",
+			`deletion_cause TEXT`,
+			"adding sessions.deletion_cause",
+		},
+		{
+			"sessions", "parser_parent_session_id",
+			`parser_parent_session_id TEXT`,
+			"adding sessions.parser_parent_session_id",
 		},
 		{
 			"sessions", "total_output_tokens",
@@ -429,6 +1028,11 @@ func EnsureSchema(
 			"adding messages.model",
 		},
 		{
+			"messages", "reasoning_effort",
+			`reasoning_effort TEXT NOT NULL DEFAULT ''`,
+			"adding messages.reasoning_effort",
+		},
+		{
 			"messages", "token_usage",
 			`token_usage TEXT NOT NULL DEFAULT ''`,
 			"adding messages.token_usage",
@@ -442,6 +1046,16 @@ func EnsureSchema(
 			"messages", "output_tokens",
 			`output_tokens INT NOT NULL DEFAULT 0`,
 			"adding messages.output_tokens",
+		},
+		{
+			"messages", "provider_id",
+			`provider_id TEXT NOT NULL DEFAULT ''`,
+			"adding messages.provider_id",
+		},
+		{
+			"usage_events", "provider_id",
+			`provider_id TEXT NOT NULL DEFAULT ''`,
+			"adding usage_events.provider_id",
 		},
 		{
 			"messages", "has_context_tokens",
@@ -472,6 +1086,11 @@ func EnsureSchema(
 			"tool_calls", "file_path",
 			`file_path TEXT`,
 			"adding tool_calls.file_path",
+		},
+		{
+			"sessions", "prompt_evidence_discarded",
+			`prompt_evidence_discarded BOOLEAN NOT NULL DEFAULT FALSE`,
+			"adding sessions.prompt_evidence_discarded",
 		},
 		{
 			"sessions", "is_automated",
@@ -649,6 +1268,11 @@ func EnsureSchema(
 			"adding messages.source_subtype",
 		},
 		{
+			"messages", "prompt_source",
+			`prompt_source TEXT NOT NULL DEFAULT ''`,
+			"adding messages.prompt_source",
+		},
+		{
 			"messages", "source_uuid",
 			`source_uuid TEXT NOT NULL DEFAULT ''`,
 			"adding messages.source_uuid",
@@ -693,9 +1317,83 @@ func EnsureSchema(
 			`session_name TEXT`,
 			"adding sessions.session_name",
 		},
+		{
+			"sessions", "agent_label",
+			`agent_label TEXT NOT NULL DEFAULT ''`,
+			"adding sessions.agent_label",
+		},
+		{
+			"sessions", "entrypoint",
+			`entrypoint TEXT NOT NULL DEFAULT ''`,
+			"adding sessions.entrypoint",
+		},
+		{
+			"sessions", "session_kind",
+			`session_kind TEXT NOT NULL DEFAULT ''`,
+			"adding sessions.session_kind",
+		},
+		{
+			"source_project_identity_observations", "source_archive_id",
+			`source_archive_id TEXT NOT NULL DEFAULT ''`,
+			"adding source_project_identity_observations.source_archive_id",
+		},
+		{
+			"source_project_identity_observations", "source_archive_salt",
+			`source_archive_salt TEXT NOT NULL DEFAULT ''`,
+			"adding source_project_identity_observations.source_archive_salt",
+		},
+		{
+			"source_project_identity_observations", "repository_path",
+			`repository_path TEXT NOT NULL DEFAULT ''`,
+			"adding source_project_identity_observations.repository_path",
+		},
+		{
+			"source_project_identity_observations", "worktree_relationship",
+			`worktree_relationship TEXT NOT NULL DEFAULT 'unknown'`,
+			"adding source_project_identity_observations.worktree_relationship",
+		},
+		{
+			"source_project_identity_observations", "checkout_state",
+			`checkout_state TEXT NOT NULL DEFAULT 'unknown'`,
+			"adding source_project_identity_observations.checkout_state",
+		},
+		{
+			"source_project_identity_observations", "git_branch",
+			`git_branch TEXT NOT NULL DEFAULT ''`,
+			"adding source_project_identity_observations.git_branch",
+		},
+		{
+			"source_project_identity_observations", "remote_resolution",
+			`remote_resolution TEXT NOT NULL DEFAULT 'unknown'`,
+			"adding source_project_identity_observations.remote_resolution",
+		},
+		{
+			"source_project_identity_observations", "remote_candidate_count",
+			`remote_candidate_count INT NOT NULL DEFAULT 0`,
+			"adding source_project_identity_observations.remote_candidate_count",
+		},
+		{
+			"sessions", "source_archive_id",
+			`source_archive_id TEXT NOT NULL DEFAULT ''`,
+			"adding sessions.source_archive_id",
+		},
+		{
+			"sessions", "source_database_generation",
+			`source_database_generation TEXT NOT NULL DEFAULT ''`,
+			"adding sessions.source_database_generation",
+		},
+		{
+			"sessions", "file_path",
+			`file_path TEXT`,
+			"adding sessions.file_path",
+		},
 	}
 	step = time.Now()
-	existingColumns, err := loadExistingColumns(ctx, db, alters)
+	existingColumns, err := loadExistingColumns(
+		ctx, db, alters,
+		"usage_events", "cursor_usage_events", "model_pricing",
+		"model_pricing_bands",
+	)
 	if err != nil {
 		return err
 	}
@@ -703,6 +1401,9 @@ func EnsureSchema(
 		"pg schema: loaded existing columns in %s",
 		time.Since(step).Round(time.Millisecond),
 	)
+	if err := migrateMoneyColumnsPG(ctx, db, existingColumns); err != nil {
+		return err
+	}
 	step = time.Now()
 	tokenCoverageColumnsAdded := false
 	sourceCurationColumnsAdded := false
@@ -745,6 +1446,26 @@ func EnsureSchema(
 			time.Since(step).Round(time.Millisecond),
 		)
 	}
+	if err := repairLegacySourceMissingDeletionPG(ctx, db); err != nil {
+		return err
+	}
+	step = time.Now()
+	remoteScrubbed, err := scrubProjectIdentityGitRemoteCredentialsPG(ctx, db)
+	if err != nil {
+		return err
+	}
+	if remoteScrubbed {
+		log.Printf(
+			"pg schema: project identity remote scrub completed in %s",
+			time.Since(step).Round(time.Millisecond),
+		)
+	} else {
+		log.Printf(
+			"pg schema: project identity remote scrub check completed"+
+				" in %s (repair skipped)",
+			time.Since(step).Round(time.Millisecond),
+		)
+	}
 	step = time.Now()
 	if _, err := db.ExecContext(ctx,
 		`CREATE INDEX IF NOT EXISTS idx_sessions_termination_status
@@ -775,6 +1496,9 @@ func EnsureSchema(
 		"pg schema: content search index step completed in %s",
 		time.Since(step).Round(time.Millisecond),
 	)
+	if _, err := ensureVectorBaseSchemaPG(ctx, db); err != nil {
+		log.Printf("pg schema: vector schema setup failed: %v", err)
+	}
 	step = time.Now()
 	runRepair, err := shouldRunTokenCoverageRepair(
 		ctx, db, tokenCoverageColumnsAdded,
@@ -826,6 +1550,13 @@ func EnsureSchema(
 // Idempotent via IF NOT EXISTS.
 func createPartialIndexesPG(ctx context.Context, db *sql.DB) error {
 	indexes := []string{
+		// Match SQLite's bounded Activity terminal-event lookup, including
+		// completions that outlive a session's ended_at metadata.
+		`CREATE INDEX IF NOT EXISTS idx_tool_result_events_terminal
+		 ON tool_result_events(session_id, timestamp)
+		 WHERE source = 'tool_execution'
+		   AND status IN ('completed', 'errored')
+		   AND timestamp IS NOT NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_sessions_cwd
 		 ON sessions(cwd) WHERE cwd != ''`,
 		`CREATE INDEX IF NOT EXISTS idx_sessions_project_git_branch
@@ -842,6 +1573,9 @@ func createPartialIndexesPG(ctx context.Context, db *sql.DB) error {
 		 WHERE token_usage != ''
 		   AND model != ''
 		   AND model != '<synthetic>'`,
+		`CREATE INDEX IF NOT EXISTS idx_messages_activity_timestamp
+		 ON messages(timestamp, session_id, ordinal)
+		 WHERE timestamp IS NOT NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_sessions_has_secret
 		 ON sessions(secret_leak_count) WHERE secret_leak_count > 0`,
 		// idx_tool_calls_file_path backs the cross-session Recent Edits feed.
@@ -849,6 +1583,10 @@ func createPartialIndexesPG(ctx context.Context, db *sql.DB) error {
 		// SQLite partial index so legacy schemas migrate cleanly.
 		`CREATE INDEX IF NOT EXISTS idx_tool_calls_file_path
 		 ON tool_calls(file_path) WHERE file_path IS NOT NULL`,
+		// idx_messages_session_role backs the dense-flow unit-range boundary
+		// fetch (user ordinals by session), mirroring the SQLite index.
+		`CREATE INDEX IF NOT EXISTS idx_messages_session_role
+		 ON messages(session_id, role)`,
 	}
 	for _, ddl := range indexes {
 		if _, err := db.ExecContext(ctx, ddl); err != nil {
@@ -934,112 +1672,13 @@ func createContentSearchIndexesPG(ctx context.Context, db *sql.DB) {
 func backfillIsAutomatedPG(
 	ctx context.Context, pg *sql.DB,
 ) error {
-	current := db.ClassifierHash()
-	var stored string
-	err := pg.QueryRowContext(ctx,
-		`SELECT value FROM sync_metadata WHERE key = $1`,
-		db.ClassifierHashKey,
-	).Scan(&stored)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf(
-			"probing PG classifier hash: %w", err,
-		)
-	}
-
-	rows, err := pg.QueryContext(ctx,
-		`SELECT
-			s.id,
-			s.first_message,
-			s.user_message_count,
-			s.is_automated,
-			(
-				SELECT m.content
-				FROM messages m
-				WHERE m.session_id = s.id
-				  AND m.role = 'user'
-				  AND COALESCE(m.is_system, false) = false
-				  AND btrim(m.content) <> ''
-				ORDER BY m.ordinal
-				LIMIT 1
-			) AS first_user_message
-		 FROM sessions s`)
-	if err != nil {
-		return fmt.Errorf(
-			"querying PG automated backfill candidates: %w",
-			err,
-		)
-	}
-	defer rows.Close()
-
-	var setIDs, clearIDs []string
-	for rows.Next() {
-		var id string
-		var fm sql.NullString
-		var firstUser sql.NullString
-		var umc int
-		var rowAutomated bool
-		if err := rows.Scan(
-			&id, &fm, &umc, &rowAutomated, &firstUser,
-		); err != nil {
-			return fmt.Errorf(
-				"scanning PG backfill candidate: %w", err,
-			)
-		}
-		want := false
-		if umc <= 1 {
-			if firstUser.Valid &&
-				strings.TrimSpace(firstUser.String) != "" {
-				want = db.IsAutomatedSession(firstUser.String)
-			}
-			if !want && fm.Valid {
-				want = db.IsAutomatedSession(fm.String)
-			}
-		}
-		if want && !rowAutomated {
-			setIDs = append(setIDs, id)
-		} else if !want && rowAutomated {
-			clearIDs = append(clearIDs, id)
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
-
-	if err := batchUpdateAutomatedPG(
-		ctx, pg, setIDs, true,
-	); err != nil {
-		return err
-	}
-	if err := batchUpdateAutomatedPG(
-		ctx, pg, clearIDs, false,
-	); err != nil {
-		return err
-	}
-
-	if len(setIDs) > 0 || len(clearIDs) > 0 {
-		log.Printf(
-			"pg migration: recomputed is_automated"+
-				" (set %d, cleared %d)",
-			len(setIDs), len(clearIDs),
-		)
-	}
-
-	if _, err := pg.ExecContext(ctx,
-		`INSERT INTO sync_metadata (key, value)
-		 VALUES ($1, $2)
-		 ON CONFLICT (key) DO UPDATE
-		 SET value = EXCLUDED.value`,
-		db.ClassifierHashKey, current,
-	); err != nil {
-		return fmt.Errorf(
-			"storing PG classifier hash: %w", err,
-		)
-	}
-	return nil
+	_, err := backfillIsAutomatedPGWithProgress(ctx, pg)
+	return err
 }
 
 // runSchemaDataRepairsPG runs the non-DDL correctness repairs that
-// EnsureSchema performs: it recomputes is_automated and backfills
+// EnsureSchema performs: it recomputes is_automated, backfills
+// source-curation baselines, scrubs stored project remotes, and repairs
 // token-coverage flags. These issue only row-level writes, so the
 // compatible-schema fast path can run them without the index and
 // column DDL that can block concurrent pg serve reads (issue #887).
@@ -1048,6 +1687,12 @@ func runSchemaDataRepairsPG(ctx context.Context, db *sql.DB) error {
 		return err
 	}
 	if _, err := runSourceCurationBackfill(ctx, db, false); err != nil {
+		return err
+	}
+	if err := repairLegacySourceMissingDeletionPG(ctx, db); err != nil {
+		return err
+	}
+	if _, err := scrubProjectIdentityGitRemoteCredentialsPG(ctx, db); err != nil {
 		return err
 	}
 	runRepair, err := shouldRunTokenCoverageRepair(ctx, db, false)
@@ -1061,6 +1706,23 @@ func runSchemaDataRepairsPG(ctx context.Context, db *sql.DB) error {
 		return err
 	}
 	return markTokenCoverageRepairDone(ctx, db)
+}
+
+// repairLegacySourceMissingDeletionPG restores mirror rows written while
+// source absence was represented as deletion. Source availability is local
+// SQLite sync state; PostgreSQL retains only user-owned deletion state.
+func repairLegacySourceMissingDeletionPG(ctx context.Context, pg *sql.DB) error {
+	_, err := pg.ExecContext(ctx, `
+		UPDATE sessions
+		SET deleted_at = NULL,
+		    source_deleted_at = NULL,
+		    deletion_cause = NULL,
+		    updated_at = NOW()
+		WHERE deletion_cause = 'source_missing'`)
+	if err != nil {
+		return fmt.Errorf("repairing legacy PG source-missing deletions: %w", err)
+	}
+	return nil
 }
 
 func backfillSourceCurationBaselines(
@@ -1148,6 +1810,141 @@ func markSourceCurationBackfillDone(
 	return nil
 }
 
+func scrubProjectIdentityGitRemoteCredentialsPG(
+	ctx context.Context, db *sql.DB,
+) (bool, error) {
+	var done bool
+	if err := db.QueryRowContext(ctx,
+		`SELECT EXISTS (
+			SELECT 1 FROM sync_metadata
+			WHERE key = $1
+		)`,
+		projectIdentityRemoteScrubMetadataKey,
+	).Scan(&done); err != nil {
+		return false, fmt.Errorf(
+			"probing project identity remote scrub metadata: %w", err,
+		)
+	}
+	if done {
+		return false, nil
+	}
+
+	rows, err := db.QueryContext(ctx, `
+		SELECT source_archive_id, source_archive_salt,
+			project, machine, root_path, git_remote, git_remote_name,
+			repository_path, worktree_name, worktree_root_path,
+			worktree_relationship, checkout_state, git_branch,
+			remote_resolution, remote_candidate_count, observed_at,
+			normalized_remote, key_source, key
+		FROM source_project_identity_observations
+		WHERE git_remote != ''
+		ORDER BY project, machine, root_path, git_remote`)
+	if err != nil {
+		return false, fmt.Errorf(
+			"listing pg project identity remotes for scrub: %w", err,
+		)
+	}
+	defer rows.Close()
+
+	type pendingScrub struct {
+		obs       export.ProjectIdentityObservation
+		rawRemote string
+	}
+	var pending []pendingScrub
+	for rows.Next() {
+		var obs export.ProjectIdentityObservation
+		if err := rows.Scan(
+			&obs.SourceArchiveID,
+			&obs.SourceArchiveSalt,
+			&obs.Project,
+			&obs.Machine,
+			&obs.RootPath,
+			&obs.GitRemote,
+			&obs.GitRemoteName,
+			&obs.RepositoryPath,
+			&obs.WorktreeName,
+			&obs.WorktreeRootPath,
+			&obs.WorktreeRelationship,
+			&obs.CheckoutState,
+			&obs.GitBranch,
+			&obs.RemoteResolution,
+			&obs.RemoteCandidateCount,
+			&obs.ObservedAt,
+			&obs.NormalizedRemote,
+			&obs.KeySource,
+			&obs.Key,
+		); err != nil {
+			_ = rows.Close()
+			return false, fmt.Errorf(
+				"scanning pg project identity remote for scrub: %w", err,
+			)
+		}
+		sanitized := export.SanitizeGitRemoteForStorage(obs.GitRemote)
+		if sanitized == obs.GitRemote {
+			continue
+		}
+		pending = append(pending, pendingScrub{
+			obs:       obs,
+			rawRemote: obs.GitRemote,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return false, fmt.Errorf(
+			"iterating pg project identity remotes for scrub: %w", err,
+		)
+	}
+	if err := rows.Close(); err != nil {
+		return false, fmt.Errorf(
+			"closing pg project identity remotes for scrub: %w", err,
+		)
+	}
+
+	for _, scrub := range pending {
+		obs := export.SanitizeStoredProjectIdentityObservation(scrub.obs)
+		if err := upsertProjectIdentityObservation(
+			ctx, db, obs, scrub.rawRemote,
+		); err != nil {
+			return false, fmt.Errorf(
+				"upserting scrubbed pg project identity remote: %w", err,
+			)
+		}
+		if _, err := db.ExecContext(ctx, `
+			DELETE FROM source_project_identity_observations
+			WHERE source_archive_id = $1 AND project = $2 AND machine = $3
+			  AND root_path = $4 AND git_remote = $5`,
+			scrub.obs.SourceArchiveID, scrub.obs.Project, scrub.obs.Machine,
+			scrub.obs.RootPath, scrub.rawRemote,
+		); err != nil {
+			return false, fmt.Errorf(
+				"removing raw pg project identity remote: %w", err,
+			)
+		}
+	}
+	if err := markProjectIdentityRemoteScrubDone(ctx, db); err != nil {
+		return false, err
+	}
+	return len(pending) > 0, nil
+}
+
+func markProjectIdentityRemoteScrubDone(
+	ctx context.Context, db *sql.DB,
+) error {
+	_, err := db.ExecContext(ctx,
+		`INSERT INTO sync_metadata (key, value)
+		 VALUES ($1, '1')
+		 ON CONFLICT (key) DO UPDATE
+		 SET value = EXCLUDED.value`,
+		projectIdentityRemoteScrubMetadataKey,
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"storing project identity remote scrub metadata: %w", err,
+		)
+	}
+	return nil
+}
+
 func batchUpdateAutomatedPG(
 	ctx context.Context, pg *sql.DB,
 	ids []string, val bool,
@@ -1179,10 +1976,18 @@ func batchUpdateAutomatedPG(
 }
 
 func loadExistingColumns(
-	ctx context.Context, db *sql.DB, alters []columnMigration,
+	ctx context.Context, db pgSessionQueryer, alters []columnMigration,
+	extraTables ...string,
 ) (map[string]map[string]bool, error) {
 	tablesSeen := map[string]bool{}
 	var tables []string
+	for _, table := range extraTables {
+		if tablesSeen[table] {
+			continue
+		}
+		tablesSeen[table] = true
+		tables = append(tables, table)
+	}
 	for _, a := range alters {
 		if tablesSeen[a.table] {
 			continue
@@ -1518,51 +2323,58 @@ func batchLoadPGMessageCoverage(
 ) (map[string][2]bool, error) {
 	coverage := map[string][2]bool{}
 	for start := 0; start < len(candidates); start += tokenCoverageBackfillBatchSize {
-		end := min(
-			start+tokenCoverageBackfillBatchSize,
-			len(candidates),
-		)
-		batch := candidates[start:end]
-		args := make([]any, len(batch))
-		placeholders := make([]string, len(batch))
-		for i, c := range batch {
-			args[i] = c.ID
-			placeholders[i] = fmt.Sprintf("$%d", i+1)
-		}
-		rows, err := conn.QueryContext(ctx,
-			`SELECT session_id, has_context_tokens,
+		if err := func() error {
+			end := min(
+				start+tokenCoverageBackfillBatchSize,
+				len(candidates),
+			)
+			batch := candidates[start:end]
+			args := make([]any, len(batch))
+			placeholders := make([]string, len(batch))
+			for i, c := range batch {
+				args[i] = c.ID
+				placeholders[i] = fmt.Sprintf("$%d", i+1)
+			}
+			rows, err := conn.QueryContext(ctx,
+				`SELECT session_id, has_context_tokens,
 				has_output_tokens
 			 FROM messages
 			 WHERE session_id IN (`+strings.Join(placeholders, ",")+`)`,
-			args...,
-		)
-		if err != nil {
-			return nil, fmt.Errorf(
-				"querying pg session message coverage: %w", err,
+				args...,
 			)
-		}
-		for rows.Next() {
-			var sessionID string
-			var hasContext, hasOutput bool
-			if err := rows.Scan(
-				&sessionID, &hasContext, &hasOutput,
-			); err != nil {
-				rows.Close()
-				return nil, fmt.Errorf(
-					"scanning pg session message coverage: %w",
-					err,
+			if err != nil {
+				return fmt.Errorf(
+					"querying pg session message coverage: %w", err,
 				)
 			}
-			entry := coverage[sessionID]
-			entry[0] = entry[0] || hasContext
-			entry[1] = entry[1] || hasOutput
-			coverage[sessionID] = entry
-		}
-		if err := rows.Err(); err != nil {
-			rows.Close()
-			return nil, err
-		}
-		if err := rows.Close(); err != nil {
+			defer rows.Close()
+			for rows.Next() {
+				var sessionID string
+				var hasContext, hasOutput bool
+				if err := rows.Scan(
+					&sessionID, &hasContext, &hasOutput,
+				); err != nil {
+					rows.Close()
+					return fmt.Errorf(
+						"scanning pg session message coverage: %w",
+						err,
+					)
+				}
+				entry := coverage[sessionID]
+				entry[0] = entry[0] || hasContext
+				entry[1] = entry[1] || hasOutput
+				coverage[sessionID] = entry
+			}
+			if err := rows.Err(); err != nil {
+				rows.Close()
+				return err
+			}
+			if err := rows.Close(); err != nil {
+				return err
+			}
+
+			return nil
+		}(); err != nil {
 			return nil, err
 		}
 	}
@@ -1655,7 +2467,14 @@ func pgHasIndex(ctx context.Context, db *sql.DB, name string) bool {
 func CheckSchemaCompat(
 	ctx context.Context, db *sql.DB,
 ) error {
-	rows, err := db.QueryContext(ctx,
+	if err := probeUsageJSONHelper(ctx, db); err != nil {
+		return fmt.Errorf(
+			"usage JSON helper missing or incompatible: %w",
+			err,
+		)
+	}
+
+	_, err := db.ExecContext(ctx,
 		`SELECT updated_at, `+pgSessionCols+`
 		 FROM sessions LIMIT 0`)
 	if err != nil {
@@ -1664,37 +2483,33 @@ func CheckSchemaCompat(
 			err,
 		)
 	}
-	rows.Close()
 
-	rows, err = db.QueryContext(ctx,
-		`SELECT source_display_name, source_deleted_at
+	_, err = db.ExecContext(ctx,
+		`SELECT source_display_name, source_deleted_at, deletion_cause
 		 FROM sessions LIMIT 0`)
 	if err != nil {
 		return fmt.Errorf(
 			"sessions table missing curation columns: %w", err,
 		)
 	}
-	rows.Close()
 
-	rows, err = db.QueryContext(ctx,
+	_, err = db.ExecContext(ctx,
 		`SELECT id FROM excluded_sessions LIMIT 0`)
 	if err != nil {
 		return fmt.Errorf(
 			"excluded_sessions table missing required columns: %w", err,
 		)
 	}
-	rows.Close()
 
-	rows, err = db.QueryContext(ctx,
+	_, err = db.ExecContext(ctx,
 		`SELECT session_id, alias_id FROM session_aliases LIMIT 0`)
 	if err != nil {
 		return fmt.Errorf(
 			"session_aliases table missing required columns: %w", err,
 		)
 	}
-	rows.Close()
 
-	rows, err = db.QueryContext(ctx,
+	_, err = db.ExecContext(ctx,
 		`SELECT call_index, file_path FROM tool_calls LIMIT 0`)
 	if err != nil {
 		return fmt.Errorf(
@@ -1702,16 +2517,15 @@ func CheckSchemaCompat(
 			err,
 		)
 	}
-	rows.Close()
 
-	rows, err = db.QueryContext(ctx,
+	_, err = db.ExecContext(ctx,
 		`SELECT session_id, ordinal, role, content, thinking_text,
 			timestamp, has_thinking, has_tool_use,
-			content_length, is_system, model, token_usage,
-			context_tokens, output_tokens,
+			content_length, is_system, model, reasoning_effort, token_usage,
+			context_tokens, output_tokens, provider_id,
 			has_context_tokens, has_output_tokens,
 			claude_message_id, claude_request_id,
-			source_type, source_subtype, source_uuid,
+			source_type, source_subtype, prompt_source, source_uuid,
 			source_parent_uuid, is_sidechain,
 			is_compact_boundary
 		 FROM messages LIMIT 0`)
@@ -1721,8 +2535,15 @@ func CheckSchemaCompat(
 			err,
 		)
 	}
-	rows.Close()
-	rows, err = db.QueryContext(ctx,
+	_, err = db.ExecContext(ctx,
+		`SELECT source_archive_id, source_archive_salt
+		 FROM source_archives LIMIT 0`)
+	if err != nil {
+		return fmt.Errorf(
+			"source_archives table missing required columns: %w", err,
+		)
+	}
+	_, err = db.ExecContext(ctx,
 		`SELECT session_id, created_at
 		 FROM starred_sessions LIMIT 0`)
 	if err != nil {
@@ -1731,8 +2552,7 @@ func CheckSchemaCompat(
 			err,
 		)
 	}
-	rows.Close()
-	rows, err = db.QueryContext(ctx,
+	_, err = db.ExecContext(ctx,
 		`SELECT id, session_id, message_id, ordinal,
 			source_uuid, note, created_at
 		 FROM pinned_messages LIMIT 0`)
@@ -1742,8 +2562,7 @@ func CheckSchemaCompat(
 			err,
 		)
 	}
-	rows.Close()
-	rows, err = db.QueryContext(ctx,
+	_, err = db.ExecContext(ctx,
 		`SELECT total_output_tokens, peak_context_tokens,
 			has_total_output_tokens, has_peak_context_tokens
 		 FROM sessions LIMIT 0`)
@@ -1753,9 +2572,8 @@ func CheckSchemaCompat(
 			err,
 		)
 	}
-	rows.Close()
 
-	rows, err = db.QueryContext(ctx,
+	_, err = db.ExecContext(ctx,
 		`SELECT quality_signal_version, short_prompt_count,
 			unstructured_start, missing_success_criteria_count,
 			missing_verification_count, duplicate_prompt_count,
@@ -1767,9 +2585,8 @@ func CheckSchemaCompat(
 			err,
 		)
 	}
-	rows.Close()
 
-	rows, err = db.QueryContext(ctx,
+	_, err = db.ExecContext(ctx,
 		`SELECT event_index FROM tool_result_events LIMIT 0`)
 	if err != nil {
 		return fmt.Errorf(
@@ -1777,19 +2594,61 @@ func CheckSchemaCompat(
 			err,
 		)
 	}
-	rows.Close()
 
-	rows, err = db.QueryContext(ctx,
-		`SELECT id FROM usage_events LIMIT 0`)
+	_, err = db.ExecContext(ctx,
+		`SELECT id, provider_id, cost_microdollars FROM usage_events LIMIT 0`)
 	if err != nil {
 		return fmt.Errorf(
 			"usage_events table missing required columns: %w",
 			err,
 		)
 	}
-	rows.Close()
 
-	rows, err = db.QueryContext(ctx,
+	hasModelPricing := true
+	_, err = db.ExecContext(ctx,
+		`SELECT input_microdollars_per_mtok,
+			output_microdollars_per_mtok,
+			cache_creation_microdollars_per_mtok,
+			cache_creation_1h_microdollars_per_mtok,
+			cache_read_microdollars_per_mtok
+		 FROM model_pricing LIMIT 0`)
+	if err != nil {
+		if !isUndefinedTable(err) {
+			return fmt.Errorf(
+				"model_pricing table missing required columns: %w",
+				err,
+			)
+		}
+		hasModelPricing = false
+	}
+
+	if hasModelPricing {
+		_, err = db.ExecContext(ctx,
+			`SELECT model_pattern, above_input_tokens,
+				input_microdollars_per_mtok, output_microdollars_per_mtok,
+				cache_creation_microdollars_per_mtok,
+				cache_creation_1h_microdollars_per_mtok,
+				cache_read_microdollars_per_mtok, updated_at
+			 FROM model_pricing_bands LIMIT 0`)
+		if err != nil {
+			return fmt.Errorf(
+				"model_pricing_bands table missing required columns: %w",
+				err,
+			)
+		}
+
+		_, err = db.ExecContext(ctx,
+			`SELECT singleton, version, source_ref, source, data_json, updated_at
+			 FROM genai_pricing LIMIT 0`)
+		if err != nil {
+			return fmt.Errorf(
+				"genai_pricing table missing required columns: %w",
+				err,
+			)
+		}
+	}
+
+	_, err = db.ExecContext(ctx,
 		`SELECT id, type, date_from, date_to, project, agent,
 			model, prompt, content, kind, schema_version,
 			template_id, template_version, aggregate_hash,
@@ -1799,14 +2658,13 @@ func CheckSchemaCompat(
 	if err != nil {
 		return fmt.Errorf("insights table missing required columns: %w", err)
 	}
-	rows.Close()
 
 	if pgHasTable(ctx, db, "cursor_usage_events") {
-		rows, err = db.QueryContext(ctx,
+		_, err = db.ExecContext(ctx,
 			`SELECT id, occurred_at, model, kind,
 				input_tokens, output_tokens,
 				cache_write_tokens, cache_read_tokens,
-				charged_cents, cursor_token_fee,
+				charged_microdollars, cursor_token_fee_microdollars,
 				user_id, user_email, is_headless, dedup_key
 			 FROM cursor_usage_events LIMIT 0`)
 		if err != nil {
@@ -1815,10 +2673,9 @@ func CheckSchemaCompat(
 				err,
 			)
 		}
-		rows.Close()
 	}
 
-	rows, err = db.QueryContext(ctx,
+	_, err = db.ExecContext(ctx,
 		`SELECT id, session_id, rule_name, confidence, location_kind,
 			message_ordinal, call_index, event_index,
 			match_start, match_end, match_index,
@@ -1827,36 +2684,77 @@ func CheckSchemaCompat(
 	if err != nil {
 		return fmt.Errorf("secret_findings table missing required columns: %w", err)
 	}
-	rows.Close()
-	return nil
-}
-
-// checkPushSchemaCompat verifies schema elements that only push needs. PG serve
-// never reads sync_metadata or owner_marker, so they live outside
-// CheckSchemaCompat (which gates read-only serve startup) and are checked only
-// on the push fast path.
-func checkPushSchemaCompat(ctx context.Context, db *sql.DB) error {
-	rows, err := db.QueryContext(ctx,
+	_, err = db.ExecContext(ctx,
+		`SELECT source_archive_id, source_archive_salt,
+			project, machine, root_path, git_remote, git_remote_name,
+			repository_path, worktree_name, worktree_root_path,
+			worktree_relationship, checkout_state, git_branch,
+			remote_resolution, remote_candidate_count, observed_at,
+			normalized_remote, key_source, key
+		 FROM source_project_identity_observations LIMIT 0`)
+	if err != nil {
+		return fmt.Errorf(
+			"source_project_identity_observations table missing required columns: %w",
+			err,
+		)
+	}
+	_, err = db.ExecContext(ctx,
+		`SELECT source_archive_id, source_database_generation,
+			source_session_id, project, machine, root_path, git_remote,
+			git_remote_name, repository_path, worktree_name,
+			worktree_root_path, worktree_relationship, checkout_state,
+			git_branch, remote_resolution, remote_candidate_count,
+			observed_at, normalized_remote, key_source, key
+		 FROM source_session_project_identity_snapshots LIMIT 0`)
+	if err != nil {
+		return fmt.Errorf(
+			"source session project identity snapshots missing required columns: %w",
+			err,
+		)
+	}
+	_, err = db.ExecContext(ctx,
+		`SELECT source_archive_id, source_database_generation, file_path
+		 FROM sessions LIMIT 0`)
+	if err != nil {
+		return fmt.Errorf(
+			"sessions table missing provenance columns: %w", err,
+		)
+	}
+	_, err = db.ExecContext(ctx,
+		`SELECT source_archive_id, machine, path_prefix, layout, project,
+			original_project, enabled, updated_at
+		 FROM source_worktree_project_mappings LIMIT 0`)
+	if err != nil {
+		return fmt.Errorf(
+			"source_worktree_project_mappings table missing required columns: %w",
+			err,
+		)
+	}
+	_, err = db.ExecContext(ctx,
 		`SELECT key, value FROM sync_metadata LIMIT 0`)
 	if err != nil {
 		return fmt.Errorf(
 			"sync_metadata table missing required columns: %w", err)
 	}
-	rows.Close()
+	return nil
+}
 
-	rows, err = db.QueryContext(ctx,
-		`SELECT owner_marker FROM sessions LIMIT 0`)
+// checkPushSchemaCompat verifies session ownership columns used only by push.
+// CheckSchemaCompat also checks sync_metadata because PG serve reads machine
+// display labels from it.
+func checkPushSchemaCompat(ctx context.Context, db *sql.DB) error {
+	_, err := db.ExecContext(ctx,
+		`SELECT owner_marker, prompt_evidence_discarded FROM sessions LIMIT 0`)
 	if err != nil {
 		return fmt.Errorf(
 			"sessions table missing push ownership columns: %w", err)
 	}
-	rows.Close()
 	return nil
 }
 
 // pushSchemaCurrent reports whether the PG schema has everything a push
 // needs. CheckSchemaCompat covers the read and PG serve write paths but does
-// not require push-only sync_metadata or sessions.owner_marker (verified by
+// not require push-only sessions.owner_marker (verified by
 // checkPushSchemaCompat), model_pricing (always queried by syncModelPricing)
 // or cursor_usage_events (written by syncCursorUsageEvents), so probe those
 // explicitly. It also requires the cursor dedup index, which the cursor usage
@@ -1871,6 +2769,15 @@ func pushSchemaCurrent(ctx context.Context, db *sql.DB) bool {
 		return false
 	}
 	if !pgHasTable(ctx, db, "model_pricing") ||
+		!pgHasTable(ctx, db, "model_pricing_bands") ||
+		!pgHasTable(ctx, db, "genai_pricing") ||
+		!pgHasTable(ctx, db, "source_archives") ||
+		!pgHasTable(ctx, db, "source_project_identity_observations") ||
+		!pgHasTable(ctx, db, "source_project_identity_observation_scopes") ||
+		!pgHasTable(ctx, db, "source_session_project_identity_snapshots") ||
+		!pgHasTable(ctx, db, "source_session_project_identity_snapshot_scopes") ||
+		!pgHasTable(ctx, db, "source_worktree_project_mappings") ||
+		!pgHasTable(ctx, db, "source_worktree_project_mapping_scopes") ||
 		!pgHasTable(ctx, db, "cursor_usage_events") {
 		return false
 	}
@@ -1878,7 +2785,10 @@ func pushSchemaCurrent(ctx context.Context, db *sql.DB) bool {
 	// DO NOTHING, which only suppresses duplicates when this partial
 	// unique index exists. Fall back to EnsureSchema when it is missing
 	// so repeated pushes cannot duplicate cursor usage rows.
-	return pgHasIndex(ctx, db, "idx_cursor_usage_events_dedup")
+	// A push may provision the schema for a read-only serve role. Include
+	// the Activity index so that upgrading through push installs it too.
+	return pgHasIndex(ctx, db, "idx_cursor_usage_events_dedup") &&
+		pgHasIndex(ctx, db, "idx_tool_result_events_terminal")
 }
 
 // CheckDataVersionCompat rejects PG datasets containing rows written by a
@@ -1908,8 +2818,7 @@ func CheckDataVersionCompat(ctx context.Context, pg *sql.DB) error {
 // read-only or insufficient-privilege condition (SQLSTATE 25006
 // or 42501). Uses pgconn.PgError for reliable SQLSTATE matching.
 func IsReadOnlyError(err error) bool {
-	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) {
+	if pgErr, ok := errors.AsType[*pgconn.PgError](err); ok {
 		return pgErr.Code == "25006" || pgErr.Code == "42501"
 	}
 	return false

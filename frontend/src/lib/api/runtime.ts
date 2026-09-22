@@ -1,24 +1,7 @@
-import {
-  ApiError as GeneratedApiError,
-  CancelError,
-  OpenAPI,
-} from "./generated/index";
-
 const SERVER_URL_KEY = "agentsview-server-url";
 const AUTH_TOKEN_KEY = "agentsview-auth-token";
 
-export function getBase(): string {
-  const server = getServerUrl();
-  if (server) return `${server}/api/v1`;
-  const baseEl = document.querySelector("base[href]");
-  if (baseEl) {
-    const base = new URL(document.baseURI).pathname.replace(/\/$/, "");
-    return `${base}/api/v1`;
-  }
-  return "/api/v1";
-}
-
-function getGeneratedBase(): string {
+export function getGeneratedBase(): string {
   const server = getServerUrl();
   if (server) return server;
   const baseEl = document.querySelector("base[href]");
@@ -62,125 +45,138 @@ export function isRemoteConnection(): boolean {
   return getServerUrl() !== "";
 }
 
-export function authHeaders(init?: RequestInit): RequestInit {
-  const token = getAuthToken();
-  if (!token) return init ?? {};
-
-  const headers = new Headers(init?.headers);
-  headers.set("Authorization", `Bearer ${token}`);
-  return { ...init, headers };
-}
-
 export class ApiError extends Error {
   constructor(
     public readonly status: number,
     message: string,
+    public readonly code?: string,
   ) {
     super(message);
     this.name = "ApiError";
   }
 }
 
-export function apiErrorMessage(status: number, body: string): string {
-  const text = body.trim();
-  if (!text) return `API ${status}`;
+function generatedHeaders(init?: HeadersInit): Headers {
+  const headers = new Headers(init);
+  const token = getAuthToken();
+  if (token && !headers.has("Authorization")) {
+    headers.set("Authorization", `Bearer ${token}`);
+  }
+  return headers;
+}
 
+export function generatedErrorMessage(err: unknown): string {
+  if (err instanceof ApiError) return err.message;
+  if (typeof err === "string") {
+    return err.trim() || "API error";
+  }
+  if (
+    err !== null &&
+    typeof err === "object" &&
+    "error" in err &&
+    typeof err.error === "string" &&
+    err.error
+  ) {
+    return err.error;
+  }
+  return err instanceof Error ? err.message : "API error";
+}
+
+function generatedErrorCode(err: unknown): string | undefined {
+  if (
+    err !== null &&
+    typeof err === "object" &&
+    "code" in err &&
+    typeof err.code === "string" &&
+    err.code
+  ) {
+    return err.code;
+  }
+  return undefined;
+}
+
+export type ApiRequestOptions = RequestInit & {
+  baseUrl?: string;
+};
+
+export async function orvalRequest<T extends Response = Response>(
+  url: string,
+  options: ApiRequestOptions = {},
+): Promise<T> {
+  const { baseUrl, ...init } = options;
+  const response = await fetch(`${baseUrl ?? getGeneratedBase()}${url}`, {
+    ...init,
+    headers: baseUrl === undefined ? generatedHeaders(init.headers) : init.headers,
+  });
+  if (response.ok) return response as T;
+
+  const body = await response.text().catch(() => "");
+  let error: unknown = body;
   try {
-    const parsed = JSON.parse(text) as unknown;
-    if (
-      parsed !== null &&
-      typeof parsed === "object" &&
-      "error" in parsed &&
-      typeof parsed.error === "string" &&
-      parsed.error
-    ) {
-      return parsed.error;
-    }
+    error = JSON.parse(body);
   } catch {
     // Plain-text error body.
   }
-
-  return text;
+  throw new ApiError(
+    response.status,
+    body.trim() ? generatedErrorMessage(error) : `API ${response.status}`,
+    generatedErrorCode(error),
+  );
 }
 
-export async function responseErrorMessage(res: Response): Promise<string> {
-  const body = await res.text().catch(() => "");
-  return apiErrorMessage(res.status, body);
+/**
+ * When a generated request's phases happened, on the `performance.now()`
+ * clock: request sent, response headers received (the server's share), and
+ * response body read. Pages use it to draw request timelines.
+ */
+export interface ResponseTiming {
+  sentAt: number;
+  headersAt: number;
+  bodyAt: number;
 }
 
-export function configureGeneratedClient(): void {
-  OpenAPI.BASE = getGeneratedBase();
-  OpenAPI.TOKEN = async () => getAuthToken();
+// Keyed by the parsed response object itself, so callers that only see the
+// data can still look up how the request that produced it went.
+const responseTimings = new WeakMap<object, ResponseTiming>();
+
+export function attachResponseTiming(data: unknown, timing: ResponseTiming): void {
+  if (typeof data === "object" && data !== null) responseTimings.set(data, timing);
 }
 
-export function generatedErrorMessage(err: GeneratedApiError): string {
-  if (typeof err.body === "string") {
-    return apiErrorMessage(err.status, err.body);
+export function responseTimingOf(data: unknown): ResponseTiming | undefined {
+  return typeof data === "object" && data !== null ? responseTimings.get(data) : undefined;
+}
+
+export async function orvalFetch<T>(url: string, options: ApiRequestOptions): Promise<T> {
+  const sentAt = performance.now();
+  const response = await orvalRequest(url, options);
+  const headersAt = performance.now();
+  if ([204, 205, 304].includes(response.status)) return undefined as T;
+
+  const body = await response.text();
+  const bodyAt = performance.now();
+  if (!body) return undefined as T;
+  if (response.headers.get("Content-Type")?.includes("json")) {
+    const data: T = JSON.parse(body);
+    attachResponseTiming(data, { sentAt, headersAt, bodyAt });
+    return data;
   }
-  if (
-    err.body !== null &&
-    typeof err.body === "object" &&
-    "error" in err.body &&
-    typeof err.body.error === "string" &&
-    err.body.error
-  ) {
-    return err.body.error;
-  }
-  return err.message || `API ${err.status}`;
+  return body as T;
 }
 
-export async function callGenerated<T>(
-  request: () => Promise<T>,
-  signal?: AbortSignal,
-): Promise<T> {
-  configureGeneratedClient();
-  try {
-    return await withAbort(request(), signal);
-  } catch (err) {
-    if (err instanceof GeneratedApiError) {
-      throw new ApiError(err.status, generatedErrorMessage(err));
-    }
-    throw err;
-  }
-}
-
-export interface CancelableLike<T> extends Promise<T> {
-  cancel: () => void;
-}
-
-export function isCancelable<T>(value: Promise<T>): value is CancelableLike<T> {
-  return typeof (value as { cancel?: unknown }).cancel === "function";
+export function isNotFoundError(err: unknown): boolean {
+  return err instanceof ApiError && err.status === 404;
 }
 
 export function isAbortError(err: unknown): boolean {
   if (err instanceof DOMException && err.name === "AbortError") {
     return true;
   }
-  if (err instanceof CancelError) {
-    return true;
-  }
   if (err === null || typeof err !== "object") {
     return false;
   }
   const candidate = err as {
-    isCancelled?: unknown;
     name?: unknown;
   };
-  return candidate.isCancelled === true ||
-    candidate.name === "CancelError";
-}
-
-export function withAbort<T>(
-  promise: Promise<T>,
-  signal?: AbortSignal,
-): Promise<T> {
-  if (!signal || !isCancelable(promise)) return promise;
-  if (signal.aborted) {
-    promise.cancel();
-  } else {
-    signal.addEventListener("abort", () => promise.cancel(), {
-      once: true,
-    });
-  }
-  return promise;
+  return candidate.name === "AbortError";
 }

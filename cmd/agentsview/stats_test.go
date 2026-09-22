@@ -3,7 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"flag"
 	"fmt"
@@ -18,6 +19,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/money"
 )
 
 // renderStatsHuman renders stats through printStatsHuman and returns the
@@ -88,16 +90,16 @@ func writeCustomModelPricingConfig(t *testing.T, dataDir string) {
 		filepath.Join(dataDir, "config.toml"),
 		[]byte(`
 [custom_model_pricing."claude-sonnet-4-20250514"]
-input = 300.0
-output = 1500.0
-cache_creation = 375.0
-cache_read = 30.0
+input_microdollars_per_mtok = 300000000
+output_microdollars_per_mtok = 1500000000
+cache_creation_microdollars_per_mtok = 375000000
+cache_read_microdollars_per_mtok = 30000000
 
 [custom_model_pricing."claude-opus-4-20250514"]
-input = 1500.0
-output = 7500.0
-cache_creation = 1875.0
-cache_read = 150.0
+input_microdollars_per_mtok = 1500000000
+output_microdollars_per_mtok = 7500000000
+cache_creation_microdollars_per_mtok = 1875000000
+cache_read_microdollars_per_mtok = 150000000
 `),
 		0o600,
 	))
@@ -188,8 +190,8 @@ func TestPrintStatsHuman_Populated(t *testing.T) {
 			CacheHitRatio: db.CacheHitRatioDistribution{
 				Overall: 0.78,
 			},
-			DollarsSavedVsUncached: 88.54,
-			DollarsSpent:           42.13,
+			DollarsSavedVsUncached: money.MustParseDollars("88.54"),
+			DollarsSpent:           money.MustParseDollars("42.13"),
 		},
 		Adoption: &db.StatsAdoption{
 			ClaudeOnly:          true,
@@ -224,28 +226,30 @@ func TestPrintStatsHuman_Populated(t *testing.T) {
 			AvgEditChurn:          1.2,
 		},
 		CodeAttribution: &db.CodeAttribution{
-			Sources: []db.CodeAttributionSource{{
-				Provider: "cursor",
-				Scope:    "machine_local",
-				Status:   "available",
-				Metrics: &db.CursorAttributionMetrics{
-					ScoredCommits:        2,
-					LinesAdded:           30,
-					LinesDeleted:         12,
-					TabLinesAdded:        8,
-					TabLinesDeleted:      2,
-					ComposerLinesAdded:   3,
-					ComposerLinesDeleted: 1,
-					HumanLinesAdded:      19,
-					HumanLinesDeleted:    9,
-					BlankLinesAdded:      4,
-					BlankLinesDeleted:    0,
-					AIAuthoredPct:        11.0 / 30.0,
-					ConversationCounts: []db.CursorConversationCount{
-						{Model: "claude-3.5-sonnet", Mode: "composer", Count: 2},
-						{Model: "claude-3.5-sonnet", Mode: "tab", Count: 1},
+			Sources: []db.CodeAttributionSource{
+				{
+					Provider: "cursor",
+					Scope:    "machine_local",
+					Status:   "available",
+					Metrics: &db.CursorAttributionMetrics{
+						ScoredCommits:        2,
+						LinesAdded:           30,
+						LinesDeleted:         12,
+						TabLinesAdded:        8,
+						TabLinesDeleted:      2,
+						ComposerLinesAdded:   3,
+						ComposerLinesDeleted: 1,
+						HumanLinesAdded:      19,
+						HumanLinesDeleted:    9,
+						BlankLinesAdded:      4,
+						BlankLinesDeleted:    0,
+						AIAuthoredPct:        11.0 / 30.0,
+						ConversationCounts: []db.CursorConversationCount{
+							{Model: "claude-3.5-sonnet", Mode: "composer", Count: 2},
+							{Model: "claude-3.5-sonnet", Mode: "tab", Count: 1},
+						},
 					},
-				}},
+				},
 			},
 		},
 		GeneratedAt: "2026-04-18T00:00:00Z",
@@ -346,7 +350,7 @@ func TestStatsCommandUsesDiscoveredDaemon(t *testing.T) {
 		"/api/v1/session-stats": func(w http.ResponseWriter, r *http.Request) {
 			gotQuery = r.URL.Query()
 			writeJSONResponse(w, `{
-				"schema_version": 1,
+				"schema_version": 2,
 				"window": {
 					"since": "2026-04-01T00:00:00Z",
 					"until": "2026-04-15T00:00:00Z",
@@ -408,7 +412,7 @@ func TestStatsCommandReportsDaemonValidationError(t *testing.T) {
 	assert.Contains(t, err.Error(), "invalid timezone: Fake/Zone")
 }
 
-func TestStatsCommandSkipsReadOnlyDaemon(t *testing.T) {
+func TestStatsCommandUsesReadOnlyDaemon(t *testing.T) {
 	dataDir := setupGoldenStatsDataDir(t)
 
 	var called bool
@@ -428,11 +432,8 @@ func TestStatsCommandSkipsReadOnlyDaemon(t *testing.T) {
 		"--timezone", "UTC",
 	)
 
-	require.NoError(t, err, "stats output:\n%s", out)
-	assert.False(t, called, "read-only daemon stats endpoint should be skipped")
-	var got db.SessionStats
-	require.NoError(t, json.Unmarshal([]byte(out), &got))
-	assert.Equal(t, len(goldenFixtureSessions), got.Totals.SessionsAll)
+	require.ErrorIs(t, err, db.ErrReadOnly, "stats output:\n%s", out)
+	assert.True(t, called, "stats should use the discovered read-only daemon")
 }
 
 // updateGolden toggles regeneration of stats_golden.json.
@@ -475,7 +476,7 @@ func TestStatsGolden(t *testing.T) {
 		"testdata", "stats_golden.json",
 	)
 	if *updateGolden {
-		buf, err := json.MarshalIndent(got, "", "  ")
+		buf, err := json.Marshal(got, jsontext.WithIndent("  "))
 		require.NoError(t, err, "marshal golden")
 		buf = append(buf, '\n')
 		require.NoError(t, os.MkdirAll(
@@ -495,15 +496,9 @@ func TestStatsGolden(t *testing.T) {
 	delete(want, "generated_at")
 
 	if !assert.Equal(t, want, got) {
-		gotBuf, _ := json.MarshalIndent(got, "", "  ")
-		wantBuf, _ := json.MarshalIndent(want, "", "  ")
-		t.Fatalf(
-			"stats JSON mismatch — regenerate with "+
-				"`go test ./cmd/agentsview -run "+
-				"TestStatsGolden -update` if intentional.\n"+
-				"--- got ---\n%s\n--- want ---\n%s",
-			gotBuf, wantBuf,
-		)
+		gotBuf, _ := json.Marshal(got, jsontext.WithIndent("  "))
+		wantBuf, _ := json.Marshal(want, jsontext.WithIndent("  "))
+		require.FailNowf(t, "stats JSON mismatch", "regenerate with `go test ./cmd/agentsview -run TestStatsGolden -update` if intentional.\n--- got ---\n%s\n--- want ---\n%s", gotBuf, wantBuf)
 	}
 }
 
@@ -515,23 +510,24 @@ func TestStatsReadOnlyOpenAppliesCustomPricing(t *testing.T) {
 	var got db.SessionStats
 	require.NoError(t, json.Unmarshal([]byte(out), &got))
 	require.NotNil(t, got.CacheEconomics)
-	assert.Greater(t, got.CacheEconomics.DollarsSpent, 600.0,
+	assert.Greater(t, got.CacheEconomics.DollarsSpent.Microdollars,
+		int64(600_000_000),
 		"custom pricing should be applied to the read-only stats DB handle")
 }
 
 var (
 	goldenFixtureTemplateOnce  sync.Once
 	goldenFixtureTemplateFiles map[string][]byte
-	goldenFixtureTemplateErr   error
+	errGoldenFixtureTemplate   error
 )
 
 func copyGoldenFixtureDB(t *testing.T, dbPath string) {
 	t.Helper()
+
 	goldenFixtureTemplateOnce.Do(func() {
-		goldenFixtureTemplateFiles, goldenFixtureTemplateErr =
-			buildGoldenFixtureTemplateFiles(t)
+		goldenFixtureTemplateFiles, errGoldenFixtureTemplate = buildGoldenFixtureTemplateFiles(t)
 	})
-	require.NoError(t, goldenFixtureTemplateErr, "build golden fixture template")
+	require.NoError(t, errGoldenFixtureTemplate, "build golden fixture template")
 	require.NoError(t, os.MkdirAll(filepath.Dir(dbPath), 0o755),
 		"create golden fixture dir")
 	for _, suffix := range []string{"", "-wal", "-shm"} {
@@ -546,14 +542,10 @@ func copyGoldenFixtureDB(t *testing.T, dbPath string) {
 
 func buildGoldenFixtureTemplateFiles(t *testing.T) (map[string][]byte, error) {
 	t.Helper()
-	dir, err := os.MkdirTemp("", "agentsview-golden-stats-*")
-	if err != nil {
-		return nil, fmt.Errorf("create golden fixture template dir: %w", err)
-	}
-	defer os.RemoveAll(dir)
+	dir := t.TempDir()
 
 	dbPath := filepath.Join(dir, "sessions.db")
-	d, err := db.Open(dbPath)
+	d, err := db.Open(t.Context(), dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("open golden fixture template db: %w", err)
 	}
@@ -565,7 +557,7 @@ func buildGoldenFixtureTemplateFiles(t *testing.T) (map[string][]byte, error) {
 	}()
 
 	seedGoldenFixtureDB(t, d)
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
 	if err := d.CheckpointWALTruncate(ctx); err != nil {
 		return nil, fmt.Errorf("checkpoint golden fixture template: %w", err)
@@ -615,17 +607,17 @@ func seedGoldenFixtureDB(t *testing.T, d *db.DB) {
 	require.NoError(t, d.UpsertModelPricing([]db.ModelPricing{
 		{
 			ModelPattern:         "claude-sonnet-4-20250514",
-			InputPerMTok:         3.0,
-			OutputPerMTok:        15.0,
-			CacheCreationPerMTok: 3.75,
-			CacheReadPerMTok:     0.30,
+			InputPerMTok:         money.MustParseDollars("3.0"),
+			OutputPerMTok:        money.MustParseDollars("15.0"),
+			CacheCreationPerMTok: money.MustParseDollars("3.75"),
+			CacheReadPerMTok:     money.MustParseDollars("0.30"),
 		},
 		{
 			ModelPattern:         "claude-opus-4-20250514",
-			InputPerMTok:         15.0,
-			OutputPerMTok:        75.0,
-			CacheCreationPerMTok: 18.75,
-			CacheReadPerMTok:     1.50,
+			InputPerMTok:         money.MustParseDollars("15.0"),
+			OutputPerMTok:        money.MustParseDollars("75.0"),
+			CacheCreationPerMTok: money.MustParseDollars("18.75"),
+			CacheReadPerMTok:     money.MustParseDollars("1.50"),
 		},
 	}), "seed pricing")
 
@@ -769,7 +761,7 @@ func seedGoldenSession(
 	// has meaningful non-zero values.
 	totalOutput := 0
 	if spec.model != "" {
-		for i := 0; i < spec.userMsgs; i++ {
+		for i := range spec.userMsgs {
 			totalOutput += goldenOutputTokens(i)
 		}
 	}
@@ -789,7 +781,7 @@ func seedGoldenSession(
 		TotalOutputTokens:    totalOutput,
 		HasTotalOutputTokens: totalOutput > 0,
 	}
-	require.NoError(t, d.UpsertSession(session), "upsert %s", spec.id)
+	require.NoError(t, d.UpsertSession(t.Context(), session), "upsert %s", spec.id)
 
 	if spec.outcome != "" || spec.healthGrade != "" ||
 		spec.retryCount > 0 || spec.editChurn > 0 ||
@@ -799,7 +791,7 @@ func seedGoldenSession(
 			g := spec.healthGrade
 			grade = &g
 		}
-		require.NoError(t, d.UpdateSessionSignals(spec.id, db.SessionSignalUpdate{
+		require.NoError(t, d.UpdateSessionSignals(t.Context(), spec.id, db.SessionSignalUpdate{
 			Outcome:         spec.outcome,
 			HealthGrade:     grade,
 			ToolRetryCount:  spec.retryCount,
@@ -810,7 +802,7 @@ func seedGoldenSession(
 
 	msgs := buildGoldenMessages(spec)
 	if len(msgs) > 0 {
-		require.NoError(t, d.InsertMessages(msgs),
+		require.NoError(t, d.InsertMessages(t.Context(), msgs),
 			"insert messages %s", spec.id)
 	}
 }
@@ -828,7 +820,7 @@ func buildGoldenMessages(spec goldenSessionSpec) []db.Message {
 	if toolName == "" && spec.toolCount > 0 {
 		toolName = "Read"
 	}
-	for i := 0; i < spec.userMsgs; i++ {
+	for i := range spec.userMsgs {
 		ts := addMinutes(spec.startedAt, i)
 		out = append(out, db.Message{
 			SessionID:     spec.id,

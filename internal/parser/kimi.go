@@ -1,7 +1,9 @@
 package parser
 
 import (
-	"encoding/json"
+	"context"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -97,7 +99,7 @@ func isKimiHash(s string) bool {
 	if len(s) != 12 {
 		return false
 	}
-	for i := 0; i < len(s); i++ {
+	for i := range len(s) {
 		c := s[i]
 		isHex := (c >= '0' && c <= '9') ||
 			(c >= 'a' && c <= 'f') ||
@@ -132,6 +134,14 @@ func kimiIDComponentsValid(components ...string) bool {
 func parseKimiSession(
 	path, project, machine string,
 ) (*ParsedSession, []ParsedMessage, error) {
+	return parseKimiSessionWithFallbackModel(
+		path, project, machine, defaultKimiModel,
+	)
+}
+
+func parseKimiSessionWithFallbackModel(
+	path, project, machine, fallbackModel string,
+) (*ParsedSession, []ParsedMessage, error) {
 	info, err := os.Stat(path)
 	if err != nil {
 		return nil, nil, fmt.Errorf("stat %s: %w", path, err)
@@ -144,6 +154,7 @@ func parseKimiSession(
 	defer f.Close()
 
 	lr := newLineReader(f, maxLineSize)
+	defer releaseLineReader(lr)
 
 	// Extract session ID from path. Both legacy and .kimi-code
 	// layouts are supported.
@@ -163,14 +174,17 @@ func parseKimiSession(
 		pendingThinkingText     []string
 		pendingToolCall         []ParsedToolCall
 		pendingModel            string
-		pendingTokenUsage       json.RawMessage
+		pendingTokenUsage       jsontext.Value
 		pendingContextTokens    int
 		pendingOutputTokens     int
 		pendingHasContextTokens bool
 		pendingHasOutputTokens  bool
 		pendingStopReason       string
-		hasThinking             bool
-		hasToolUse              bool
+		// Kimi Work can write tool.result before the step's trailing usage.
+		pendingUsageMessageIndex = -1
+		hasThinking              bool
+		hasToolUse               bool
+		cwd                      string
 
 		// Track token usage from StatusUpdate.
 		totalOutputTokens    int
@@ -183,7 +197,7 @@ func parseKimiSession(
 		currentTS time.Time
 		pendingTS time.Time
 
-		currentModel = defaultKimiModel
+		currentModel = fallbackModel
 	)
 
 	resetAssistantTurn := func() {
@@ -202,12 +216,12 @@ func parseKimiSession(
 		hasToolUse = false
 	}
 
-	flushAssistantTurn := func() {
+	flushAssistantTurn := func() int {
 		content := strings.Join(pendingText, "\n")
 		if strings.TrimSpace(content) == "" &&
 			len(pendingToolCall) == 0 {
 			resetAssistantTurn()
-			return
+			return -1
 		}
 
 		// Kimi wire logs often omit the model; fall back to the current
@@ -217,6 +231,7 @@ func parseKimiSession(
 			turnModel = currentModel
 		}
 
+		messageIndex := len(messages)
 		messages = append(messages, ParsedMessage{
 			Ordinal:          ordinal,
 			Role:             RoleAssistant,
@@ -237,6 +252,30 @@ func parseKimiSession(
 		})
 		ordinal++
 		resetAssistantTurn()
+		return messageIndex
+	}
+
+	hasPendingAssistantTurn := func() bool {
+		return strings.TrimSpace(strings.Join(pendingText, "\n")) != "" ||
+			len(pendingToolCall) > 0
+	}
+
+	attachPendingTurn := func(message *ParsedMessage) {
+		if pendingModel != "" {
+			message.Model = pendingModel
+		} else if message.Model == "" {
+			message.Model = currentModel
+		}
+		if len(message.TokenUsage) == 0 && len(pendingTokenUsage) > 0 {
+			message.TokenUsage = pendingTokenUsage
+			message.OutputTokens = pendingOutputTokens
+			message.ContextTokens = pendingContextTokens
+			message.HasOutputTokens = pendingHasOutputTokens
+			message.HasContextTokens = pendingHasContextTokens
+		}
+		if pendingStopReason != "" {
+			message.StopReason = pendingStopReason
+		}
 	}
 
 	for {
@@ -275,9 +314,13 @@ func parseKimiSession(
 				if model := root.Get("modelAlias").Str; model != "" {
 					currentModel = model
 				}
+				if value := root.Get("cwd").Str; value != "" {
+					cwd = value
+				}
 
 			case "turn.prompt", "turn.steer":
 				flushAssistantTurn()
+				pendingUsageMessageIndex = -1
 
 				userText := kimiContentPartsText(root.Get("input"))
 				if userText == "" {
@@ -347,18 +390,19 @@ func parseKimiSession(
 						ToolName:  fnName,
 						Category:  NormalizeToolCategory(fnName),
 						InputJSON: fnArgs,
-						SkillName: inferToolSkillName(
+						SkillName: inferToolSkillName(context.Background(),
 							fnName, fnArgs,
 						),
 					}
-					pendingToolCall = append(pendingToolCall, tc)
-
 					argsResult := kimiJSONResult(event.Get("args"))
-					pendingText = append(pendingText,
-						formatKimiToolUse(fnName, argsResult))
+					tc.Rendering = formatKimiToolUse(fnName, argsResult)
+					pendingToolCall = append(pendingToolCall, tc)
+					pendingText = append(pendingText, tc.Rendering)
 
 				case "tool.result":
-					flushAssistantTurn()
+					if index := flushAssistantTurn(); index >= 0 {
+						pendingUsageMessageIndex = index
+					}
 
 					toolCallID := event.Get("toolCallId").Str
 					result := event.Get("result")
@@ -397,8 +441,7 @@ func parseKimiSession(
 					pendingStopReason = event.Get("finishReason").Str
 					if usage := event.Get("usage"); usage.Exists() {
 						tokenUsage, outputTokens, contextTokens,
-							hasOutput, hasContext :=
-							kimiNativeTokenUsage(usage)
+							hasOutput, hasContext := kimiNativeTokenUsage(usage)
 						pendingTokenUsage = tokenUsage
 						pendingOutputTokens = outputTokens
 						pendingContextTokens = contextTokens
@@ -415,10 +458,23 @@ func parseKimiSession(
 							}
 						}
 					}
-					flushAssistantTurn()
+					if !hasPendingAssistantTurn() &&
+						pendingUsageMessageIndex >= 0 &&
+						pendingUsageMessageIndex < len(messages) {
+						target := &messages[pendingUsageMessageIndex]
+						attachPendingTurn(target)
+						hasAttachedUsage := len(target.TokenUsage) > 0
+						resetAssistantTurn()
+						if hasAttachedUsage {
+							pendingUsageMessageIndex = -1
+						}
+					} else {
+						flushAssistantTurn()
+						pendingUsageMessageIndex = -1
+					}
 
 				case "step.begin":
-					// Informational; no action needed.
+					pendingUsageMessageIndex = -1
 				}
 
 			case "usage.record":
@@ -427,18 +483,27 @@ func parseKimiSession(
 				}
 				if usage := root.Get("usage"); usage.Exists() &&
 					len(messages) > 0 {
+					var target *ParsedMessage
 					last := &messages[len(messages)-1]
-					if last.Role == RoleAssistant &&
-						len(last.TokenUsage) == 0 {
+					if last.Role == RoleAssistant && len(last.TokenUsage) == 0 {
+						target = last
+					} else if pendingUsageMessageIndex >= 0 &&
+						pendingUsageMessageIndex < len(messages) {
+						candidate := &messages[pendingUsageMessageIndex]
+						if candidate.Role == RoleAssistant &&
+							len(candidate.TokenUsage) == 0 {
+							target = candidate
+						}
+					}
+					if target != nil {
 						tokenUsage, outputTokens, contextTokens,
-							hasOutput, hasContext :=
-							kimiNativeTokenUsage(usage)
-						last.Model = currentModel
-						last.TokenUsage = tokenUsage
-						last.OutputTokens = outputTokens
-						last.ContextTokens = contextTokens
-						last.HasOutputTokens = hasOutput
-						last.HasContextTokens = hasContext
+							hasOutput, hasContext := kimiNativeTokenUsage(usage)
+						target.Model = currentModel
+						target.TokenUsage = tokenUsage
+						target.OutputTokens = outputTokens
+						target.ContextTokens = contextTokens
+						target.HasOutputTokens = hasOutput
+						target.HasContextTokens = hasContext
 						if hasOutput {
 							hasTotalOutputTokens = true
 							totalOutputTokens += outputTokens
@@ -448,6 +513,9 @@ func parseKimiSession(
 							if contextTokens > peakContextTokens {
 								peakContextTokens = contextTokens
 							}
+						}
+						if len(tokenUsage) > 0 {
+							pendingUsageMessageIndex = -1
 						}
 					}
 				}
@@ -538,16 +606,15 @@ func parseKimiSession(
 				ToolName:  fnName,
 				Category:  NormalizeToolCategory(fnName),
 				InputJSON: fnArgs,
-				SkillName: inferToolSkillName(
+				SkillName: inferToolSkillName(context.Background(),
 					fnName, fnArgs,
 				),
 			}
+			// Format tool use display text and keep it on the call so
+			// storage policies that drop tool inputs can replace it.
+			tc.Rendering = formatKimiToolUse(fnName, gjson.Parse(fnArgs))
 			pendingToolCall = append(pendingToolCall, tc)
-
-			// Format tool use display text.
-			argsResult := gjson.Parse(fnArgs)
-			pendingText = append(pendingText,
-				formatKimiToolUse(fnName, argsResult))
+			pendingText = append(pendingText, tc.Rendering)
 
 		case "ToolResult":
 			flushAssistantTurn()
@@ -630,6 +697,7 @@ func parseKimiSession(
 		Project:                     displayProject,
 		Machine:                     machine,
 		Agent:                       AgentKimi,
+		Cwd:                         cwd,
 		FirstMessage:                firstMessage,
 		StartedAt:                   startTime,
 		EndedAt:                     endTime,
@@ -734,7 +802,7 @@ func kimiJSONResult(value gjson.Result) gjson.Result {
 
 func kimiNativeTokenUsage(
 	usage gjson.Result,
-) (json.RawMessage, int, int, bool, bool) {
+) (jsontext.Value, int, int, bool, bool) {
 	var (
 		inputOther          int
 		output              int
@@ -774,7 +842,7 @@ func kimiNativeTokenUsage(
 		"cache_read_input_tokens":     inputCacheRead,
 		"cache_creation_input_tokens": inputCacheCreate,
 	}
-	raw, err := json.Marshal(normalized)
+	raw, err := json.Marshal(normalized, json.Deterministic(true))
 	if err != nil {
 		return nil, 0, 0, false, false
 	}
@@ -826,7 +894,7 @@ func formatKimiToolUse(name string, input gjson.Result) string {
 		if desc != "" {
 			return fmt.Sprintf("[Bash: %s]\n$ %s", desc, cmd)
 		}
-		return fmt.Sprintf("[Bash]\n$ %s", cmd)
+		return "[Bash]\n$ " + cmd
 	case "Grep":
 		return fmt.Sprintf("[Grep: %s]", input.Get("pattern").Str)
 	case "Glob":

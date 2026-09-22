@@ -1,7 +1,9 @@
 package parser
 
 import (
+	"context"
 	"database/sql"
+	"encoding/binary"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -55,6 +57,11 @@ func antigravityIDECompanionPaths(path string) []string {
 		path + "-wal",
 		path + "-shm",
 		filepath.Join(root, "annotations", id+".pbtxt"),
+		// The agy-reader trajectory sidecar is a transcript source for
+		// IDE sessions too (see parseSession), so a sidecar write must
+		// change the fingerprint even when the database files themselves
+		// are untouched.
+		strings.TrimSuffix(path, ".db") + ".trajectory.json",
 	}
 	return append(companions, antigravityBrainCompanions(
 		filepath.Join(root, "brain", id),
@@ -64,7 +71,7 @@ func antigravityIDECompanionPaths(path string) []string {
 // parseSession parses one IDE session DB. It is owned by the
 // antigravityProvider; the package-level ParseAntigravitySession
 // entrypoint was folded onto the provider.
-func (p *antigravityProvider) parseSession(
+func (p *antigravityProvider) parseSession(ctx context.Context,
 	path, project, machine string,
 ) (*ParsedSession, []ParsedMessage, []ParsedUsageEvent, error) {
 	info, err := os.Stat(path)
@@ -81,8 +88,7 @@ func (p *antigravityProvider) parseSession(
 
 	// Open read-only; SQLite session files have WAL/SHM
 	// sidecars that the driver expects in the same dir.
-	dsn := "file:" + sqliteURIPath(path) + "?mode=ro&immutable=0"
-	db, err := sql.Open("sqlite3", dsn)
+	db, err := openSQLiteReadOnly(path, sqliteReadOptions{})
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf(
 			"open antigravity db %s: %w", path, err,
@@ -93,12 +99,67 @@ func (p *antigravityProvider) parseSession(
 	// Schema-fingerprint label for the producing agy build. Computed from
 	// the open DB so IDE and CLI classify identically; empty when the
 	// schema cannot be read.
-	sourceVersion := antigravitySourceVersion(db)
+	sourceVersion := antigravitySourceVersion(ctx, db)
 
-	messages, usageEvents, hasGenMetadata, err := loadAntigravitySteps(db)
+	dbResult, err := loadAntigravityStepsWithRawCount(ctx, db)
 	if err != nil {
+		// Fail closed on an unreadable steps table, deliberately: a
+		// covering sidecar cannot rescue an unreadable DB because
+		// coverage is unprovable without the DB's raw step count (a
+		// displayable sidecar may lag a live session), and this
+		// provider force-replaces on success (the engine's
+		// shouldReplaceFullParseMessages plus the unconditional
+		// ForceReplace outcome), so any rescue would risk overwriting a
+		// previously complete stored transcript with a stale sidecar
+		// (roborev jobs 1982 and 2112, both high). Safe rescue needs
+		// engine-level no-clobber support, tracked separately. The
+		// parse error preserves stored data and the engine retries
+		// failed files.
 		return nil, nil, nil, err
 	}
+	messages := dbResult.messages
+	// gen_metadata token usage describes the session's actual
+	// consumption no matter which transcript source wins below. The
+	// trajectory sidecar also extracts generatorMetadata usage, but the
+	// .db gen_metadata events win and sidecar events only fill the gap
+	// (missing gen_metadata table) so the same generation is never
+	// counted twice -- mirroring the CLI path's merge behavior.
+	usageEvents := dbResult.usageEvents
+	hasGenMetadata := dbResult.hasGenMetadata
+	// TranscriptFidelity is left empty (treated as full) for the heuristic
+	// decode, matching prior IDE behavior; a covering sidecar sets it to
+	// TranscriptFidelityFull explicitly below.
+	transcriptFidelity := ""
+
+	// Prefer the agy-reader trajectory sidecar: it is the daemon's own
+	// decode, with structured tool calls/results and thinking, where the
+	// heuristic DB decode only recovers loose strings. Selection is
+	// content-based, not mtime-based: the sidecar wins only when it covers
+	// at least as many steps as the raw DB decode, so a sidecar lagging
+	// behind a live session loses until agy-reader catches up. When the
+	// sidecar is absent, malformed, or fails the coverage gate the parser
+	// falls back to the heuristic decode exactly as before.
+	sidecarPath := strings.TrimSuffix(path, ".db") + ".trajectory.json"
+	tRes, tErr := parseAntigravityCLITrajectory(
+		sidecarPath, dbResult.executors,
+	)
+	sidecarOK := tErr == nil &&
+		hasDisplayableAntigravityCLITrajectoryMessage(tRes.messages)
+	sidecarCovers := dbResult.rawStepCount == 0 ||
+		tRes.rawSteps >= dbResult.rawStepCount
+	if sidecarOK && sidecarCovers {
+		messages = tRes.messages
+		transcriptFidelity = TranscriptFidelityFull
+	}
+	// Coverage gates usage just like the transcript: a lagging sidecar
+	// carries only the generations it has seen, so persisting those would
+	// underreport totals on a row that looks current. sidecarCovers stays
+	// true when the DB offers no coverage signal (zero rows), so gap-fill
+	// still applies there.
+	if len(usageEvents) == 0 && tErr == nil && sidecarCovers {
+		usageEvents = tRes.usageEvents
+	}
+
 	messages = append(messages,
 		collectAntigravityBrainMessages(
 			filepath.Join(root, "brain", id),
@@ -157,16 +218,17 @@ func (p *antigravityProvider) parseSession(
 	}
 
 	sess := &ParsedSession{
-		ID:               antigravityIDPrefix + id,
-		Project:          project,
-		Machine:          machine,
-		Agent:            AgentAntigravity,
-		FirstMessage:     firstMessage,
-		StartedAt:        startedAt,
-		EndedAt:          endedAt,
-		MessageCount:     len(messages),
-		UserMessageCount: userCount,
-		SourceVersion:    sourceVersion,
+		ID:                 antigravityIDPrefix + id,
+		Project:            project,
+		Machine:            machine,
+		Agent:              AgentAntigravity,
+		FirstMessage:       firstMessage,
+		StartedAt:          startedAt,
+		EndedAt:            endedAt,
+		MessageCount:       len(messages),
+		UserMessageCount:   userCount,
+		SourceVersion:      sourceVersion,
+		TranscriptFidelity: transcriptFidelity,
 		File: FileInfo{
 			Path:  path,
 			Size:  size,
@@ -190,19 +252,13 @@ func (p *antigravityProvider) parseSession(
 	return sess, messages, usageEvents, nil
 }
 
-func loadAntigravitySteps(
-	db *sql.DB,
-) ([]ParsedMessage, []ParsedUsageEvent, bool, error) {
-	result, err := loadAntigravityStepsWithRawCount(db)
-	if err != nil {
-		return nil, nil, false, err
-	}
-	return result.messages, result.usageEvents, result.hasGenMetadata, nil
-}
-
 type antigravityStepLoadResult struct {
-	messages     []ParsedMessage
-	usageEvents  []ParsedUsageEvent
+	messages    []ParsedMessage
+	usageEvents []ParsedUsageEvent
+	// executors is retained for preferred trajectory sidecars so their
+	// generatorMetadata uses the same range-qualified model attribution as
+	// SQLite gen_metadata.
+	executors    []antigravityExecutorMetadata
 	rawStepCount int
 	// hasGenMetadata reports whether the steps DB carried a non-empty
 	// gen_metadata table. Paired with an empty usageEvents slice it flags a
@@ -221,6 +277,30 @@ type antigravityStepKind int
 const (
 	antigravityStepKindUserInput       antigravityStepKind = 14
 	antigravityStepKindPlannerResponse antigravityStepKind = 15
+)
+
+// These field numbers come from the FileDescriptorProto records embedded in
+// the official Antigravity CLI 1.1.16 Go binary. Keep the identifiers aligned
+// with the producer's protobuf names so the parser does not turn schema paths
+// back into anonymous numeric guesses.
+const (
+	agCortexStepGeneratorMetadataChatModelField   = 1
+	agCortexStepGeneratorMetadataStepIndicesField = 2
+
+	agChatModelMetadataUsageField            = 4
+	agChatModelMetadataResponseModelField    = 19
+	agChatModelMetadataModelDisplayNameField = 21
+
+	agModelUsageStatsModelField            = 1
+	agModelUsageStatsInputTokensField      = 2
+	agModelUsageStatsOutputTokensField     = 3
+	agModelUsageStatsCacheWriteTokensField = 4
+	agModelUsageStatsCacheReadTokensField  = 5
+
+	agExecutorMetadataLastStepIndexField = 3
+	agExecutorMetadataCascadeConfigField = 10
+	agCascadeConfigPlannerConfigField    = 1
+	agCascadePlannerConfigModelNameField = 28
 )
 
 type antigravityStep struct {
@@ -274,34 +354,25 @@ func roleForAntigravityStepKind(kind antigravityStepKind) RoleType {
 	}
 }
 
-func loadAntigravityStepsWithRawCount(
+func loadAntigravityStepsWithRawCount(ctx context.Context,
 	db *sql.DB,
 ) (antigravityStepLoadResult, error) {
-	rows, err := db.Query(
-		`SELECT idx, step_type, step_payload FROM steps ` +
+	generations := loadAntigravityGenerationMetadata(ctx, db)
+	executors := loadAntigravityExecutorMetadata(ctx, db)
+	result := antigravityStepLoadResult{
+		executors:      executors,
+		hasGenMetadata: len(generations) > 0,
+	}
+	rows, err := db.QueryContext(ctx,
+		`SELECT idx, step_type, step_payload FROM steps `+
 			`ORDER BY idx`,
 	)
 	if err != nil {
-		return antigravityStepLoadResult{}, fmt.Errorf("query steps: %w", err)
+		return result, fmt.Errorf("query steps: %w", err)
 	}
 	defer rows.Close()
-
-	// Gracefully query gen_metadata if the table exists
-	var genMeta map[int][]byte
-	if genRows, err := db.Query("SELECT idx, data FROM gen_metadata"); err == nil {
-		defer genRows.Close()
-		genMeta = make(map[int][]byte)
-		for genRows.Next() {
-			var idx int
-			var data []byte
-			if err := genRows.Scan(&idx, &data); err == nil {
-				genMeta[idx] = data
-			}
-		}
-	}
-
-	var result antigravityStepLoadResult
-	result.hasGenMetadata = len(genMeta) > 0
+	steps := make([]antigravityLoadedStep, 0)
+	stepPositions := make(map[int]int)
 	for rows.Next() {
 		var (
 			idx      int
@@ -309,22 +380,255 @@ func loadAntigravityStepsWithRawCount(
 			payload  []byte
 		)
 		if err := rows.Scan(&idx, &stepType, &payload); err != nil {
-			return antigravityStepLoadResult{}, fmt.Errorf("scan step: %w", err)
+			return result, fmt.Errorf("scan step: %w", err)
 		}
+		parsedStep, parsed := newAntigravityStep(idx, stepType, payload)
+		var msg ParsedMessage
+		var decoded bool
+		kind := antigravityStepKind(stepType)
+		if parsed {
+			kind = parsedStep.kind
+			msg, decoded = decodeAntigravityParsedStep(parsedStep)
+		}
+		stepPositions[idx] = len(steps)
+		steps = append(steps, antigravityLoadedStep{
+			kind: kind, msg: msg, decoded: decoded,
+		})
 		result.rawStepCount++
-		msg, decoded := decodeAntigravityStep(idx, stepType, payload)
-		if data, ok := genMeta[idx]; ok {
-			msg = result.appendGenMetadataUsage(data, msg, decoded)
-		}
-		if !decoded {
-			continue
-		}
-		result.messages = append(result.messages, msg)
 	}
 	if err := rows.Err(); err != nil {
-		return antigravityStepLoadResult{}, fmt.Errorf("iterate steps: %w", err)
+		return result, fmt.Errorf("iterate steps: %w", err)
+	}
+
+	for _, generation := range generations {
+		position, found := generationPlannerStep(
+			generation, steps, stepPositions,
+		)
+		executorModel := ""
+		if stepIndex, known := generation.maxStepIndex(); known {
+			executorModel = executorModelForStep(executors, stepIndex)
+		}
+		if !found {
+			result.appendGenMetadataUsage(
+				generation.data, ParsedMessage{}, false, executorModel,
+			)
+			continue
+		}
+		step := &steps[position]
+		step.msg = result.appendGenMetadataUsage(
+			generation.data, step.msg, step.decoded, executorModel,
+		)
+	}
+	for _, step := range steps {
+		if step.decoded {
+			result.messages = append(result.messages, step.msg)
+		}
 	}
 	return result, nil
+}
+
+type antigravityLoadedStep struct {
+	kind    antigravityStepKind
+	msg     ParsedMessage
+	decoded bool
+}
+
+type antigravityGenerationMetadata struct {
+	idx              int
+	data             []byte
+	stepIndices      []int
+	hasStepIndices   bool
+	stepIndicesValid bool
+}
+
+func (g antigravityGenerationMetadata) maxStepIndex() (int, bool) {
+	if !g.hasStepIndices {
+		return g.idx, true
+	}
+	if !g.stepIndicesValid {
+		return 0, false
+	}
+	return maxAntigravityStepIndex(g.stepIndices)
+}
+
+func maxAntigravityStepIndex(indices []int) (int, bool) {
+	maxIdx := -1
+	for _, idx := range indices {
+		if idx > maxIdx {
+			maxIdx = idx
+		}
+	}
+	return maxIdx, maxIdx >= 0
+}
+
+type antigravityExecutorMetadata struct {
+	lastStepIndex int
+	modelName     string
+}
+
+func loadAntigravityGenerationMetadata(ctx context.Context,
+	db *sql.DB,
+) []antigravityGenerationMetadata {
+	rows, err := db.QueryContext(ctx, "SELECT idx, data FROM gen_metadata ORDER BY idx")
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+
+	var generations []antigravityGenerationMetadata
+	for rows.Next() {
+		var generation antigravityGenerationMetadata
+		if err := rows.Scan(&generation.idx, &generation.data); err != nil {
+			continue
+		}
+		generation.stepIndices,
+			generation.hasStepIndices,
+			generation.stepIndicesValid = extractAntigravityStepIndices(generation.data)
+		generations = append(generations, generation)
+	}
+	if rows.Err() != nil {
+		return nil
+	}
+	return generations
+}
+
+func loadAntigravityExecutorMetadata(ctx context.Context,
+	db *sql.DB,
+) []antigravityExecutorMetadata {
+	rows, err := db.QueryContext(ctx, "SELECT data FROM executor_metadata ORDER BY idx")
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+
+	var executors []antigravityExecutorMetadata
+	for rows.Next() {
+		var data []byte
+		if err := rows.Scan(&data); err != nil {
+			continue
+		}
+		executor, ok := extractAntigravityExecutorMetadata(data)
+		if ok {
+			executors = append(executors, executor)
+		}
+	}
+	if rows.Err() != nil {
+		return nil
+	}
+	sort.SliceStable(executors, func(i, j int) bool {
+		return executors[i].lastStepIndex < executors[j].lastStepIndex
+	})
+	return executors
+}
+
+func extractAntigravityStepIndices(
+	data []byte,
+) (indices []int, present bool, valid bool) {
+	fields, err := agProtoParse(data)
+	if err != nil {
+		return nil, false, false
+	}
+	maxInt := uint64(^uint(0) >> 1)
+	for _, field := range fields {
+		if field.Number != agCortexStepGeneratorMetadataStepIndicesField {
+			continue
+		}
+		present = true
+		if field.Wire == pbWireVarint {
+			if field.Varint > maxInt {
+				return nil, true, false
+			}
+			indices = append(indices, int(field.Varint))
+			continue
+		}
+		if field.Wire != pbWireBytes {
+			return nil, true, false
+		}
+		for packed := field.Bytes; len(packed) > 0; {
+			value, size := binary.Uvarint(packed)
+			if size <= 0 || value > maxInt {
+				return nil, true, false
+			}
+			indices = append(indices, int(value))
+			packed = packed[size:]
+		}
+	}
+	return indices, present, true
+}
+
+func extractAntigravityExecutorMetadata(
+	data []byte,
+) (antigravityExecutorMetadata, bool) {
+	fields, err := agProtoParse(data)
+	if err != nil {
+		return antigravityExecutorMetadata{}, false
+	}
+	lastStep, ok := agProtoFind(
+		fields, agExecutorMetadataLastStepIndexField,
+	)
+	if !ok || lastStep.Wire != pbWireVarint {
+		return antigravityExecutorMetadata{}, false
+	}
+	cascadeConfig, ok := agProtoFind(
+		fields, agExecutorMetadataCascadeConfigField,
+	)
+	if !ok || cascadeConfig.Nested == nil {
+		return antigravityExecutorMetadata{}, false
+	}
+	plannerConfig, ok := agProtoFind(
+		cascadeConfig.Nested, agCascadeConfigPlannerConfigField,
+	)
+	if !ok || plannerConfig.Nested == nil {
+		return antigravityExecutorMetadata{}, false
+	}
+	modelNameField, ok := agProtoFind(
+		plannerConfig.Nested, agCascadePlannerConfigModelNameField,
+	)
+	if !ok {
+		return antigravityExecutorMetadata{}, false
+	}
+	modelName, ok := agProtoString(modelNameField)
+	if !ok || !isPlausibleModelName(modelName) {
+		return antigravityExecutorMetadata{}, false
+	}
+	return antigravityExecutorMetadata{
+		lastStepIndex: int(lastStep.Varint),
+		modelName:     modelName,
+	}, true
+}
+
+func generationPlannerStep(
+	generation antigravityGenerationMetadata,
+	steps []antigravityLoadedStep,
+	positions map[int]int,
+) (int, bool) {
+	for _, idx := range generation.stepIndices {
+		position, ok := positions[idx]
+		if !ok {
+			continue
+		}
+		step := steps[position]
+		if step.kind == antigravityStepKindPlannerResponse &&
+			step.decoded {
+			return position, true
+		}
+	}
+	if generation.hasStepIndices {
+		return 0, false
+	}
+	position, ok := positions[generation.idx]
+	return position, ok
+}
+
+func executorModelForStep(
+	executors []antigravityExecutorMetadata, stepIndex int,
+) string {
+	for _, executor := range executors {
+		if executor.lastStepIndex >= stepIndex {
+			return executor.modelName
+		}
+	}
+	return ""
 }
 
 // appendGenMetadataUsage records a usage event from one gen_metadata
@@ -334,19 +638,18 @@ func loadAntigravityStepsWithRawCount(
 // cannot render can still be rescued by the CLI trajectory sidecar
 // transcript, and its usage must not be dropped.
 func (r *antigravityStepLoadResult) appendGenMetadataUsage(
-	data []byte, msg ParsedMessage, decoded bool,
+	data []byte,
+	msg ParsedMessage,
+	decoded bool,
+	executorModel string,
 ) ParsedMessage {
-	genModel := extractModelName(data)
+	genModel := resolveAntigravityGenerationModel(data, executorModel)
 	block, okUsage := extractTokenUsage(data)
 	if okUsage {
-		// gen_metadata field semantics (cross-validated against sidecar
-		// generatorMetadata ground truth in 550/550 blocks):
-		//   f2 = uncached input (inputTokens)
-		//   f3 = total output including thinking (outputTokens)
-		//   f5 = cache-read (cacheReadTokens, absent when no cache hits)
-		//   f4 = always 0/absent, ignored
-		// No per-field reasoning breakdown is available; f3 already
-		// includes thinking tokens.
+		// ModelUsageStats.input_tokens is uncached input,
+		// output_tokens includes thinking in the observed SQLite blocks,
+		// and cache_read_tokens is absent when there are no cache hits.
+		// Those blocks do not provide a separate persisted reasoning count.
 		context := block.UncachedInput + block.CacheRead
 		eventModel := genModel
 		var occurredAt string
@@ -384,16 +687,17 @@ func (r *antigravityStepLoadResult) appendGenMetadataUsage(
 // ground truth (generatorMetadata[].chatModel.usage matches in 550/550
 // blocks):
 //
-//	UncachedInput = f2 (inputTokens, tokens not served from cache)
-//	TotalOutput   = f3 (outputTokens, includes thinking)
-//	CacheRead     = f5 (cacheReadTokens, absent/zero for cache-miss sessions)
+//	UncachedInput = ModelUsageStats.input_tokens
+//	TotalOutput   = ModelUsageStats.output_tokens, including thinking in
+//	                observed SQLite blocks
+//	CacheRead     = ModelUsageStats.cache_read_tokens
 //
 // No per-field reasoning breakdown is available in gen_metadata;
 // TotalOutput already includes thinking tokens.
 type agTokenBlock struct {
-	UncachedInput int // f2: tokens not served from cache
-	TotalOutput   int // f3: total output including thinking
-	CacheRead     int // f5: cache-read tokens (0 when absent)
+	UncachedInput int // ModelUsageStats.input_tokens
+	TotalOutput   int // ModelUsageStats.output_tokens
+	CacheRead     int // ModelUsageStats.cache_read_tokens
 }
 
 // maxPlausibleTokens caps the token values accepted by the heuristic.
@@ -409,6 +713,25 @@ func extractTokenUsage(data []byte) (agTokenBlock, bool) {
 	if err != nil {
 		return agTokenBlock{}, false
 	}
+	if chatModel, ok := extractAntigravityChatModel(fields); ok {
+		usage, ok := agProtoFind(
+			chatModel, agChatModelMetadataUsageField,
+		)
+		if !ok || usage.Nested == nil {
+			return agTokenBlock{}, false
+		}
+		return tokenBlockFrom(usage.Nested)
+	}
+	return extractLegacyAntigravityTokenUsage(fields)
+}
+
+// extractLegacyAntigravityTokenUsage preserves support for older persisted
+// records that predate CortexStepGeneratorMetadata.chat_model. Their enclosing
+// message is not represented by the current embedded descriptors, so finding
+// ModelUsageStats still requires the established bounded recursive walk.
+func extractLegacyAntigravityTokenUsage(
+	fields []agProtoField,
+) (agTokenBlock, bool) {
 	var found bool
 	var block agTokenBlock
 	var walk func([]agProtoField)
@@ -433,112 +756,259 @@ func extractTokenUsage(data []byte) (agTokenBlock, bool) {
 
 // tokenBlockFrom reports whether fs is a plausible token usage block.
 //
-// Field semantics are cross-validated against sidecar ground truth
+// The embedded ModelUsageStats descriptor names the fields below. Their usage
+// semantics are cross-validated against sidecar ground truth
 // (generatorMetadata[].chatModel.usage matches in 550/550 blocks):
 //
-//	f1 = model-kind varint in [1000, 5000)
-//	f2 = uncached input (inputTokens)
-//	f3 = total output including thinking (outputTokens)
-//	f4 = always 0/absent, ignored
-//	f5 = cache-read (cacheReadTokens, absent when no cache hits)
+//	model             = enum varint in [1000, 5000)
+//	input_tokens      = uncached input
+//	output_tokens     = total output including thinking
+//	cache_write_tokens = deprecated and ignored
+//	cache_read_tokens = cache-read input, absent when there are no cache hits
 //
 // No per-field reasoning breakdown is available in gen_metadata;
 // the reasoning return value is always 0.
 //
-// f2 and f3 are required. f5 is optional: proto3 omits zero-valued
-// fields, and a fresh session with no cache hits omits f5 entirely.
-// Requiring f5 (the previous heuristic) caused the parser to miss
-// token blocks in such sessions, which is why the single-generation
-// June-11 archives all have no extracted block under the old mapping.
+// input_tokens and output_tokens are required. cache_read_tokens is optional:
+// proto3 omits zero-valued fields, and a fresh session with no cache hits omits
+// it entirely. Requiring cache_read_tokens (the previous heuristic) caused the
+// parser to miss token blocks in such sessions.
 func tokenBlockFrom(fs []agProtoField) (agTokenBlock, bool) {
-	f1, ok1 := agProtoFind(fs, 1)
-	f2, ok2 := agProtoFind(fs, 2)
-	f3, ok3 := agProtoFind(fs, 3)
-	// f5 (cache-read) is optional: proto3 omits zero-valued fields, and
-	// cache-read is absent when a session has no cache hits.
-	f5, hasF5 := agProtoFind(fs, 5)
+	model, hasModel := agProtoFind(fs, agModelUsageStatsModelField)
+	inputTokens, hasInput := agProtoFind(
+		fs, agModelUsageStatsInputTokensField,
+	)
+	outputTokens, hasOutput := agProtoFind(
+		fs, agModelUsageStatsOutputTokensField,
+	)
+	// cache_read_tokens is optional: proto3 omits zero-valued fields.
+	cacheReadTokens, hasCacheRead := agProtoFind(
+		fs, agModelUsageStatsCacheReadTokensField,
+	)
 
-	if !ok1 || !ok2 || !ok3 ||
-		f1.Wire != pbWireVarint || f2.Wire != pbWireVarint ||
-		f3.Wire != pbWireVarint {
+	if !hasModel || !hasInput || !hasOutput ||
+		model.Wire != pbWireVarint || inputTokens.Wire != pbWireVarint ||
+		outputTokens.Wire != pbWireVarint {
 		return agTokenBlock{}, false
 	}
-	if f1.Varint < 1000 || f1.Varint >= 5000 {
+	if model.Varint < 1000 || model.Varint >= 5000 {
 		return agTokenBlock{}, false
 	}
-	if f2.Varint > maxPlausibleTokens || f3.Varint > maxPlausibleTokens {
+	if inputTokens.Varint > maxPlausibleTokens ||
+		outputTokens.Varint > maxPlausibleTokens {
 		return agTokenBlock{}, false
 	}
-	// f2 (input) and f3 (output) are independent quantities, but an
-	// implausibly large combined footprint (input + output > cap)
-	// signals a decoy block where both values individually pass the
-	// per-field cap but are collectively implausible for a single
-	// generation.
-	if f2.Varint+f3.Varint > maxPlausibleTokens {
+	// Input and output are independent quantities, but an implausibly large
+	// combined footprint signals a decoy block where both values individually
+	// pass the per-field cap.
+	if inputTokens.Varint+outputTokens.Varint > maxPlausibleTokens {
 		return agTokenBlock{}, false
 	}
-	// f4 is consistently absent/zero in real blocks and carries no
-	// semantics. Tolerate its presence but ignore the value.
-	if f4, hasF4 := agProtoFind(fs, 4); hasF4 {
-		if f4.Wire != pbWireVarint || f4.Varint > maxPlausibleTokens {
+	// cache_write_tokens is deprecated. Observed gen_metadata blocks leave it
+	// absent or zero; validate it when present but do not report another class.
+	if cacheWriteTokens, hasCacheWrite := agProtoFind(
+		fs, agModelUsageStatsCacheWriteTokensField,
+	); hasCacheWrite {
+		if cacheWriteTokens.Wire != pbWireVarint ||
+			cacheWriteTokens.Varint > maxPlausibleTokens {
 			return agTokenBlock{}, false
 		}
 	}
-	if hasF5 {
-		if f5.Wire != pbWireVarint || f5.Varint > maxPlausibleTokens {
+	if hasCacheRead {
+		if cacheReadTokens.Wire != pbWireVarint ||
+			cacheReadTokens.Varint > maxPlausibleTokens {
 			return agTokenBlock{}, false
 		}
 	}
 
 	block := agTokenBlock{
-		UncachedInput: int(f2.Varint),
-		TotalOutput:   int(f3.Varint),
+		UncachedInput: int(inputTokens.Varint),
+		TotalOutput:   int(outputTokens.Varint),
 	}
-	if hasF5 {
-		block.CacheRead = int(f5.Varint)
+	if hasCacheRead {
+		block.CacheRead = int(cacheReadTokens.Varint)
 	}
 	return block, true
 }
 
-// extractModelName recursively walks fields to extract the model name from Field 21 or Field 19.
+// extractModelName prefers ChatModelMetadata.model_display_name and falls back
+// to ChatModelMetadata.response_model.
 func extractModelName(data []byte) string {
+	model, _ := extractAntigravityGenerationModel(data)
+	return model
+}
+
+func extractAntigravityGenerationModel(data []byte) (string, bool) {
 	fields, err := agProtoParse(data)
 	if err != nil {
+		return "", false
+	}
+	if chatModel, ok := extractAntigravityChatModel(fields); ok {
+		return extractAntigravityChatModelName(chatModel)
+	}
+	return extractLegacyAntigravityGenerationModel(fields)
+}
+
+func extractAntigravityChatModel(
+	fields []agProtoField,
+) ([]agProtoField, bool) {
+	chatModel, ok := agProtoFind(
+		fields, agCortexStepGeneratorMetadataChatModelField,
+	)
+	if !ok || chatModel.Nested == nil {
+		return nil, false
+	}
+	if usage, ok := agProtoFind(
+		chatModel.Nested, agChatModelMetadataUsageField,
+	); ok && usage.Nested != nil {
+		return chatModel.Nested, true
+	}
+	if extractModelNameField(
+		chatModel.Nested, agChatModelMetadataModelDisplayNameField,
+	) != "" {
+		return chatModel.Nested, true
+	}
+	if extractModelNameField(
+		chatModel.Nested, agChatModelMetadataResponseModelField,
+	) != "" {
+		return chatModel.Nested, true
+	}
+	return nil, false
+}
+
+func extractAntigravityChatModelName(
+	fields []agProtoField,
+) (string, bool) {
+	if model := extractModelNameField(
+		fields, agChatModelMetadataModelDisplayNameField,
+	); model != "" {
+		return model, true
+	}
+	return extractModelNameField(
+		fields, agChatModelMetadataResponseModelField,
+	), false
+}
+
+func extractModelNameField(fields []agProtoField, fieldNumber int) string {
+	field, ok := agProtoFind(fields, fieldNumber)
+	if !ok {
 		return ""
 	}
-	var model string
-	var walk func([]agProtoField)
-	walk = func(fs []agProtoField) {
-		if model != "" {
-			return
-		}
-		if f21, ok := agProtoFind(fs, 21); ok {
-			if s, ok := agProtoString(f21); ok &&
-				isPlausibleModelName(s) {
-				model = s
-				return
-			}
-		}
-		if f19, ok := agProtoFind(fs, 19); ok {
-			if s, ok := agProtoString(f19); ok &&
-				isPlausibleModelName(s) {
-				model = s
-				return
-			}
-		}
-		for _, f := range fs {
-			if f.Nested != nil {
-				walk(f.Nested)
+	model, ok := agProtoString(field)
+	if !ok || !isPlausibleModelName(model) {
+		return ""
+	}
+	return model
+}
+
+// extractLegacyAntigravityGenerationModel preserves the recursive decoder for
+// older persisted records that do not contain
+// CortexStepGeneratorMetadata.chat_model.
+func extractLegacyAntigravityGenerationModel(
+	fields []agProtoField,
+) (string, bool) {
+	if model := extractModelNameFromFields(
+		fields, agChatModelMetadataModelDisplayNameField,
+	); model != "" {
+		return model, true
+	}
+	return extractModelNameFromFields(
+		fields, agChatModelMetadataResponseModelField,
+	), false
+}
+
+func extractModelNameFromFields(
+	fields []agProtoField, fieldNumber int,
+) string {
+	for _, field := range fields {
+		if field.Number == fieldNumber {
+			if model, ok := agProtoString(field); ok &&
+				isPlausibleModelName(model) {
+				return model
 			}
 		}
 	}
-	walk(fields)
+	for _, field := range fields {
+		if field.Nested != nil {
+			if model := extractModelNameFromFields(
+				field.Nested, fieldNumber,
+			); model != "" {
+				return model
+			}
+		}
+	}
+	return ""
+}
+
+func resolveAntigravityGenerationModel(
+	data []byte, executorModel string,
+) string {
+	generationModel, hasDisplayLabel := extractAntigravityGenerationModel(data)
+	return resolveAntigravityModelName(
+		generationModel, executorModel, hasDisplayLabel,
+	)
+}
+
+// resolveAntigravityModelName reconciles the model reported by downstream LLM
+// RPC generation metadata with the user's intended effort-qualified model from
+// the covering executor range.
+//
+// Antigravity CLI does not record reasoning effort in generation metadata
+// (field 19 response_model), recording only the base model slug or an internal
+// serving canary identifier (e.g. "gemini-3.7-flash-exp-b"). The effort
+// qualification (-low, -medium, -high) is recorded only in the covering
+// ExecutorMetadata. If the generation model matches the executor's base model
+// after stripping known experimental serving variants, the effort-qualified
+// executor model is returned so dashboard usage accounting is not fragmented.
+// If hasDisplayLabel is true or the models do not match, generationModel is
+// preserved unchanged.
+func resolveAntigravityModelName(
+	generationModel, executorModel string, hasDisplayLabel bool,
+) string {
+	if hasDisplayLabel || executorModel == "" {
+		return generationModel
+	}
+	normalizedGeneration := stripAntigravityExperimentalVariant(generationModel)
+	if antigravityBaseModel(executorModel) == normalizedGeneration {
+		return executorModel
+	}
+	return generationModel
+}
+
+func antigravityBaseModel(model string) string {
+	for _, suffix := range []string{"-low", "-medium", "-high"} {
+		if base, ok := strings.CutSuffix(model, suffix); ok {
+			return base
+		}
+	}
+	return model
+}
+
+// stripAntigravityExperimentalVariant strips internal backend serving
+// experiment / canary suffixes (such as "-exp-b") observed in Antigravity CLI
+// RPC responses so the model can be matched against covering executor ranges.
+//
+// Guidance for adding future suffixes:
+//   - Only add exact, observed serving canary suffixes here (e.g. "-exp-a",
+//     "-exp-c") once verified against upstream captures.
+//   - DO NOT strip generic "-exp": standalone models exist whose canonical
+//     name ends in "-exp" (e.g. "gemini-2.0-flash-exp"). Stripping generic
+//     "-exp" causes false-positive matches against -high/-medium/-low executors
+//     and incorrectly overrides the user's chosen model.
+//   - Adding or modifying suffixes alters historical session parsing: always
+//     bump dataVersion in internal/db/db.go, update the provenance notes in
+//     docs/internal/session-format-sources.md, and add regression tests in
+//     internal/parser/antigravity_test.go.
+func stripAntigravityExperimentalVariant(model string) string {
+	if base, ok := strings.CutSuffix(model, "-exp-b"); ok {
+		return base
+	}
 	return model
 }
 
 // isPlausibleModelName reports whether s looks like a human-readable
-// model identifier. Field 21/19 sometimes carries a nested protobuf
-// message whose low bytes (tags, varints, NULs) are valid UTF-8 --
+// model identifier. The model_display_name and response_model fields can carry
+// a nested protobuf message in older records whose low bytes are valid UTF-8.
 // agProtoString cannot tell those apart from text, and the raw bytes
 // previously leaked into messages.model (and broke `pg push`, which
 // rejects NUL bytes). Require every rune to be printable, at least
@@ -579,7 +1049,12 @@ func decodeAntigravityStep(
 	if !ok {
 		return ParsedMessage{}, false
 	}
+	return decodeAntigravityParsedStep(step)
+}
 
+func decodeAntigravityParsedStep(
+	step antigravityStep,
+) (ParsedMessage, bool) {
 	// Extract tool calls for assistant steps before the content guard
 	// so that tool-only steps (no displayable text) are not silently
 	// dropped.

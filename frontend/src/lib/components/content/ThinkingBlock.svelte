@@ -1,74 +1,59 @@
 <script lang="ts">
-  import { applyHighlight, escapeHTML } from "../../utils/highlight.js";
+  import { searchBlock } from "../../search/session-block.svelte.js";
+  import { searchCollapsed } from "../../search/component-state.js";
+  import { inSessionSearch } from "../../stores/inSessionSearch.svelte.js";
+  import { ui } from "../../stores/ui.svelte.js";
+  import SearchMatchCount from "./SearchMatchCount.svelte";
   import { ChevronRightIcon } from "../../icons.js";
   import { m } from "../../i18n/index.js";
-  import { ui } from "../../stores/ui.svelte.js";
 
   interface Props {
     content: string;
-    highlightQuery?: string;
-    isCurrentHighlight?: boolean;
+    searchKey?: string;
   }
 
-  let { content, highlightQuery = "", isCurrentHighlight = false }: Props = $props();
-  let userCollapsed: boolean = $state(true);
-  let userOverride: boolean = $state(false);
-  let searchExpanded: boolean = $state(false);
-  let prevQuery: string = "";
-  let appliedBulkCommandId: number = $state(0);
+  let { content, searchKey }: Props = $props();
+  let userCollapsed = $state(true);
+  let overrideSeq = $state(-1);
+  let collapsed = $derived(searchCollapsed(
+    userCollapsed, inSessionSearch.isCurrentBlock(searchKey),
+    inSessionSearch.navigationRevision, overrideSeq,
+  ));
 
-  // Auto-expand when a search match exists in this block.
-  // Only reset the user override when the query itself changes,
-  // not when content updates (e.g. during streaming).
-  $effect(() => {
-    const q = highlightQuery;
-    const hasMatch =
-      q.trim() !== "" &&
-      content.toLowerCase().includes(q.toLowerCase());
-    searchExpanded = hasMatch;
-    if (q !== prevQuery) {
-      userOverride = false;
-      prevQuery = q;
-    }
-  });
-
+  // A bulk collapse/expand command from the breadcrumb controls acts
+  // like a manual toggle on every visible block of this kind: it wins
+  // over search auto-reveal until the next search navigation.
+  let appliedBulkCommandId = $state(0);
   $effect(() => {
     const command = ui.bulkCollapseCommand;
     if (!command || command.id === appliedBulkCommandId) return;
     appliedBulkCommandId = command.id;
     if (!command.visibleBlocks.includes("thinking")) return;
     userCollapsed = command.target === "collapsed";
-    userOverride = true;
+    overrideSeq = inSessionSearch.navigationRevision;
   });
-
-  let collapsed = $derived(
-    userOverride ? userCollapsed
-      : searchExpanded ? false
-      : userCollapsed,
-  );
 </script>
 
 <div class="thinking-block">
   <button
     class="thinking-header"
-    title={collapsed
-      ? m.thinking_block_expand()
-      : m.thinking_block_collapse()}
-    aria-label={collapsed
-      ? m.thinking_block_expand()
-      : m.thinking_block_collapse()}
-    onclick={() => { userCollapsed = !userCollapsed; userOverride = true; }}
+    aria-expanded={!collapsed}
+    onclick={() => {
+      userCollapsed = !collapsed;
+      overrideSeq = inSessionSearch.navigationRevision;
+    }}
   >
     <span class="thinking-chevron" class:open={!collapsed}>
       <ChevronRightIcon size="10" strokeWidth="2.4" aria-hidden="true" />
     </span>
     <span class="thinking-label">{m.thinking_block_label()}</span>
+    <SearchMatchCount {searchKey} />
   </button>
   {#if !collapsed}
     <div
       class="thinking-content"
-      use:applyHighlight={{ q: highlightQuery, current: isCurrentHighlight, content }}
-    >{@html escapeHTML(content)}</div>
+      {@attach searchBlock(searchKey)}
+    >{content}</div>
   {/if}
 </div>
 

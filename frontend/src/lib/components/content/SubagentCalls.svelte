@@ -1,14 +1,15 @@
 <!-- ABOUTME: Inline-expansion of a sub-agent session's call list inside the parent Calls section. -->
 <script lang="ts">
   import { m } from "../../i18n/index.js";
+  import { liveTick } from "../../stores/liveTick.svelte.js";
   import type {
-    SessionTiming,
-    CallTiming,
-    TurnTiming,
-  } from "../../api/types/timing.js";
+    DbSessionTiming as SessionTiming,
+    DbCallTiming as CallTiming,
+    DbTurnTiming as TurnTiming,
+  } from "../../api/generated/index.js";
   import { formatDuration } from "../../utils/duration.js";
   import { formatNumber } from "../../utils/format.js";
-  import { liveTick } from "../../stores/liveTick.svelte.js";
+  import { turnHasCategory } from "../../utils/timing.js";
   import CallRow from "./CallRow.svelte";
   import CallGroup from "./CallGroup.svelte";
 
@@ -36,18 +37,6 @@
 
   function isLastTurn(idx: number): boolean {
     return idx === timing.turns.length - 1;
-  }
-
-  function turnHeaderBarPct(turn: {
-    duration_ms: number | null;
-  }): number {
-    if (turn.duration_ms == null || timing.total_duration_ms <= 0) {
-      return 0;
-    }
-    return Math.min(
-      100,
-      (turn.duration_ms / timing.total_duration_ms) * 100,
-    );
   }
 
   function liveElapsedFor(turn: TurnTiming): number {
@@ -88,14 +77,11 @@
       {:else}
         <CallGroup
           calls={turn.calls}
-          groupDurationMs={turn.duration_ms}
           {barScalePct}
-          headerBarPct={turnHeaderBarPct(turn)}
           isLive={isLive}
           liveDurationMs={liveElapsed}
           expandable={false}
-          dimmed={categoryFilter !== null &&
-            turn.primary_category !== categoryFilter}
+          dimmed={categoryFilter !== null && !turnHasCategory(turn, categoryFilter)}
           onCallClick={() => {}}
           onSubagentExpand={noopExpand}
           expandedSubagentIds={noSubagentExpansion}
@@ -106,12 +92,11 @@
 </div>
 
 <style>
-  /* Copied verbatim from
-     docs/superpowers/specs/2026-04-26-session-duration-ux-mockup.html
-     (.sa-expand rules, lines 671–692). */
+  /* Adapted from the session-duration UX mockup, with the raw colors mapped
+     to theme tokens (the mockup's rail red is exactly --cat-task). */
   .sa-expand {
-    background: rgba(196, 90, 90, 0.04);
-    border-left: 2px solid #c45a5a;
+    background: color-mix(in srgb, var(--cat-task) 4%, transparent);
+    border-left: 2px solid var(--cat-task);
     margin: 2px 0 4px 26px;
     padding: 4px 4px 4px 0;
     border-radius: 0 3px 3px 0;
@@ -119,7 +104,9 @@
   .sa-expand .sa-eh {
     font-family: ui-monospace, monospace;
     font-size: 9px;
-    color: #c47a7a;
+    /* Mockup used a lighter tint of the task red; mix --cat-task toward
+       the foreground so it stays readable on both themes. */
+    color: color-mix(in srgb, var(--cat-task) 80%, var(--text-primary));
     text-transform: uppercase;
     letter-spacing: 0.5px;
     padding: 2px 8px 5px;
@@ -127,7 +114,7 @@
     justify-content: space-between;
   }
   .sa-expand .sa-eh-meta {
-    color: #888;
+    color: var(--text-muted);
     text-transform: none;
     letter-spacing: 0;
   }

@@ -1,7 +1,7 @@
 package importer
 
 import (
-	"context"
+	"database/sql"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +13,7 @@ import (
 
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/dbtest"
+	"go.kenn.io/agentsview/internal/parser"
 )
 
 const testConversationsJSON = `[
@@ -122,10 +123,10 @@ func testDB(t *testing.T) *db.DB {
 
 func TestImportClaudeAI(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	stats, err := ImportClaudeAI(
-		ctx, d, strings.NewReader(testConversationsJSON), nil,
+		ctx, d, strings.NewReader(testConversationsJSON), nil, "workstation",
 	)
 	require.NoError(t, err)
 	assert.Equal(t, 1, stats.Imported)
@@ -136,6 +137,7 @@ func TestImportClaudeAI(t *testing.T) {
 	require.NotNil(t, s)
 	assert.Equal(t, "claude.ai", s.Project)
 	assert.Equal(t, "claude-ai", s.Agent)
+	assert.Equal(t, "workstation", s.Machine)
 	require.NotNil(t, s.DisplayName)
 	assert.Equal(t, "First Chat", *s.DisplayName)
 
@@ -146,7 +148,7 @@ func TestImportClaudeAI(t *testing.T) {
 
 func TestImportClaudeAIIncludesAttachmentContent(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	stats, err := ImportClaudeAI(
 		ctx, d, strings.NewReader(testConversationsWithAttachmentJSON), nil,
@@ -161,8 +163,7 @@ func TestImportClaudeAIIncludesAttachmentContent(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, msgs, 2)
 	assert.Equal(t, "Can you show me the config?", msgs[0].Content)
-	assert.Equal(
-		t,
+	assert.Equal(t,
 		"Sure, here it is.\n\n[Attachment: agent.yaml]\nmodel: claude-3.7\nmode: debug",
 		msgs[1].Content,
 	)
@@ -170,7 +171,7 @@ func TestImportClaudeAIIncludesAttachmentContent(t *testing.T) {
 
 func TestImportClaudeAIReimportRefreshesAttachmentContent(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	stats, err := ImportClaudeAI(
 		ctx, d, strings.NewReader(testConversationsWithoutAttachmentJSON), nil,
@@ -198,8 +199,7 @@ func TestImportClaudeAIReimportRefreshesAttachmentContent(t *testing.T) {
 	)
 	require.NoError(t, err)
 	require.Len(t, msgs, 2)
-	assert.Equal(
-		t,
+	assert.Equal(t,
 		"Sure, here it is.\n\n[Attachment: agent.yaml]\nmodel: claude-3.7\nmode: debug",
 		msgs[1].Content,
 	)
@@ -207,7 +207,7 @@ func TestImportClaudeAIReimportRefreshesAttachmentContent(t *testing.T) {
 
 func TestImportClaudeAI_ReimportSkipsUnchanged(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	_, err := ImportClaudeAI(
 		ctx, d, strings.NewReader(testConversationsJSON), nil,
@@ -236,7 +236,7 @@ func TestImportClaudeAI_PreservesDisplayNameOnReimport(
 	t *testing.T,
 ) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	_, err := ImportClaudeAI(
 		ctx, d, strings.NewReader(testConversationsJSON), nil,
@@ -244,7 +244,7 @@ func TestImportClaudeAI_PreservesDisplayNameOnReimport(
 	require.NoError(t, err)
 
 	newName := "My Custom Name"
-	err = d.RenameSession(
+	err = d.RenameSession(ctx,
 		"claude-ai:import-test-001", &newName,
 	)
 	require.NoError(t, err)
@@ -277,7 +277,7 @@ const testChatGPTConv = `[{
 
 func TestImportChatGPT(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	dir := t.TempDir()
 	require.NoError(t, os.WriteFile(
@@ -287,7 +287,7 @@ func TestImportChatGPT(t *testing.T) {
 	assetsDir := filepath.Join(t.TempDir(), "assets")
 
 	stats, err := ImportChatGPT(
-		ctx, d, dir, assetsDir, nil,
+		ctx, d, dir, assetsDir, nil, "workstation",
 	)
 	require.NoError(t, err)
 	assert.Equal(t, 1, stats.Imported)
@@ -297,11 +297,12 @@ func TestImportChatGPT(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, s)
 	assert.Equal(t, "chatgpt.com", s.Project)
+	assert.Equal(t, "workstation", s.Machine)
 }
 
 func TestImportChatGPTSanitizesParserRows(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	longModel := strings.Repeat("m", db.MaxModelLen+16)
 	conv := `[{
@@ -350,9 +351,53 @@ func TestImportChatGPTSanitizesParserRows(t *testing.T) {
 	assert.Len(t, msgs[1].Model, db.MaxModelLen)
 }
 
+func TestUpsertConversationPreservesSessionIdentity(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+
+	status, err := upsertConversation(
+		ctx,
+		d,
+		parser.ParseResult{
+			Session: parser.ParsedSession{
+				ID:               "import-identity-001",
+				Project:          "claude.ai",
+				Machine:          "workstation",
+				Agent:            parser.AgentClaude,
+				AgentLabel:       " Claude Code ",
+				Entrypoint:       " claude-sdk ",
+				FirstMessage:     "hello",
+				StartedAt:        time.Unix(1706745600, 0).UTC(),
+				EndedAt:          time.Unix(1706745660, 0).UTC(),
+				MessageCount:     1,
+				UserMessageCount: 1,
+			},
+			Messages: []parser.ParsedMessage{
+				{
+					Ordinal:       0,
+					Role:          parser.RoleUser,
+					Content:       "hello",
+					Timestamp:     time.Unix(1706745600, 0).UTC(),
+					ContentLength: len("hello"),
+				},
+			},
+		},
+		newLazyFTS(ctx, d, nil),
+	)
+	require.NoError(t, err)
+	assert.Equal(t, importNew, status)
+
+	s, err := d.GetSession(ctx, "import-identity-001")
+	require.NoError(t, err)
+	require.NotNil(t, s)
+	assert.Equal(t, "claude", s.Agent)
+	assert.Equal(t, " Claude Code ", s.AgentLabel)
+	assert.Equal(t, " claude-sdk ", s.Entrypoint)
+}
+
 func TestImportAdvancesLocalModifiedAt(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	_, err := ImportClaudeAI(
 		ctx, d, strings.NewReader(testConversationsJSON), nil,
@@ -372,19 +417,25 @@ func TestImportAdvancesLocalModifiedAt(t *testing.T) {
 
 func TestImportSkipPathBumpsLocalModifiedAt(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// First import — establishes session_name and local_modified_at.
 	_, err := ImportClaudeAI(ctx, d, strings.NewReader(testConversationsJSON), nil)
 	require.NoError(t, err)
 
+	// Backdate the fixture so the skip-path bump is detectably later without
+	// depending on wall-clock scheduling.
+	require.NoError(t, d.Update(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx,
+			"UPDATE sessions SET local_modified_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '-1 second') "+
+				"WHERE id = 'claude-ai:import-test-001'")
+		return err
+	}))
+
 	full1, err := d.GetSessionFull(ctx, "claude-ai:import-test-001")
 	require.NoError(t, err)
 	require.NotNil(t, full1.LocalModifiedAt)
 	t1 := *full1.LocalModifiedAt
-
-	// Ensure wall-clock advances so a bumped timestamp is detectably later.
-	time.Sleep(2 * time.Millisecond)
 
 	// Re-import with same messages but a different name. Message count and
 	// ended_at are unchanged, so upsertConversation takes the skip path and
@@ -400,7 +451,7 @@ func TestImportSkipPathBumpsLocalModifiedAt(t *testing.T) {
 
 	// local_modified_at must be bumped on the skip path so incremental PG
 	// push picks up the session_name change.
-	assert.True(t, t2 > t1,
+	assert.Greater(t, t2, t1,
 		"local_modified_at must advance on skip-path reimport (t1=%s t2=%s)", t1, t2)
 
 	// Confirm session_name was also updated.
@@ -412,7 +463,7 @@ func TestImportSkipPathBumpsLocalModifiedAt(t *testing.T) {
 
 func TestImportSetsDisplayName(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	stats, err := ImportClaudeAI(
 		ctx, d, strings.NewReader(testConversationsJSON), nil,
@@ -429,7 +480,7 @@ func TestImportSetsDisplayName(t *testing.T) {
 
 func TestImportChatGPT_UpdatesSessionNameOnReimport(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	dir := t.TempDir()
 	require.NoError(t, os.WriteFile(
@@ -468,7 +519,7 @@ func TestImportChatGPT_UpdatesSessionNameOnReimport(t *testing.T) {
 
 func TestImportChatGPTSanitizesSessionNameOnReimport(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	dir := t.TempDir()
 	require.NoError(t, os.WriteFile(
@@ -502,7 +553,7 @@ func TestImportChatGPTSanitizesSessionNameOnReimport(t *testing.T) {
 
 func TestImportChatGPT_ReimportPreservesExistingFields(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	dir := t.TempDir()
 	require.NoError(t, os.WriteFile(
@@ -549,7 +600,7 @@ func TestImportChatGPT_ReimportPreservesExistingFields(t *testing.T) {
 
 func TestImportChatGPT_SkipsExisting(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	dir := t.TempDir()
 	require.NoError(t, os.WriteFile(

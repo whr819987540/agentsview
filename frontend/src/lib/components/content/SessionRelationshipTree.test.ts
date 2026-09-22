@@ -8,10 +8,8 @@ import {
   vi,
 } from "vitest";
 import { mount, tick, unmount } from "svelte";
-import type {
-  Session,
-  SessionTreeResponse,
-} from "../../api/types/core.js";
+import type { Session } from "../../api/types/core.js";
+import type { SessionTreeResponse } from "../../api/generated/index.js";
 
 const mocks = vi.hoisted(() => ({
   fetchSessionTree: vi.fn(),
@@ -31,6 +29,19 @@ function makeSession(
   overrides: Partial<Session> = {},
 ): Session {
   return {
+    compaction_count: 0,
+    consecutive_failure_max: 0,
+    edit_churn_count: 0,
+    ended_with_role: "",
+    final_failure_streak: 0,
+    has_peak_context_tokens: false,
+    has_total_output_tokens: false,
+    mid_task_compaction_count: 0,
+    outcome: "",
+    outcome_confidence: "",
+    secret_leak_count: 0,
+    tool_failure_signal_count: 0,
+    tool_retry_count: 0,
     id,
     project: "agentsview",
     machine: "test",

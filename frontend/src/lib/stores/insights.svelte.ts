@@ -1,23 +1,21 @@
+import { m } from "../i18n/index.js";
 import type {
-  Insight,
-  InsightsResponse,
   InsightType,
   AgentName,
   CannedInsightKind,
   AutomatedScope,
-  InsightGenerationFilters,
+  Session,
 } from "../api/types.js";
-import {
-  ApiError as GeneratedApiError,
-  InsightsService,
-} from "../api/generated/index";
-import { configureGeneratedClient } from "../api/runtime.js";
+import type { CannedSessionFiltersInput as InsightGenerationFilters } from "../api/generated/index.js";
+import { InsightsService, type DbInsight } from "../api/generated/index";
+import { ApiError, isAbortError } from "../api/runtime.js";
 import {
   generateInsight,
   type GenerateInsightHandle,
   type InsightLogEvent,
 } from "../api/client.js";
 import { localDateStr } from "../utils/dates.js";
+import { LatestRead } from "../utils/latest-read.js";
 
 export interface InsightTask {
   clientId: string;
@@ -29,6 +27,7 @@ export interface InsightTask {
   kind?: CannedInsightKind;
   promptText: string;
   automatedScope: AutomatedScope;
+  sessionId?: string;
   sessionFilters?: InsightGenerationFilters;
   status: "generating" | "done" | "error";
   phase: string;
@@ -48,6 +47,7 @@ interface GenerationSnapshot {
   kind?: CannedInsightKind;
   promptText: string;
   automatedScope: AutomatedScope;
+  sessionId?: string;
   sessionFilters?: InsightGenerationFilters;
 }
 
@@ -58,9 +58,9 @@ class InsightsStore {
   cannedKind: CannedInsightKind = $state("prompt_maturity_review");
   project: string = $state("");
   agent: AgentName = $state("claude");
+  sessionAgent: string = $state("");
   automatedScope: AutomatedScope = $state("human");
-  sessionFilters: InsightGenerationFilters | undefined = $state();
-  items: Insight[] = $state([]);
+  items: DbInsight[] = $state([]);
   selectedId: number | null = $state(null);
   selectedTaskId: string | null = $state(null);
   loading = $state(false);
@@ -68,54 +68,51 @@ class InsightsStore {
   tasks: InsightTask[] = $state([]);
 
   #handles = new Map<string, GenerateInsightHandle>();
+  #nextTaskId = 0;
   #version = 0;
+  #listRead = new LatestRead();
 
-  get selectedItem(): Insight | undefined {
-    return this.items.find(
-      (s) => s.id === this.selectedId,
-    );
+  get selectedItem(): DbInsight | undefined {
+    return this.items.find((s) => s.id === this.selectedId);
   }
 
   get selectedTask(): InsightTask | undefined {
     if (this.selectedTaskId === null) return undefined;
-    return this.tasks.find(
-      (t) => t.clientId === this.selectedTaskId,
-    );
+    return this.tasks.find((t) => t.clientId === this.selectedTaskId);
   }
 
   get generatingCount(): number {
-    return this.tasks.filter(
-      (t) => t.status === "generating",
-    ).length;
+    return this.tasks.filter((t) => t.status === "generating").length;
   }
 
   async load() {
     const v = ++this.#version;
+    const signal = this.#listRead.begin();
     this.loading = true;
     try {
-      configureGeneratedClient();
-      const res =
-        await InsightsService.getApiV1Insights({}) as unknown as InsightsResponse;
-      if (this.#version === v) {
+      const res = await InsightsService.getApiV1Insights({}, { signal });
+      if (this.#version === v && this.#listRead.isCurrent(signal)) {
         this.items = res.insights;
-        if (
-          this.selectedId !== null &&
-          !this.items.some(
-            (s) => s.id === this.selectedId,
-          )
-        ) {
+        if (this.selectedId !== null && !this.items.some((s) => s.id === this.selectedId)) {
           this.selectedId = null;
         }
       }
-    } catch {
+    } catch (e) {
+      if (isAbortError(e) || !this.#listRead.isCurrent(signal)) return;
       if (this.#version === v) {
         this.items = [];
       }
     } finally {
-      if (this.#version === v) {
+      if (this.#listRead.finish(signal)) {
         this.loading = false;
       }
     }
+  }
+
+  cancelInFlightReads(): void {
+    this.#version++;
+    this.#listRead.cancel();
+    this.loading = false;
   }
 
   setDateFrom(date: string) {
@@ -142,14 +139,12 @@ class InsightsStore {
     this.agent = agent;
   }
 
-  setAutomatedScope(scope: AutomatedScope) {
-    this.automatedScope = scope;
+  setSessionAgent(agent: string) {
+    this.sessionAgent = agent;
   }
 
-  setSessionFilters(filters?: InsightGenerationFilters) {
-    this.sessionFilters = filters
-      ? { ...filters }
-      : undefined;
+  setAutomatedScope(scope: AutomatedScope) {
+    this.automatedScope = scope;
   }
 
   select(id: number) {
@@ -169,15 +164,36 @@ class InsightsStore {
       dateTo: this.dateTo,
       project: this.project,
       agent: this.agent,
-      kind: this.type === "llm_canned"
-        ? this.cannedKind
-        : undefined,
+      kind: this.type === "llm_canned" ? this.cannedKind : undefined,
       promptText: this.promptText,
       automatedScope: this.automatedScope,
-      sessionFilters: this.sessionFilters
-        ? { ...this.sessionFilters }
-        : undefined,
+      sessionId: undefined,
+      sessionFilters:
+        this.type === "llm_canned" && this.sessionAgent ? { agent: this.sessionAgent } : undefined,
     });
+  }
+
+  generateForSession(session: Session) {
+    const date = sessionInsightDate(session);
+    this.type = "agent_analysis";
+    this.dateFrom = date;
+    this.dateTo = date;
+    this.project = session.project || "";
+    this.automatedScope = "human";
+    this.#startGeneration(
+      {
+        type: "agent_analysis",
+        dateFrom: date,
+        dateTo: date,
+        project: session.project || "",
+        agent: this.agent,
+        promptText: this.promptText,
+        automatedScope: "human",
+        sessionId: session.id,
+      },
+      undefined,
+      true,
+    );
   }
 
   retryTask(clientId: string) {
@@ -193,9 +209,8 @@ class InsightsStore {
         kind: task.kind,
         promptText: task.promptText,
         automatedScope: task.automatedScope,
-        sessionFilters: task.sessionFilters
-          ? { ...task.sessionFilters }
-          : undefined,
+        sessionId: task.sessionId,
+        sessionFilters: task.sessionFilters ? { ...task.sessionFilters } : undefined,
       },
       clientId,
       true,
@@ -204,7 +219,7 @@ class InsightsStore {
 
   #startGeneration(
     snap: GenerationSnapshot,
-    clientId: string = crypto.randomUUID(),
+    clientId: string = String(++this.#nextTaskId),
     selectTask = false,
   ) {
     const task: InsightTask = {
@@ -217,9 +232,8 @@ class InsightsStore {
       kind: snap.kind,
       promptText: snap.promptText,
       automatedScope: snap.automatedScope,
-      sessionFilters: snap.sessionFilters
-        ? { ...snap.sessionFilters }
-        : undefined,
+      sessionId: snap.sessionId,
+      sessionFilters: snap.sessionFilters ? { ...snap.sessionFilters } : undefined,
       status: "generating",
       phase: "generating",
       error: null,
@@ -227,9 +241,7 @@ class InsightsStore {
       logs: [],
     };
     if (this.tasks.some((t) => t.clientId === clientId)) {
-      this.tasks = this.tasks.map((t) =>
-        t.clientId === clientId ? task : t,
-      );
+      this.tasks = this.tasks.map((t) => (t.clientId === clientId ? task : t));
     } else {
       this.tasks = [...this.tasks, task];
     }
@@ -245,23 +257,18 @@ class InsightsStore {
         date_to: snap.dateTo,
         project: snap.project || undefined,
         prompt: snap.promptText || undefined,
+        session_id: snap.sessionId,
         timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
         agent: snap.agent,
         kind: snap.kind,
-        llm_opt_in: snap.type === "llm_canned"
-          ? true
-          : undefined,
+        llm_opt_in: snap.type === "llm_canned" ? true : undefined,
         automated_scope: snap.automatedScope,
         ...(snap.type === "llm_canned" && snap.sessionFilters
           ? { filters: snap.sessionFilters }
           : {}),
       },
       (phase) => {
-        this.tasks = this.tasks.map((t) =>
-          t.clientId === clientId
-            ? { ...t, phase }
-            : t,
-        );
+        this.tasks = this.tasks.map((t) => (t.clientId === clientId ? { ...t, phase } : t));
       },
       (logEvent) => {
         this.tasks = this.tasks.map((t) => {
@@ -281,17 +288,11 @@ class InsightsStore {
     handle.done
       .then((insight) => {
         this.#handles.delete(clientId);
-        this.tasks = this.tasks.filter(
-          (t) => t.clientId !== clientId,
-        );
+        this.tasks = this.tasks.filter((t) => t.clientId !== clientId);
 
-        const filtersMatch =
-          this.project === snap.project;
+        const filtersMatch = this.project === snap.project;
         if (filtersMatch) {
-          this.items = [
-            insight,
-            ...this.items.filter((s) => s.id !== insight.id),
-          ];
+          this.items = [insight, ...this.items.filter((s) => s.id !== insight.id)];
           this.selectedId = insight.id;
         } else {
           this.load();
@@ -299,23 +300,13 @@ class InsightsStore {
       })
       .catch((e) => {
         this.#handles.delete(clientId);
-        if (
-          e instanceof DOMException &&
-          e.name === "AbortError"
-        ) {
-          this.tasks = this.tasks.filter(
-            (t) => t.clientId !== clientId,
-          );
+        if (e instanceof DOMException && e.name === "AbortError") {
+          this.tasks = this.tasks.filter((t) => t.clientId !== clientId);
           return;
         }
-        const msg =
-          e instanceof Error
-            ? e.message
-            : "Generation failed";
+        const msg = e instanceof Error ? e.message : m.activity_insight_generation_failed();
         this.tasks = this.tasks.map((t) =>
-          t.clientId === clientId
-            ? { ...t, status: "error" as const, error: msg }
-            : t,
+          t.clientId === clientId ? { ...t, status: "error" as const, error: msg } : t,
         );
         this.selectedTaskId = clientId;
         this.selectedId = null;
@@ -328,9 +319,7 @@ class InsightsStore {
 
   dismissTask(clientId: string) {
     this.#handles.delete(clientId);
-    this.tasks = this.tasks.filter(
-      (t) => t.clientId !== clientId,
-    );
+    this.tasks = this.tasks.filter((t) => t.clientId !== clientId);
     if (this.selectedTaskId === clientId) {
       this.selectedTaskId = null;
     }
@@ -338,10 +327,9 @@ class InsightsStore {
 
   async deleteItem(id: number) {
     try {
-      configureGeneratedClient();
-      await InsightsService.deleteApiV1InsightsId({ id });
+      await InsightsService.deleteApiV1InsightsById({ id });
     } catch (e) {
-      if (!(e instanceof GeneratedApiError && e.status === 404)) {
+      if (!(e instanceof ApiError && e.status === 404)) {
         return;
       }
     }
@@ -359,3 +347,8 @@ class InsightsStore {
 }
 
 export const insights = new InsightsStore();
+
+function sessionInsightDate(session: Session): string {
+  const ts = session.started_at || session.ended_at || session.created_at;
+  return ts.slice(0, 10);
+}

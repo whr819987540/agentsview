@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -36,7 +37,7 @@ type serveReplacementDecision struct {
 
 var foregroundServeLaunchLocks sync.Map
 
-func prepareForegroundServeDaemon(
+func prepareForegroundServeDaemon(ctx context.Context,
 	cfg *config.Config, opts serveReplacementOptions,
 ) (bool, func(), error) {
 	noRelease := func() {}
@@ -67,7 +68,7 @@ func prepareForegroundServeDaemon(
 		}
 		return false, noRelease, nil
 	case serveReplacementAuto, serveReplacementExplicit:
-		if err := checkForegroundReplacementDataVersion(
+		if err := checkForegroundReplacementDataVersion(ctx,
 			*cfg, decision,
 		); err != nil {
 			return false, noRelease, err
@@ -80,9 +81,8 @@ func prepareForegroundServeDaemon(
 		ownsStartLock, acquiredStartLock := markDaemonStarting(cfg.DataDir)
 		if !ownsStartLock {
 			releaseReplacementLock()
-			return false, noRelease, fmt.Errorf(
-				"agentsview serve startup is already in progress; " +
-					"wait for it to finish or run `agentsview serve status`",
+			return false, noRelease, errors.New("agentsview serve startup is already in progress; " +
+				"wait for it to finish or run `agentsview daemon status`",
 			)
 		}
 		fmt.Println("Replacing agentsview daemon")
@@ -92,7 +92,7 @@ func prepareForegroundServeDaemon(
 		if !opts.NoSyncExplicit {
 			adoptDaemonRuntimeLaunchOptions(cfg, decision.Runtime)
 		}
-		if err := stopDaemonRuntimeForUpgrade(*cfg, decision.Runtime); err != nil {
+		if err := stopDaemonRuntimeForUpgrade(ctx, *cfg, decision.Runtime); err != nil {
 			if acquiredStartLock {
 				UnmarkDaemonStarting(cfg.DataDir)
 			}
@@ -116,9 +116,8 @@ func acquireForegroundServeLaunchLock(cfg config.Config) (func(), error) {
 	}
 	lock, ok := acquireBackgroundLaunchLock(cfg.DataDir)
 	if !ok {
-		return nil, fmt.Errorf(
-			"agentsview serve --background is already in progress; " +
-				"wait for it to finish or run `agentsview serve status`",
+		return nil, errors.New("agentsview serve --background is already in progress; " +
+			"wait for it to finish or run `agentsview daemon status`",
 		)
 	}
 	path := backgroundLaunchLockPath(cfg.DataDir)
@@ -136,7 +135,7 @@ func ownsForegroundServeLaunchLock(dataDir string) bool {
 	return ok
 }
 
-func checkForegroundReplacementDataVersion(
+func checkForegroundReplacementDataVersion(ctx context.Context,
 	cfg config.Config, decision serveReplacementDecision,
 ) error {
 	if cfg.DBPath == "" {
@@ -147,7 +146,7 @@ func checkForegroundReplacementDataVersion(
 	default:
 		return nil
 	}
-	return db.CheckDataVersion(cfg.DBPath)
+	return db.CheckDataVersion(ctx, cfg.DBPath)
 }
 
 func decideServeDaemonReplacement(
@@ -304,17 +303,18 @@ func serveDaemonConflictLines(decision serveReplacementDecision) []string {
 	switch decision.Action {
 	case serveReplacementRefuse:
 		return append(lines,
-			"Run `agentsview serve --replace` to replace it, or "+
-				"`agentsview serve stop` to stop it first.",
+			"Run `agentsview daemon restart` to restart it from config.toml, "+
+				"`agentsview serve --replace` to replace it with these serve "+
+				"flags, or `agentsview daemon stop` to stop it first.",
 		)
 	case serveReplacementUseExisting:
 		return append(lines,
-			"Using the existing daemon. Run `agentsview serve stop` "+
+			"Using the existing daemon. Run `agentsview daemon stop` "+
 				"to stop it first.",
 		)
 	default:
 		return append(lines,
-			"Run `agentsview serve stop` to stop it first.",
+			"Run `agentsview daemon stop` to stop it first.",
 		)
 	}
 }
@@ -328,7 +328,7 @@ func serveDaemonReplacementLines(decision serveReplacementDecision) []string {
 		return lines
 	}
 	return append(lines,
-		"Run `agentsview serve stop` to stop it manually instead.",
+		"Run `agentsview daemon stop` to stop it manually instead.",
 	)
 }
 
@@ -341,10 +341,10 @@ func serveDaemonDecisionLines(
 	}
 	lines := []string{
 		header,
-		fmt.Sprintf("  url:             %s", urlFromDaemonRuntime(rt)),
+		"  url:             " + urlFromDaemonRuntime(rt),
 		fmt.Sprintf("  pid:             %d", rt.Record.PID),
-		fmt.Sprintf("  daemon version:  %s", serveDaemonVersion(rt)),
-		fmt.Sprintf("  binary version:  %s", serveCurrentVersion()),
+		"  daemon version:  " + serveDaemonVersion(rt),
+		"  binary version:  " + serveCurrentVersion(),
 		fmt.Sprintf(
 			"  API version:     daemon %d, current %d",
 			rt.API, daemonAPIVersion,
@@ -360,7 +360,7 @@ func serveDaemonDecisionLines(
 		)
 	}
 	if decision.Reason != "" {
-		lines = append(lines, fmt.Sprintf("  reason:          %s", decision.Reason))
+		lines = append(lines, "  reason:          "+decision.Reason)
 	}
 	return lines
 }

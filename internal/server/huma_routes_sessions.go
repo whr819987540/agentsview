@@ -10,49 +10,61 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"time"
 
 	"github.com/danielgtaylor/huma/v2"
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/export"
+	"go.kenn.io/agentsview/internal/money"
 	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/service"
 	"go.kenn.io/agentsview/internal/sessionwatch"
+	"go.kenn.io/agentsview/internal/stringutil"
 )
 
 func (s *Server) registerSessionRoutes() {
-	group := newRouteGroup(s.api, "/api/v1", "Sessions")
+	group := huma.NewGroup(s.api, "/api/v1")
+	configureRouteGroup(group, "Sessions")
 
-	get(s, group, "/sessions", "List sessions", s.humaListSessions)
-	get(s, group, "/sessions/sidebar-index", "List sidebar sessions", s.humaSidebarSessionIndex)
-	get(s, group, "/session-ids/resolve", "Resolve session IDs", s.humaResolveSessionIDs)
-	get(s, group, "/sessions/{id}", "Get session", s.humaGetSession)
-	get(s, group, "/sessions/{id}/messages", "List session messages", s.humaGetMessages)
-	get(s, group, "/sessions/{id}/input-outline", "List session input outline", s.humaInputOutline)
-	get(s, group, "/sessions/{id}/tool-calls", "List session tool calls", s.humaToolCalls)
-	get(s, group, "/sessions/{id}/tree", "Get session relationship tree", s.humaGetSessionTree)
-	get(s, group, "/sessions/{id}/children", "List child sessions", s.humaGetChildSessions)
-	get(s, group, "/sessions/{id}/activity", "Get session activity", s.humaGetSessionActivity)
-	get(s, group, "/sessions/{id}/timing", "Get session timing", s.humaSessionTiming)
-	get(s, group, "/sessions/{id}/usage", "Get session usage", s.humaSessionUsage)
-	stream(s, group, http.MethodGet, "/sessions/{id}/watch", "Watch session events", s.humaWatchSession)
-	stream(s, group, http.MethodGet, "/events", "Watch server events", s.humaEvents)
-	raw(s, group, http.MethodGet, "/sessions/{id}/export", "Export session as HTML", s.humaExportSession)
-	raw(s, group, http.MethodGet, "/sessions/{id}/md", "Export session as Markdown", s.humaMarkdownSession)
-	post(s, group, "/sessions/{id}/publish", "Publish session", s.humaPublishSession)
-	post(s, group, "/sessions/{id}/resume", "Resume session", s.humaResumeSession)
-	get(s, group, "/sessions/{id}/directory", "Get session directory", s.humaGetSessionDir)
-	get(s, group, "/sessions/{id}/search", "Search within a session", s.humaSearchSession)
-	post(s, group, "/sessions/{id}/open", "Open session directory", s.humaOpenSession)
-	post(s, group, "/sessions/upload", "Upload a session export", s.humaUploadSession)
-	patch(s, group, "/sessions/{id}/rename", "Rename session", s.humaRenameSession)
-	post(s, group, "/sessions/batch-delete", "Batch delete sessions", s.humaBatchDeleteSessions)
-	deleteRoute(s, group, "/sessions/{id}", "Delete session", s.humaDeleteSession)
-	post(s, group, "/sessions/{id}/restore", "Restore session", s.humaRestoreSession)
-	deleteRoute(s, group, "/sessions/{id}/permanent", "Permanently delete session", s.humaPermanentDeleteSession)
-	get(s, group, "/trash", "List trash", s.humaListTrash)
-	deleteRoute(s, group, "/trash", "Empty trash", s.humaEmptyTrash)
+	s.get(group, "/sessions", "List sessions", s.humaListSessions)
+	s.get(group, "/sessions/sidebar-index", "List sidebar sessions", s.humaSidebarSessionIndex)
+	s.get(group, "/session-ids/resolve", "Resolve session IDs", s.humaResolveSessionIDs)
+	s.get(group, "/sessions/{id}", "Get session", s.humaGetSession)
+	s.get(group, "/sessions/{id}/messages", "List session messages", s.humaGetMessages)
+	s.get(group, "/sessions/{id}/input-outline", "List session input outline", s.humaInputOutline)
+	s.get(group, "/sessions/{id}/tool-calls", "List session tool calls", s.humaToolCalls)
+	s.get(group, "/sessions/{id}/tree", "Get session relationship tree", s.humaGetSessionTree)
+	s.get(group, "/sessions/{id}/children", "List child sessions", s.humaGetChildSessions)
+	s.get(group, "/sessions/{id}/activity", "Get session activity", s.humaGetSessionActivity)
+	s.get(group, "/sessions/{id}/timing", "Get session timing", s.humaSessionTiming)
+	// Huma does not infer nullability for pointers to object schemas.
+	registry := s.api.OpenAPI().Components.Schemas
+	timing := registry.Schema(reflect.TypeFor[db.SessionTiming](), false, "")
+	timing.Properties["slowest_call"] = &huma.Schema{
+		AnyOf: []*huma.Schema{registry.Schema(reflect.TypeFor[db.CallTiming](), true, ""), {Type: "null"}},
+	}
+
+	s.get(group, "/sessions/{id}/usage", "Get session usage", s.humaSessionUsage)
+	s.stream(group, http.MethodGet, "/sessions/{id}/watch", "Watch session events", s.humaWatchSession)
+	s.stream(group, http.MethodGet, "/events", "Watch server events", s.humaEvents)
+	s.raw(group, http.MethodGet, "/sessions/{id}/export", "Export session as HTML", "text/html", s.humaExportSession)
+	s.raw(group, http.MethodGet, "/sessions/{id}/md", "Export session as Markdown", "text/markdown", s.humaMarkdownSession)
+	s.post(group, "/sessions/{id}/publish", "Publish session", s.humaPublishSession)
+	s.post(group, "/sessions/{id}/resume", "Resume session", s.humaResumeSession)
+	s.get(group, "/sessions/{id}/directory", "Get session directory", s.humaGetSessionDir)
+	s.get(group, "/sessions/{id}/search", "Search within a session", s.humaSearchSession)
+	s.post(group, "/sessions/{id}/open", "Open session directory", s.humaOpenSession)
+	s.post(group, "/sessions/upload", "Upload a session export", s.humaUploadSession)
+	s.patch(group, "/sessions/{id}/rename", "Rename session", s.humaRenameSession)
+	s.post(group, "/sessions/batch-delete", "Batch delete sessions", s.humaBatchDeleteSessions)
+	s.deleteRoute(group, "/sessions/{id}", "Delete session", s.humaDeleteSession)
+	s.post(group, "/sessions/{id}/restore", "Restore session", s.humaRestoreSession)
+	s.deleteRoute(group, "/sessions/{id}/permanent", "Permanently delete session", s.humaPermanentDeleteSession)
+	s.get(group, "/trash", "List trash", s.humaListTrash)
+	s.deleteRoute(group, "/trash", "Empty trash", s.humaEmptyTrash)
 }
 
 type messageDirection string
@@ -65,9 +77,10 @@ type sessionFilterInput struct {
 	Machine          string            `query:"machine" doc:"Filter by machine"`
 	GitBranch        string            `query:"git_branch" doc:"Filter by git branch; opaque (project, branch) tokens from the /branches endpoint"`
 	Agent            string            `query:"agent" doc:"Filter by agent"`
-	Date             string            `query:"date" format:"date" doc:"Filter to a single YYYY-MM-DD date"`
-	DateFrom         string            `query:"date_from" format:"date" doc:"Filter start date"`
-	DateTo           string            `query:"date_to" format:"date" doc:"Filter end date"`
+	Date             string            `query:"date" format:"date" doc:"Filter sessions active on this YYYY-MM-DD date"`
+	DateFrom         string            `query:"date_from" format:"date" doc:"Filter sessions active on or after this date"`
+	DateTo           string            `query:"date_to" format:"date" doc:"Filter sessions active on or before this date"`
+	Timezone         string            `query:"timezone" doc:"IANA timezone for calendar-date filters; defaults to UTC"`
 	ActiveSince      string            `query:"active_since" format:"date-time" doc:"Filter sessions active since this RFC3339 timestamp"`
 	MinMessages      int               `query:"min_messages" minimum:"0" doc:"Minimum total message count"`
 	MaxMessages      int               `query:"max_messages" minimum:"0" doc:"Maximum total message count"`
@@ -75,6 +88,7 @@ type sessionFilterInput struct {
 	IncludeOneShot   bool              `query:"include_one_shot" doc:"Include one-shot sessions"`
 	IncludeAutomated bool              `query:"include_automated" doc:"Include automated sessions"`
 	IncludeChildren  bool              `query:"include_children" doc:"Include child sessions"`
+	IncludeSource    bool              `query:"include_source" doc:"Include source file paths"`
 	Outcome          string            `query:"outcome" doc:"Filter by detected outcome"`
 	HealthGrade      string            `query:"health_grade" doc:"Filter by health grade"`
 	Cursor           string            `query:"cursor" doc:"Opaque pagination cursor"`
@@ -92,6 +106,10 @@ type messageListInput struct {
 	Limit              int              `query:"limit" minimum:"0" doc:"Maximum number of messages"`
 	Direction          messageDirection `query:"direction" enum:"asc,desc" doc:"Message ordering direction"`
 	From               optionalIntParam `query:"from" minimum:"0" doc:"Starting message ordinal"`
+	Around             optionalIntParam `query:"around" minimum:"0" doc:"Center a symmetric window on this ordinal (mutually exclusive with from/direction)"`
+	Before             optionalIntParam `query:"before" minimum:"0" doc:"Messages before the around anchor (default 5)"`
+	After              optionalIntParam `query:"after" minimum:"0" doc:"Messages after the around anchor (default 5)"`
+	Roles              string           `query:"roles" doc:"Comma-separated roles to include, e.g. user,assistant"`
 	IncludeForkContext bool             `query:"include_fork_context" doc:"Include inherited parent context before fork sessions"`
 }
 
@@ -106,12 +124,14 @@ type searchSessionInput struct {
 }
 
 type resolveSessionIDsInput struct {
-	Partial string `query:"partial" required:"true" doc:"Session ID substring"`
-	Limit   int    `query:"limit" minimum:"0" maximum:"1000" doc:"Maximum number of matching IDs"`
+	Partial   string `query:"partial" required:"true" doc:"Session ID substring or raw suffix"`
+	Limit     int    `query:"limit" minimum:"0" maximum:"1000" doc:"Maximum number of matching IDs"`
+	RawSuffix bool   `query:"raw_suffix" doc:"Use literal exact, colon-suffix, or host-tilde-suffix matching"`
 }
 
 type resolveSessionIDsResponse struct {
-	IDs []string `json:"ids"`
+	IDs       []string `json:"ids"`
+	RawSuffix bool     `json:"raw_suffix,omitempty"`
 }
 
 const sessionTreeMaxNodes = 500
@@ -135,6 +155,10 @@ func (in *sessionFilterInput) listFilter() (service.ListFilter, error) {
 	if err := validateDateFilterValues(in.Date, in.DateFrom, in.DateTo, in.ActiveSince); err != nil {
 		return service.ListFilter{}, err
 	}
+	timezone, err := db.NormalizeSessionTimezone(in.Timezone)
+	if err != nil {
+		return service.ListFilter{}, apiError(http.StatusBadRequest, err.Error())
+	}
 	if _, err := db.ParseSortSpec(in.OrderBy); err != nil {
 		return service.ListFilter{}, apiError(http.StatusBadRequest, "invalid order_by: "+err.Error())
 	}
@@ -148,6 +172,7 @@ func (in *sessionFilterInput) listFilter() (service.ListFilter, error) {
 		Date:             in.Date,
 		DateFrom:         in.DateFrom,
 		DateTo:           in.DateTo,
+		Timezone:         timezone,
 		ActiveSince:      in.ActiveSince,
 		MinMessages:      in.MinMessages,
 		MaxMessages:      in.MaxMessages,
@@ -155,6 +180,7 @@ func (in *sessionFilterInput) listFilter() (service.ListFilter, error) {
 		IncludeOneShot:   in.IncludeOneShot,
 		IncludeAutomated: in.IncludeAutomated,
 		IncludeChildren:  in.IncludeChildren,
+		IncludeSource:    in.IncludeSource,
 		Outcome:          in.Outcome,
 		HealthGrade:      in.HealthGrade,
 		Cursor:           in.Cursor,
@@ -175,6 +201,10 @@ func (in *sessionFilterInput) dbFilter(includeChildren bool) (db.SessionFilter, 
 	if err := validateDateFilterValues(in.Date, in.DateFrom, in.DateTo, in.ActiveSince); err != nil {
 		return db.SessionFilter{}, err
 	}
+	timezone, err := db.NormalizeSessionTimezone(in.Timezone)
+	if err != nil {
+		return db.SessionFilter{}, apiError(http.StatusBadRequest, err.Error())
+	}
 	// The order_by param is shared with the list route via this struct; reject
 	// malformed specs here too (the dropped enum used to guard every route),
 	// even though the sidebar index applies its own ordering and ignores it.
@@ -194,6 +224,7 @@ func (in *sessionFilterInput) dbFilter(includeChildren bool) (db.SessionFilter, 
 		Date:             in.Date,
 		DateFrom:         in.DateFrom,
 		DateTo:           in.DateTo,
+		Timezone:         timezone,
 		ActiveSince:      in.ActiveSince,
 		MinMessages:      in.MinMessages,
 		MaxMessages:      in.MaxMessages,
@@ -234,6 +265,10 @@ func (s *Server) humaSidebarSessionIndex(
 	if err != nil {
 		return nil, err
 	}
+	filter.Machine, err = db.ResolveMachineFilter(ctx, s.db, filter.Machine)
+	if err != nil {
+		return nil, serverError(err)
+	}
 	index, err := s.db.GetSidebarSessionIndex(ctx, filter)
 	if err != nil {
 		if errors.Is(err, db.ErrInvalidCursor) {
@@ -248,7 +283,13 @@ func (s *Server) humaResolveSessionIDs(
 	ctx context.Context,
 	in *resolveSessionIDsInput,
 ) (*jsonOutput[resolveSessionIDsResponse], error) {
-	ids, err := s.sessions.FindSessionIDsByPartial(ctx, in.Partial, in.Limit)
+	var ids []string
+	var err error
+	if in.RawSuffix {
+		ids, err = s.sessions.FindSessionIDsByRawSuffix(ctx, in.Partial, in.Limit)
+	} else {
+		ids, err = s.sessions.FindSessionIDsByPartial(ctx, in.Partial, in.Limit)
+	}
 	if err != nil {
 		if handled := handleHumaContextError(err); handled != nil {
 			return nil, handled
@@ -259,7 +300,7 @@ func (s *Server) humaResolveSessionIDs(
 		return nil, serverError(err)
 	}
 	return &jsonOutput[resolveSessionIDsResponse]{
-		Body: resolveSessionIDsResponse{IDs: ids},
+		Body: resolveSessionIDsResponse{IDs: ids, RawSuffix: in.RawSuffix},
 	}, nil
 }
 
@@ -422,8 +463,24 @@ func (s *Server) humaGetMessages(
 	if in.From.IsSet {
 		filter.From = &in.From.Value
 	}
+	if in.Around.IsSet {
+		filter.Around = &in.Around.Value
+	}
+	if in.Before.IsSet {
+		filter.Before = &in.Before.Value
+	}
+	if in.After.IsSet {
+		filter.After = &in.After.Value
+	}
+	if in.Roles != "" {
+		filter.Roles = splitTrimmedNonEmpty(in.Roles)
+	}
 	list, err := s.sessions.Messages(ctx, in.ID, filter)
 	if err != nil {
+		if errors.Is(err, service.ErrAroundMutuallyExclusive) ||
+			errors.Is(err, service.ErrBeforeAfterRequireAround) {
+			return nil, apiError(http.StatusBadRequest, err.Error())
+		}
 		return nil, serverError(err)
 	}
 	return &jsonOutput[*service.MessageList]{Body: list}, nil
@@ -438,6 +495,21 @@ func (s *Server) humaInputOutline(
 		return nil, serverError(err)
 	}
 	return &jsonOutput[*service.InputOutline]{Body: outline}, nil
+}
+
+// splitTrimmedNonEmpty splits s on commas, trims surrounding whitespace from
+// each part, and drops empty parts. This matches the CLI's `session search
+// --in` convention (cmd/agentsview/session_search.go) so a trailing or
+// doubled comma (e.g. "user,") narrows the filter by one intended value
+// instead of silently adding a spurious "" element that matches nothing.
+func splitTrimmedNonEmpty(s string) []string {
+	var out []string
+	for part := range strings.SplitSeq(s, ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
 }
 
 func (s *Server) humaToolCalls(
@@ -477,18 +549,53 @@ func (s *Server) humaSessionTiming(
 }
 
 type sessionUsageResponse struct {
-	SessionID         string   `json:"session_id"`
-	Agent             string   `json:"agent"`
-	Project           string   `json:"project"`
-	TotalOutputTokens int      `json:"total_output_tokens"`
-	PeakContextTokens int      `json:"peak_context_tokens"`
-	HasTokenData      bool     `json:"has_token_data"`
-	CostUSD           float64  `json:"cost_usd"`
-	HasCost           bool     `json:"has_cost"`
-	AICredits         float64  `json:"ai_credits,omitempty"`
-	Models            []string `json:"models"`
-	UnpricedModels    []string `json:"unpriced_models"`
-	ServerRunning     bool     `json:"server_running"`
+	SessionID         string      `json:"session_id"`
+	Agent             string      `json:"agent"`
+	Project           string      `json:"project"`
+	TotalOutputTokens int         `json:"total_output_tokens"`
+	PeakContextTokens int         `json:"peak_context_tokens"`
+	HasTokenData      bool        `json:"has_token_data"`
+	Cost              money.Money `json:"cost"`
+	HasCost           bool        `json:"has_cost"`
+	// CostUSD is a deprecated compatibility alias for
+	// Cost.Microdollars/1e6; see db.SessionUsage.CostUSD.
+	CostUSD             *float64                        `json:"cost_usd,omitempty"`
+	CostSource          export.CostSource               `json:"cost_source,omitempty"`
+	AICredits           float64                         `json:"ai_credits,omitzero"`
+	Models              []string                        `json:"models"`
+	UnpricedModels      []string                        `json:"unpriced_models"`
+	BreakdownCount      int                             `json:"breakdown_count"`
+	SubagentCount       int                             `json:"subagent_count,omitzero"`
+	Breakdown           []sessionUsageBreakdownResponse `json:"breakdown"`
+	ServerRunning       bool                            `json:"server_running"`
+	RollupCost          *money.Money                    `json:"rollup_cost,omitempty"`
+	RollupCostSource    export.CostSource               `json:"rollup_cost_source,omitempty"`
+	HasRollupCost       *bool                           `json:"has_rollup_cost,omitempty"`
+	RollupSubagentCount *int                            `json:"rollup_subagent_count,omitempty"`
+}
+
+type sessionUsageInput struct {
+	ID        string `path:"id" required:"true" doc:"Session ID"`
+	Breakdown bool   `query:"breakdown" doc:"Include per-step breakdown rows"`
+	Rollup    bool   `query:"rollup" doc:"Include explicit subagent descendant costs"`
+	Subagents bool   `query:"subagents" doc:"Fold subagent descendant usage into the totals, models, and breakdown"`
+}
+
+type sessionUsageBreakdownResponse struct {
+	Ordinal                  int         `json:"ordinal"`
+	MessageOrdinal           *int        `json:"message_ordinal,omitempty"`
+	Source                   string      `json:"source"`
+	Label                    string      `json:"label"`
+	Timestamp                string      `json:"timestamp"`
+	Model                    string      `json:"model"`
+	SubagentSessionID        string      `json:"subagent_session_id,omitempty"`
+	InputTokens              int         `json:"input_tokens"`
+	OutputTokens             int         `json:"output_tokens"`
+	CacheCreationInputTokens int         `json:"cache_creation_input_tokens"`
+	CacheReadInputTokens     int         `json:"cache_read_input_tokens"`
+	WebSearchRequests        int         `json:"web_search_requests,omitzero"`
+	Cost                     money.Money `json:"cost"`
+	HasCost                  bool        `json:"has_cost"`
 }
 
 type sessionUsageErrorBody struct {
@@ -514,6 +621,25 @@ func newSessionUsageHumaResponse(usage *db.SessionUsage) sessionUsageResponse {
 	if unpricedModels == nil {
 		unpricedModels = []string{}
 	}
+	breakdown := make([]sessionUsageBreakdownResponse, 0, len(usage.Breakdown))
+	for _, entry := range usage.Breakdown {
+		breakdown = append(breakdown, sessionUsageBreakdownResponse{
+			Ordinal:                  entry.Ordinal,
+			MessageOrdinal:           entry.MessageOrdinal,
+			Source:                   entry.Source,
+			Label:                    entry.Label,
+			Timestamp:                entry.Timestamp,
+			Model:                    entry.Model,
+			SubagentSessionID:        entry.SubagentSessionID,
+			InputTokens:              entry.InputTokens,
+			OutputTokens:             entry.OutputTokens,
+			CacheCreationInputTokens: entry.CacheCreationInputTokens,
+			CacheReadInputTokens:     entry.CacheReadInputTokens,
+			WebSearchRequests:        entry.WebSearchRequests,
+			Cost:                     entry.Cost,
+			HasCost:                  entry.HasCost,
+		})
+	}
 	return sessionUsageResponse{
 		SessionID:         usage.SessionID,
 		Agent:             usage.Agent,
@@ -521,20 +647,56 @@ func newSessionUsageHumaResponse(usage *db.SessionUsage) sessionUsageResponse {
 		TotalOutputTokens: usage.TotalOutputTokens,
 		PeakContextTokens: usage.PeakContextTokens,
 		HasTokenData:      usage.HasTokenData,
-		CostUSD:           usage.CostUSD,
+		Cost:              usage.Cost,
 		HasCost:           usage.HasCost,
+		CostUSD:           usage.CostUSD,
+		CostSource:        usage.CostSource,
 		AICredits:         usage.AICredits,
 		Models:            usage.Models,
 		UnpricedModels:    unpricedModels,
+		BreakdownCount:    usage.BreakdownCount,
+		SubagentCount:     usage.SubagentCount,
+		Breakdown:         breakdown,
 		ServerRunning:     true,
 	}
 }
 
 func (s *Server) humaSessionUsage(
 	ctx context.Context,
-	in *idPathInput,
+	in *sessionUsageInput,
 ) (*jsonOutput[sessionUsageResponse], error) {
-	usage, err := s.db.GetSessionUsage(ctx, in.ID)
+	if in.Rollup {
+		rollup, err := service.GetSessionUsageRollup(ctx, s.db, in.ID, in.Breakdown)
+		if err != nil {
+			if handled := handleHumaContextError(err); handled != nil {
+				return nil, handled
+			}
+			return nil, &sessionUsageError{Status: http.StatusInternalServerError, Body: sessionUsageErrorBody{Code: "usage_query_failed", Message: "failed to query session usage"}}
+		}
+		if rollup == nil {
+			return nil, &sessionUsageError{Status: http.StatusNotFound, Body: sessionUsageErrorBody{Code: "session_not_found", Message: "session not found"}}
+		}
+		body := newSessionUsageHumaResponse(rollup.Usage)
+		if rollup.HasCost {
+			body.RollupCost = &rollup.Cost
+			body.RollupCostSource = rollup.CostSource
+		}
+		body.HasRollupCost = &rollup.HasCost
+		body.RollupSubagentCount = &rollup.SubagentCount
+		return &jsonOutput[sessionUsageResponse]{Body: body}, nil
+	}
+	// `subagents` is additive: it changes the totals, models and breakdown
+	// in place rather than adding parallel rollup_* fields, so a caller
+	// (the CLI) gets one combined document. `rollup` above keeps its own
+	// shape because the SPA reads those fields.
+	var usage *db.SessionUsage
+	var err error
+	if in.Subagents {
+		usage, err = service.SessionUsageWithSubagents(
+			ctx, s.db, in.ID, in.Breakdown)
+	} else {
+		usage, err = s.db.GetSessionUsage(ctx, in.ID, in.Breakdown)
+	}
 	if err != nil {
 		if handled := handleHumaContextError(err); handled != nil {
 			return nil, handled
@@ -641,7 +803,7 @@ func (s *Server) humaGetSessionDir(
 		return nil, apiError(http.StatusNotFound, "session not found")
 	}
 	return &jsonOutput[sessionDirectoryResponse]{
-		Body: sessionDirectoryResponse{Path: resolveSessionDir(session)},
+		Body: sessionDirectoryResponse{Path: resolveSessionPath(session, filepath.IsAbs)},
 	}, nil
 }
 
@@ -675,7 +837,7 @@ func (s *Server) humaOpenSession(
 		return nil, apiError(http.StatusBadRequest,
 			fmt.Sprintf("opener %q not found", in.Body.OpenerID))
 	}
-	if err := launchOpener(*opener, projectDir); err != nil {
+	if err := launchOpener(ctx, *opener, projectDir); err != nil {
 		return nil, apiError(http.StatusInternalServerError, "failed to launch")
 	}
 	return &jsonOutput[openSessionResponse]{
@@ -703,7 +865,7 @@ func (s *Server) humaPublishSession(
 	filename := session.Project + "-" + formatDateShort(session.StartedAt) + ".html"
 	first := ""
 	if session.FirstMessage != nil {
-		first = truncateStr(*session.FirstMessage, 100)
+		first = stringutil.TruncateRunes(*session.FirstMessage, 100, "...")
 	}
 	description := fmt.Sprintf("Agent session: %s - %s", session.Project, first)
 	gist, err := createGist(ctx, token, filename, description, htmlContent, !in.Secret)
@@ -747,7 +909,7 @@ func (s *Server) humaRenameSession(
 	if displayName != nil && *displayName == "" {
 		displayName = nil
 	}
-	if err := s.db.RenameSession(in.ID, displayName); err != nil {
+	if err := s.db.RenameSession(ctx, in.ID, displayName); err != nil {
 		if handled := handleHumaReadOnly(err); handled != nil {
 			return nil, handled
 		}
@@ -775,12 +937,13 @@ func (s *Server) humaDeleteSession(
 	if session == nil {
 		return nil, apiError(http.StatusNotFound, "session not found")
 	}
-	if err := s.db.SoftDeleteSession(in.ID); err != nil {
+	if err := s.db.SoftDeleteSession(ctx, in.ID); err != nil {
 		if handled := handleHumaReadOnly(err); handled != nil {
 			return nil, handled
 		}
 		return nil, internalError("soft delete session", err)
 	}
+	s.notifySessionMutation()
 	return &noContentOutput{Status: http.StatusNoContent}, nil
 }
 
@@ -790,27 +953,34 @@ type batchDeleteInput struct {
 	}
 }
 
-func (s *Server) humaBatchDeleteSessions(
-	_ context.Context,
+// notifySessionMutation reports a completed session-lifecycle change to the
+// registered notifier, if any.
+func (s *Server) notifySessionMutation() {
+	if s.sessionMutationNotify != nil {
+		s.sessionMutationNotify()
+	}
+}
+
+func (s *Server) humaBatchDeleteSessions(ctx context.Context,
 	in *batchDeleteInput,
 ) (*noContentOutput, error) {
 	if len(in.Body.SessionIDs) == 0 {
 		return &noContentOutput{Status: http.StatusNoContent}, nil
 	}
-	if _, err := s.db.SoftDeleteSessions(in.Body.SessionIDs); err != nil {
+	if _, err := s.db.SoftDeleteSessions(ctx, in.Body.SessionIDs); err != nil {
 		if handled := handleHumaReadOnly(err); handled != nil {
 			return nil, handled
 		}
 		return nil, internalError("batch delete sessions", err)
 	}
+	s.notifySessionMutation()
 	return &noContentOutput{Status: http.StatusNoContent}, nil
 }
 
-func (s *Server) humaRestoreSession(
-	_ context.Context,
+func (s *Server) humaRestoreSession(ctx context.Context,
 	in *idPathInput,
 ) (*noContentOutput, error) {
-	n, err := s.db.RestoreSession(in.ID)
+	n, err := s.db.RestoreSession(ctx, in.ID)
 	if err != nil {
 		if handled := handleHumaReadOnly(err); handled != nil {
 			return nil, handled
@@ -820,14 +990,14 @@ func (s *Server) humaRestoreSession(
 	if n == 0 {
 		return nil, apiError(http.StatusNotFound, "session not found or not in trash")
 	}
+	s.notifySessionMutation()
 	return &noContentOutput{Status: http.StatusNoContent}, nil
 }
 
-func (s *Server) humaPermanentDeleteSession(
-	_ context.Context,
+func (s *Server) humaPermanentDeleteSession(ctx context.Context,
 	in *idPathInput,
 ) (*noContentOutput, error) {
-	n, err := s.db.DeleteSessionIfTrashed(in.ID)
+	n, err := s.db.DeleteSessionIfTrashed(ctx, in.ID)
 	if err != nil {
 		if handled := handleHumaReadOnly(err); handled != nil {
 			return nil, handled
@@ -837,6 +1007,7 @@ func (s *Server) humaPermanentDeleteSession(
 	if n == 0 {
 		return nil, apiError(http.StatusConflict, "session not found or not in trash")
 	}
+	s.notifySessionMutation()
 	return &noContentOutput{Status: http.StatusNoContent}, nil
 }
 
@@ -851,24 +1022,25 @@ func (s *Server) humaListTrash(
 	return &jsonOutput[trashResponse]{Body: trashResponse{Sessions: sessions}}, nil
 }
 
-func (s *Server) humaEmptyTrash(
-	_ context.Context,
+func (s *Server) humaEmptyTrash(ctx context.Context,
 	_ *emptyInput,
 ) (*jsonOutput[emptyTrashResponse], error) {
-	count, err := s.db.EmptyTrash()
+	count, err := s.db.EmptyTrash(ctx)
 	if err != nil {
 		if handled := handleHumaReadOnly(err); handled != nil {
 			return nil, handled
 		}
 		return nil, internalError("empty trash", err)
 	}
+	s.notifySessionMutation()
 	return &jsonOutput[emptyTrashResponse]{Body: emptyTrashResponse{Deleted: count}}, nil
 }
 
 type uploadSessionInput struct {
-	Project string `query:"project" required:"true" doc:"Project for imported session"`
-	Machine string `query:"machine" default:"remote" doc:"Machine name for imported session"`
-	RawBody huma.MultipartFormFiles[uploadSessionForm]
+	Project      string `query:"project" required:"true" doc:"Project for imported session"`
+	Machine      string `query:"machine" default:"remote" doc:"Machine name for imported session"`
+	AllowShorter bool   `query:"allow_shorter" doc:"Permit replacing an existing session with fewer messages"`
+	RawBody      huma.MultipartFormFiles[uploadSessionForm]
 }
 
 type uploadSessionForm struct {
@@ -959,7 +1131,7 @@ func (s *Server) humaWatchSession(
 		stream, ok := newHumaSSEStream(hctx)
 		if !ok {
 			writeHumaJSON(hctx, http.StatusInternalServerError,
-				apiErrorResponse{Message: "streaming not supported"})
+				apiResponseError{Message: "streaming not supported"})
 			return
 		}
 		streamCtx := hctx.Context()
@@ -1008,7 +1180,7 @@ func (s *Server) humaEvents(
 		stream, ok := newHumaSSEStream(hctx)
 		if !ok {
 			writeHumaJSON(hctx, http.StatusInternalServerError,
-				apiErrorResponse{Message: "streaming not supported"})
+				apiResponseError{Message: "streaming not supported"})
 			return
 		}
 		sub, unsub := s.broadcaster.Subscribe()
@@ -1093,16 +1265,21 @@ func (s *Server) humaUploadSession(
 	if len(results) == 0 {
 		return nil, apiError(http.StatusBadRequest, "no sessions parsed from upload")
 	}
+	stem := strings.TrimSuffix(safeName, ".jsonl")
+	if results[0].Session.ID != stem && parser.IsValidSessionID(results[0].Session.ID) {
+		upload.finalPath = filepath.Join(filepath.Dir(upload.finalPath), results[0].Session.ID+".jsonl")
+	}
 	for i := range results {
 		results[i].Session.File.Path = upload.finalPath
 	}
 	writes := make([]db.SessionBatchWrite, len(results))
 	for i, pr := range results {
 		writes[i] = sessionBatchWriteFromParsed(pr.Session, pr.Messages)
+		writes[i].RejectMessageCountDecrease = !in.AllowShorter
 	}
 	var commitErr error
 	var uploadCommit committedUpload
-	_, err = s.db.WriteSessionBatchAtomic(writes, func() error {
+	_, err = s.db.WriteSessionBatchAtomic(ctx, writes, func() error {
 		uploadCommit, commitErr = commitUpload(upload)
 		return commitErr
 	})
@@ -1120,6 +1297,13 @@ func (s *Server) humaUploadSession(
 		}
 		if handled := handleHumaReadOnly(err); handled != nil {
 			return nil, handled
+		}
+		if shorter, ok := errors.AsType[*db.SessionWouldShortenError](err); ok {
+			return nil, apiError(http.StatusConflict, fmt.Sprintf(
+				"session upload rejected: session %s has %d messages, upload has %d; retry with allow_shorter=true",
+				shorter.SessionID, shorter.ExistingMessages,
+				shorter.IncomingMessages,
+			))
 		}
 		if errors.Is(err, db.ErrSessionExcluded) ||
 			errors.Is(err, db.ErrSessionTrashed) {
@@ -1159,17 +1343,18 @@ func (s *Server) humaResumeSession(
 	if session == nil || session.DeletedAt != nil {
 		return nil, apiError(http.StatusNotFound, "session not found")
 	}
-	if host, _ := parser.StripHostPrefix(in.ID); host != "" {
+	req := in.Body
+	host, rawID := parser.StripHostPrefix(in.ID)
+	if host != "" && (!req.CommandOnly || req.FromOrdinal != nil) {
 		return nil, apiError(http.StatusBadRequest, "cannot resume remote session")
 	}
-	tmpl, ok := resumeAgents[string(session.Agent)]
+	tmpl, ok := resumeAgents[session.Agent]
 	if !ok {
 		return nil, apiError(http.StatusBadRequest,
 			fmt.Sprintf("agent %q does not support resume", session.Agent))
 	}
-	req := in.Body
 	if req.FromOrdinal != nil {
-		if string(session.Agent) != "claude" {
+		if session.Agent != "claude" {
 			return nil, apiError(http.StatusBadRequest,
 				"message-point fork is only available for Claude sessions")
 		}
@@ -1240,7 +1425,7 @@ func (s *Server) humaResumeSession(
 		detectCwd := launchDir
 		if termCfg.Mode == string(terminalModeAuto) {
 			detectCwd = resumeLaunchCwd(
-				string(session.Agent), "auto", runtime.GOOS, launchDir,
+				session.Agent, "auto", runtime.GOOS, launchDir,
 			)
 		}
 		termBin, termArgs, termName, termErr := detectTerminal(
@@ -1257,7 +1442,11 @@ func (s *Server) humaResumeSession(
 				},
 			}, nil
 		}
-		proc := exec.Command(termBin, termArgs...)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		// A resumed terminal belongs to the user and outlives this request.
+		proc := exec.CommandContext(context.WithoutCancel(ctx), termBin, termArgs...)
 		proc.Stdout = nil
 		proc.Stderr = nil
 		proc.Stdin = nil
@@ -1285,15 +1474,30 @@ func (s *Server) humaResumeSession(
 			},
 		}, nil
 	}
-	prefix := string(session.Agent) + ":"
-	rawID := strings.TrimPrefix(in.ID, prefix)
-	var cmd string
-	if strings.Contains(tmpl, "%s") {
-		cmd = fmt.Sprintf(tmpl, shellQuote(rawID))
-	} else {
-		cmd = tmpl
+	prefix := session.Agent + ":"
+	rawID = strings.TrimPrefix(rawID, prefix)
+	if s.db.ReadOnly() && !req.CommandOnly {
+		return nil, apiError(http.StatusNotImplemented,
+			"session launch not available in remote mode")
 	}
-	if string(session.Agent) == "claude" {
+	model := ""
+	if resumeAgentNeedsModel(session.Agent) {
+		counts, err := s.db.GetResumeModelCounts(ctx, session.ID)
+		if err != nil {
+			return nil, internalError("resume: model lookup failed", err)
+		}
+		model = primaryResumeModel(counts)
+	}
+	resumeTarget := rawID
+	if session.Agent == string(parser.AgentPi) && session.FilePath != nil &&
+		*session.FilePath != "" {
+		resumeTarget = *session.FilePath
+		if host != "" {
+			resumeTarget = strings.TrimPrefix(resumeTarget, host+":")
+		}
+	}
+	cmd := resumeCommand(session.Agent, tmpl, resumeTarget, model)
+	if session.Agent == "claude" {
 		if req.SkipPermissions {
 			cmd += " --dangerously-skip-permissions"
 		}
@@ -1301,14 +1505,23 @@ func (s *Server) humaResumeSession(
 			cmd += " --fork-session"
 		}
 	}
-	launchDir, workspaceDir := resolveResumePaths(session)
-	if string(session.Agent) == "cursor" && workspaceDir != "" {
+	var launchDir, workspaceDir string
+	if host != "" {
+		launchDir = session.Cwd
+	} else {
+		launchDir, workspaceDir = resolveResumePaths(session)
+	}
+	if session.Agent == "cursor" && workspaceDir != "" {
 		cmd += " --workspace " + shellQuote(workspaceDir)
 	}
 	responseCmd := cmd
-	switch string(session.Agent) {
-	case "claude", "kiro":
-		responseCmd = commandWithCwd(cmd, launchDir)
+	switch session.Agent {
+	case "claude", "kiro", "pi":
+		if host != "" {
+			responseCmd = commandWithDir(cmd, launchDir)
+		} else {
+			responseCmd = commandWithCwd(cmd, launchDir)
+		}
 	}
 	if req.CommandOnly {
 		return &jsonOutput[resumeResponse]{
@@ -1319,12 +1532,8 @@ func (s *Server) humaResumeSession(
 			},
 		}, nil
 	}
-	if s.db.ReadOnly() {
-		return nil, apiError(http.StatusNotImplemented,
-			"session launch not available in remote mode")
-	}
 	if req.OpenerID != "" {
-		return s.humaResumeWithOpener(session, rawID, cmd, responseCmd, launchDir, req.OpenerID)
+		return s.humaResumeWithOpener(ctx, session, rawID, cmd, responseCmd, launchDir, req.OpenerID)
 	}
 	s.mu.RLock()
 	termCfg := s.cfg.Terminal
@@ -1341,7 +1550,7 @@ func (s *Server) humaResumeSession(
 	detectCwd := launchDir
 	if termCfg.Mode == string(terminalModeAuto) {
 		detectCwd = resumeLaunchCwd(
-			string(session.Agent), "auto", runtime.GOOS, launchDir,
+			session.Agent, "auto", runtime.GOOS, launchDir,
 		)
 	}
 	termBin, termArgs, termName, termErr := detectTerminal(cmd, detectCwd, termCfg)
@@ -1356,7 +1565,11 @@ func (s *Server) humaResumeSession(
 			},
 		}, nil
 	}
-	proc := exec.Command(termBin, termArgs...)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	// A resumed terminal belongs to the user and outlives this request.
+	proc := exec.CommandContext(context.WithoutCancel(ctx), termBin, termArgs...)
 	proc.Stdout = nil
 	proc.Stderr = nil
 	proc.Stdin = nil
@@ -1385,7 +1598,7 @@ func (s *Server) humaResumeSession(
 	}, nil
 }
 
-func (s *Server) humaResumeWithOpener(
+func (s *Server) humaResumeWithOpener(ctx context.Context,
 	session *db.Session,
 	rawID string,
 	cmd string,
@@ -1406,11 +1619,14 @@ func (s *Server) humaResumeWithOpener(
 			fmt.Sprintf("opener %q not found", openerID))
 	}
 	if opener.ID == "claude-desktop" {
-		if string(session.Agent) != "claude" {
+		if session.Agent != "claude" {
 			return nil, apiError(http.StatusBadRequest,
 				"Claude Desktop resume only supports Claude sessions")
 		}
-		proc := launchClaudeDesktop(rawID, launchDir)
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		proc := launchClaudeDesktop(context.WithoutCancel(ctx), rawID, launchDir)
 		if err := proc.Start(); err != nil {
 			log.Printf("resume: Claude Desktop launch failed: %v", err)
 			return &jsonOutput[resumeResponse]{
@@ -1433,9 +1649,12 @@ func (s *Server) humaResumeWithOpener(
 		}, nil
 	}
 	openerCwd := resumeLaunchCwd(
-		string(session.Agent), opener.ID, runtime.GOOS, launchDir,
+		session.Agent, opener.ID, runtime.GOOS, launchDir,
 	)
-	proc := launchResumeInOpener(*opener, cmd, openerCwd)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	proc := launchResumeInOpener(context.WithoutCancel(ctx), *opener, cmd, openerCwd)
 	if proc == nil {
 		return &jsonOutput[resumeResponse]{
 			Body: resumeResponse{

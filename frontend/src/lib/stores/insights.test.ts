@@ -1,12 +1,8 @@
-import {
-  describe,
-  it,
-  expect,
-  vi,
-  beforeEach,
-} from "vite-plus/test";
+import { InsightsService } from "../api/generated/index";
+import { describe, it, expect, vi, beforeEach } from "vite-plus/test";
 import { insights } from "./insights.svelte.js";
-import type { Insight } from "../api/types.js";
+import type { Session } from "../api/types.js";
+import type { DbInsight as Insight } from "../api/generated/index.js";
 
 const api = vi.hoisted(() => {
   class MockApiError extends Error {
@@ -33,21 +29,20 @@ vi.mock("../api/client.js", () => ({
 }));
 
 vi.mock("../api/runtime.js", () => ({
-  configureGeneratedClient: vi.fn(),
-  callGenerated: vi.fn((request: () => Promise<unknown>) => request()),
+  ApiError: api.ApiError,
+
+  isAbortError: vi.fn(() => false),
 }));
 
 vi.mock("../api/generated/index", () => ({
   ApiError: api.ApiError,
   InsightsService: {
     getApiV1Insights: vi.fn(() => api.listInsights()),
-    deleteApiV1InsightsId: vi.fn(({ id }) => api.deleteInsight(id)),
+    deleteApiV1InsightsById: vi.fn(({ id }) => api.deleteInsight(id)),
   },
 }));
 
-function makeInsight(
-  overrides: Partial<Insight> = {},
-): Insight {
+function makeInsight(overrides: Partial<Insight> = {}): Insight {
   return {
     id: 1,
     type: "daily_activity",
@@ -59,6 +54,38 @@ function makeInsight(
     prompt: null,
     content: "# Summary\nThings happened.",
     created_at: "2025-01-15T12:00:00.000Z",
+    ...overrides,
+  };
+}
+
+function makeSession(overrides: Partial<Session> = {}): Session {
+  return {
+    compaction_count: 0,
+    consecutive_failure_max: 0,
+    edit_churn_count: 0,
+    ended_with_role: "",
+    final_failure_streak: 0,
+    has_peak_context_tokens: false,
+    has_total_output_tokens: false,
+    mid_task_compaction_count: 0,
+    outcome: "",
+    outcome_confidence: "",
+    secret_leak_count: 0,
+    tool_failure_signal_count: 0,
+    tool_retry_count: 0,
+    id: "run:session-1",
+    project: "proj-a",
+    machine: "local",
+    agent: "claude",
+    first_message: "hello",
+    started_at: "2026-07-05T14:30:00Z",
+    ended_at: "2026-07-05T14:45:00Z",
+    message_count: 2,
+    user_message_count: 1,
+    total_output_tokens: 0,
+    peak_context_tokens: 0,
+    is_automated: false,
+    created_at: "2026-07-05T14:30:00Z",
     ...overrides,
   };
 }
@@ -76,12 +103,39 @@ beforeEach(() => {
   insights.setCannedKind("prompt_maturity_review");
   insights.setProject("");
   insights.setAgent("claude");
+  insights.setSessionAgent("");
   insights.setAutomatedScope("human");
-  insights.setSessionFilters(undefined);
   insights.promptText = "";
 });
 
 describe("load", () => {
+  it("aborts an obsolete list read without aborting generation", async () => {
+    vi.mocked(api.listInsights)
+      .mockImplementationOnce(() => new Promise(() => {}))
+      .mockResolvedValueOnce({ insights: [] });
+
+    void insights.load();
+    await Promise.resolve();
+    await insights.load();
+
+    expect(vi.mocked(InsightsService.getApiV1Insights).mock.calls[0]?.[1]?.signal?.aborted).toBe(
+      true,
+    );
+    expect(api.generateInsight).not.toHaveBeenCalled();
+  });
+
+  it("aborts the list read on page teardown", async () => {
+    vi.mocked(api.listInsights).mockImplementationOnce(() => new Promise(() => {}));
+
+    void insights.load();
+    await Promise.resolve();
+    insights.cancelInFlightReads();
+
+    expect(vi.mocked(InsightsService.getApiV1Insights).mock.calls[0]?.[1]?.signal?.aborted).toBe(
+      true,
+    );
+  });
+
   it("fetches insights and updates state", async () => {
     const s1 = makeInsight({ id: 1 });
     const s2 = makeInsight({ id: 2, project: "my-app" });
@@ -165,9 +219,7 @@ describe("date range mode switching", () => {
       abort: vi.fn(),
       done: Promise.resolve(makeInsight({ id: 1 })),
     };
-    vi.mocked(api.generateInsight).mockReturnValueOnce(
-      mockHandle,
-    );
+    vi.mocked(api.generateInsight).mockReturnValueOnce(mockHandle);
 
     insights.generate();
 
@@ -190,9 +242,7 @@ describe("date range mode switching", () => {
       abort: vi.fn(),
       done: Promise.resolve(makeInsight({ id: 1 })),
     };
-    vi.mocked(api.generateInsight).mockReturnValueOnce(
-      mockHandle,
-    );
+    vi.mocked(api.generateInsight).mockReturnValueOnce(mockHandle);
 
     insights.generate();
 
@@ -250,6 +300,44 @@ describe("selectedItem", () => {
 });
 
 describe("generate (multi-task)", () => {
+  it("starts independent report and session tasks without crypto.randomUUID", () => {
+    // Non-localhost HTTP origins do not expose crypto.randomUUID.
+    vi.stubGlobal("crypto", {});
+    const abortReport = vi.fn();
+    const abortSession = vi.fn();
+    vi.mocked(api.generateInsight)
+      .mockReturnValueOnce({ abort: abortReport, done: new Promise(() => {}) })
+      .mockReturnValueOnce({ abort: abortSession, done: new Promise(() => {}) });
+
+    try {
+      insights.setType("llm_canned");
+      insights.generate();
+      insights.generateForSession(makeSession());
+
+      expect(api.generateInsight).toHaveBeenNthCalledWith(
+        1,
+        expect.objectContaining({ type: "llm_canned", llm_opt_in: true }),
+        expect.any(Function),
+        expect.any(Function),
+      );
+      expect(api.generateInsight).toHaveBeenNthCalledWith(
+        2,
+        expect.objectContaining({ type: "agent_analysis", session_id: "run:session-1" }),
+        expect.any(Function),
+        expect.any(Function),
+      );
+      expect(insights.tasks).toHaveLength(2);
+      insights.cancelTask(insights.tasks[0]!.clientId);
+      expect(abortReport).toHaveBeenCalledOnce();
+      expect(abortSession).not.toHaveBeenCalled();
+      insights.cancelTask(insights.tasks[1]!.clientId);
+      expect(abortSession).toHaveBeenCalledOnce();
+    } finally {
+      api.generateInsight.mockReset();
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("includes the browser timezone so summaries align with the dashboard", () => {
     const mockHandle = {
       abort: vi.fn(),
@@ -274,9 +362,7 @@ describe("generate (multi-task)", () => {
       abort: vi.fn(),
       done: Promise.resolve(newInsight),
     };
-    vi.mocked(api.generateInsight).mockReturnValueOnce(
-      mockHandle,
-    );
+    vi.mocked(api.generateInsight).mockReturnValueOnce(mockHandle);
 
     insights.generate();
 
@@ -298,11 +384,7 @@ describe("generate (multi-task)", () => {
       content: "cached",
       cache_status: "hit",
     });
-    insights.items = [
-      makeInsight({ id: 1 }),
-      existing,
-      makeInsight({ id: 2 }),
-    ];
+    insights.items = [makeInsight({ id: 1 }), existing, makeInsight({ id: 2 })];
     vi.mocked(api.generateInsight).mockReturnValueOnce({
       abort: vi.fn(),
       done: Promise.resolve(cached),
@@ -340,19 +422,33 @@ describe("generate (multi-task)", () => {
     );
   });
 
-  it("sends dashboard session filters for canned recommendations", async () => {
+  it("generates agent analysis for a single session", () => {
+    vi.mocked(api.generateInsight).mockReturnValueOnce({
+      abort: vi.fn(),
+      done: Promise.resolve(makeInsight({ id: 32 })),
+    });
+
+    insights.generateForSession(makeSession());
+
+    expect(api.generateInsight).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "agent_analysis",
+        date_from: "2026-07-05",
+        date_to: "2026-07-05",
+        project: "proj-a",
+        session_id: "run:session-1",
+      }),
+      expect.any(Function),
+      expect.any(Function),
+    );
+    expect(insights.selectedTaskId).toBe(insights.tasks[0]?.clientId);
+  });
+
+  it("sends only visible session scope for canned recommendations", async () => {
     insights.setType("llm_canned");
     insights.setCannedKind("prompt_maturity_review");
-    insights.setSessionFilters({
-      timezone: "America/New_York",
-      machine: "workstation",
-      agent: "codex",
-      termination: "clean",
-      min_user_messages: 2,
-      include_one_shot: false,
-      automated_scope: "human",
-      active_since: "2025-01-15T12:00:00.000Z",
-    });
+    insights.setSessionAgent("codex");
+    insights.setAutomatedScope("all");
     vi.mocked(api.generateInsight).mockReturnValueOnce({
       abort: vi.fn(),
       done: Promise.resolve(makeInsight({ id: 31 })),
@@ -363,15 +459,10 @@ describe("generate (multi-task)", () => {
     expect(api.generateInsight).toHaveBeenCalledWith(
       expect.objectContaining({
         type: "llm_canned",
+        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+        automated_scope: "all",
         filters: {
-          timezone: "America/New_York",
-          machine: "workstation",
           agent: "codex",
-          termination: "clean",
-          min_user_messages: 2,
-          include_one_shot: false,
-          automated_scope: "human",
-          active_since: "2025-01-15T12:00:00.000Z",
         },
       }),
       expect.any(Function),
@@ -422,9 +513,7 @@ describe("generate (multi-task)", () => {
       abort: vi.fn(),
       done: Promise.reject(new Error("CLI not found")),
     };
-    vi.mocked(api.generateInsight).mockReturnValueOnce(
-      mockHandle,
-    );
+    vi.mocked(api.generateInsight).mockReturnValueOnce(mockHandle);
 
     insights.generate();
     await new Promise((r) => setTimeout(r, 0));
@@ -432,9 +521,7 @@ describe("generate (multi-task)", () => {
     expect(insights.tasks).toHaveLength(1);
     expect(insights.tasks[0]!.status).toBe("error");
     expect(insights.tasks[0]!.error).toBe("CLI not found");
-    expect(insights.selectedTaskId).toBe(
-      insights.tasks[0]!.clientId,
-    );
+    expect(insights.selectedTaskId).toBe(insights.tasks[0]!.clientId);
     expect(insights.selectedId).toBeNull();
   });
 
@@ -456,14 +543,8 @@ describe("generate (multi-task)", () => {
     insights.setDateTo("2025-01-31");
     insights.setProject("middleman");
     insights.setAgent("codex");
+    insights.setSessionAgent("codex");
     insights.setAutomatedScope("automated");
-    insights.setSessionFilters({
-      timezone: "America/Chicago",
-      machine: "laptop",
-      agent: "codex",
-      include_one_shot: true,
-      automated_scope: "automated",
-    });
     insights.promptText = "Focus on cache misses";
 
     insights.generate();
@@ -473,12 +554,7 @@ describe("generate (multi-task)", () => {
     expect(failedTask.status).toBe("error");
 
     insights.promptText = "A different current focus";
-    insights.setSessionFilters({
-      timezone: "UTC",
-      machine: "other",
-      include_one_shot: false,
-      automated_scope: "human",
-    });
+    insights.setSessionAgent("claude");
     insights.retryTask(failedTask.clientId);
 
     expect(insights.tasks).toHaveLength(1);
@@ -497,11 +573,7 @@ describe("generate (multi-task)", () => {
         llm_opt_in: true,
         automated_scope: "automated",
         filters: {
-          timezone: "America/Chicago",
-          machine: "laptop",
           agent: "codex",
-          include_one_shot: true,
-          automated_scope: "automated",
         },
       },
       expect.any(Function),
@@ -516,24 +588,22 @@ describe("generate (multi-task)", () => {
 
   it("captures streaming logs per task", async () => {
     let doneResolve!: (s: Insight) => void;
-    vi.mocked(api.generateInsight).mockImplementationOnce(
-      (_req, _onStatus, onLog) => {
-        onLog?.({ stream: "stdout", line: "{\"type\":\"system\"}" });
-        onLog?.({ stream: "stderr", line: "rate limit warning" });
-        return {
-          abort: vi.fn(),
-          done: new Promise<Insight>((resolve) => {
-            doneResolve = resolve;
-          }),
-        };
-      },
-    );
+    vi.mocked(api.generateInsight).mockImplementationOnce((_req, _onStatus, onLog) => {
+      onLog?.({ stream: "stdout", line: '{"type":"system"}' });
+      onLog?.({ stream: "stderr", line: "rate limit warning" });
+      return {
+        abort: vi.fn(),
+        done: new Promise<Insight>((resolve) => {
+          doneResolve = resolve;
+        }),
+      };
+    });
 
     insights.generate();
 
     expect(insights.tasks).toHaveLength(1);
     expect(insights.tasks[0]!.logs).toEqual([
-      { stream: "stdout", line: "{\"type\":\"system\"}" },
+      { stream: "stdout", line: '{"type":"system"}' },
       { stream: "stderr", line: "rate limit warning" },
     ]);
 
@@ -544,22 +614,20 @@ describe("generate (multi-task)", () => {
 
   it("caps logs to the most recent 200 lines", async () => {
     let doneResolve!: (s: Insight) => void;
-    vi.mocked(api.generateInsight).mockImplementationOnce(
-      (_req, _onStatus, onLog) => {
-        for (let i = 0; i < 250; i++) {
-          onLog?.({
-            stream: "stdout",
-            line: `line-${i}`,
-          });
-        }
-        return {
-          abort: vi.fn(),
-          done: new Promise<Insight>((resolve) => {
-            doneResolve = resolve;
-          }),
-        };
-      },
-    );
+    vi.mocked(api.generateInsight).mockImplementationOnce((_req, _onStatus, onLog) => {
+      for (let i = 0; i < 250; i++) {
+        onLog?.({
+          stream: "stdout",
+          line: `line-${i}`,
+        });
+      }
+      return {
+        abort: vi.fn(),
+        done: new Promise<Insight>((resolve) => {
+          doneResolve = resolve;
+        }),
+      };
+    });
 
     insights.generate();
     expect(insights.tasks).toHaveLength(1);
@@ -581,9 +649,7 @@ describe("generate (multi-task)", () => {
         resolveDone = resolve;
       }),
     };
-    vi.mocked(api.generateInsight).mockReturnValueOnce(
-      mockHandle,
-    );
+    vi.mocked(api.generateInsight).mockReturnValueOnce(mockHandle);
     vi.mocked(api.listInsights).mockResolvedValue({
       insights: [newInsight],
     });
@@ -602,17 +668,12 @@ describe("generate (multi-task)", () => {
   });
 
   it("removes task on abort without error", async () => {
-    const abortError = new DOMException(
-      "Aborted",
-      "AbortError",
-    );
+    const abortError = new DOMException("Aborted", "AbortError");
     const mockHandle = {
       abort: vi.fn(),
       done: Promise.reject(abortError),
     };
-    vi.mocked(api.generateInsight).mockReturnValueOnce(
-      mockHandle,
-    );
+    vi.mocked(api.generateInsight).mockReturnValueOnce(mockHandle);
 
     insights.generate();
     await new Promise((r) => setTimeout(r, 0));
@@ -631,9 +692,7 @@ describe("cancelTask", () => {
         rejectDone = reject;
       }),
     };
-    vi.mocked(api.generateInsight).mockReturnValueOnce(
-      mockHandle,
-    );
+    vi.mocked(api.generateInsight).mockReturnValueOnce(mockHandle);
 
     insights.generate();
     const clientId = insights.tasks[0]!.clientId;
@@ -641,9 +700,7 @@ describe("cancelTask", () => {
     insights.cancelTask(clientId);
     expect(abortFn).toHaveBeenCalled();
 
-    rejectDone(
-      new DOMException("Aborted", "AbortError"),
-    );
+    rejectDone(new DOMException("Aborted", "AbortError"));
     await new Promise((r) => setTimeout(r, 0));
 
     expect(insights.tasks).toHaveLength(0);
@@ -656,9 +713,7 @@ describe("dismissTask", () => {
       abort: vi.fn(),
       done: Promise.reject(new Error("fail")),
     };
-    vi.mocked(api.generateInsight).mockReturnValueOnce(
-      mockHandle,
-    );
+    vi.mocked(api.generateInsight).mockReturnValueOnce(mockHandle);
 
     insights.generate();
     await new Promise((r) => setTimeout(r, 0));
@@ -677,9 +732,7 @@ describe("deleteItem", () => {
     const s = makeInsight({ id: 5 });
     insights.items = [s];
     insights.selectedId = 5;
-    vi.mocked(api.deleteInsight).mockResolvedValueOnce(
-      undefined,
-    );
+    vi.mocked(api.deleteInsight).mockResolvedValueOnce(undefined);
 
     await insights.deleteItem(5);
 
@@ -693,9 +746,7 @@ describe("deleteItem", () => {
     const s2 = makeInsight({ id: 2 });
     insights.items = [s1, s2];
     insights.selectedId = 1;
-    vi.mocked(api.deleteInsight).mockResolvedValueOnce(
-      undefined,
-    );
+    vi.mocked(api.deleteInsight).mockResolvedValueOnce(undefined);
 
     await insights.deleteItem(2);
 
@@ -707,9 +758,7 @@ describe("deleteItem", () => {
     const s = makeInsight({ id: 5 });
     insights.items = [s];
     insights.selectedId = 5;
-    vi.mocked(api.deleteInsight).mockRejectedValueOnce(
-      new ApiError(500, "internal error"),
-    );
+    vi.mocked(api.deleteInsight).mockRejectedValueOnce(new ApiError(500, "internal error"));
 
     await insights.deleteItem(5);
 
@@ -721,9 +770,7 @@ describe("deleteItem", () => {
     const s = makeInsight({ id: 5 });
     insights.items = [s];
     insights.selectedId = 5;
-    vi.mocked(api.deleteInsight).mockRejectedValueOnce(
-      new ApiError(404, "not found"),
-    );
+    vi.mocked(api.deleteInsight).mockRejectedValueOnce(new ApiError(404, "not found"));
 
     await insights.deleteItem(5);
 
@@ -772,10 +819,7 @@ describe("cancelAll", () => {
     expect(abort1).toHaveBeenCalled();
     expect(abort2).toHaveBeenCalled();
 
-    const abortErr = new DOMException(
-      "Aborted",
-      "AbortError",
-    );
+    const abortErr = new DOMException("Aborted", "AbortError");
     reject1(abortErr);
     reject2(abortErr);
     await new Promise((r) => setTimeout(r, 0));
@@ -787,9 +831,7 @@ describe("cancelAll", () => {
 describe("load error handling", () => {
   it("clears items on API error", async () => {
     insights.items = [makeInsight({ id: 1 })];
-    vi.mocked(api.listInsights).mockRejectedValueOnce(
-      new Error("network error"),
-    );
+    vi.mocked(api.listInsights).mockRejectedValueOnce(new Error("network error"));
 
     await insights.load();
 

@@ -3,7 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
-	"encoding/json"
+	"database/sql"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"net"
@@ -25,6 +26,7 @@ import (
 	"go.kenn.io/agentsview/internal/dbtest"
 	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/server"
+	"go.kenn.io/agentsview/internal/service"
 	agentsync "go.kenn.io/agentsview/internal/sync"
 	"go.kenn.io/kit/daemon"
 )
@@ -89,7 +91,8 @@ func seedUsageSession(
 	t *testing.T, d *db.DB, id, project, agent string, outputTokens int,
 ) {
 	t.Helper()
-	require.NoError(t, d.UpsertSession(db.Session{
+	recordFixtureInstallation(t, d)
+	require.NoError(t, d.UpsertSession(t.Context(), db.Session{
 		ID:                   id,
 		Project:              project,
 		Machine:              "usage-host",
@@ -135,8 +138,7 @@ func forbidPGReadStore(t *testing.T) {
 	openPGReadStore = func(
 		config.Config, config.PGConfig,
 	) (db.Store, func(), error) {
-		t.Fatal("openPGReadStore should not be called without --pg")
-		return nil, nil, nil
+		return nil, nil, errors.New("openPGReadStore should not be called without --pg")
 	}
 	t.Cleanup(func() { openPGReadStore = orig })
 }
@@ -144,18 +146,22 @@ func forbidPGReadStore(t *testing.T) {
 // remoteUsageSpec configures newRemoteUsageServer. Zero values fall back to
 // the common defaults (codex agent, remote-project, 42 output tokens).
 type remoteUsageSpec struct {
-	canonicalID   string        // id whose detail and usage routes return 200
-	agent         string        // defaults to "codex"
-	project       string        // defaults to "remote-project"
-	outputTokens  int           // defaults to 42
-	bearer        string        // if set, asserts Authorization: Bearer <bearer>
-	serverRunning bool          // include server_running:true in the usage body
-	usageDelay    time.Duration // optional sleep before serving /usage
+	canonicalID   string          // id whose detail and usage routes return 200
+	apiVersion    int             // defaults to the current server API version
+	agent         string          // defaults to "codex"
+	project       string          // defaults to "remote-project"
+	outputTokens  int             // defaults to 42
+	bearer        string          // if set, asserts Authorization: Bearer <bearer>
+	serverRunning bool            // include server_running:true in the usage body
+	usageBlock    <-chan struct{} // optional block before serving /usage
 }
 
 // remoteUsageRequests records what the fake usage server observed.
 type remoteUsageRequests struct {
-	UsagePath string
+	UsagePath   string
+	UsageQuery  string
+	SyncInput   service.SyncInput
+	RequestPath []string
 }
 
 // newRemoteUsageServer stands in for a remote agentsview server answering
@@ -175,12 +181,16 @@ func newRemoteUsageServer(
 	if spec.outputTokens == 0 {
 		spec.outputTokens = 42
 	}
+	if spec.apiVersion == 0 {
+		spec.apiVersion = server.APIVersion
+	}
 	reqs := &remoteUsageRequests{}
 	detailPath := "/api/v1/sessions/" + spec.canonicalID
 	usagePath := detailPath + "/usage"
 	detailJSON := fmt.Sprintf(`{"id":%q,"agent":%q,"project":%q}`,
 		spec.canonicalID, spec.agent, spec.project)
 	usageJSON := remoteUsageJSON(spec)
+	var serverURL string
 	ts := httptest.NewServer(http.HandlerFunc(func(
 		w http.ResponseWriter, r *http.Request,
 	) {
@@ -190,19 +200,40 @@ func newRemoteUsageServer(
 		} else {
 			assert.Empty(t, r.Header.Get("Authorization"))
 		}
+		reqs.RequestPath = append(reqs.RequestPath, r.URL.Path)
 		switch r.URL.Path {
+		case "/api/v1/sync":
+			assert.Equal(t, http.MethodPost, r.Method)
+			assert.Equal(t, "true", r.URL.Query().Get("startup_only"))
+			writeJSONResponse(w, `{}`)
+		case "/api/v1/version":
+			writeJSONResponse(w, fmt.Sprintf(
+				`{"api_version":%d}`, spec.apiVersion))
 		case detailPath:
+			writeJSONResponse(w, detailJSON)
+		case "/api/v1/sessions/sync":
+			if !assert.Equal(t, http.MethodPost, r.Method) {
+				return
+			}
+			if !assert.Equal(t, serverURL, r.Header.Get("Origin")) {
+				return
+			}
+			if !assert.NoError(t, json.UnmarshalRead(r.Body, &reqs.SyncInput)) {
+				return
+			}
 			writeJSONResponse(w, detailJSON)
 		case usagePath:
 			reqs.UsagePath = r.URL.Path
-			if spec.usageDelay > 0 {
-				time.Sleep(spec.usageDelay)
+			reqs.UsageQuery = r.URL.RawQuery
+			if spec.usageBlock != nil {
+				<-spec.usageBlock
 			}
 			writeJSONResponse(w, usageJSON)
 		default:
 			http.NotFound(w, r)
 		}
 	}))
+	serverURL = ts.URL
 	t.Cleanup(ts.Close)
 	return ts, reqs
 }
@@ -221,7 +252,7 @@ func remoteUsageJSON(spec remoteUsageSpec) string {
 		"total_output_tokens": %d,
 		"peak_context_tokens": 2048,
 		"has_token_data": true,
-		"cost_usd": 0.5,
+		"cost": {"microdollars": 500000},
 		"has_cost": true,
 		"models": ["gpt-5.1"],
 		"unpriced_models": []%s
@@ -236,7 +267,7 @@ func TestSessionHelp_ShowsSubcommands(t *testing.T) {
 	cmd.SetErr(buf)
 	cmd.SetArgs([]string{"session", "--help"})
 	if err := cmd.Execute(); err != nil {
-		t.Fatal(err)
+		require.NoError(t, err)
 	}
 	help := buf.String()
 	for _, name := range []string{
@@ -298,9 +329,10 @@ func seedSessionsWithOpts(t *testing.T, dataDir string, seeds ...sessionSeed) {
 
 func seedSessionArchiveRows(t *testing.T, dataDir string, seeds ...sessionSeed) {
 	t.Helper()
+
 	dbPath := sessionsDBPath(dataDir)
 	dbtest.EnsureTestDBAt(t, dbPath)
-	d, err := db.Open(dbPath)
+	d, err := db.Open(t.Context(), dbPath)
 	require.NoError(t, err)
 	closed := false
 	t.Cleanup(func() {
@@ -323,7 +355,7 @@ func seedSessionArchiveRows(t *testing.T, dataDir string, seeds ...sessionSeed) 
 		if seed.mut != nil {
 			seed.mut(&s)
 		}
-		require.NoError(t, d.UpsertSession(s))
+		require.NoError(t, d.UpsertSession(t.Context(), s))
 	}
 	err = d.Close()
 	closed = true
@@ -344,15 +376,20 @@ func registerSQLiteDaemonRuntimeWithEngine(
 	t *testing.T, dataDir string, writable bool,
 ) {
 	t.Helper()
+
 	cfg, err := config.LoadMinimal()
 	require.NoError(t, err)
 	if cfg.DataDir != dataDir {
 		cfg.DataDir = dataDir
 		cfg.DBPath = sessionsDBPath(dataDir)
 	}
-	database, err := openDB(cfg)
+	fixture, err := db.Open(t.Context(), cfg.DBPath)
 	require.NoError(t, err)
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	recordFixtureInstallation(t, fixture)
+	require.NoError(t, fixture.Close())
+	database, err := openDB(t.Context(), cfg)
+	require.NoError(t, err)
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	port := ln.Addr().(*net.TCPAddr).Port
 	cfg.Host = "127.0.0.1"
@@ -360,7 +397,7 @@ func registerSQLiteDaemonRuntimeWithEngine(
 	cfg.WriteTimeout = 30 * time.Second
 	var engine *agentsync.Engine
 	if writable {
-		engine = agentsync.NewEngine(database, agentsync.EngineConfig{
+		engine = agentsync.NewEngine(t.Context(), database, agentsync.EngineConfig{
 			Ephemeral: true,
 		})
 	}
@@ -374,6 +411,15 @@ func registerSQLiteDaemonRuntimeWithEngine(
 		RemoveDaemonRuntime(dataDir)
 	})
 	registerSyncRouteTestRuntime(t, dataDir, ts.URL)
+}
+
+func recordFixtureInstallation(t *testing.T, database *db.DB) {
+	t.Helper()
+	cfg, err := config.LoadMinimal()
+	require.NoError(t, err)
+	// Named fixture machines are archive inputs; this installation owns none
+	// of those rows, so preserve their labels while recording that decision.
+	require.NoError(t, database.AdoptMachineIdentity(t.Context(), cfg.InstallationID, nil))
 }
 
 func TestSessionGetVariants(t *testing.T) {
@@ -422,9 +468,9 @@ func TestSessionGetVariants(t *testing.T) {
 		out, err := executeCommand(newRootCommand(),
 			"session", "get", "s-2")
 		require.NoError(t, err)
-		assert.True(t, strings.Contains(out, "s-2"),
+		assert.Contains(t, out, "s-2",
 			"human output should contain session id, got: %q", out)
-		assert.True(t, strings.Contains(out, "proj"),
+		assert.Contains(t, out, "proj",
 			"human output should contain project, got: %q", out)
 	})
 
@@ -595,10 +641,14 @@ func TestSessionList_ServerFlagUsesHTTP(t *testing.T) {
 	var gotPath, gotProject string
 	ts := httptest.NewServer(http.HandlerFunc(
 		func(w http.ResponseWriter, r *http.Request) {
-			gotPath = r.URL.Path
-			gotProject = r.URL.Query().Get("project")
 			assert.Equal(t, http.MethodGet, r.Method)
 			w.Header().Set("Content-Type", "application/json")
+			if r.URL.Path == "/api/v1/machines" {
+				_, _ = w.Write([]byte(`{"machine_labels":{}}`))
+				return
+			}
+			gotPath = r.URL.Path
+			gotProject = r.URL.Query().Get("project")
 			_, _ = w.Write([]byte(`{
 				"sessions": [
 					{"id":"remote-session","project":"remote","agent":"claude"}
@@ -793,7 +843,8 @@ func TestSessionList_MinToolFailuresZero(t *testing.T) {
 // timestamps one minute apart starting at 2026-04-01T00:00:00Z.
 func seedMessages(t *testing.T, dataDir, sessionID string, n int) {
 	t.Helper()
-	d, err := db.Open(filepath.Join(dataDir, "sessions.db"))
+
+	d, err := db.Open(t.Context(), filepath.Join(dataDir, "sessions.db"))
 	require.NoError(t, err)
 	t.Cleanup(func() { d.Close() })
 
@@ -814,7 +865,7 @@ func seedMessages(t *testing.T, dataDir, sessionID string, n int) {
 			Timestamp:     base.Add(time.Duration(i) * time.Minute).Format(time.RFC3339),
 		})
 	}
-	require.NoError(t, d.InsertMessages(msgs))
+	require.NoError(t, d.InsertMessages(t.Context(), msgs))
 	require.NoError(t, d.Close())
 }
 
@@ -831,7 +882,7 @@ func TestSessionMessagesVariants(t *testing.T) {
 		got := decodeCLIJSON[cliMessageList](t, out)
 		assert.Equal(t, 5, got.Count)
 		require.Len(t, got.Messages, 5)
-		assert.Equal(t, float64(1), got.Messages[0]["ordinal"])
+		assert.InDelta(t, float64(1), got.Messages[0]["ordinal"], 0)
 	})
 
 	t.Run("from and limit", func(t *testing.T) {
@@ -843,7 +894,7 @@ func TestSessionMessagesVariants(t *testing.T) {
 		got := decodeCLIJSON[cliMessageList](t, out)
 		assert.Equal(t, 2, got.Count)
 		require.Len(t, got.Messages, 2)
-		assert.Equal(t, float64(3), got.Messages[0]["ordinal"])
+		assert.InDelta(t, float64(3), got.Messages[0]["ordinal"], 0)
 	})
 
 	t.Run("direction desc", func(t *testing.T) {
@@ -855,11 +906,11 @@ func TestSessionMessagesVariants(t *testing.T) {
 		got := decodeCLIJSON[cliMessageList](t, out)
 		assert.Equal(t, 5, got.Count)
 		require.Len(t, got.Messages, 5)
-		assert.Equal(t, float64(5), got.Messages[0]["ordinal"])
-		assert.Equal(t, float64(4), got.Messages[1]["ordinal"])
-		assert.Equal(t, float64(3), got.Messages[2]["ordinal"])
-		assert.Equal(t, float64(2), got.Messages[3]["ordinal"])
-		assert.Equal(t, float64(1), got.Messages[4]["ordinal"])
+		assert.InDelta(t, float64(5), got.Messages[0]["ordinal"], 0)
+		assert.InDelta(t, float64(4), got.Messages[1]["ordinal"], 0)
+		assert.InDelta(t, float64(3), got.Messages[2]["ordinal"], 0)
+		assert.InDelta(t, float64(2), got.Messages[3]["ordinal"], 0)
+		assert.InDelta(t, float64(1), got.Messages[4]["ordinal"], 0)
 	})
 }
 
@@ -870,7 +921,8 @@ func seedMessagesWithToolCalls(
 	t *testing.T, dataDir, sessionID string, n int,
 ) {
 	t.Helper()
-	d, err := db.Open(filepath.Join(dataDir, "sessions.db"))
+
+	d, err := db.Open(t.Context(), filepath.Join(dataDir, "sessions.db"))
 	require.NoError(t, err)
 	t.Cleanup(func() { d.Close() })
 
@@ -894,7 +946,7 @@ func seedMessagesWithToolCalls(
 		HasToolUse:    true,
 		ToolCalls:     calls,
 	}
-	require.NoError(t, d.InsertMessages([]db.Message{msg}))
+	require.NoError(t, d.InsertMessages(t.Context(), []db.Message{msg}))
 	require.NoError(t, d.Close())
 }
 
@@ -945,6 +997,274 @@ func TestSessionExport_StreamsFromDisk(t *testing.T) {
 		"session", "export", "s-1")
 	require.NoError(t, err)
 	assert.Equal(t, body, out)
+}
+
+func TestSessionExportArchiveContent(t *testing.T) {
+	for _, policy := range []config.ArchiveContent{
+		config.ArchiveContentFull, config.ArchiveContentTranscripts, config.ArchiveContentUsage,
+	} {
+		t.Run(string(policy), func(t *testing.T) {
+			dataDir := newAgentDataDir(t)
+			t.Setenv("AGENTSVIEW_ARCHIVE_CONTENT", string(policy))
+			src := filepath.Join(t.TempDir(), "session.jsonl")
+			const body = "{\"type\":\"user\",\"content\":\"source transcript\"}\n"
+			require.NoError(t, os.WriteFile(src, []byte(body), 0o600))
+			database, err := db.OpenWithArchiveContent(t.Context(), sessionsDBPath(dataDir), policy)
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = database.Close() })
+			require.NoError(t, database.UpsertSession(t.Context(), db.Session{
+				ID: "export-policy", Project: "proj", Machine: "local", Agent: "claude", FilePath: &src,
+			}))
+			require.NoError(t, database.InsertMessages(t.Context(), []db.Message{{
+				SessionID: "export-policy", Role: "user", Content: "source transcript",
+			}}))
+			require.NoError(t, database.Close())
+			out, err := executeCommand(newRootCommand(), "session", "export", "export-policy")
+			if policy.UsageOnly() {
+				require.ErrorContains(t, err, "archive_content=usage")
+				assert.Empty(t, out)
+			} else {
+				require.NoError(t, err)
+				assert.Equal(t, body, out)
+			}
+		})
+	}
+}
+
+func createTraeExportStateDB(t *testing.T, root string) string {
+	t.Helper()
+
+	dbPath := filepath.Join(root, "workspaceStorage", "hash", "state.vscdb")
+	require.NoError(t, os.MkdirAll(filepath.Dir(dbPath), 0o755))
+
+	conn, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	defer func() { _ = conn.Close() }()
+
+	_, err = conn.ExecContext(t.Context(), `
+		CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT);
+		INSERT INTO ItemTable(key, value) VALUES (
+			'memento/icube-ai-agent-storage',
+			'{"list":[{"sessionId":"session-1","messages":[{"role":"user","content":"target trae message"}]}]}'
+		);
+	`)
+	require.NoError(t, err)
+	return dbPath
+}
+
+func TestSessionExportTraeStateDB(t *testing.T) {
+	dataDir := newAgentDataDir(t)
+	root := t.TempDir()
+	dbPath := createTraeExportStateDB(t, root)
+	virtualPath := dbPath + "#session-1"
+
+	seedSessionWithOpts(t, dataDir, "trae:session-1", "proj",
+		func(s *db.Session) {
+			s.Agent = string(parser.AgentTrae)
+			s.SourceSessionID = "session-1"
+			s.FilePath = &virtualPath
+		})
+
+	out, err := executeCommand(newRootCommand(),
+		"session", "export", "trae:session-1")
+	require.NoError(t, err)
+	var doc map[string]any
+	require.NoError(t, json.Unmarshal([]byte(out), &doc))
+	assert.Equal(t, "session-1", doc["sessionId"])
+	messages, ok := doc["messages"].([]any)
+	require.True(t, ok)
+	require.Len(t, messages, 1)
+	first, ok := messages[0].(map[string]any)
+	require.True(t, ok)
+	assert.Equal(t, "user", first["role"])
+	assert.Equal(t, "target trae message", first["content"])
+}
+
+func createHermesExportStateDB(t *testing.T, root string) string {
+	t.Helper()
+
+	sessionsDir := filepath.Join(root, "sessions")
+	require.NoError(t, os.MkdirAll(sessionsDir, 0o755))
+
+	dbPath := filepath.Join(root, "state.db")
+	conn, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	defer func() { _ = conn.Close() }()
+
+	_, err = conn.ExecContext(t.Context(), `
+		CREATE TABLE sessions (
+			id TEXT PRIMARY KEY,
+			source TEXT NOT NULL,
+			model TEXT,
+			parent_session_id TEXT,
+			started_at REAL NOT NULL,
+			ended_at REAL,
+			message_count INTEGER DEFAULT 0,
+			input_tokens INTEGER DEFAULT 0,
+			output_tokens INTEGER DEFAULT 0,
+			cache_read_tokens INTEGER DEFAULT 0,
+			cache_write_tokens INTEGER DEFAULT 0,
+			reasoning_tokens INTEGER DEFAULT 0,
+			estimated_cost_usd REAL,
+			actual_cost_usd REAL,
+			cost_status TEXT,
+			cost_source TEXT,
+			title TEXT,
+			api_call_count INTEGER DEFAULT 0
+		);
+		CREATE TABLE messages (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			session_id TEXT NOT NULL,
+			role TEXT NOT NULL,
+			content TEXT,
+			tool_call_id TEXT,
+			tool_calls TEXT,
+			timestamp REAL NOT NULL,
+			finish_reason TEXT,
+			reasoning TEXT,
+			reasoning_content TEXT,
+			reasoning_details TEXT,
+			codex_reasoning_items TEXT,
+			codex_message_items TEXT
+		);
+		INSERT INTO sessions (
+			id, source, model, started_at, ended_at, message_count, title
+		) VALUES
+			('child', 'profile', 'gpt-5.4', 1778767200.0, 1778767800.0, 1, 'Child Session'),
+			('sibling', 'profile', 'gpt-5.4', 1778767200.0, 1778767800.0, 1, 'Sibling Session');
+		INSERT INTO messages (
+			session_id, role, content, timestamp
+		) VALUES
+			('child', 'user', 'target hermes message', 1778767210.0),
+			('sibling', 'user', 'sibling hermes message', 1778767211.0);
+	`)
+	require.NoError(t, err)
+	return dbPath
+}
+
+func TestSessionExportHermesStateDB(t *testing.T) {
+	dataDir := newAgentDataDir(t)
+
+	wrongRoot := t.TempDir()
+	_ = createHermesExportStateDB(t, wrongRoot)
+	root := t.TempDir()
+	dbPath := createHermesExportStateDB(t, root)
+	t.Setenv("HERMES_SESSIONS_DIR", filepath.Join(wrongRoot, "sessions"))
+
+	seedSessionWithOpts(t, dataDir, "hermes:child", "proj",
+		func(s *db.Session) {
+			s.Agent = string(parser.AgentHermes)
+			s.SourceSessionID = "child"
+			s.SourceVersion = "hermes-state-db"
+			s.FilePath = &dbPath
+		})
+
+	out, err := executeCommand(newRootCommand(),
+		"session", "export", "hermes:child")
+	require.NoError(t, err)
+	assert.NotContains(t, out, "SQLite format 3")
+	assert.Contains(t, out, `"role":"session_meta"`)
+	assert.Contains(t, out, "target hermes message")
+	assert.NotContains(t, out, "sibling hermes message")
+	assert.NotContains(t, out, "wrong root message")
+}
+
+func TestSessionExportHermesStateDBWithoutSourceVersion(t *testing.T) {
+	dataDir := newAgentDataDir(t)
+
+	root := t.TempDir()
+	dbPath := createHermesExportStateDB(t, root)
+
+	seedSessionWithOpts(t, dataDir, "hermes:child", "proj",
+		func(s *db.Session) {
+			s.Agent = string(parser.AgentHermes)
+			s.FilePath = &dbPath
+		})
+
+	out, err := executeCommand(newRootCommand(),
+		"session", "export", "hermes:child")
+	require.NoError(t, err)
+	assert.NotContains(t, out, "SQLite format 3")
+	assert.Contains(t, out, `"role":"session_meta"`)
+	assert.Contains(t, out, "target hermes message")
+	assert.NotContains(t, out, "sibling hermes message")
+}
+
+func TestSessionExportAugureDesktopStateDB(t *testing.T) {
+	dataDir := newAgentDataDir(t)
+
+	root := t.TempDir()
+	dbPath := createHermesExportStateDB(t, root)
+	virtualPath := dbPath + "#child"
+
+	seedSessionWithOpts(t, dataDir, "augure-desktop:child", "proj",
+		func(s *db.Session) {
+			s.Agent = string(parser.AgentAugureDesktop)
+			s.SourceSessionID = "child"
+			s.FilePath = &virtualPath
+		})
+
+	out, err := executeCommand(newRootCommand(),
+		"session", "export", "augure-desktop:child")
+	require.NoError(t, err)
+	// The selected session's JSONL must stream, not the SQLite file.
+	assert.NotContains(t, out, "SQLite format 3")
+	assert.Contains(t, out, `"role":"session_meta"`)
+	assert.Contains(t, out, "target hermes message")
+	assert.NotContains(t, out, "sibling hermes message")
+}
+
+func TestSessionExportAugureDesktopStateDBWithoutSourceSessionID(t *testing.T) {
+	dataDir := newAgentDataDir(t)
+
+	root := t.TempDir()
+	dbPath := createHermesExportStateDB(t, root)
+	virtualPath := dbPath + "#child"
+
+	seedSessionWithOpts(t, dataDir, "augure-desktop:child", "proj",
+		func(s *db.Session) {
+			s.Agent = string(parser.AgentAugureDesktop)
+			s.FilePath = &virtualPath
+		})
+
+	// SourceSessionID is empty, so the raw ID is derived from the
+	// augure-desktop: prefix.
+	out, err := executeCommand(newRootCommand(),
+		"session", "export", "augure-desktop:child")
+	require.NoError(t, err)
+	assert.NotContains(t, out, "SQLite format 3")
+	assert.Contains(t, out, `"role":"session_meta"`)
+	assert.Contains(t, out, "target hermes message")
+	assert.NotContains(t, out, "sibling hermes message")
+}
+
+func TestSessionExportAugureDesktopDoesNotFallBackToHermesRoots(t *testing.T) {
+	dataDir := newAgentDataDir(t)
+	require.NoError(t, os.WriteFile(
+		filepath.Join(dataDir, "config.toml"),
+		[]byte("augure_desktop_dirs = []\n"), 0o600,
+	))
+
+	// A Hermes store holds a session with the same raw ID as the fork's.
+	hermesRoot := t.TempDir()
+	_ = createHermesExportStateDB(t, hermesRoot)
+	t.Setenv("HERMES_SESSIONS_DIR", filepath.Join(hermesRoot, "sessions"))
+
+	// The fork's stored state.db is gone, so only a root search could
+	// resolve the session.
+	virtualPath := filepath.Join(t.TempDir(), "state.db") + "#child"
+	seedSessionWithOpts(t, dataDir, "augure-desktop:child", "proj",
+		func(s *db.Session) {
+			s.Agent = string(parser.AgentAugureDesktop)
+			s.SourceSessionID = "child"
+			s.FilePath = &virtualPath
+		})
+
+	out, err := executeCommand(newRootCommand(),
+		"session", "export", "augure-desktop:child")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "source file not found")
+	assert.NotContains(t, out, "target hermes message")
 }
 
 func TestSessionExport_AiderVirtualPathStreamsOnlySelectedRun(t *testing.T) {
@@ -1080,11 +1400,314 @@ func TestSessionUsage_ServerFlagUsesHTTP(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, out)
 	assert.Equal(t, "/api/v1/sessions/remote-session/usage", reqs.UsagePath)
+	assert.Equal(t, "breakdown=true&subagents=true", reqs.UsageQuery,
+		"remote CLI must request full breakdown rows and subagent usage")
+	assert.Equal(t, service.SyncInput{
+		ID: "remote-session", Subagents: true,
+	}, reqs.SyncInput)
+	assert.Equal(t, []string{
+		"/api/v1/version",
+		"/api/v1/sessions/remote-session",
+		"/api/v1/sessions/sync",
+		"/api/v1/sessions/remote-session/usage",
+	}, reqs.RequestPath)
 	assert.Equal(t, tokenUseExitOK, code)
 	assert.Equal(t, "remote-session", out.SessionID)
 	assert.Equal(t, "remote-project", out.Project)
 	assert.Equal(t, 42, out.TotalOutputTokens)
 	assert.True(t, out.ServerRunning)
+}
+
+func TestSessionUsage_NoSyncPreservesAuthenticatedResolution(t *testing.T) {
+	dataDir := newAgentDataDir(t)
+	tokenFile := filepath.Join(dataDir, "remote-token")
+	require.NoError(t, os.WriteFile(tokenFile, []byte("test-token\n"), 0o600))
+	const rawID = "session-uuid"
+	const canonicalID = "codex:" + rawID
+	ts, reqs := newRemoteUsageServer(t, remoteUsageSpec{
+		canonicalID: canonicalID,
+		bearer:      "test-token",
+	})
+	cmd := sessionUsageCommand(t, "session", "usage", rawID,
+		"--server", ts.URL, "--server-token-file", tokenFile, "--no-sync")
+
+	out, code, err := sessionUsageDataForCommand(cmd, rawID)
+	require.NoError(t, err)
+	require.NotNil(t, out)
+	assert.Equal(t, tokenUseExitOK, code)
+	assert.Equal(t, canonicalID, out.SessionID)
+	assert.Equal(t, 42, out.TotalOutputTokens)
+	assert.Equal(t, "breakdown=true&subagents=true", reqs.UsageQuery)
+	assert.Empty(t, reqs.SyncInput.ID)
+	assert.NotContains(t, reqs.RequestPath, "/api/v1/sessions/sync")
+	assert.Contains(t, reqs.RequestPath, "/api/v1/sessions/"+rawID)
+	assert.Contains(t, reqs.RequestPath, "/api/v1/sessions/"+canonicalID)
+}
+
+func TestSessionUsage_NoSyncAutostartDisablesSourceSync(t *testing.T) {
+	testDataDir(t)
+	ts, reqs := newRemoteUsageServer(t, remoteUsageSpec{canonicalID: "remote-session"})
+	u, err := url.Parse(ts.URL)
+	require.NoError(t, err)
+	host, portText, err := net.SplitHostPort(u.Host)
+	require.NoError(t, err)
+	port, err := strconv.Atoi(portText)
+	require.NoError(t, err)
+	var started bool
+	stubStartBackgroundServeForTransport(t, func(
+		_ context.Context, cfg *config.Config, _ time.Duration,
+	) (*DaemonRuntime, error) {
+		started = true
+		assert.True(t, cfg.NoSync)
+		return &DaemonRuntime{Host: host, Port: port}, nil
+	})
+	cmd := sessionUsageCommand(t, "session", "usage", "remote-session", "--no-sync")
+	out, code, err := sessionUsageDataForCommand(cmd, "remote-session")
+	require.NoError(t, err)
+	require.NotNil(t, out)
+	assert.True(t, started)
+	assert.Equal(t, tokenUseExitOK, code)
+	assert.Empty(t, reqs.SyncInput.ID)
+	assert.Equal(t, "breakdown=true&subagents=true", reqs.UsageQuery)
+}
+
+func TestSessionUsage_NoSyncDiscoveredDaemon(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		status    int
+		body      string
+		code      int
+		wantError bool
+	}{
+		{
+			"subagent usage", http.StatusOK,
+			`{"session_id":"codex:parent","total_output_tokens":24,"has_token_data":true,"subagent_count":2}`,
+			tokenUseExitOK, false,
+		},
+		{
+			"no data", http.StatusOK,
+			`{"session_id":"codex:parent","has_token_data":false,"has_cost":false}`,
+			tokenUseExitNoTokenData, false,
+		},
+		{"missing", http.StatusNotFound, "", tokenUseExitNotFound, false},
+		{"unauthorized", http.StatusUnauthorized, "", tokenUseExitErr, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dataDir := newAgentDataDir(t)
+			writeTestConfig(t, dataDir, `auth_token = "test-token"`)
+			var paths []string
+			ts := sessionUsageRuntimeServer(t, func(w http.ResponseWriter, r *http.Request) {
+				assert.Equal(t, http.MethodGet, r.Method)
+				assert.Equal(t, "Bearer test-token", r.Header.Get("Authorization"))
+				paths = append(paths, r.URL.Path)
+				switch r.URL.Path {
+				case "/api/v1/sessions/codex:parent":
+					writeJSONResponse(w, `{"id":"codex:parent","agent":"codex"}`)
+				case "/api/v1/sessions/codex:parent/usage":
+					assert.Equal(t, "breakdown=true&subagents=true", r.URL.RawQuery)
+					w.WriteHeader(tc.status)
+					_, _ = w.Write([]byte(tc.body))
+				default:
+					http.NotFound(w, r)
+				}
+			})
+			registerSyncRouteTestRuntime(t, dataDir, ts.URL)
+			cmd := sessionUsageCommand(t, "session", "usage", "codex:parent", "--no-sync")
+			out, code, err := sessionUsageDataForCommand(cmd, "codex:parent")
+			if tc.wantError {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+			assert.Equal(t, tc.code, code)
+			assert.Equal(t, []string{
+				"/api/v1/sessions/codex:parent",
+				"/api/v1/sessions/codex:parent/usage",
+			}, paths)
+			if tc.code == tokenUseExitOK {
+				require.NotNil(t, out)
+				assert.Equal(t, 24, out.TotalOutputTokens)
+				assert.Equal(t, 2, out.SubagentCount)
+			}
+		})
+	}
+}
+
+func TestSessionUsage_NoSyncLocalAttributionAndMissingData(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		id       string
+		ownOnly  bool
+		code     int
+		output   int
+		children int
+	}{
+		{"subagent usage", "claude:parent-only", false, tokenUseExitOK, 24, 1},
+		{"own only", "claude:parent-only", true, tokenUseExitNoTokenData, 0, 0},
+		{"missing", "claude:missing", false, tokenUseExitNotFound, 0, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dataDir := newAgentDataDir(t)
+			localDB := dbtest.OpenTestDBAt(t, sessionsDBPath(dataDir))
+			seedSubagentOnlyUsage(t, localDB, "claude:parent-only", "agent-child", 24)
+			backend := localArchiveQueryBackend{
+				cfg:      config.Config{DBPath: sessionsDBPath(dataDir)},
+				database: localDB,
+				offline:  true,
+			}
+			out, code, err := backend.SessionUsage(t.Context(), sessionUsageQuery{
+				SessionID: tc.id, OwnOnly: tc.ownOnly, NoSync: true,
+			})
+			require.NoError(t, err)
+			assert.Equal(t, tc.code, code)
+			if tc.code == tokenUseExitNotFound {
+				assert.Nil(t, out)
+				return
+			}
+			require.NotNil(t, out)
+			assert.Equal(t, tc.output, out.TotalOutputTokens)
+			assert.Equal(t, tc.children, out.SubagentCount)
+		})
+	}
+}
+
+func TestSessionUsage_ServerFlagRejectsCombinedUsageFromOlderDaemon(
+	t *testing.T,
+) {
+	newAgentDataDir(t)
+
+	ts, reqs := newRemoteUsageServer(t, remoteUsageSpec{
+		canonicalID: "remote-session",
+		apiVersion:  5,
+	})
+	cmd := sessionUsageCommand(t,
+		"session", "usage", "remote-session", "--server", ts.URL)
+
+	out, code, err := sessionUsageDataForCommand(cmd, "remote-session")
+
+	require.Error(t, err)
+	assert.Nil(t, out)
+	assert.Equal(t, tokenUseExitErr, code)
+	assert.Contains(t, err.Error(),
+		"does not support combined subagent usage")
+	assert.Contains(t, err.Error(), "--own-only")
+	assert.Equal(t, []string{"/api/v1/version"}, reqs.RequestPath)
+	assert.Empty(t, reqs.SyncInput.ID)
+	assert.Empty(t, reqs.UsagePath)
+}
+
+func TestSessionUsage_ServerFlagOwnOnlySkipsSubagents(t *testing.T) {
+	newAgentDataDir(t)
+
+	ts, reqs := newRemoteUsageServer(t, remoteUsageSpec{
+		canonicalID:   "remote-session",
+		apiVersion:    4,
+		serverRunning: true,
+	})
+
+	cmd := sessionUsageCommand(t,
+		"session", "usage", "remote-session", "--server", ts.URL, "--own-only")
+
+	out, code, err := sessionUsageDataForCommand(cmd, "remote-session")
+	require.NoError(t, err)
+	require.NotNil(t, out)
+	assert.Equal(t, "breakdown=true", reqs.UsageQuery,
+		"--own-only must not ask the daemon for subagent usage")
+	assert.Empty(t, reqs.SyncInput.ID,
+		"--own-only must not ask the daemon to refresh subagents")
+	assert.Equal(t, []string{
+		"/api/v1/sessions/remote-session",
+		"/api/v1/sessions/remote-session/usage",
+	}, reqs.RequestPath)
+	assert.Equal(t, tokenUseExitOK, code)
+}
+
+// seedSubagentOnlyUsage seeds a parent session with no usage of its own and
+// one subagent transcript that holds all the token data, which is the shape
+// that used to make `session usage <parent>` exit 3 with an empty report.
+func seedSubagentOnlyUsage(
+	t *testing.T, d *db.DB, parentID, childID string, outputTokens int,
+) {
+	t.Helper()
+	recordFixtureInstallation(t, d)
+	require.NoError(t, d.UpsertSession(t.Context(), db.Session{
+		ID:               parentID,
+		Project:          "local-project",
+		Machine:          "usage-host",
+		Agent:            "claude",
+		MessageCount:     2,
+		UserMessageCount: 2,
+	}))
+	require.NoError(t, d.UpsertSession(t.Context(), db.Session{
+		ID:                   childID,
+		Project:              "local-project",
+		Machine:              "usage-host",
+		Agent:                "claude",
+		MessageCount:         2,
+		ParentSessionID:      &parentID,
+		RelationshipType:     "subagent",
+		TotalOutputTokens:    outputTokens,
+		HasTotalOutputTokens: true,
+	}))
+}
+
+func TestSessionUsage_LocalIncludesSubagentUsageByDefault(t *testing.T) {
+	dataDir := newAgentDataDir(t)
+	t.Setenv("AGENTSVIEW_NO_DAEMON", "1")
+
+	localDB := dbtest.OpenTestDBAt(t, sessionsDBPath(dataDir))
+	seedSubagentOnlyUsage(t, localDB, "claude:parent-only", "agent-child", 24)
+
+	cmd := sessionUsageCommand(t, "session", "usage", "claude:parent-only")
+
+	out, code, err := sessionUsageDataForCommand(cmd, "claude:parent-only")
+	require.NoError(t, err)
+	require.NotNil(t, out)
+	assert.Equal(t, tokenUseExitOK, code,
+		"a parent whose token data lives in subagents must not exit 3")
+	assert.Equal(t, "claude:parent-only", out.SessionID)
+	assert.Equal(t, 1, out.SubagentCount)
+	assert.Equal(t, 24, out.TotalOutputTokens)
+	assert.True(t, out.HasTokenData)
+}
+
+func TestSessionUsage_LocalOwnOnlyExcludesSubagentUsage(t *testing.T) {
+	dataDir := newAgentDataDir(t)
+	t.Setenv("AGENTSVIEW_NO_DAEMON", "1")
+
+	localDB := dbtest.OpenTestDBAt(t, sessionsDBPath(dataDir))
+	seedSubagentOnlyUsage(t, localDB, "claude:parent-only", "agent-child", 24)
+
+	cmd := sessionUsageCommand(t,
+		"session", "usage", "claude:parent-only", "--own-only")
+
+	out, code, err := sessionUsageDataForCommand(cmd, "claude:parent-only")
+	require.NoError(t, err)
+	require.NotNil(t, out)
+	assert.Equal(t, tokenUseExitNoTokenData, code,
+		"--own-only restores the pre-rollup empty report and exit code")
+	assert.Zero(t, out.SubagentCount)
+	assert.Zero(t, out.TotalOutputTokens)
+	assert.False(t, out.HasTokenData)
+}
+
+func TestSessionUsage_PGFlagIncludesSubagentUsage(t *testing.T) {
+	dataDir := newAgentDataDir(t)
+	t.Setenv("AGENTSVIEW_PG_URL", "postgres://example.test/agentsview")
+
+	pgDB := dbtest.OpenTestDBAt(t, filepath.Join(dataDir, "pg.db"))
+	seedSubagentOnlyUsage(t, pgDB, "claude:pg-parent", "agent-pg-child", 42)
+
+	stubPGReadStore(t, pgDB)
+
+	cmd := sessionUsageCommand(t, "session", "usage", "claude:pg-parent", "--pg")
+
+	out, code, err := sessionUsageDataForCommand(cmd, "claude:pg-parent")
+	require.NoError(t, err)
+	require.NotNil(t, out)
+	assert.Equal(t, tokenUseExitOK, code)
+	assert.Equal(t, 1, out.SubagentCount)
+	assert.Equal(t, 42, out.TotalOutputTokens)
 }
 
 func TestSessionUsage_UsesDiscoveredDaemon(t *testing.T) {
@@ -1100,6 +1723,15 @@ func TestSessionUsage_UsesDiscoveredDaemon(t *testing.T) {
 				"agent": "codex",
 				"project": "remote-project"
 			}`))
+		case "/api/v1/sessions/sync":
+			var input service.SyncInput
+			if !assert.NoError(t, json.UnmarshalRead(r.Body, &input)) {
+				return
+			}
+			assert.Equal(t, service.SyncInput{
+				ID: "remote-session", Subagents: true,
+			}, input)
+			_, _ = w.Write([]byte(`{"id":"remote-session"}`))
 		case "/api/v1/sessions/remote-session/usage":
 			gotUsagePath = r.URL.Path
 			_, _ = w.Write([]byte(`{
@@ -1109,13 +1741,13 @@ func TestSessionUsage_UsesDiscoveredDaemon(t *testing.T) {
 				"total_output_tokens": 42,
 				"peak_context_tokens": 2048,
 				"has_token_data": true,
-				"cost_usd": 0.5,
+				"cost": {"microdollars": 500000},
 				"has_cost": true,
 				"models": ["gpt-5.1"],
 				"unpriced_models": []
 			}`))
 		default:
-			t.Errorf("unexpected path: %s", r.URL.Path)
+			http.Error(w, "unexpected path: "+r.URL.Path, http.StatusInternalServerError)
 			http.NotFound(w, r)
 		}
 	})
@@ -1133,27 +1765,23 @@ func TestSessionUsage_UsesDiscoveredDaemon(t *testing.T) {
 	assert.NoFileExists(t, filepath.Join(dataDir, "sessions.db"))
 }
 
-func TestSessionUsage_DefaultRefusesReadOnlyDaemon(t *testing.T) {
+func TestSessionUsage_DefaultUsesArchivedReadOnlyDaemonUsage(t *testing.T) {
 	dataDir := newAgentDataDir(t)
-
-	var gotUsagePath string
-	ts := sessionUsageRuntimeServer(t, func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasSuffix(r.URL.Path, "/usage") {
-			gotUsagePath = r.URL.Path
-		}
-		http.NotFound(w, r)
-	})
+	ts, paths := readOnlySessionUsageRuntimeServer(t)
 	registerTestRuntime(t, dataDir, ts.URL, true)
 
 	cmd := sessionUsageCommand(t, "session", "usage", "remote-session")
 
 	out, code, err := sessionUsageDataForCommand(cmd, "remote-session")
-	require.Error(t, err)
-	assert.Nil(t, out)
-	assert.Equal(t, tokenUseExitErr, code)
-	assert.Contains(t, err.Error(), "read-only")
-	assert.Contains(t, err.Error(), "use --pg")
-	assert.Empty(t, gotUsagePath)
+	require.NoError(t, err)
+	require.NotNil(t, out)
+	assert.Equal(t, tokenUseExitOK, code)
+	assert.Equal(t, 42, out.TotalOutputTokens)
+	assert.Equal(t, []string{
+		"/api/v1/sessions/remote-session",
+		"/api/v1/sessions/sync",
+		"/api/v1/sessions/remote-session/usage",
+	}, *paths)
 	assert.NoFileExists(t, filepath.Join(dataDir, "sessions.db"))
 }
 
@@ -1170,6 +1798,15 @@ func TestTokenUse_UsesDiscoveredDaemon(t *testing.T) {
 				"agent": "codex",
 				"project": "remote-project"
 			}`))
+		case "/api/v1/sessions/sync":
+			var input service.SyncInput
+			if !assert.NoError(t, json.UnmarshalRead(r.Body, &input)) {
+				return
+			}
+			assert.Equal(t, service.SyncInput{
+				ID: "remote-session", Subagents: true,
+			}, input)
+			_, _ = w.Write([]byte(`{"id":"remote-session"}`))
 		case "/api/v1/sessions/remote-session/usage":
 			gotUsagePath = r.URL.Path
 			_, _ = w.Write([]byte(`{
@@ -1179,13 +1816,13 @@ func TestTokenUse_UsesDiscoveredDaemon(t *testing.T) {
 				"total_output_tokens": 42,
 				"peak_context_tokens": 2048,
 				"has_token_data": true,
-				"cost_usd": 0.5,
+				"cost": {"microdollars": 500000},
 				"has_cost": true,
 				"models": ["gpt-5.1"],
 				"unpriced_models": []
 			}`))
 		default:
-			t.Errorf("unexpected path: %s", r.URL.Path)
+			http.Error(w, "unexpected path: "+r.URL.Path, http.StatusInternalServerError)
 			http.NotFound(w, r)
 		}
 	})
@@ -1201,31 +1838,72 @@ func TestTokenUse_UsesDiscoveredDaemon(t *testing.T) {
 	assert.NoFileExists(t, filepath.Join(dataDir, "sessions.db"))
 }
 
-func TestTokenUse_RefusesReadOnlyDaemon(t *testing.T) {
+func TestTokenUse_UsesArchivedReadOnlyDaemonUsage(t *testing.T) {
 	dataDir := newAgentDataDir(t)
-
-	var gotUsagePath string
-	ts := sessionUsageRuntimeServer(t, func(w http.ResponseWriter, r *http.Request) {
-		if strings.HasSuffix(r.URL.Path, "/usage") {
-			gotUsagePath = r.URL.Path
-		}
-		http.NotFound(w, r)
-	})
+	ts, paths := readOnlySessionUsageRuntimeServer(t)
 	registerTestRuntime(t, dataDir, ts.URL, true)
 
 	out, code, err := sessionUsageData("remote-session")
-	require.Error(t, err)
-	assert.Nil(t, out)
-	assert.Equal(t, tokenUseExitErr, code)
-	assert.Contains(t, err.Error(), "read-only")
-	assert.Contains(t, err.Error(), "use --pg")
-	assert.Empty(t, gotUsagePath)
+	require.NoError(t, err)
+	require.NotNil(t, out)
+	assert.Equal(t, tokenUseExitOK, code)
+	assert.Equal(t, 42, out.TotalOutputTokens)
+	assert.Equal(t, []string{
+		"/api/v1/sessions/remote-session",
+		"/api/v1/sessions/sync",
+		"/api/v1/sessions/remote-session/usage",
+	}, *paths)
 	assert.NoFileExists(t, filepath.Join(dataDir, "sessions.db"))
+}
+
+func readOnlySessionUsageRuntimeServer(
+	t *testing.T,
+) (*httptest.Server, *[]string) {
+	t.Helper()
+	paths := []string{}
+	ts := sessionUsageRuntimeServer(t, func(w http.ResponseWriter, r *http.Request) {
+		paths = append(paths, r.URL.Path)
+		switch r.URL.Path {
+		case "/api/v1/sessions/remote-session":
+			writeJSONResponse(w, `{
+				"id":"remote-session",
+				"agent":"codex",
+				"project":"remote-project"
+			}`)
+		case "/api/v1/sessions/sync":
+			assert.Equal(t, http.MethodPost, r.Method)
+			w.WriteHeader(http.StatusNotImplemented)
+		case "/api/v1/sessions/remote-session/usage":
+			writeJSONResponse(w, `{
+				"session_id":"remote-session",
+				"agent":"codex",
+				"project":"remote-project",
+				"total_output_tokens":42,
+				"has_token_data":true
+			}`)
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	return ts, &paths
 }
 
 func sessionUsageRuntimeServer(
 	t *testing.T,
 	sessionHandler http.HandlerFunc,
+) *httptest.Server {
+	t.Helper()
+	return sessionUsageRuntimeServerWithMachines(
+		t, `{"machines":[],"machine_labels":{},"machine_aliases":{}}`,
+		sessionHandler,
+	)
+}
+
+func sessionUsageRuntimeServerWithMachines(
+	t *testing.T,
+	machineResponse string,
+	sessionHandler http.HandlerFunc,
+	onMachineRequest ...func(),
 ) *httptest.Server {
 	t.Helper()
 	ping := daemon.NewPingHandler(daemon.PingHandlerOptions{
@@ -1238,6 +1916,17 @@ func sessionUsageRuntimeServer(
 	) {
 		if r.URL.Path == "/api/ping" {
 			ping.ServeHTTP(w, r)
+			return
+		}
+		if r.Method == http.MethodPost && r.URL.Path == "/api/v1/sync" && r.URL.Query().Get("startup_only") == "true" {
+			writeJSONResponse(w, `{}`)
+			return
+		}
+		if r.URL.Path == "/api/v1/machines" {
+			if len(onMachineRequest) > 0 {
+				onMachineRequest[0]()
+			}
+			writeJSONResponse(w, machineResponse)
 			return
 		}
 		sessionHandler(w, r)
@@ -1348,6 +2037,31 @@ func TestSessionUsage_ServerTokenSendsBearer(t *testing.T) {
 	require.NotNil(t, out)
 }
 
+func TestSessionUsage_ServerTokenFileExpandsHome(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	tokenFile := filepath.Join(home, "remote-token")
+	require.NoError(t, os.WriteFile(
+		tokenFile, []byte("remote-secret\n"), 0o600,
+	))
+
+	ts, _ := newRemoteUsageServer(t, remoteUsageSpec{
+		canonicalID:   "remote-session",
+		bearer:        "remote-secret",
+		serverRunning: true,
+	})
+
+	cmd := sessionUsageCommand(t,
+		"session", "usage", "remote-session",
+		"--server", ts.URL,
+		"--server-token-file", "~/remote-token")
+
+	out, _, err := sessionUsageDataForCommand(cmd, "remote-session")
+	require.NoError(t, err)
+	require.NotNil(t, out)
+}
+
 func TestSessionUsage_ServerHTTPClientHasTimeout(t *testing.T) {
 	oldClient := sessionUsageHTTPClient
 	sessionUsageHTTPClient = &http.Client{Timeout: 20 * time.Millisecond}
@@ -1355,9 +2069,11 @@ func TestSessionUsage_ServerHTTPClientHasTimeout(t *testing.T) {
 
 	newAgentDataDir(t)
 
+	usageBlock := make(chan struct{})
+	defer close(usageBlock)
 	ts, _ := newRemoteUsageServer(t, remoteUsageSpec{
 		canonicalID: "remote-session",
-		usageDelay:  200 * time.Millisecond,
+		usageBlock:  usageBlock,
 	})
 
 	cmd := sessionUsageCommand(t,
@@ -1506,7 +2222,9 @@ func TestSessionSync_ServerFlagTreatsPathShapedArgAsRemotePath(t *testing.T) {
 		func(w http.ResponseWriter, r *http.Request) {
 			assert.Equal(t, http.MethodPost, r.Method)
 			assert.Equal(t, "/api/v1/sessions/sync", r.URL.Path)
-			require.NoError(t, json.NewDecoder(r.Body).Decode(&got))
+			if !assert.NoError(t, json.UnmarshalRead(r.Body, &got)) {
+				return
+			}
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{
 				"id": "remote-session",
@@ -1577,8 +2295,12 @@ func TestSessionSync_ColdArchiveWriteAutoStartsDaemon(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(
 		w http.ResponseWriter, r *http.Request,
 	) {
-		require.Equal(t, "/api/v1/sessions/sync", r.URL.Path)
-		require.Equal(t, http.MethodPost, r.Method)
+		if !assert.Equal(t, "/api/v1/sessions/sync", r.URL.Path) {
+			return
+		}
+		if !assert.Equal(t, http.MethodPost, r.Method) {
+			return
+		}
 		syncCalled = true
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"id":"daemon-synced"}`))
@@ -1606,6 +2328,7 @@ func TestSessionSync_ColdArchiveWriteAutoStartsDaemon(t *testing.T) {
 
 func daemonRuntimeFromTestURL(t *testing.T, rawURL string) *DaemonRuntime {
 	t.Helper()
+
 	u, err := url.Parse(rawURL)
 	require.NoError(t, err)
 	host, portText, err := net.SplitHostPort(u.Host)
@@ -1615,17 +2338,7 @@ func daemonRuntimeFromTestURL(t *testing.T, rawURL string) *DaemonRuntime {
 	return &DaemonRuntime{Host: host, Port: port}
 }
 
-// TestSessionWatch_ExitsOnCancel verifies that `session watch`
-// exits cleanly when the cobra Command's context is cancelled,
-// without hanging on the upstream channel. Any NDJSON emitted
-// to stdout must parse as one JSON object per line. We don't
-// drive DB changes here (poll interval is 1.5s) — this test
-// only asserts the plumbing: service resolution, channel wiring,
-// and the shutdown path.
-//
-// To distinguish a real Watch call from an early-return stub, we
-// also assert the command runs past a short delay: any stub that
-// returns synchronously would complete in single-digit ms.
+// TestSessionWatch_ExitsOnCancel cancels only after the real service subscribes.
 func TestSessionWatch_ExitsOnCancel(t *testing.T) {
 	dataDir := newAgentDataDir(t)
 	seedSession(t, dataDir, "s-watch", "proj")
@@ -1636,14 +2349,12 @@ func TestSessionWatch_ExitsOnCancel(t *testing.T) {
 	root.SetErr(buf)
 	root.SetArgs([]string{"session", "watch", "s-watch"})
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	go func() {
-		time.Sleep(50 * time.Millisecond)
-		cancel()
-	}()
-
-	start := time.Now()
+	started := false
+	original := sessionWatchStarted
+	sessionWatchStarted = func() { started = true; cancel() }
+	t.Cleanup(func() { sessionWatchStarted = original })
 	done := make(chan error, 1)
 	go func() { done <- root.ExecuteContext(ctx) }()
 
@@ -1651,24 +2362,18 @@ func TestSessionWatch_ExitsOnCancel(t *testing.T) {
 	select {
 	case execErr = <-done:
 	case <-time.After(3 * time.Second):
-		t.Fatal("session watch did not exit within 3s after ctx cancel")
+		require.FailNow(t, "session watch did not exit within 3s after ctx cancel")
 	}
-	elapsed := time.Since(start)
 
 	// Clean cancellation must surface as either nil (upstream channel
 	// closed on ctx cancel) or an error that wraps context.Canceled.
 	// Anything else indicates a regression that earlier versions of
 	// this test swallowed by discarding execErr.
 	if execErr != nil && !errors.Is(execErr, context.Canceled) {
-		t.Fatalf("expected nil or context.Canceled, got %v", execErr)
+		require.FailNowf(t, "expected nil or context.Canceled", "got %v", execErr)
 	}
 
-	// A stub that returns immediately would complete far faster
-	// than the cancel delay. Require the command to actually
-	// wait on the Watch channel.
-	assert.GreaterOrEqual(t, elapsed, 30*time.Millisecond,
-		"session watch returned too quickly (%v) — "+
-			"likely a stub, not a real Watch", elapsed)
+	assert.True(t, started, "the real Watch subscription must start before cancellation")
 
 	// Any output must be valid NDJSON. Empty output is fine.
 	for line := range bytes.SplitSeq(buf.Bytes(), []byte("\n")) {
@@ -1740,8 +2445,7 @@ func TestLooksLikePath(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.in, func(t *testing.T) {
 			if got := looksLikePath(tc.in); got != tc.want {
-				t.Fatalf("looksLikePath(%q) = %v, want %v",
-					tc.in, got, tc.want)
+				assert.Equal(t, tc.want, got, "looksLikePath(%q)", tc.in)
 			}
 		})
 	}

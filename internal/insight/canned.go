@@ -1,19 +1,19 @@
 package insight
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
-	"io"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/money"
+	"go.kenn.io/agentsview/internal/stringutil"
 )
 
 const (
@@ -156,19 +156,19 @@ type CannedUsageSummary struct {
 	OutputTokens        int                    `json:"output_tokens"`
 	CacheCreationTokens int                    `json:"cache_creation_tokens"`
 	CacheReadTokens     int                    `json:"cache_read_tokens"`
-	TotalCost           float64                `json:"total_cost"`
-	CacheSavings        float64                `json:"cache_savings"`
+	TotalCost           money.Money            `json:"total_cost"`
+	CacheSavings        money.Money            `json:"cache_savings"`
 	ModelBreakdowns     []CannedModelBreakdown `json:"model_breakdowns,omitempty"`
 	TopSessionsByCost   []db.TopSessionEntry   `json:"top_sessions_by_cost,omitempty"`
 }
 
 type CannedModelBreakdown struct {
-	ModelName           string  `json:"model_name"`
-	InputTokens         int     `json:"input_tokens"`
-	OutputTokens        int     `json:"output_tokens"`
-	CacheCreationTokens int     `json:"cache_creation_tokens"`
-	CacheReadTokens     int     `json:"cache_read_tokens"`
-	Cost                float64 `json:"cost"`
+	ModelName           string      `json:"model_name"`
+	InputTokens         int         `json:"input_tokens"`
+	OutputTokens        int         `json:"output_tokens"`
+	CacheCreationTokens int         `json:"cache_creation_tokens"`
+	CacheReadTokens     int         `json:"cache_read_tokens"`
+	Cost                money.Money `json:"cost"`
 }
 
 type CannedEvidenceRef struct {
@@ -285,6 +285,7 @@ func CannedCacheKey(
 	dateFrom, dateTo, project, requestedAgent, focus, aggregateHash string,
 	automatedScope string,
 	filters CannedSessionFilters,
+	generation GenerateOptions,
 ) (string, error) {
 	t, ok := CannedTemplate(kind)
 	if !ok {
@@ -296,18 +297,37 @@ func CannedCacheKey(
 		return "", err
 	}
 	filterSum := sha256.Sum256(filterData)
+	generationBackend := requestedAgent
+	generationModel := ""
+	generationEndpointHash := ""
+	if generation.Endpoint != nil &&
+		strings.TrimSpace(generation.Endpoint.Endpoint) != "" &&
+		strings.TrimSpace(generation.Endpoint.Model) != "" {
+		generationBackend = "openai"
+		generationModel = strings.TrimSpace(generation.Endpoint.Model)
+		endpointSum := sha256.Sum256(
+			[]byte(strings.TrimSpace(generation.Endpoint.Endpoint)),
+		)
+		generationEndpointHash = hex.EncodeToString(endpointSum[:])
+		requestedAgent = ""
+	} else if requestedAgent == "gemini" {
+		generationModel = geminiInsightModel
+	}
 	input := map[string]string{
-		"kind":             string(kind),
-		"date_from":        dateFrom,
-		"date_to":          dateTo,
-		"project":          project,
-		"requested_agent":  requestedAgent,
-		"template_version": t.Version,
-		"schema_version":   CannedSchemaVersion,
-		"aggregate_hash":   aggregateHash,
-		"focus_hash":       hex.EncodeToString(focusSum[:]),
-		"automated_scope":  automatedScope,
-		"filter_hash":      hex.EncodeToString(filterSum[:]),
+		"kind":                     string(kind),
+		"date_from":                dateFrom,
+		"date_to":                  dateTo,
+		"project":                  project,
+		"requested_agent":          requestedAgent,
+		"template_version":         t.Version,
+		"schema_version":           CannedSchemaVersion,
+		"aggregate_hash":           aggregateHash,
+		"focus_hash":               hex.EncodeToString(focusSum[:]),
+		"automated_scope":          automatedScope,
+		"filter_hash":              hex.EncodeToString(filterSum[:]),
+		"generation_backend":       generationBackend,
+		"generation_model":         generationModel,
+		"generation_endpoint_hash": generationEndpointHash,
 	}
 	data, err := canonicalJSON(input)
 	if err != nil {
@@ -399,6 +419,8 @@ func writeCannedKindRules(
 			b.WriteString("- Context pressure coverage is present; pressure conclusions must cite the aggregate pressure fields and stay proportional to the covered session count.\n")
 		}
 		b.WriteString("\n")
+	default:
+		// Other templates need no context-setup rules.
 	}
 }
 
@@ -410,16 +432,10 @@ func ParseCannedEnvelope(raw string) (CannedRecommendationEnvelope, error) {
 	clean = strings.TrimSpace(clean)
 
 	var out CannedRecommendationEnvelope
-	dec := json.NewDecoder(strings.NewReader(clean))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&out); err != nil {
+	if err := json.Unmarshal(
+		[]byte(clean), &out, json.RejectUnknownMembers(true),
+	); err != nil {
 		return out, fmt.Errorf("parsing canned insight JSON: %w", err)
-	}
-	var extra struct{}
-	if err := dec.Decode(&extra); err == nil {
-		return out, errors.New("canned insight JSON contains trailing values")
-	} else if !errors.Is(err, io.EOF) {
-		return out, fmt.Errorf("canned insight JSON has trailing data: %w", err)
 	}
 	return out, nil
 }
@@ -546,15 +562,7 @@ func NewCannedProvenance(
 }
 
 func canonicalJSON(v any) ([]byte, error) {
-	data, err := json.Marshal(v)
-	if err != nil {
-		return nil, err
-	}
-	var buf bytes.Buffer
-	if err := json.Compact(&buf, data); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
+	return json.Marshal(v, json.Deterministic(true))
 }
 
 func validConfidence(v string) bool {
@@ -1100,11 +1108,11 @@ func sortedKeys(values map[string]bool) []string {
 }
 
 func truncateRunes(s string, maxRunes int) string {
-	runes := []rune(strings.TrimSpace(s))
-	if len(runes) <= maxRunes {
-		return string(runes)
+	s = string([]rune(strings.TrimSpace(s)))
+	if stringutil.TruncateRunes(s, maxRunes, "") == s {
+		return s
 	}
-	return string(runes[:maxRunes-3]) + "..."
+	return stringutil.TruncateRunes(s, maxRunes-3, "...")
 }
 
 func round1(v float64) float64 {
@@ -1124,8 +1132,8 @@ func CannedEvidenceRefs(
 			usage.OutputTokens > 0 ||
 			usage.CacheCreationTokens > 0 ||
 			usage.CacheReadTokens > 0 ||
-			usage.TotalCost != 0 ||
-			usage.CacheSavings != 0 ||
+			usage.TotalCost.Microdollars != 0 ||
+			usage.CacheSavings.Microdollars != 0 ||
 			len(usage.ModelBreakdowns) > 0 ||
 			len(usage.TopSessionsByCost) > 0)
 	refs := []CannedEvidenceRef{

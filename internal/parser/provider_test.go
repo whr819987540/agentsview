@@ -2,8 +2,8 @@ package parser
 
 import (
 	"context"
-	"encoding/json"
-	"errors"
+	"encoding/json/v2"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -29,7 +29,7 @@ func TestProviderConfigCloneCopiesRoots(t *testing.T) {
 }
 
 func TestProviderBaseZeroValueOptionalMethods(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	var base ProviderBase
 
 	discovered, err := base.Discover(ctx)
@@ -65,7 +65,7 @@ func TestProviderBaseZeroValueOptionalMethods(t *testing.T) {
 	})
 	require.Error(t, err)
 	assert.Empty(t, fingerprint)
-	assert.True(t, errors.Is(err, ErrUnsupportedProviderFeature))
+	require.ErrorIs(t, err, ErrUnsupportedProviderFeature)
 	var unsupported UnsupportedProviderFeatureError
 	require.ErrorAs(t, err, &unsupported)
 	assert.Equal(t, AgentType(""), unsupported.Provider)
@@ -93,7 +93,7 @@ func TestUnsupportedProviderFeatureErrorWrapsSentinel(t *testing.T) {
 		Feature:  ProviderFeatureFingerprint,
 	}
 
-	assert.True(t, errors.Is(err, ErrUnsupportedProviderFeature))
+	require.ErrorIs(t, err, ErrUnsupportedProviderFeature)
 	assert.Contains(t, err.Error(), string(AgentCodex))
 	assert.Contains(t, err.Error(), ProviderFeatureFingerprint)
 }
@@ -147,6 +147,100 @@ func TestProviderRegistryMirrorsAgentRegistry(t *testing.T) {
 	}
 }
 
+func TestStoredSourceHintCapabilitiesMatchConsumers(t *testing.T) {
+	wantSupported := map[AgentType]bool{
+		AgentCursorIDE: true,
+		AgentDevin:     true,
+		AgentForge:     true,
+		AgentKiro:      true,
+		AgentPiebald:   true,
+		AgentShelley:   true,
+		AgentTrae:      true,
+		AgentVSCopilot: true,
+		AgentWarp:      true,
+		AgentWindsurf:  true,
+		AgentZCode:     true,
+		AgentZed:       true,
+		AgentCline:     true,
+	}
+
+	for _, factory := range ProviderFactories() {
+		agent := factory.Definition().Type
+		got := factory.Capabilities().Source.StoredSourceHints
+		if wantSupported[agent] {
+			assert.Equalf(t, CapabilitySupported, got, "%s consumes stored path hints", agent)
+			provider := factory.NewProvider(ProviderConfig{})
+			assert.Equalf(t, CapabilitySupported,
+				provider.Capabilities().Source.StoredSourceHints,
+				"%s configured provider consumes stored path hints", agent)
+			assert.Implementsf(t, (*StoredSourceHintScopeProvider)(nil), provider,
+				"%s must scope stored hints before the engine queries them", agent)
+		} else {
+			assert.Equalf(t, CapabilityUnsupported, got, "%s must not schedule stored path hints", agent)
+		}
+	}
+}
+
+func TestStoredSourceHintScopesDistinguishContainersFromExactMembers(t *testing.T) {
+	root := t.TempDir()
+	forge, ok := NewProvider(AgentForge, ProviderConfig{Roots: []string{root}})
+	require.True(t, ok)
+	forgeScopes := forge.(StoredSourceHintScopeProvider)
+	dbPath := filepath.Join(root, ForgeDBFilename)
+	assert.Equal(t, []StoredSourceHintScope{{
+		Path: dbPath, IncludeVirtualMembers: true,
+	}}, forgeScopes.StoredSourceHintScopes(ChangedPathRequest{
+		Path: dbPath + "-wal", WatchRoot: root,
+	}))
+	virtualPath := VirtualSourcePath(dbPath, "conversation-a")
+	assert.Equal(t, []StoredSourceHintScope{{Path: virtualPath}},
+		forgeScopes.StoredSourceHintScopes(ChangedPathRequest{
+			Path: virtualPath, WatchRoot: root,
+		}))
+
+	visualStudio, ok := NewProvider(AgentVSCopilot, ProviderConfig{Roots: []string{root}})
+	require.True(t, ok)
+	visualStudioScopes := visualStudio.(StoredSourceHintScopeProvider)
+	conversationID := "4a8f63f6-7626-4416-a874-fc7bd2c3f005"
+	container := filepath.Join(
+		root, ".vs", "SampleApp", "copilot-chat", "thread", "sessions",
+		conversationID,
+	)
+	assert.Equal(t, []StoredSourceHintScope{{
+		Path: container, IncludeVirtualMembers: true,
+	}}, visualStudioScopes.StoredSourceHintScopes(ChangedPathRequest{Path: container}))
+	member := VisualStudioCopilotVirtualPath(container, conversationID)
+	assert.Equal(t, []StoredSourceHintScope{{Path: member}},
+		visualStudioScopes.StoredSourceHintScopes(ChangedPathRequest{Path: member}))
+}
+
+func TestVerifiedLocalStatCapabilitiesMatchConsumers(t *testing.T) {
+	assert.Equal(t, CapabilityUnsupported,
+		(SourceCapabilities{}).VerifiedLocalStat,
+		"new providers must opt in explicitly")
+
+	wantSupported := map[AgentType]bool{
+		AgentClaude: true,
+		AgentCodex:  true,
+		// TraeX and Augure Code share the Codex provider; the gate stats the
+		// transcript and only looks for a session_index.jsonl sidecar under
+		// Codex itself.
+		AgentTraeX:      true,
+		AgentAugureCode: true,
+	}
+	for _, factory := range ProviderFactories() {
+		agent := factory.Definition().Type
+		got := factory.Capabilities().Source.VerifiedLocalStat
+		if wantSupported[agent] {
+			assert.Equalf(t, CapabilitySupported, got,
+				"%s supports verified local stat trust", agent)
+		} else {
+			assert.Equalf(t, CapabilityUnsupported, got,
+				"%s must not schedule verified local stat trust", agent)
+		}
+	}
+}
+
 func TestProviderFactoryLookupRejectsMissingAgent(t *testing.T) {
 	require.NotEmpty(t, Registry)
 	agent := Registry[0].Type
@@ -166,6 +260,19 @@ func TestProviderFactoryLookupRejectsMissingAgent(t *testing.T) {
 	assert.False(t, ok)
 	_, ok = NewProvider("missing", ProviderConfig{})
 	assert.False(t, ok)
+}
+
+func TestProviderFactoryByTypeDevin(t *testing.T) {
+	factory, ok := ProviderFactoryByType(AgentDevin)
+	require.True(t, ok)
+	assert.Equal(t, AgentDevin, factory.Definition().Type)
+
+	provider := factory.NewProvider(ProviderConfig{
+		Roots:   []string{"/tmp/devin"},
+		Machine: "devbox",
+	})
+	require.NotNil(t, provider)
+	assert.Equal(t, AgentDevin, provider.Definition().Type)
 }
 
 func TestProviderMigrationModesCoverRegistry(t *testing.T) {
@@ -194,7 +301,8 @@ func TestProviderMigrationModesRestrictImportOnlyMode(t *testing.T) {
 }
 
 type testProviderFactory struct {
-	def AgentDef
+	def  AgentDef
+	caps Capabilities
 }
 
 func (f testProviderFactory) Definition() AgentDef {
@@ -202,15 +310,14 @@ func (f testProviderFactory) Definition() AgentDef {
 }
 
 func (f testProviderFactory) Capabilities() Capabilities {
-	return Capabilities{}
+	return f.caps
 }
 
 func (f testProviderFactory) NewProvider(cfg ProviderConfig) Provider {
 	return &testProvider{
-		ProviderBase: ProviderBase{
-			Def:    cloneAgentDef(f.def),
-			Config: cfg.Clone(),
-		},
+		Def:    cloneAgentDef(f.def),
+		Caps:   f.caps,
+		Config: cfg.Clone(),
 	}
 }
 

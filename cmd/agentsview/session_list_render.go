@@ -8,9 +8,9 @@ import (
 	"strconv"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/stringutil"
 )
 
 // resumeActiveWindow flags a session as in-flight when its last activity
@@ -67,29 +67,41 @@ func isSessionRecentlyActive(s db.Session, now time.Time) bool {
 	return now.Sub(t) < resumeActiveWindow
 }
 
+// humanizeAgeRelative renders the age of t relative to now using the shared
+// relative buckets: "now" for a future/clock-skewed timestamp, then
+// seconds/minutes/hours/days. It returns ("", false) once the age reaches a
+// week, leaving the absolute-format choice to each caller — session list keeps
+// a year-less "Jan 02"; search disambiguates the year.
+func humanizeAgeRelative(t, now time.Time) (string, bool) {
+	d := now.Sub(t)
+	switch {
+	case d < 0:
+		return "now", true
+	case d < time.Minute:
+		return strconv.Itoa(int(d.Seconds())) + "s", true
+	case d < time.Hour:
+		return strconv.Itoa(int(d.Minutes())) + "m", true
+	case d < 24*time.Hour:
+		return strconv.Itoa(int(d.Hours())) + "h", true
+	case d < 7*24*time.Hour:
+		return strconv.Itoa(int(d/(24*time.Hour))) + "d", true
+	default:
+		return "", false
+	}
+}
+
 // humanizeSessionAge renders a session's last-activity time relative to
-// now: seconds/minutes/hours/days for the recent past, an absolute month
-// and day beyond a week, and an em dash when no timestamp is available.
+// now: seconds/minutes/hours/days for the recent past, an absolute year-less
+// month and day beyond a week, and an em dash when no timestamp is available.
 func humanizeSessionAge(s db.Session, now time.Time) string {
 	t := sessionActivityTime(s)
 	if t.IsZero() {
 		return emDash
 	}
-	d := now.Sub(t)
-	switch {
-	case d < 0:
-		return "now"
-	case d < time.Minute:
-		return strconv.Itoa(int(d.Seconds())) + "s"
-	case d < time.Hour:
-		return strconv.Itoa(int(d.Minutes())) + "m"
-	case d < 24*time.Hour:
-		return strconv.Itoa(int(d.Hours())) + "h"
-	case d < 7*24*time.Hour:
-		return strconv.Itoa(int(d/(24*time.Hour))) + "d"
-	default:
-		return t.Format("Jan 02")
+	if rel, ok := humanizeAgeRelative(t, now); ok {
+		return rel
 	}
+	return t.Format("Jan 02")
 }
 
 // sessionDisplayName is the session's human label: DisplayName when set,
@@ -135,8 +147,8 @@ func collapseHome(cwd, home string) string {
 
 // truncName collapses internal whitespace and trims to max runes, adding
 // an ellipsis when it cut anything.
-func truncName(s string, max int) string {
-	t, cut := truncateRunes(collapseWhitespace(s), max)
+func truncName(s string, maximum int) string {
+	t, cut := truncateRunes(collapseWhitespace(s), maximum)
 	if cut {
 		return t + "…"
 	}
@@ -151,16 +163,10 @@ func collapseWhitespace(s string) string {
 
 // truncateRunes cuts s to at most max runes on a rune boundary, returning
 // the (possibly shortened) string and whether truncation occurred.
-func truncateRunes(s string, max int) (string, bool) {
-	if max <= 0 || utf8.RuneCountInString(s) <= max {
+func truncateRunes(s string, maximum int) (string, bool) {
+	if maximum <= 0 {
 		return s, false
 	}
-	n := 0
-	for i := range s {
-		if n == max {
-			return s[:i], true
-		}
-		n++
-	}
-	return s, false
+	prefix := stringutil.TruncateRunes(s, maximum, "")
+	return prefix, len(prefix) < len(s)
 }

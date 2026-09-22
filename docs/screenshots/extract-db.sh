@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 # Extract only screenshot-safe project sessions from the source
 # database. This runs on the host before the Docker build so the
@@ -8,19 +9,38 @@ set -euo pipefail
 SOURCE="${1:-${SOURCE:-/data/source.db}}"
 OUTPUT="${2:-${OUTPUT:-/data/test-sessions.db}}"
 HISTORY_DAYS="${SCREENSHOT_HISTORY_DAYS:-60}"
-BLOCKED_TERMS_FILE="${SCREENSHOT_BLOCKED_TERMS_FILE:-$HOME/.config/agentsview-docs/screenshot-blocked-terms.txt}"
+DEFAULT_BLOCKED_TERMS_FILE="$HOME/.config/agentsview-docs/screenshot-blocked-terms.txt"
+BLOCKED_TERMS_FILE="${SCREENSHOT_BLOCKED_TERMS_FILE:-$DEFAULT_BLOCKED_TERMS_FILE}"
+PRIVATE_TERMS_FILE="${KENN_PRIVATE_TERMS_FILE:-$HOME/.config/kenn/private-terms.txt}"
+HOME_PATH="${HOME:-}"
 BLOCKED_TERMS="${SCREENSHOT_BLOCKED_TERMS:-}"
-BLOCKED_PATTERNS_SQL="$(mktemp "${TMPDIR:-/tmp}/agentsview-screenshot-blocked-patterns.XXXXXX.sql")"
+BLOCKED_PATTERNS_SQL="$(mktemp "${TMPDIR:-/tmp}/agentsview-screenshot-blocked-patterns.XXXXXX")"
 trap 'rm -f "$BLOCKED_PATTERNS_SQL"' EXIT
 
-if [ -f "$BLOCKED_TERMS_FILE" ]; then
-  FILE_BLOCKED_TERMS="$(<"$BLOCKED_TERMS_FILE")"
-  if [ -n "$BLOCKED_TERMS" ] && [ -n "$FILE_BLOCKED_TERMS" ]; then
-    BLOCKED_TERMS="$BLOCKED_TERMS"$'\n'"$FILE_BLOCKED_TERMS"
-  else
-    BLOCKED_TERMS="$BLOCKED_TERMS$FILE_BLOCKED_TERMS"
+append_blocked_terms() {
+  local terms="$1"
+  if [ -z "$terms" ]; then
+    return
   fi
-fi
+
+  if [ -n "$BLOCKED_TERMS" ]; then
+    BLOCKED_TERMS="$BLOCKED_TERMS"$'\n'"$terms"
+  else
+    BLOCKED_TERMS="$terms"
+  fi
+}
+
+append_blocked_terms_file() {
+  local terms_file="$1"
+  if [ ! -f "$terms_file" ]; then
+    return
+  fi
+
+  append_blocked_terms "$(<"$terms_file")"
+}
+
+append_blocked_terms_file "$BLOCKED_TERMS_FILE"
+append_blocked_terms_file "$PRIVATE_TERMS_FILE"
 
 if [[ ! "$HISTORY_DAYS" =~ ^[0-9]+$ ]] || [ "$HISTORY_DAYS" -lt 1 ]; then
   echo "Error: SCREENSHOT_HISTORY_DAYS must be a positive integer"
@@ -49,6 +69,15 @@ mkdir -p "$(dirname "$OUTPUT")"
 rm -f "$OUTPUT"
 
 {
+  echo "CREATE TEMP TABLE screenshot_redactions(from_text TEXT PRIMARY KEY, to_text TEXT NOT NULL, encoded_from_text TEXT NOT NULL);"
+  if [ -n "$HOME_PATH" ] && [ "$HOME_PATH" != "/" ]; then
+    home_sql="${HOME_PATH//\'/\'\'}"
+    # Claude replaces every character except ASCII letters, digits, and dashes.
+    encoded_home="${HOME_PATH//[^a-zA-Z0-9-]/-}"
+    printf "INSERT OR IGNORE INTO screenshot_redactions(from_text, to_text, encoded_from_text) VALUES ('%s', '~', '%s');\n" \
+      "$home_sql" "$encoded_home"
+  fi
+
   echo "CREATE TEMP TABLE screenshot_blocked_patterns(pattern TEXT PRIMARY KEY);"
   while IFS= read -r term || [ -n "$term" ]; do
     trimmed="$(printf '%s' "$term" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
@@ -82,7 +111,7 @@ rm -f "$OUTPUT"
 # reads one snapshot-isolated pass that concurrent writes do not
 # restart, and does not touch the source. The target must not exist
 # (rm -f above guarantees that).
-sqlite3 "$SOURCE" "VACUUM INTO '$OUTPUT'"
+sqlite3 -readonly "$SOURCE" "VACUUM INTO '$OUTPUT'"
 
 # Delete sessions (and related data) for non-matching projects.
 # The heredoc delimiter is quoted so bash does NOT expand $ or
@@ -101,27 +130,28 @@ INSERT INTO screenshot_projects(name) VALUES
   ('roborev'),
   ('roborev_docs');
 
+-- Host-prefixed imports can expose original machine names in IDs and paths.
+-- Use local transcripts; the capture runner supplies example remote machines.
+INSERT OR IGNORE INTO screenshot_blocked_patterns(pattern)
+SELECT '%' || replace(replace(replace(
+  lower(substr(id, 1, instr(id, '~') - 1)), '\', '\\'), '%', '\%'), '_', '\_') || '%'
+FROM sessions WHERE instr(id, '~') > 0;
+
+CREATE TEMP TABLE screenshot_safe_sessions(id TEXT PRIMARY KEY);
+CREATE TEMP TABLE screenshot_root_sessions(id TEXT PRIMARY KEY);
 CREATE TEMP TABLE screenshot_sessions(id TEXT PRIMARY KEY);
 CREATE TEMP TABLE screenshot_bounds(
   cutoff_session_at TEXT,
   newest_session_at TEXT
 );
-INSERT INTO screenshot_bounds(cutoff_session_at, newest_session_at)
-SELECT
-  datetime(max(session_at), printf('-%d days', @history_days)),
-  max(session_at)
-FROM (
-  SELECT datetime(COALESCE(NULLIF(s.started_at, ''), s.created_at)) AS session_at
-  FROM sessions s
-  WHERE s.project IN (SELECT name FROM screenshot_projects)
-);
 
-INSERT INTO screenshot_sessions(id)
+INSERT INTO screenshot_safe_sessions(id)
 SELECT id
 FROM sessions s
-CROSS JOIN screenshot_bounds b
 WHERE s.project IN (SELECT name FROM screenshot_projects)
-  AND datetime(COALESCE(NULLIF(s.started_at, ''), s.created_at)) >= b.cutoff_session_at
+  AND instr(s.id, '~') = 0
+  AND s.message_count > 0
+  AND s.deleted_at IS NULL
   AND NOT EXISTS (
     SELECT 1
     FROM screenshot_blocked_patterns p
@@ -164,6 +194,63 @@ WHERE s.project IN (SELECT name FROM screenshot_projects)
     WHERE tre.session_id = s.id
   );
 
+INSERT INTO screenshot_bounds(cutoff_session_at, newest_session_at)
+SELECT
+  datetime(max(session_at), printf('-%d days', @history_days)),
+  max(session_at)
+FROM (
+  SELECT datetime(COALESCE(NULLIF(s.started_at, ''), s.created_at)) AS session_at
+  FROM sessions s
+  JOIN screenshot_safe_sessions safe ON safe.id = s.id
+  WHERE COALESCE(s.parent_session_id, '') = ''
+    AND s.relationship_type NOT IN ('subagent', 'fork', 'continuation')
+);
+
+INSERT INTO screenshot_root_sessions(id)
+SELECT s.id
+FROM sessions s
+JOIN screenshot_safe_sessions safe ON safe.id = s.id
+CROSS JOIN screenshot_bounds b
+WHERE COALESCE(s.parent_session_id, '') = ''
+  AND s.relationship_type NOT IN ('subagent', 'fork', 'continuation')
+  AND datetime(COALESCE(NULLIF(s.started_at, ''), s.created_at)) >= b.cutoff_session_at;
+
+WITH RECURSIVE screenshot_tree(id) AS (
+  SELECT id FROM screenshot_root_sessions
+  UNION
+  SELECT child.id
+  FROM sessions child
+  JOIN screenshot_tree parent ON child.parent_session_id = parent.id
+  JOIN screenshot_safe_sessions safe ON safe.id = child.id
+)
+INSERT INTO screenshot_sessions(id)
+SELECT id FROM screenshot_tree;
+
+-- Thinking-block screenshots navigate directly to one rich session because
+-- thinking messages are rare and often older than the recent sidebar window.
+-- Prefer a human root for this direct navigation fixture, while keeping
+-- automated sessions available for usage/activity categorization screenshots.
+INSERT OR IGNORE INTO screenshot_sessions(id)
+SELECT s.id
+FROM sessions s
+JOIN screenshot_safe_sessions safe ON safe.id = s.id
+WHERE COALESCE(s.parent_session_id, '') = ''
+  AND s.relationship_type NOT IN ('subagent', 'fork', 'continuation')
+  AND COALESCE(s.is_automated, 0) = 0
+  AND EXISTS (
+    SELECT 1
+    FROM messages m
+    WHERE m.session_id = s.id
+      AND COALESCE(m.thinking_text, '') != ''
+  )
+ORDER BY (
+  SELECT COUNT(*)
+  FROM messages m
+  WHERE m.session_id = s.id
+    AND COALESCE(m.thinking_text, '') != ''
+) DESC, s.id
+LIMIT 1;
+
 -- Drop FTS5 sync triggers before the bulk delete. Each
 -- DELETE FROM messages otherwise fires messages_ad which
 -- runs an FTS5 'delete' command, and that trips
@@ -204,6 +291,45 @@ DELETE FROM messages WHERE session_id IN (
 );
 DELETE FROM sessions
 WHERE id NOT IN (SELECT id FROM screenshot_sessions);
+
+-- Project identity rows can retain the source hostname, repository paths, and
+-- remotes independently of sessions. The screenshot UI does not need this
+-- export-only evidence, so remove both the source rows and their publication
+-- journals before PostgreSQL push sees the fixture.
+DELETE FROM project_identity_observations;
+DELETE FROM session_project_identity_snapshots;
+DELETE FROM project_identity_observation_changes;
+DELETE FROM session_project_identity_snapshot_changes;
+DELETE FROM worktree_project_mappings;
+
+-- Keep generated screenshots independent of the source machine's hostname.
+-- The PostgreSQL fixture relabels a subset as work-desktop after push so the
+-- multi-machine UI remains covered with deterministic example identities.
+UPDATE sessions SET machine = 'dev-laptop';
+
+-- Redact both plain home paths and encoded Claude project folders.
+UPDATE sessions
+SET first_message = replace(replace(first_message, r.from_text, r.to_text), r.encoded_from_text, '-home-user'),
+    display_name = replace(replace(display_name, r.from_text, r.to_text), r.encoded_from_text, '-home-user'),
+    session_name = replace(replace(session_name, r.from_text, r.to_text), r.encoded_from_text, '-home-user'),
+    cwd = replace(replace(cwd, r.from_text, r.to_text), r.encoded_from_text, '-home-user'),
+    file_path = replace(replace(file_path, r.from_text, r.to_text), r.encoded_from_text, '-home-user')
+FROM screenshot_redactions r;
+
+UPDATE messages
+SET content = replace(replace(content, r.from_text, r.to_text), r.encoded_from_text, '-home-user'),
+    thinking_text = replace(replace(thinking_text, r.from_text, r.to_text), r.encoded_from_text, '-home-user')
+FROM screenshot_redactions r;
+
+UPDATE tool_calls
+SET file_path = replace(replace(file_path, r.from_text, r.to_text), r.encoded_from_text, '-home-user'),
+    input_json = replace(replace(input_json, r.from_text, r.to_text), r.encoded_from_text, '-home-user'),
+    result_content = replace(replace(result_content, r.from_text, r.to_text), r.encoded_from_text, '-home-user')
+FROM screenshot_redactions r;
+
+UPDATE tool_result_events
+SET content = replace(replace(content, r.from_text, r.to_text), r.encoded_from_text, '-home-user')
+FROM screenshot_redactions r;
 
 -- Rebuild FTS index from the surviving messages.
 INSERT INTO messages_fts(messages_fts) VALUES('rebuild');
@@ -330,9 +456,16 @@ Refactored the review submission API to accept batch requests. Previously each f
 
 One short session updated the API documentation in `docs/api.md` to reflect the new batch endpoint and its request/response schema.',
 '2026-02-18T16:20:00.000Z');
-
-VACUUM;
 SQL
+
+# The mapping delete above journals tombstones in current archives, so clear
+# that journal last. Older valid archives predate the table and its triggers.
+if [[ $(sqlite3 "$OUTPUT" \
+  "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'worktree_project_mapping_changes';") == "1" ]]; then
+  sqlite3 "$OUTPUT" "DELETE FROM worktree_project_mapping_changes;"
+fi
+
+sqlite3 "$OUTPUT" "VACUUM;"
 
 SESSIONS=$(sqlite3 "$OUTPUT" "SELECT COUNT(*) FROM sessions;")
 MESSAGES=$(sqlite3 "$OUTPUT" "SELECT COUNT(*) FROM messages;")

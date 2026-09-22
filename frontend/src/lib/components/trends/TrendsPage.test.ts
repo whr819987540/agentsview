@@ -1,16 +1,10 @@
 // @vitest-environment jsdom
-import {
-  afterEach,
-  beforeEach,
-  describe,
-  expect,
-  it,
-  vi,
-} from "vite-plus/test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { mount, tick, unmount } from "svelte";
 import { trends } from "../../stores/trends.svelte.js";
+import { settings } from "../../stores/settings.svelte.js";
 import { yokedDates } from "../../stores/yokedDates.svelte.js";
-import type { TrendsTermsResponse } from "../../api/types.js";
+import type { DbTrendsTermsResponse as TrendsTermsResponse } from "../../api/generated/index.js";
 import source from "./TrendsPage.svelte?raw";
 
 const mocks = vi.hoisted(() => ({
@@ -18,8 +12,7 @@ const mocks = vi.hoisted(() => ({
 }));
 
 vi.mock("../../api/runtime.js", () => ({
-  configureGeneratedClient: vi.fn(),
-  callGenerated: vi.fn((request: () => Promise<unknown>) => request()),
+  isAbortError: vi.fn(() => false),
 }));
 
 vi.mock("../../api/generated/index", () => ({
@@ -31,10 +24,7 @@ vi.mock("../../api/generated/index", () => ({
 // @ts-ignore
 import TrendsPage from "./TrendsPage.svelte";
 
-function makeResponse(
-  from = "2024-01-01",
-  to = "2024-01-31",
-): TrendsTermsResponse {
+function makeResponse(from = "2024-01-01", to = "2024-01-31"): TrendsTermsResponse {
   return {
     granularity: "week",
     from,
@@ -59,6 +49,7 @@ describe("TrendsPage", () => {
       "ResizeObserver",
       class {
         observe() {}
+        unobserve() {}
         disconnect() {}
       },
     );
@@ -72,7 +63,8 @@ describe("TrendsPage", () => {
     trends.response = null;
     trends.loading.terms = false;
     trends.errors.terms = null;
-    yokedDates.range = null;
+    settings.chartPalette = "agentsview";
+    yokedDates.setEnabled(false);
     localStorage.clear();
     window.history.replaceState(null, "", "/trends");
   });
@@ -86,34 +78,38 @@ describe("TrendsPage", () => {
     window.history.replaceState(null, "", "/");
     vi.useRealTimers();
     vi.unstubAllGlobals();
+    yokedDates.setEnabled(false);
+    settings.chartPalette = "agentsview";
   });
 
   it("refreshes with the changed date value", async () => {
+    window.history.replaceState(null, "", "/trends?from=2024-01-02&to=2024-01-31");
     component = mount(TrendsPage, { target: document.body });
     await flushPromises();
 
-    // Open the unified range picker. The default 2024 span doesn't match any
-    // rolling preset, so it opens on the Custom tab with the From/To inputs.
+    // Open the unified range picker on the fixed query range; the Custom
+    // tab picks the span with two clicks on the embedded calendar.
     const trigger = document.querySelector<HTMLButtonElement>(
-      "button.trigger",
+      "button.kit-date-range-picker__trigger",
     );
     expect(trigger).not.toBeNull();
     trigger!.click();
     await tick();
 
-    const fromInput = document.querySelector<HTMLInputElement>(
-      'input[type="date"]',
-    );
-    expect(fromInput).not.toBeNull();
-
-    fromInput!.value = "2024-01-10";
-    // input updates the bound value; change commits the custom range.
-    fromInput!.dispatchEvent(new Event("input", { bubbles: true }));
-    fromInput!.dispatchEvent(new Event("change", { bubbles: true }));
+    const dayButton = (label: string) =>
+      document.querySelector<HTMLButtonElement>(`.kit-calendar button[aria-label="${label}"]`);
+    const fromDay = dayButton("Jan 10, 2024");
+    expect(fromDay).not.toBeNull();
+    fromDay!.click();
+    await tick();
+    const toDay = dayButton("Jan 25, 2024");
+    expect(toDay).not.toBeNull();
+    // The second click completes and commits the custom range.
+    toDay!.click();
     await flushPromises();
 
-    expect(mocks.getApiV1TrendsTerms).toHaveBeenLastCalledWith(
-      expect.objectContaining({ from: "2024-01-10" }),
+    expect(mocks.getApiV1TrendsTerms.mock.lastCall?.[0]).toEqual(
+      expect.objectContaining({ from: "2024-01-10", to: "2024-01-25" }),
     );
     expect(window.location.search).toContain("from=2024-01-10");
   });
@@ -122,9 +118,9 @@ describe("TrendsPage", () => {
     component = mount(TrendsPage, { target: document.body });
     await flushPromises();
 
-    const trigger = Array.from(
-      document.querySelectorAll<HTMLButtonElement>("button"),
-    ).find((b) => b.textContent?.includes("Group by"));
+    const trigger = Array.from(document.querySelectorAll<HTMLButtonElement>("button")).find((b) =>
+      b.textContent?.includes("Group by"),
+    );
     expect(trigger).not.toBeNull();
     trigger!.click();
     await tick();
@@ -136,7 +132,7 @@ describe("TrendsPage", () => {
     monthItem!.click();
     await flushPromises();
 
-    expect(mocks.getApiV1TrendsTerms).toHaveBeenLastCalledWith(
+    expect(mocks.getApiV1TrendsTerms.mock.lastCall?.[0]).toEqual(
       expect.objectContaining({ granularity: "month" }),
     );
     expect(window.location.search).toContain("granularity=month");
@@ -149,7 +145,67 @@ describe("TrendsPage", () => {
     expect(document.body.textContent).toContain("one per line");
   });
 
+  it("materializes its bare default without establishing an enabled empty yoke", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-06-20T12:00:00"));
+    yokedDates.setEnabled(true);
+    expect(yokedDates.range).toBeNull();
+
+    component = mount(TrendsPage, { target: document.body });
+    await flushPromises();
+
+    expect(mocks.getApiV1TrendsTerms.mock.lastCall?.[0]).toEqual(
+      expect.objectContaining({
+        from: "2025-06-21",
+        to: "2026-06-20",
+      }),
+    );
+    expect(window.location.search).not.toContain("window_days");
+    expect(window.location.search).not.toContain("from=");
+    expect(window.location.search).not.toContain("to=");
+    expect(yokedDates.range).toBeNull();
+  });
+
+  it("does not turn a bare Trends reload into explicit date intent", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-06-20T12:00:00"));
+    yokedDates.setEnabled(true);
+
+    component = mount(TrendsPage, { target: document.body });
+    await flushPromises();
+    expect(window.location.search).not.toContain("window_days");
+
+    unmount(component);
+    component = undefined;
+    component = mount(TrendsPage, { target: document.body });
+    await flushPromises();
+
+    expect(window.location.search).not.toContain("window_days");
+    expect(yokedDates.range).toBeNull();
+  });
+
+  it("restores a bare Trends history entry without publishing default dates", async () => {
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-06-20T12:00:00"));
+    yokedDates.setEnabled(true);
+
+    component = mount(TrendsPage, { target: document.body });
+    await flushPromises();
+    unmount(component);
+    component = undefined;
+
+    window.history.pushState(null, "", "/usage");
+    window.history.replaceState(null, "", "/trends");
+    window.dispatchEvent(new PopStateEvent("popstate"));
+    component = mount(TrendsPage, { target: document.body });
+    await flushPromises();
+
+    expect(window.location.search).not.toContain("window_days");
+    expect(yokedDates.range).toBeNull();
+  });
+
   it("seeds bare trends URLs from the saved yoke range", async () => {
+    yokedDates.setEnabled(true);
     yokedDates.updateFromPanel({
       from: "2024-02-01",
       to: "2024-02-07",
@@ -159,7 +215,7 @@ describe("TrendsPage", () => {
     component = mount(TrendsPage, { target: document.body });
     await flushPromises();
 
-    expect(mocks.getApiV1TrendsTerms).toHaveBeenLastCalledWith(
+    expect(mocks.getApiV1TrendsTerms.mock.lastCall?.[0]).toEqual(
       expect.objectContaining({
         from: "2024-02-01",
         to: "2024-02-07",
@@ -172,18 +228,15 @@ describe("TrendsPage", () => {
   it("hydrates rolling window URLs before fixed date params", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(new Date("2026-06-19T12:00:00"));
-    window.history.replaceState(
-      null,
-      "",
-      "/trends?window_days=30&from=2026-01-01&to=2026-01-31",
-    );
+    window.history.replaceState(null, "", "/trends?window_days=30&from=2026-01-01&to=2026-01-31");
+    yokedDates.setEnabled(true);
 
     component = mount(TrendsPage, { target: document.body });
     await flushPromises();
 
-    expect(mocks.getApiV1TrendsTerms).toHaveBeenLastCalledWith(
+    expect(mocks.getApiV1TrendsTerms.mock.lastCall?.[0]).toEqual(
       expect.objectContaining({
-        from: "2026-05-20",
+        from: "2026-05-21",
         to: "2026-06-19",
       }),
     );
@@ -194,36 +247,44 @@ describe("TrendsPage", () => {
     expect(window.location.search).toContain("window_days=30");
   });
 
+  it("does not publish explicit URL dates while linking is disabled", async () => {
+    window.history.replaceState(null, "", "/trends?window_days=30&from=2026-01-01&to=2026-01-31");
+
+    component = mount(TrendsPage, { target: document.body });
+    await flushPromises();
+
+    expect(mocks.getApiV1TrendsTerms).toHaveBeenCalled();
+    expect(yokedDates.enabled).toBe(false);
+    expect(yokedDates.range).toBeNull();
+  });
+
   it("recomputes rolling windows before manual refresh", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(new Date("2026-06-19T12:00:00"));
-    window.history.replaceState(
-      null,
-      "",
-      "/trends?window_days=30&from=2026-01-01&to=2026-01-31",
-    );
+    window.history.replaceState(null, "", "/trends?window_days=30&from=2026-01-01&to=2026-01-31");
+    yokedDates.setEnabled(true);
 
     component = mount(TrendsPage, { target: document.body });
     await flushPromises();
 
     vi.setSystemTime(new Date("2026-06-20T12:00:00"));
-    const refresh = Array.from(
-      document.querySelectorAll<HTMLButtonElement>("button"),
-    ).find((b) => b.textContent?.trim() === "Refresh");
+    const refresh = Array.from(document.querySelectorAll<HTMLButtonElement>("button")).find(
+      (b) => b.textContent?.trim() === "Refresh",
+    );
     expect(refresh).not.toBeNull();
     refresh!.click();
     await flushPromises();
 
-    expect(mocks.getApiV1TrendsTerms).toHaveBeenLastCalledWith(
+    expect(mocks.getApiV1TrendsTerms.mock.lastCall?.[0]).toEqual(
       expect.objectContaining({
-        from: "2026-05-21",
+        from: "2026-05-22",
         to: "2026-06-20",
       }),
     );
-    expect(window.location.search).toContain("from=2026-05-21");
+    expect(window.location.search).toContain("from=2026-05-22");
     expect(window.location.search).toContain("to=2026-06-20");
     expect(yokedDates.range).toMatchObject({
-      from: "2026-05-21",
+      from: "2026-05-22",
       to: "2026-06-20",
       mode: "rolling",
       windowDays: 30,
@@ -233,30 +294,26 @@ describe("TrendsPage", () => {
   it("recomputes rolling windows before reset", async () => {
     vi.useFakeTimers({ toFake: ["Date"] });
     vi.setSystemTime(new Date("2026-06-19T12:00:00"));
-    window.history.replaceState(
-      null,
-      "",
-      "/trends?window_days=30&from=2026-01-01&to=2026-01-31",
-    );
+    window.history.replaceState(null, "", "/trends?window_days=30&from=2026-01-01&to=2026-01-31");
 
     component = mount(TrendsPage, { target: document.body });
     await flushPromises();
 
     vi.setSystemTime(new Date("2026-06-20T12:00:00"));
-    const reset = Array.from(
-      document.querySelectorAll<HTMLButtonElement>("button"),
-    ).find((b) => b.textContent?.trim() === "Reset");
+    const reset = Array.from(document.querySelectorAll<HTMLButtonElement>("button")).find(
+      (b) => b.textContent?.trim() === "Reset",
+    );
     expect(reset).not.toBeNull();
     reset!.click();
     await flushPromises();
 
-    expect(mocks.getApiV1TrendsTerms).toHaveBeenLastCalledWith(
+    expect(mocks.getApiV1TrendsTerms.mock.lastCall?.[0]).toEqual(
       expect.objectContaining({
-        from: "2026-05-21",
+        from: "2026-05-22",
         to: "2026-06-20",
       }),
     );
-    expect(window.location.search).toContain("from=2026-05-21");
+    expect(window.location.search).toContain("from=2026-05-22");
     expect(window.location.search).toContain("to=2026-06-20");
   });
 
@@ -267,9 +324,7 @@ describe("TrendsPage", () => {
   });
 
   it("shows chart loading status while trends are computing", async () => {
-    let resolveFetch:
-      | ((response: TrendsTermsResponse) => void)
-      | undefined;
+    let resolveFetch: ((response: TrendsTermsResponse) => void) | undefined;
     mocks.getApiV1TrendsTerms.mockReturnValueOnce(
       new Promise<TrendsTermsResponse>((resolve) => {
         resolveFetch = resolve;
@@ -279,18 +334,14 @@ describe("TrendsPage", () => {
     component = mount(TrendsPage, { target: document.body });
     await tick();
 
-    const status = document.querySelector<HTMLElement>(
-      '[role="status"]',
-    );
+    const status = document.querySelector<HTMLElement>('[role="status"]');
     expect(status).not.toBeNull();
     expect(status!.textContent).toContain("Computing trends");
 
     resolveFetch!(makeResponse());
     await flushPromises();
 
-    expect(document.body.textContent).not.toContain(
-      "Computing trends",
-    );
+    expect(document.body.textContent).not.toContain("Computing trends");
   });
 
   it("surfaces explicit refresh errors after initial data loads", async () => {
@@ -301,23 +352,19 @@ describe("TrendsPage", () => {
     mocks.getApiV1TrendsTerms.mockRejectedValueOnce(
       new Error("at least one trend term is required"),
     );
-    const textarea = document.querySelector<HTMLTextAreaElement>(
-      "#trend-terms",
-    );
+    const textarea = document.querySelector<HTMLTextAreaElement>("#trend-terms");
     expect(textarea).not.toBeNull();
     textarea!.value = "";
     textarea!.dispatchEvent(new Event("input", { bubbles: true }));
 
-    const refreshButton = Array.from(
-      document.querySelectorAll<HTMLButtonElement>("button"),
-    ).find((button) => button.textContent?.trim() === "Refresh");
+    const refreshButton = Array.from(document.querySelectorAll<HTMLButtonElement>("button")).find(
+      (button) => button.textContent?.trim() === "Refresh",
+    );
     expect(refreshButton).not.toBeNull();
     refreshButton!.click();
     await flushPromises();
 
-    expect(document.body.textContent).toContain(
-      "at least one trend term is required",
-    );
+    expect(document.body.textContent).toContain("at least one trend term is required");
     warn.mockRestore();
   });
 
@@ -343,9 +390,7 @@ describe("TrendsPage", () => {
     expect(document.body.textContent).toContain("Count");
     expect(document.body.textContent).toContain("2");
 
-    const checkbox = document.querySelector<HTMLInputElement>(
-      'input[type="checkbox"]',
-    );
+    const checkbox = document.querySelector<HTMLInputElement>('input[type="checkbox"]');
     expect(checkbox).not.toBeNull();
     checkbox!.click();
     await tick();
@@ -358,9 +403,10 @@ describe("TrendsPage", () => {
     component = mount(TrendsPage, { target: document.body });
     await flushPromises();
 
-    expect(document.body.textContent).toContain(
-      "Normalize by number of messages",
-    );
+    expect(document.body.textContent).toContain("Normalize by number of messages");
+    const normalize = document.querySelector<HTMLInputElement>('input[role="switch"]');
+    expect(normalize).not.toBeNull();
+    expect(normalize?.closest("label")?.textContent).toContain("Normalize by number of messages");
   });
 
   it("shows a y-axis metric label", async () => {
@@ -402,9 +448,7 @@ describe("TrendsPage", () => {
     component = mount(TrendsPage, { target: document.body });
     await flushPromises();
 
-    const swatches = Array.from(
-      document.querySelectorAll<HTMLElement>(".swatch"),
-    );
+    const swatches = Array.from(document.querySelectorAll<HTMLElement>(".swatch"));
     const styles = swatches.map((el) => el.getAttribute("style") ?? "");
     expect(styles.slice(0, 7)).toEqual([
       "background: var(--trend-blue);",
@@ -415,6 +459,54 @@ describe("TrendsPage", () => {
       "background: var(--trend-slate);",
       "background: var(--trend-red);",
     ]);
+  });
+
+  it("shares lexical Matplotlib colors between chart lines and table terms", async () => {
+    settings.chartPalette = "matplotlib";
+    mocks.getApiV1TrendsTerms.mockResolvedValueOnce({
+      granularity: "week",
+      from: "2024-01-01",
+      to: "2024-01-31",
+      message_count: 10,
+      buckets: [
+        { date: "2024-01-01", message_count: 5 },
+        { date: "2024-01-08", message_count: 5 },
+      ],
+      series: [
+        {
+          term: "zeta",
+          variants: ["zeta"],
+          total: 3,
+          points: [
+            { date: "2024-01-01", count: 1 },
+            { date: "2024-01-08", count: 2 },
+          ],
+        },
+        {
+          term: "alpha",
+          variants: ["alpha"],
+          total: 4,
+          points: [
+            { date: "2024-01-01", count: 2 },
+            { date: "2024-01-08", count: 2 },
+          ],
+        },
+      ],
+    });
+
+    component = mount(TrendsPage, { target: document.body });
+    await flushPromises();
+
+    const strokes = Array.from(
+      document.querySelectorAll<SVGPathElement>(
+        '.chart path[fill="none"]:not([stroke="transparent"])',
+      ),
+    ).map((line) => line.getAttribute("stroke"));
+    const swatches = Array.from(document.querySelectorAll<HTMLElement>(".swatch")).map(
+      (swatch) => swatch.style.background,
+    );
+    expect(strokes).toEqual(["#ff7f0e", "#1f77b4"]);
+    expect(swatches).toEqual(["rgb(255, 127, 14)", "rgb(31, 119, 180)"]);
   });
 });
 

@@ -12,6 +12,7 @@ import (
 	"unicode"
 
 	"go.kenn.io/agentsview/internal/signals"
+	"go.kenn.io/agentsview/internal/stringutil"
 )
 
 // maxSQLVars is the maximum bind variables per IN clause to stay
@@ -113,33 +114,46 @@ type AnalyticsFilter struct {
 	// on the sum/count surfaces GetAnalyticsSummary and
 	// GetAnalyticsProjects. Distribution surfaces (session-shape,
 	// velocity, timing) leave it false so short subagent sessions do not
-	// skew them. Fork rows stay excluded regardless because their tokens
-	// overlap a root.
+	// skew them.
 	IncludeSubagents bool
+	// IncludeForks counts fork sessions (rewound conversation branches
+	// split out by the claude and piebald parsers). Fork sessions hold
+	// only their own branch's messages, never replayed copies, so their
+	// usage is real spend; GetDailyUsage counts it via per-row dedup.
+	// Set only by GetActivityReport so its cost totals match daily
+	// usage. Aggregate analytics surfaces leave forks excluded so a
+	// rewound branch does not count as an extra session.
+	IncludeForks bool
 }
 
 // RelationshipExclusionSQL returns the relationship_type predicate for
 // analytics aggregation. The default excludes subagent and fork rows
-// (matching the session list). When IncludeSubagents is set, subagent
-// rows are counted while fork rows stay excluded to avoid
-// double-counting tokens that overlap their root session. Exported so
-// the PostgreSQL and DuckDB analytics builders apply the same rule.
+// (matching the session list); IncludeSubagents and IncludeForks each
+// lift one exclusion. Exported so the PostgreSQL and DuckDB analytics
+// builders apply the same rule.
 func (f AnalyticsFilter) RelationshipExclusionSQL() string {
-	return RelationshipExclusionSQL(f.IncludeSubagents, "")
+	return RelationshipExclusionSQL(f.IncludeSubagents, f.IncludeForks, "")
 }
 
 // RelationshipExclusionSQL is the single source of truth for the
 // relationship_type analytics predicate, shared by the analytics
 // builders (AnalyticsFilter) and the stats pipeline (StatsFilter).
 // colPrefix qualifies the column for callers that alias the sessions
-// table (e.g. "s."); pass "" for an unqualified column. fork rows are
-// always excluded; subagents are excluded unless includeSubagents.
-func RelationshipExclusionSQL(includeSubagents bool, colPrefix string) string {
+// table (e.g. "s."); pass "" for an unqualified column. Subagent and
+// fork rows are excluded unless the corresponding include flag is set;
+// with both set the predicate is a no-op so the clause stays composable.
+func RelationshipExclusionSQL(includeSubagents, includeForks bool, colPrefix string) string {
 	col := colPrefix + "relationship_type"
-	if includeSubagents {
+	switch {
+	case includeSubagents && includeForks:
+		return "1=1"
+	case includeSubagents:
 		return col + " NOT IN ('fork')"
+	case includeForks:
+		return col + " NOT IN ('subagent')"
+	default:
+		return col + " NOT IN ('subagent', 'fork')"
 	}
-	return col + " NOT IN ('subagent', 'fork')"
 }
 
 // OneShotExclusionSQL wraps the one-shot exclusion predicate so it does
@@ -209,6 +223,60 @@ func (f AnalyticsFilter) utcRange() (string, string) {
 		to = tTo.Add(14 * time.Hour).Format(time.RFC3339)
 	}
 	return from, to
+}
+
+func (f AnalyticsFilter) messageWindowBoundsUTC() (string, string) {
+	from, to := f.utcRange()
+	if f.From == "" {
+		from = ""
+	}
+	if f.To == "" {
+		to = ""
+	} else if f.To == "9999-12-31" {
+		to = ""
+	} else if t, err := time.Parse(time.RFC3339, to); err == nil {
+		to = t.Add(time.Second).Format(time.RFC3339)
+	}
+	return strings.TrimSuffix(from, "Z"), strings.TrimSuffix(to, "Z")
+}
+
+func analyticsMessageWindowPred(col, from, to string) (string, []any) {
+	var preds []string
+	var args []any
+	if from != "" {
+		preds = append(preds, col+" >= ?")
+		args = append(args, from)
+	}
+	if to != "" {
+		preds = append(preds, col+" < ?")
+		args = append(args, to)
+	}
+	if len(preds) == 0 {
+		return "", nil
+	}
+	return "(" + col + " IS NULL OR " + col + " = '' OR strftime('%Y', " + col + ") IS NULL OR (" + strings.Join(preds, " AND ") + "))", args
+}
+
+var analyticsQueryObserver func(string)
+
+func observeAnalyticsQuery(query string) {
+	if analyticsQueryObserver != nil {
+		analyticsQueryObserver(query)
+	}
+}
+
+func (f AnalyticsFilter) toolSessionWindowSQL(dateCol, sessionID string) (string, []any) {
+	from, to := f.messageWindowBoundsUTC()
+	sessionPred, args := analyticsMessageWindowPred(dateCol, from, to)
+	if sessionPred == "" {
+		return "", nil
+	}
+	messagePred, messageArgs := analyticsMessageWindowPred("wm.timestamp", from, to)
+	return "(" + sessionPred + " OR EXISTS (SELECT 1 FROM messages wm WHERE wm.session_id = " + sessionID + " AND " + messagePred + "))", append(args, messageArgs...)
+}
+
+func sqliteAnalyticsMinuteKey() string {
+	return "COALESCE(strftime('%Y-%m-%dT%H:%M', m.timestamp), m.timestamp, '')"
 }
 
 // buildWhere returns a WHERE clause and args for common
@@ -1043,6 +1111,7 @@ func (db *DB) GetAnalyticsSummary(
 		return AnalyticsSummary{},
 			fmt.Errorf("querying analytics summary: %w", err)
 	}
+	defer rows.Close()
 	s := AnalyticsSummary{
 		Agents: make(map[string]*AgentSummary),
 		Models: []string{},
@@ -1531,11 +1600,11 @@ func (db *DB) GetAnalyticsActivity(
 	}
 
 	query := `SELECT ` + dateCol + `, s.agent, s.id,
-		m.role, m.has_thinking, m.is_system, COUNT(*)
+		m.role, m.has_thinking, m.is_system, COALESCE(m.source_subtype, ''), COUNT(*)
 		FROM sessions s
 		LEFT JOIN messages m ON m.session_id = s.id
 		WHERE ` + where + `
-		GROUP BY s.id, m.role, m.has_thinking, m.is_system`
+		GROUP BY s.id, m.role, m.has_thinking, m.is_system, m.source_subtype`
 
 	rows, err := db.getReader().QueryContext(ctx, query, args...)
 	if err != nil {
@@ -1551,11 +1620,12 @@ func (db *DB) GetAnalyticsActivity(
 	for rows.Next() {
 		var ts, agent, sid string
 		var role *string
+		var sourceSubtype string
 		var hasThinking, isSystem *bool
 		var count int
 		if err := rows.Scan(
 			&ts, &agent, &sid, &role,
-			&hasThinking, &isSystem, &count,
+			&hasThinking, &isSystem, &sourceSubtype, &count,
 		); err != nil {
 			return ActivityResponse{},
 				fmt.Errorf("scanning activity row: %w", err)
@@ -1592,7 +1662,7 @@ func (db *DB) GetAnalyticsActivity(
 			entry.ByAgent[agent] += count
 			switch *role {
 			case "user":
-				if !sys {
+				if !sys && sourceSubtype != "tool_result" {
 					entry.UserMessages += count
 				}
 			case "assistant":
@@ -2536,6 +2606,7 @@ func (db *DB) queryAutonomyChunk(
 	ph, args := inPlaceholders(chunk)
 	q := `SELECT session_id,
 		SUM(CASE WHEN role='user' AND is_system=0
+			AND COALESCE(source_subtype, '') <> 'tool_result'
 			THEN 1 ELSE 0 END),
 		SUM(CASE WHEN role='assistant'
 			AND has_tool_use=1 THEN 1 ELSE 0 END)
@@ -2582,6 +2653,15 @@ type ToolAgentBreakdown struct {
 	Categories []ToolCategoryCount `json:"categories"`
 }
 
+// ToolUsageAnalysis holds ranked usage for one concrete tool name.
+type ToolUsageAnalysis struct {
+	ToolName     string  `json:"tool_name"`
+	Category     string  `json:"category"`
+	CallCount    int     `json:"call_count"`
+	SessionCount int     `json:"session_count"`
+	Pct          float64 `json:"pct"`
+}
+
 // ToolTrendEntry holds tool call counts for one time bucket.
 type ToolTrendEntry struct {
 	Date  string         `json:"date"`
@@ -2593,7 +2673,19 @@ type ToolsAnalyticsResponse struct {
 	TotalCalls int                  `json:"total_calls"`
 	ByCategory []ToolCategoryCount  `json:"by_category"`
 	ByAgent    []ToolAgentBreakdown `json:"by_agent"`
+	ByTool     []ToolUsageAnalysis  `json:"by_tool"`
 	Trend      []ToolTrendEntry     `json:"trend"`
+}
+
+// ToolAnalyticsRow is a backend-neutral intermediate row used to
+// aggregate concrete tool usage after native stores apply their filters.
+type ToolAnalyticsRow struct {
+	SessionID string
+	ToolName  string
+	Category  string
+	Agent     string
+	Date      string
+	Count     int
 }
 
 // SkillAgentBreakdown holds skill usage for one agent.
@@ -2645,6 +2737,162 @@ type SkillAnalyticsRow struct {
 	Count      int
 }
 
+type toolUsageAccumulator struct {
+	toolName   string
+	category   string
+	callCount  int
+	sessionIDs map[string]struct{}
+}
+
+// BuildToolsAnalytics folds backend-neutral tool rows into the public
+// response shape. Tool names are trimmed and blank names are reported as
+// Unknown so legacy rows remain visible instead of disappearing.
+func BuildToolsAnalytics(rows []ToolAnalyticsRow) ToolsAnalyticsResponse {
+	resp := ToolsAnalyticsResponse{
+		ByCategory: []ToolCategoryCount{},
+		ByAgent:    []ToolAgentBreakdown{},
+		ByTool:     []ToolUsageAnalysis{},
+		Trend:      []ToolTrendEntry{},
+	}
+	if len(rows) == 0 {
+		return resp
+	}
+
+	catCounts := make(map[string]int)
+	agentCats := make(map[string]map[string]int)
+	trendBuckets := make(map[string]map[string]int)
+	toolCounts := make(map[string]*toolUsageAccumulator)
+
+	for _, row := range rows {
+		if row.Count <= 0 {
+			continue
+		}
+		catCounts[row.Category] += row.Count
+		resp.TotalCalls += row.Count
+
+		if agentCats[row.Agent] == nil {
+			agentCats[row.Agent] = make(map[string]int)
+		}
+		agentCats[row.Agent][row.Category] += row.Count
+
+		week := bucketDate(row.Date, "week")
+		if trendBuckets[week] == nil {
+			trendBuckets[week] = make(map[string]int)
+		}
+		trendBuckets[week][row.Category] += row.Count
+
+		name := strings.TrimSpace(row.ToolName)
+		if name == "" {
+			name = "Unknown"
+		}
+		key := row.Category + "\x00" + name
+		acc := toolCounts[key]
+		if acc == nil {
+			acc = &toolUsageAccumulator{
+				toolName:   name,
+				category:   row.Category,
+				sessionIDs: map[string]struct{}{},
+			}
+			toolCounts[key] = acc
+		}
+		acc.callCount += row.Count
+		if row.SessionID != "" {
+			acc.sessionIDs[row.SessionID] = struct{}{}
+		}
+	}
+
+	if resp.TotalCalls == 0 {
+		return resp
+	}
+
+	resp.ByCategory = make([]ToolCategoryCount, 0, len(catCounts))
+	for cat, count := range catCounts {
+		pct := math.Round(
+			float64(count)/float64(resp.TotalCalls)*1000,
+		) / 10
+		resp.ByCategory = append(resp.ByCategory,
+			ToolCategoryCount{
+				Category: cat, Count: count, Pct: pct,
+			})
+	}
+	sort.Slice(resp.ByCategory, func(i, j int) bool {
+		if resp.ByCategory[i].Count != resp.ByCategory[j].Count {
+			return resp.ByCategory[i].Count > resp.ByCategory[j].Count
+		}
+		return resp.ByCategory[i].Category < resp.ByCategory[j].Category
+	})
+
+	agentKeys := make([]string, 0, len(agentCats))
+	for agent := range agentCats {
+		agentKeys = append(agentKeys, agent)
+	}
+	sort.Strings(agentKeys)
+	resp.ByAgent = make([]ToolAgentBreakdown, 0, len(agentKeys))
+	for _, agent := range agentKeys {
+		cats := agentCats[agent]
+		total := 0
+		for _, c := range cats {
+			total += c
+		}
+		catList := make([]ToolCategoryCount, 0, len(cats))
+		for cat, count := range cats {
+			pct := math.Round(
+				float64(count)/float64(total)*1000,
+			) / 10
+			catList = append(catList, ToolCategoryCount{
+				Category: cat, Count: count, Pct: pct,
+			})
+		}
+		sort.Slice(catList, func(i, j int) bool {
+			if catList[i].Count != catList[j].Count {
+				return catList[i].Count > catList[j].Count
+			}
+			return catList[i].Category < catList[j].Category
+		})
+		resp.ByAgent = append(resp.ByAgent,
+			ToolAgentBreakdown{
+				Agent:      agent,
+				Total:      total,
+				Categories: catList,
+			})
+	}
+
+	resp.ByTool = make([]ToolUsageAnalysis, 0, len(toolCounts))
+	for _, acc := range toolCounts {
+		pct := math.Round(
+			float64(acc.callCount)/float64(resp.TotalCalls)*1000,
+		) / 10
+		resp.ByTool = append(resp.ByTool, ToolUsageAnalysis{
+			ToolName:     acc.toolName,
+			Category:     acc.category,
+			CallCount:    acc.callCount,
+			SessionCount: len(acc.sessionIDs),
+			Pct:          pct,
+		})
+	}
+	sort.Slice(resp.ByTool, func(i, j int) bool {
+		if resp.ByTool[i].CallCount != resp.ByTool[j].CallCount {
+			return resp.ByTool[i].CallCount > resp.ByTool[j].CallCount
+		}
+		if resp.ByTool[i].ToolName != resp.ByTool[j].ToolName {
+			return resp.ByTool[i].ToolName < resp.ByTool[j].ToolName
+		}
+		return resp.ByTool[i].Category < resp.ByTool[j].Category
+	})
+
+	resp.Trend = make([]ToolTrendEntry, 0, len(trendBuckets))
+	for week, cats := range trendBuckets {
+		resp.Trend = append(resp.Trend, ToolTrendEntry{
+			Date: week, ByCat: cats,
+		})
+	}
+	sort.Slice(resp.Trend, func(i, j int) bool {
+		return resp.Trend[i].Date < resp.Trend[j].Date
+	})
+
+	return resp
+}
+
 type skillUsageAccumulator struct {
 	callCount     int
 	sessionIDs    map[string]struct{}
@@ -2672,17 +2920,31 @@ func timestampAfter(a, b string) bool {
 	return a > b
 }
 
+// skillsTrendGranularity normalizes a skills trend granularity value.
+// Empty defaults to week, the endpoint's historical bucket size.
+func skillsTrendGranularity(granularity string) string {
+	switch granularity {
+	case "day", "week", "month":
+		return granularity
+	default:
+		return "week"
+	}
+}
+
 // BuildSkillsAnalytics folds backend-neutral skill rows into the public
 // response shape. Skill names are trimmed and empty names are ignored.
-func BuildSkillsAnalytics(rows []SkillAnalyticsRow) SkillsAnalyticsResponse {
+// granularity picks the trend bucket size (day, week, or month); empty
+// or unknown values fall back to week. When from and to are present, the
+// trend includes every bucket in that range, including zero-usage buckets.
+func BuildSkillsAnalytics(
+	rows []SkillAnalyticsRow, from, to, granularity string,
+) SkillsAnalyticsResponse {
 	resp := SkillsAnalyticsResponse{
 		BySkill: []SkillUsage{},
 		Trend:   []SkillTrendEntry{},
 	}
-	if len(rows) == 0 {
-		return resp
-	}
 
+	bucket := skillsTrendGranularity(granularity)
 	bySkill := map[string]*skillUsageAccumulator{}
 	trendBuckets := map[string]map[string]int{}
 
@@ -2715,15 +2977,23 @@ func BuildSkillsAnalytics(rows []SkillAnalyticsRow) SkillsAnalyticsResponse {
 			acc.lastUsedAt = row.LastUsedAt
 		}
 		if row.Date != "" {
-			week := bucketDate(row.Date, "week")
-			if trendBuckets[week] == nil {
-				trendBuckets[week] = map[string]int{}
+			date := bucketDate(row.Date, bucket)
+			if trendBuckets[date] == nil {
+				trendBuckets[date] = map[string]int{}
 			}
-			trendBuckets[week][name] += row.Count
+			trendBuckets[date][name] += row.Count
 		}
 	}
 
 	resp.DistinctSkills = len(bySkill)
+	if resp.DistinctSkills == 0 {
+		return resp
+	}
+	for _, entry := range TrendBucketRange(from, to, bucket) {
+		if trendBuckets[entry.Date] == nil {
+			trendBuckets[entry.Date] = map[string]int{}
+		}
+	}
 	for name, acc := range bySkill {
 		usage := SkillUsage{
 			SkillName:        name,
@@ -2746,9 +3016,9 @@ func BuildSkillsAnalytics(rows []SkillAnalyticsRow) SkillsAnalyticsResponse {
 		return resp.BySkill[i].SkillName < resp.BySkill[j].SkillName
 	})
 
-	for week, skills := range trendBuckets {
+	for date, skills := range trendBuckets {
 		resp.Trend = append(resp.Trend, SkillTrendEntry{
-			Date: week, BySkill: skills,
+			Date: date, BySkill: skills,
 		})
 	}
 	sort.Slice(resp.Trend, func(i, j int) bool {
@@ -2797,11 +3067,13 @@ func skillProjectBreakdowns(
 func analyticsToolsQuery(
 	placeholders string,
 	modelPred string,
+	windowPred string,
 	includeMessageMeta bool,
 ) string {
-	query := `SELECT tc.session_id, tc.category, COUNT(*)`
+	query := `SELECT tc.session_id, tc.category,
+			TRIM(COALESCE(tc.tool_name, '')), COUNT(*)`
 	if includeMessageMeta {
-		query += `, COALESCE(m.timestamp, '')`
+		query += `, MAX(COALESCE(m.timestamp, ''))`
 	}
 	query += `
 		FROM tool_calls tc`
@@ -2816,10 +3088,14 @@ func analyticsToolsQuery(
 		query += `
 			AND ` + modelPred
 	}
+	if windowPred != "" {
+		query += ` AND ` + windowPred
+	}
 	query += `
-		GROUP BY tc.session_id, tc.category`
+		GROUP BY tc.session_id, tc.category,
+			TRIM(COALESCE(tc.tool_name, ''))`
 	if includeMessageMeta {
-		query += `, COALESCE(m.timestamp, '')`
+		query += `, ` + sqliteAnalyticsMinuteKey()
 	}
 	return query
 }
@@ -2827,6 +3103,7 @@ func analyticsToolsQuery(
 func analyticsSkillsQuery(
 	placeholders string,
 	modelPred string,
+	windowPred string,
 ) string {
 	query := `SELECT tc.session_id, TRIM(tc.skill_name), COUNT(*),
 			COALESCE(m.timestamp, '')
@@ -2838,6 +3115,9 @@ func analyticsSkillsQuery(
 	if modelPred != "" {
 		query += `
 			AND ` + modelPred
+	}
+	if windowPred != "" {
+		query += ` AND ` + windowPred
 	}
 	query += `
 		GROUP BY tc.session_id, TRIM(tc.skill_name),
@@ -2852,6 +3132,10 @@ func (db *DB) GetAnalyticsTools(
 ) (ToolsAnalyticsResponse, error) {
 	dateCol := "COALESCE(NULLIF(started_at, ''), created_at)"
 	where, args := f.buildWhereWithoutDate()
+	if pred, windowArgs := f.toolSessionWindowSQL(dateCol, "sessions.id"); pred != "" {
+		where += " AND " + pred
+		args = append(args, windowArgs...)
+	}
 
 	// Fetch filtered session IDs and their metadata.
 	sessQ := `SELECT id, ` + dateCol + `, agent
@@ -2888,6 +3172,7 @@ func (db *DB) GetAnalyticsTools(
 	resp := ToolsAnalyticsResponse{
 		ByCategory: []ToolCategoryCount{},
 		ByAgent:    []ToolAgentBreakdown{},
+		ByTool:     []ToolUsageAnalysis{},
 		Trend:      []ToolTrendEntry{},
 	}
 
@@ -2896,13 +3181,7 @@ func (db *DB) GetAnalyticsTools(
 	}
 
 	// Query tool_calls for filtered sessions (chunked).
-	type toolRow struct {
-		sessionID string
-		category  string
-		count     int
-		date      string
-	}
-	var toolRows []toolRow
+	var toolRows []ToolAnalyticsRow
 
 	err = queryChunked(sessionIDs,
 		func(chunk []string) error {
@@ -2911,7 +3190,11 @@ func (db *DB) GetAnalyticsTools(
 				"m.model", f.Model,
 			)
 			chunkArgs = append(chunkArgs, modelArgs...)
-			q := analyticsToolsQuery(ph, modelPred, true)
+			from, to := f.messageWindowBoundsUTC()
+			windowPred, windowArgs := analyticsMessageWindowPred("m.timestamp", from, to)
+			chunkArgs = append(chunkArgs, windowArgs...)
+			q := analyticsToolsQuery(ph, modelPred, windowPred, true)
+			observeAnalyticsQuery(q)
 			rows, qErr := db.getReader().QueryContext(
 				ctx, q, chunkArgs...,
 			)
@@ -2922,10 +3205,10 @@ func (db *DB) GetAnalyticsTools(
 			}
 			defer rows.Close()
 			for rows.Next() {
-				var sid, cat, ts string
+				var sid, cat, toolName, ts string
 				var count int
 				if err := rows.Scan(
-					&sid, &cat, &count, &ts,
+					&sid, &cat, &toolName, &count, &ts,
 				); err != nil {
 					return fmt.Errorf(
 						"scanning tool_call: %w", err,
@@ -2941,11 +3224,13 @@ func (db *DB) GetAnalyticsTools(
 				if !keep {
 					continue
 				}
-				toolRows = append(toolRows, toolRow{
-					sessionID: sid,
-					category:  cat,
-					count:     count,
-					date:      date,
+				toolRows = append(toolRows, ToolAnalyticsRow{
+					SessionID: sid,
+					Category:  cat,
+					ToolName:  toolName,
+					Agent:     info.agent,
+					Count:     count,
+					Date:      date,
 				})
 			}
 			return rows.Err()
@@ -2958,105 +3243,7 @@ func (db *DB) GetAnalyticsTools(
 		return resp, nil
 	}
 
-	// Aggregate in Go.
-	catCounts := make(map[string]int)
-	agentCats := make(map[string]map[string]int)    // agent → cat → count
-	trendBuckets := make(map[string]map[string]int) // week → cat → count
-
-	for _, tr := range toolRows {
-		info := sessionMap[tr.sessionID]
-		catCounts[tr.category] += tr.count
-
-		if agentCats[info.agent] == nil {
-			agentCats[info.agent] = make(map[string]int)
-		}
-		agentCats[info.agent][tr.category] += tr.count
-
-		week := bucketDate(tr.date, "week")
-		if trendBuckets[week] == nil {
-			trendBuckets[week] = make(map[string]int)
-		}
-		trendBuckets[week][tr.category] += tr.count
-	}
-
-	for _, count := range catCounts {
-		resp.TotalCalls += count
-	}
-
-	// Build ByCategory sorted by count desc.
-	resp.ByCategory = make(
-		[]ToolCategoryCount, 0, len(catCounts),
-	)
-	for cat, count := range catCounts {
-		pct := math.Round(
-			float64(count)/float64(resp.TotalCalls)*1000,
-		) / 10
-		resp.ByCategory = append(resp.ByCategory,
-			ToolCategoryCount{
-				Category: cat, Count: count, Pct: pct,
-			})
-	}
-	sort.Slice(resp.ByCategory, func(i, j int) bool {
-		if resp.ByCategory[i].Count != resp.ByCategory[j].Count {
-			return resp.ByCategory[i].Count > resp.ByCategory[j].Count
-		}
-		return resp.ByCategory[i].Category < resp.ByCategory[j].Category
-	})
-
-	// Build ByAgent sorted alphabetically.
-	agentKeys := make([]string, 0, len(agentCats))
-	for k := range agentCats {
-		agentKeys = append(agentKeys, k)
-	}
-	sort.Strings(agentKeys)
-	resp.ByAgent = make(
-		[]ToolAgentBreakdown, 0, len(agentKeys),
-	)
-	for _, agent := range agentKeys {
-		cats := agentCats[agent]
-		total := 0
-		for _, c := range cats {
-			total += c
-		}
-		catList := make(
-			[]ToolCategoryCount, 0, len(cats),
-		)
-		for cat, count := range cats {
-			pct := math.Round(
-				float64(count)/float64(total)*1000,
-			) / 10
-			catList = append(catList, ToolCategoryCount{
-				Category: cat, Count: count, Pct: pct,
-			})
-		}
-		sort.Slice(catList, func(i, j int) bool {
-			if catList[i].Count != catList[j].Count {
-				return catList[i].Count > catList[j].Count
-			}
-			return catList[i].Category < catList[j].Category
-		})
-		resp.ByAgent = append(resp.ByAgent,
-			ToolAgentBreakdown{
-				Agent:      agent,
-				Total:      total,
-				Categories: catList,
-			})
-	}
-
-	// Build Trend sorted by date.
-	resp.Trend = make(
-		[]ToolTrendEntry, 0, len(trendBuckets),
-	)
-	for week, cats := range trendBuckets {
-		resp.Trend = append(resp.Trend, ToolTrendEntry{
-			Date: week, ByCat: cats,
-		})
-	}
-	sort.Slice(resp.Trend, func(i, j int) bool {
-		return resp.Trend[i].Date < resp.Trend[j].Date
-	})
-
-	return resp, nil
+	return BuildToolsAnalytics(toolRows), nil
 }
 
 // ResolveSkillRowTime resolves the timestamp for a single skill call and
@@ -3091,12 +3278,17 @@ func (f AnalyticsFilter) ResolveSkillRowTime(
 }
 
 // GetAnalyticsSkills returns skill usage analytics aggregated
-// from non-empty tool_calls.skill_name values.
+// from non-empty tool_calls.skill_name values. granularity picks the
+// trend bucket size (day, week, or month); empty defaults to week.
 func (db *DB) GetAnalyticsSkills(
-	ctx context.Context, f AnalyticsFilter,
+	ctx context.Context, f AnalyticsFilter, granularity string,
 ) (SkillsAnalyticsResponse, error) {
 	dateCol := "COALESCE(NULLIF(started_at, ''), created_at)"
 	where, args := f.buildWhereWithoutDate()
+	if pred, windowArgs := f.toolSessionWindowSQL(dateCol, "sessions.id"); pred != "" {
+		where += " AND " + pred
+		args = append(args, windowArgs...)
+	}
 
 	sessQ := `SELECT id, ` + dateCol + `, agent, project
 		FROM sessions WHERE ` + where
@@ -3136,7 +3328,7 @@ func (db *DB) GetAnalyticsSkills(
 			fmt.Errorf("iterating skill sessions: %w", err)
 	}
 	if len(sessionIDs) == 0 {
-		return BuildSkillsAnalytics(nil), nil
+		return BuildSkillsAnalytics(nil, f.From, f.To, granularity), nil
 	}
 
 	var skillRows []SkillAnalyticsRow
@@ -3147,7 +3339,11 @@ func (db *DB) GetAnalyticsSkills(
 				"m.model", f.Model,
 			)
 			chunkArgs = append(chunkArgs, modelArgs...)
-			q := analyticsSkillsQuery(ph, modelPred)
+			from, to := f.messageWindowBoundsUTC()
+			windowPred, windowArgs := analyticsMessageWindowPred("m.timestamp", from, to)
+			chunkArgs = append(chunkArgs, windowArgs...)
+			q := analyticsSkillsQuery(ph, modelPred, windowPred)
+			observeAnalyticsQuery(q)
 			rows, qErr := db.getReader().QueryContext(
 				ctx, q, chunkArgs...,
 			)
@@ -3190,7 +3386,9 @@ func (db *DB) GetAnalyticsSkills(
 		return SkillsAnalyticsResponse{}, err
 	}
 
-	return BuildSkillsAnalytics(skillRows), nil
+	return BuildSkillsAnalytics(
+		skillRows, f.From, f.To, granularity,
+	), nil
 }
 
 // --- Velocity ---
@@ -3859,7 +4057,7 @@ type SignalCalibration struct {
 // an aggregate signal, including the best available message excerpt.
 type SignalSessionsResponse struct {
 	Signal   string                 `json:"signal"`
-	Sessions []SignalSessionExample `json:"sessions" nullable:"false"`
+	Sessions []SignalSessionExample `json:"sessions"`
 }
 
 type SignalSessionExample struct {
@@ -3881,13 +4079,14 @@ type SignalSessionExample struct {
 }
 
 type SignalMessage struct {
-	SessionID  string
-	Ordinal    int
-	Role       string
-	Content    string
-	Timestamp  string
-	IsSystem   bool
-	HasToolUse bool
+	SourceSubtype string
+	SessionID     string
+	Ordinal       int
+	Role          string
+	Content       string
+	Timestamp     string
+	IsSystem      bool
+	HasToolUse    bool
 }
 
 // SignalsTrendBucket holds signal data for one date bucket.
@@ -4162,7 +4361,7 @@ func (db *DB) populateFrustrationMarkers(
 		ph, args := inPlaceholders(chunk)
 		q := `SELECT session_id, ordinal, content, is_system
 			FROM messages
-			WHERE role = 'user' AND session_id IN ` + ph
+			WHERE role = 'user' AND COALESCE(source_subtype, '') <> 'tool_result' AND session_id IN ` + ph
 		msgRows, err := db.getReader().QueryContext(ctx, q, args...)
 		if err != nil {
 			return fmt.Errorf(
@@ -4282,13 +4481,14 @@ func (db *DB) signalMessages(
 		for sessionID, scopedRows := range rowsBySession {
 			for _, row := range scopedRows {
 				out[sessionID] = append(out[sessionID], SignalMessage{
-					SessionID:  row.SessionID,
-					Ordinal:    row.Ordinal,
-					Role:       row.Role,
-					Content:    row.Content,
-					Timestamp:  row.Timestamp,
-					IsSystem:   row.IsSystem,
-					HasToolUse: row.HasToolUse,
+					SessionID:     row.SessionID,
+					Ordinal:       row.Ordinal,
+					Role:          row.Role,
+					SourceSubtype: row.SourceSubtype,
+					Content:       row.Content,
+					Timestamp:     row.Timestamp,
+					IsSystem:      row.IsSystem,
+					HasToolUse:    row.HasToolUse,
 				})
 			}
 		}
@@ -4298,7 +4498,7 @@ func (db *DB) signalMessages(
 	err := queryChunked(ids, func(chunk []string) error {
 		ph, args := inPlaceholders(chunk)
 		q := `SELECT session_id, ordinal, role, content,
-					COALESCE(timestamp, ''), is_system, has_tool_use
+					COALESCE(timestamp, ''), is_system, has_tool_use, COALESCE(source_subtype, '')
 				FROM messages
 				WHERE session_id IN ` + ph
 		if len(filterModels) == 1 {
@@ -4323,7 +4523,7 @@ func (db *DB) signalMessages(
 			if err := msgRows.Scan(
 				&m.SessionID, &m.Ordinal, &m.Role,
 				&m.Content, &m.Timestamp,
-				&m.IsSystem, &m.HasToolUse,
+				&m.IsSystem, &m.HasToolUse, &m.SourceSubtype,
 			); err != nil {
 				return fmt.Errorf(
 					"scanning signal message: %w", err,
@@ -4563,7 +4763,7 @@ func firstToolUseMessage(
 	messages []SignalMessage,
 ) (string, *int, bool) {
 	for _, m := range messages {
-		if m.IsSystem || !m.HasToolUse {
+		if m.IsSystem || m.SourceSubtype == "tool_result" || !m.HasToolUse {
 			continue
 		}
 		content, ordinal := messageEvidence(m)
@@ -4577,7 +4777,7 @@ func lastSessionMessage(
 ) (string, *int, bool) {
 	for _, v := range slices.Backward(messages) {
 		m := v
-		if m.IsSystem {
+		if m.IsSystem || m.SourceSubtype == "tool_result" {
 			continue
 		}
 		if !isSubstantiveEvidence(m.Content) && !m.HasToolUse {
@@ -4604,6 +4804,7 @@ func firstSubstantiveUserMessage(
 
 func isUserEvidenceMessage(m SignalMessage) bool {
 	return m.Role == "user" &&
+		m.SourceSubtype != "tool_result" &&
 		!m.IsSystem &&
 		isSubstantiveEvidence(m.Content)
 }
@@ -4716,15 +4917,15 @@ func normalizeEvidenceText(content string) string {
 	return spaceReplacer(lower)
 }
 
-func truncateExcerpt(s string, max int) string {
+func truncateExcerpt(s string, maximum int) string {
 	s = strings.TrimSpace(spaceReplacer(s))
-	if len(s) <= max {
+	if len(s) <= maximum {
 		return s
 	}
-	if max <= 3 {
-		return s[:max]
+	if maximum <= 3 {
+		return stringutil.SafeTruncate(s, maximum)
 	}
-	return s[:max-3] + "..."
+	return stringutil.SafeTruncate(s, maximum-3) + "..."
 }
 
 func spaceReplacer(s string) string {
@@ -4812,8 +5013,7 @@ func AggregateSignals(
 		resp.ContextHealth.AvgCompactionCount += float64(
 			r.CompactionCount,
 		)
-		resp.ContextHealth.MidTaskCompactionCount +=
-			r.MidTaskCompactionCount
+		resp.ContextHealth.MidTaskCompactionCount += r.MidTaskCompactionCount
 		if r.MidTaskCompactionCount > 0 {
 			resp.ContextHealth.SessionsWithMidTaskCompac++
 		}
@@ -5054,8 +5254,7 @@ func accumulateQualityHealth(
 		q.Totals.UnstructuredStart++
 		q.SessionsWithSignal.UnstructuredStart++
 	}
-	q.Totals.MissingSuccessCriteriaCount +=
-		r.MissingSuccessCriteriaCount
+	q.Totals.MissingSuccessCriteriaCount += r.MissingSuccessCriteriaCount
 	if r.MissingSuccessCriteriaCount > 0 {
 		q.SessionsWithSignal.MissingSuccessCriteriaCount++
 	}
@@ -5218,10 +5417,6 @@ func signalValue(r SignalRow, signal string) int {
 		return r.FrustrationMarkerCount
 	}
 	return 0
-}
-
-func SignalValue(r SignalRow, signal string) int {
-	return signalValue(r, signal)
 }
 
 func isIncompleteOrLowQuality(r SignalRow) bool {

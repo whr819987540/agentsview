@@ -1,7 +1,10 @@
 package db
 
 import (
+	"context"
 	"time"
+
+	"go.kenn.io/agentsview/internal/stringutil"
 )
 
 // This file is the single centralized validation and sanitization pass
@@ -36,13 +39,15 @@ import (
 //     blanked. Empty-string handling is preserved as-is so downstream
 //     localTime treats a blanked timestamp as invalid.
 //
-// Message.TokenUsage (json.RawMessage), tool-call input JSON, and transient
+// Message.TokenUsage (jsontext.Value) and transient
 // ToolResults.ContentRaw are intentionally not run through this pass. They are
 // raw provider payloads, not persisted display text. Persisted result content
 // (tool_calls.result_content and tool_result_events.content) follows the same
 // text contract as Message.Content, with length fields reduced by the
 // stripped-byte delta so re-ingest rewrites historical poison rows into the
-// stable stored shape.
+// stable stored shape. Persisted tool-call input JSON (tool_calls.input_json,
+// as of dataVersion 59) is sanitized without length tracking since no length
+// column exists for it.
 //
 // CRITICAL idempotency invariant: SanitizeUTF8 is the shared
 // sanitization seam used here, by the local fingerprint builders, and
@@ -117,17 +122,38 @@ func (s *ValidationStats) add(o ValidationStats) {
 func ValidateAndSanitize(
 	s *Session, msgs []Message, events []UsageEvent,
 ) ValidationStats {
+	stats, _ := ValidateAndSanitizeContext(
+		context.Background(), s, msgs, events,
+	)
+	return stats
+}
+
+// ValidateAndSanitizeContext applies the central validation contract while
+// allowing bounded callers to stop between rows.
+func ValidateAndSanitizeContext(
+	ctx context.Context,
+	s *Session, msgs []Message, events []UsageEvent,
+) (ValidationStats, error) {
 	var stats ValidationStats
+	if err := ctx.Err(); err != nil {
+		return stats, err
+	}
 	if s != nil {
 		stats.add(SanitizeSession(s))
 	}
 	for i := range msgs {
+		if err := ctx.Err(); err != nil {
+			return stats, err
+		}
 		stats.add(SanitizeMessage(&msgs[i]))
 	}
 	for i := range events {
+		if err := ctx.Err(); err != nil {
+			return stats, err
+		}
 		stats.add(SanitizeUsageEvent(&events[i]))
 	}
-	return stats
+	return stats, ctx.Err()
 }
 
 // SanitizeMessage applies the contract to a single message row.
@@ -177,17 +203,19 @@ func SanitizeMessage(m *Message) ValidationStats {
 	sanitizeStringField(&m.ClaudeRequestID, &stats)
 	sanitizeStringField(&m.SourceType, &stats)
 	sanitizeStringField(&m.SourceSubtype, &stats)
+	sanitizeStringField(&m.PromptSource, &stats)
 	sanitizeStringField(&m.SourceUUID, &stats)
 	sanitizeStringField(&m.SourceParentUUID, &stats)
 
 	for i := range m.ToolCalls {
-		sanitizeToolCallResultContent(&m.ToolCalls[i], &stats)
+		sanitizeToolCallContent(&m.ToolCalls[i], &stats)
 	}
 
 	sanitizeStringField(&m.Model, &stats)
 	if ClampModel(&m.Model) {
 		stats.ModelClamped++
 	}
+	sanitizeStringField(&m.ReasoningEffort, &stats)
 
 	if clampTokens(&m.ContextTokens) {
 		stats.TokensClamped++
@@ -203,9 +231,17 @@ func SanitizeMessage(m *Message) ValidationStats {
 	return stats
 }
 
-func sanitizeToolCallResultContent(
+func sanitizeToolCallContent(
 	tc *ToolCall, stats *ValidationStats,
 ) {
+	// InputJSON is raw model output and can carry NUL/control bytes
+	// just like result content; unsanitized rows break DuckDB pushes
+	// and force the resync copy path to re-scan them (#945).
+	sanitizeStringField(&tc.InputJSON, stats)
+	// The recorded rendering must keep matching the message content byte
+	// for byte after the content is sanitized, so it gets the same
+	// treatment. Its stripped bytes are already counted under the content.
+	tc.Rendering = SanitizeUTF8(tc.Rendering)
 	sanitizeLengthTrackedString(
 		&tc.ResultContent, &tc.ResultContentLength, stats,
 	)
@@ -216,6 +252,14 @@ func sanitizeToolCallResultContent(
 			stats,
 		)
 	}
+}
+
+// SanitizeToolCall applies the parser-derived content contract to one tool
+// call that is being updated outside a normal message write.
+func SanitizeToolCall(tc *ToolCall) ValidationStats {
+	var stats ValidationStats
+	sanitizeToolCallContent(tc, &stats)
+	return stats
 }
 
 // SanitizeUsageEvent applies the contract to a single usage event row.
@@ -287,6 +331,9 @@ func SanitizeSession(s *Session) ValidationStats {
 	sanitizeStringField(&s.Project, &stats)
 	sanitizeStringField(&s.Machine, &stats)
 	sanitizeStringField(&s.Agent, &stats)
+	sanitizeStringField(&s.AgentLabel, &stats)
+	sanitizeStringField(&s.Entrypoint, &stats)
+	sanitizeStringField(&s.SessionKind, &stats)
 	sanitizeStringField(&s.Cwd, &stats)
 	sanitizeStringField(&s.GitBranch, &stats)
 	sanitizeStringField(&s.SourceSessionID, &stats)
@@ -303,6 +350,25 @@ func SanitizeSession(s *Session) ValidationStats {
 	if next, blanked := BlankImplausibleTimestampPtr(s.EndedAt); blanked {
 		s.EndedAt = next
 		stats.TimestampsBlanked++
+	}
+
+	// A session cannot be its own parent. A parser or an imported artifact
+	// that reports one (corrupt or crafted source data) must not store it:
+	// the hierarchy queries would treat the row as a non-root and hide it,
+	// and linking ignores self-referential spawn edges, so nothing would
+	// later correct it. The claim falls back to the parser-derived parent
+	// when that names another session, and is dropped otherwise;
+	// relationship_type stays intact so a real spawn edge can still link
+	// the row. This mirrors clearSelfParentedSessionsSQL.
+	if s.ParserParentSessionID != nil && *s.ParserParentSessionID == s.ID {
+		s.ParserParentSessionID = nil
+	}
+	if s.ParentSessionID != nil && *s.ParentSessionID == s.ID {
+		s.ParentSessionID = nil
+		if s.ParserParentSessionID != nil {
+			restored := *s.ParserParentSessionID
+			s.ParentSessionID = &restored
+		}
 	}
 
 	return stats
@@ -355,19 +421,8 @@ func ClampModel(p *string) bool {
 	if len(*p) <= MaxModelLen {
 		return false
 	}
-	cut := MaxModelLen
-	// Back up to a rune boundary so we never split a multibyte rune.
-	for cut > 0 && !utf8RuneStart((*p)[cut]) {
-		cut--
-	}
-	*p = (*p)[:cut]
+	*p = stringutil.SafeTruncate(*p, MaxModelLen)
 	return true
-}
-
-// utf8RuneStart reports whether b is the first byte of a UTF-8
-// encoded rune (i.e. not a continuation byte 0b10xxxxxx).
-func utf8RuneStart(b byte) bool {
-	return b&0xC0 != 0x80
 }
 
 // ClampParsedTokens bounds a token count to [0, maxPlausibleTokens] and

@@ -1,13 +1,15 @@
 <script lang="ts">
+  import { SearchInput } from "@kenn-io/kit-ui";
   import { PencilIcon } from "../../icons.js";
   import { m } from "../../i18n/index.js";
   import { RecentEditsService } from "../../api/generated/index";
-  import { callGenerated } from "../../api/runtime.js";
+  import { isAbortError } from "../../api/runtime.js";
   import { ui } from "../../stores/ui.svelte.js";
   import { router } from "../../stores/router.svelte.js";
   import { sessions } from "../../stores/sessions.svelte.js";
   import { formatRelativeTime } from "../../utils/format.js";
   import ProjectTypeahead from "../layout/ProjectTypeahead.svelte";
+  import { LatestRead } from "../../utils/latest-read.js";
 
   interface Edit {
     session_id: string;
@@ -29,11 +31,6 @@
     edits_truncated: boolean;
   }
 
-  interface Resp {
-    files: FileRow[];
-    has_more: boolean;
-  }
-
   const PAGE = 50;
   let files = $state<FileRow[]>([]);
   let hasMore = $state(false);
@@ -46,6 +43,7 @@
   let requestSeq = 0;
   // Debounce timer for the file-path search box; plain, gates control flow.
   let searchTimer: ReturnType<typeof setTimeout> | undefined;
+  const pageRead = new LatestRead();
 
   function key(f: FileRow) {
     return JSON.stringify([f.project, f.file_path]);
@@ -58,6 +56,7 @@
 
   async function load(reset = false) {
     const seq = ++requestSeq;
+    const signal = pageRead.begin();
     const project = sessions.filters.project || undefined;
     const searchTerm = search.trim() || undefined;
     // Derive the page offset from what is already loaded so a failed page
@@ -69,24 +68,23 @@
       files = [];
     }
     try {
-      const res = (await callGenerated(() =>
-        RecentEditsService.getApiV1RecentEdits({
+      const res = (await RecentEditsService.getApiV1RecentEdits({
           limit: PAGE,
           offset: requestOffset,
           project,
           search: searchTerm,
-        }),
-      )) as unknown as Resp;
+        }, { signal }));
       // A newer project change, refresh, or load-more supersedes this one.
-      if (seq !== requestSeq) return;
+      if (seq !== requestSeq || !pageRead.isCurrent(signal)) return;
       files = reset
         ? (res.files ?? [])
         : [...files, ...(res.files ?? [])];
       hasMore = res.has_more ?? false;
-    } catch {
+    } catch (e) {
+      if (isAbortError(e) || !pageRead.isCurrent(signal)) return;
       // leave current list; empty state covers first load
     } finally {
-      if (seq === requestSeq) loading = false;
+      if (pageRead.finish(signal)) loading = false;
     }
   }
 
@@ -122,7 +120,10 @@
   }
 
   // Drop a pending debounced search if the page unmounts mid-typing.
-  $effect(() => () => clearTimeout(searchTimer));
+  $effect(() => () => {
+    clearTimeout(searchTimer);
+    pageRead.cancel();
+  });
 
   // Initial load, and reload when the header's project filter changes.
   // No SSE subscription: feed only reloads on open, explicit refresh,
@@ -156,13 +157,14 @@
       value={sessions.filters.project}
       onselect={(v) => sessions.setProjectFilter(v)}
     />
-    <input
+    <SearchInput
       class="re-search"
-      type="search"
       bind:value={search}
       oninput={scheduleSearch}
       placeholder={m.recent_edits_search_placeholder()}
-      aria-label={m.recent_edits_search_placeholder()}
+      ariaLabel={m.recent_edits_search_placeholder()}
+      clearLabel={m.recent_edits_clear_search()}
+      block
     />
   </div>
 
@@ -232,7 +234,7 @@
   .re-header {
     display: flex;
     align-items: center;
-    gap: 10px;
+    gap: var(--space-4);
     margin-bottom: 24px;
     color: var(--text-muted);
   }
@@ -263,36 +265,20 @@
   }
 
   .re-refresh:disabled {
-    opacity: 0.55;
+    opacity: var(--opacity-disabled);
     cursor: default;
   }
 
   .re-toolbar {
     display: flex;
     align-items: center;
-    gap: 10px;
+    gap: var(--space-5);
     margin-bottom: 20px;
   }
 
-  .re-search {
+  .re-toolbar :global(.re-search) {
     flex: 1;
     min-width: 0;
-    font-size: 13px;
-    color: var(--text-primary);
-    background: var(--bg-surface);
-    border: 1px solid var(--border-muted);
-    border-radius: var(--radius-sm);
-    padding: 6px 12px;
-    transition: border-color 0.12s;
-  }
-
-  .re-search::placeholder {
-    color: var(--text-muted);
-  }
-
-  .re-search:focus {
-    outline: none;
-    border-color: var(--accent-blue);
   }
 
   .re-loading {
@@ -329,7 +315,7 @@
   .re-file-row {
     display: flex;
     align-items: center;
-    gap: 10px;
+    gap: var(--space-4);
     width: 100%;
     padding: 10px 14px;
     text-align: left;
@@ -389,7 +375,7 @@
   .re-edit {
     display: flex;
     align-items: center;
-    gap: 10px;
+    gap: var(--space-4);
     width: 100%;
     padding: 8px 14px 8px 24px;
     text-align: left;
@@ -461,7 +447,7 @@
   }
 
   .re-load-more:disabled {
-    opacity: 0.55;
+    opacity: var(--opacity-disabled);
     cursor: default;
   }
 </style>

@@ -1,8 +1,7 @@
 package db
 
 import (
-	"context"
-	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -28,7 +27,7 @@ func seedSearchSession(t *testing.T, d *DB, id, project string, msgs [][2]string
 			Content: rc[1], Timestamp: "2026-05-20T12:00:0" + itoa(i) + "Z",
 		})
 	}
-	require.NoError(t, d.ReplaceSessionMessages(id, out), "ReplaceSessionMessages")
+	require.NoError(t, d.ReplaceSessionMessages(t.Context(), id, out), "ReplaceSessionMessages")
 }
 
 func TestSearchContentSubstringMessages(t *testing.T) {
@@ -37,7 +36,7 @@ func TestSearchContentSubstringMessages(t *testing.T) {
 		{"user", "please find the DATABASE_URL value"},
 		{"assistant", "sure, here is the answer"},
 	})
-	got, err := d.SearchContent(context.Background(), ContentSearchFilter{
+	got, err := d.SearchContent(t.Context(), ContentSearchFilter{
 		Pattern: "database_url", Mode: "substring",
 		Sources: []string{"messages"}, Limit: 50,
 	})
@@ -68,7 +67,7 @@ func TestSearchContentRedactsStraddlingSecret(t *testing.T) {
 		Pattern: "attached key", Mode: "substring",
 		Sources: []string{"messages"}, Limit: 50,
 	}
-	got, err := d.SearchContent(context.Background(), base)
+	got, err := d.SearchContent(t.Context(), base)
 	require.NoError(t, err, "SearchContent")
 	require.Len(t, got.Matches, 1)
 	assert.NotContains(t, got.Matches[0].Snippet, "SECRETKEYMATERIAL",
@@ -78,22 +77,67 @@ func TestSearchContentRedactsStraddlingSecret(t *testing.T) {
 
 	// Reveal opts out of redaction (localhost-gated upstream): raw bytes show.
 	base.RevealSecrets = true
-	rev, err := d.SearchContent(context.Background(), base)
+	rev, err := d.SearchContent(t.Context(), base)
 	require.NoError(t, err, "SearchContent reveal")
 	assert.Contains(t, rev.Matches[0].Snippet, "SECRETKEYMATERIAL",
 		"reveal snippet should show raw bytes")
 }
 
-// TestCaseInsensitiveIndexUnicodeOffset pins that the returned offset indexes
+// TestCaseInsensitiveSpanUnicodeOffset pins that the returned offsets index
 // the original string, not strings.ToLower(s). The Kelvin sign U+212A is three
 // bytes but lowercases to one ('k'), so a ToLower-based index would report a
 // byte offset shifted left of the real match position.
-func TestCaseInsensitiveIndexUnicodeOffset(t *testing.T) {
+func TestCaseInsensitiveSpanUnicodeOffset(t *testing.T) {
 	body := strings.Repeat("K", 5) + "match here"
-	got := CaseInsensitiveIndex(body, "MATCH")
+	start, end, ok := CaseInsensitiveSpan(body, "MATCH")
+	require.True(t, ok, "CaseInsensitiveSpan did not find the match")
 	want := strings.Index(body, "match") // real offset into the original string
-	assert.Equal(t, want, got,
-		"CaseInsensitiveIndex offset into original body")
+	assert.Equal(t, want, start,
+		"CaseInsensitiveSpan start into original body")
+	assert.Equal(t, want+len("match"), end,
+		"CaseInsensitiveSpan end into original body")
+}
+
+// TestCaseInsensitiveSpanEndTracksMatchedBytes pins that the end offset is
+// taken from the matched bytes rather than from the pattern. U+212A KELVIN
+// SIGN is three bytes and folds to the one-byte "k", so start+len(pattern)
+// lands inside a rune of the body when the body carries the long form and
+// overshoots the match when the pattern does. snippetBounds snaps only its
+// padding edges and leaves the span alone, so a span that is not rune-aligned
+// reaches the slice unrepaired.
+func TestCaseInsensitiveSpanEndTracksMatchedBytes(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		body    string
+		pattern string
+		match   string
+	}{
+		{"body rune longer than pattern", "a\u212Ab", "k", "\u212A"},
+		{"body rune shorter than pattern", "akb", "\u212A", "k"},
+		{"multi rune phrase", "the Key word", "key", "Key"},
+		{"ascii unaffected", "the key word", "KEY", "key"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			start, end, ok := CaseInsensitiveSpan(tc.body, tc.pattern)
+			require.True(t, ok, "no match for %q in %q", tc.pattern, tc.body)
+			assert.Equal(t, tc.match, tc.body[start:end],
+				"span does not cover exactly the matched bytes")
+			assert.True(t, utf8.ValidString(tc.body[start:end]),
+				"span splits a rune: %d..%d of %q", start, end, tc.body)
+		})
+	}
+}
+
+// TestFTSSnippetRangeRuneAligned pins the same guarantee for the shared
+// snippet-centering helper every backend calls (SQLite, the PostgreSQL keyword
+// and hybrid legs, DuckDB).
+func TestFTSSnippetRangeRuneAligned(t *testing.T) {
+	body := "prefix a\u212Ab suffix"
+	start, end := FTSSnippetRange("k", body)
+	assert.Equal(t, "\u212A", body[start:end],
+		"FTS snippet range does not cover the matched bytes")
+	assert.True(t, utf8.RuneStart(body[end]),
+		"FTS snippet range end %d splits a rune in %q", end, body)
 }
 
 // TestSubstringSnippetUnicodeOffset guards against the snippet panic and
@@ -123,10 +167,10 @@ func TestSearchContentToolIO(t *testing.T) {
 			ResultContent: "AWS_SECRET=topsecretvalue123",
 		}},
 	}}
-	require.NoError(t, d.ReplaceSessionMessages("s2", msgs),
+	require.NoError(t, d.ReplaceSessionMessages(t.Context(), "s2", msgs),
 		"ReplaceSessionMessages")
 	// match in tool input
-	in, err := d.SearchContent(context.Background(), ContentSearchFilter{
+	in, err := d.SearchContent(t.Context(), ContentSearchFilter{
 		Pattern: "printenv", Mode: "substring",
 		Sources: []string{"tool_input"}, Limit: 50,
 	})
@@ -135,7 +179,7 @@ func TestSearchContentToolIO(t *testing.T) {
 	require.Equal(t, "tool_input", in.Matches[0].Location, "Location")
 	assert.Equal(t, "Bash", in.Matches[0].ToolName, "ToolName")
 	// match in tool result
-	res, err := d.SearchContent(context.Background(), ContentSearchFilter{
+	res, err := d.SearchContent(t.Context(), ContentSearchFilter{
 		Pattern: "topsecretvalue", Mode: "substring",
 		Sources: []string{"tool_result"}, Limit: 50,
 	})
@@ -171,7 +215,7 @@ func TestSearchContentEmptyToolUseIDNotSuppressed(t *testing.T) {
 			},
 		},
 	}}
-	require.NoError(t, d.ReplaceSessionMessages("empti", msgs),
+	require.NoError(t, d.ReplaceSessionMessages(t.Context(), "empti", msgs),
 		"ReplaceSessionMessages")
 	// ReplaceSessionMessages routes empty ToolUseID through nilIfEmpty so
 	// it lands as NULL. NULL = NULL is false in SQL, so the dedup bug we
@@ -183,11 +227,11 @@ func TestSearchContentEmptyToolUseIDNotSuppressed(t *testing.T) {
 		"UPDATE tool_calls SET tool_use_id = '' WHERE session_id = 'empti'",
 		"UPDATE tool_result_events SET tool_use_id = '' WHERE session_id = 'empti'",
 	} {
-		_, err := d.getWriter().Exec(sql)
+		_, err := d.getWriter().Exec(t.Context(), sql)
 		require.NoError(t, err, "force empty tool_use_id")
 	}
 	for _, mode := range []string{"substring", "regex"} {
-		got, err := d.SearchContent(context.Background(), ContentSearchFilter{
+		got, err := d.SearchContent(t.Context(), ContentSearchFilter{
 			Pattern: "FINDA", Mode: mode,
 			Sources: []string{"tool_result"}, Limit: 50,
 		})
@@ -198,7 +242,7 @@ func TestSearchContentEmptyToolUseIDNotSuppressed(t *testing.T) {
 			"%s: want 1 tool_result", mode)
 	}
 	// The event-delivered result is still searchable via the events branch.
-	ev, err := d.SearchContent(context.Background(), ContentSearchFilter{
+	ev, err := d.SearchContent(t.Context(), ContentSearchFilter{
 		Pattern: "FINDB", Mode: "substring",
 		Sources: []string{"tool_result"}, Limit: 50,
 	})
@@ -227,7 +271,7 @@ func TestSearchContentPaginationStableAcrossTies(t *testing.T) {
 			ResultContent: "FINDME in result",
 		}},
 	}}
-	require.NoError(t, d.ReplaceSessionMessages("tie", msgs),
+	require.NoError(t, d.ReplaceSessionMessages(t.Context(), "tie", msgs),
 		"ReplaceSessionMessages")
 	base := ContentSearchFilter{
 		Pattern: "FINDME", Mode: "substring",
@@ -235,7 +279,7 @@ func TestSearchContentPaginationStableAcrossTies(t *testing.T) {
 	}
 	full := base
 	full.Limit = 50
-	all, err := d.SearchContent(context.Background(), full)
+	all, err := d.SearchContent(t.Context(), full)
 	require.NoError(t, err, "SearchContent full")
 	require.Len(t, all.Matches, 3, "tied matches")
 	// The tie-break orders the three sources deterministically by source rank.
@@ -249,7 +293,7 @@ func TestSearchContentPaginationStableAcrossTies(t *testing.T) {
 		p := base
 		p.Limit = 1
 		p.Cursor = cursor
-		page, err := d.SearchContent(context.Background(), p)
+		page, err := d.SearchContent(t.Context(), p)
 		require.NoError(t, err, "SearchContent page at cursor %d", cursor)
 		paged = append(paged, page.Matches...)
 		if page.NextCursor == 0 {
@@ -271,7 +315,7 @@ func TestSearchContentRegex(t *testing.T) {
 		{"user", "key AKIA" + "7QHWN2DKR4FYPLJM here"},
 		{"assistant", "no secrets in this line"},
 	})
-	got, err := d.SearchContent(context.Background(), ContentSearchFilter{
+	got, err := d.SearchContent(t.Context(), ContentSearchFilter{
 		Pattern: `AKIA[0-9A-Z]{16}`, Mode: "regex",
 		Sources: []string{"messages"}, Limit: 50,
 	})
@@ -282,7 +326,7 @@ func TestSearchContentRegex(t *testing.T) {
 
 func TestSearchContentUnknownSource(t *testing.T) {
 	d := testDB(t)
-	_, err := d.SearchContent(context.Background(), ContentSearchFilter{
+	_, err := d.SearchContent(t.Context(), ContentSearchFilter{
 		Pattern: "x", Mode: "substring", Sources: []string{"messages", "bogus"},
 	})
 	require.Error(t, err, "expected error for unknown source name")
@@ -290,7 +334,7 @@ func TestSearchContentUnknownSource(t *testing.T) {
 
 func TestSearchContentRegexInvalid(t *testing.T) {
 	d := testDB(t)
-	_, err := d.SearchContent(context.Background(), ContentSearchFilter{
+	_, err := d.SearchContent(t.Context(), ContentSearchFilter{
 		Pattern: `(unclosed`, Mode: "regex", Sources: []string{"messages"},
 	})
 	require.Error(t, err, "expected error for invalid regex")
@@ -298,13 +342,13 @@ func TestSearchContentRegexInvalid(t *testing.T) {
 
 func TestSearchContentFTS(t *testing.T) {
 	d := testDB(t)
-	if !d.HasFTS() {
+	if !d.HasFTS(t.Context()) {
 		t.Skip("fts5 not available")
 	}
 	seedSearchSession(t, d, "f1", "proj", [][2]string{
 		{"user", "optimize the database query performance"},
 	})
-	got, err := d.SearchContent(context.Background(), ContentSearchFilter{
+	got, err := d.SearchContent(t.Context(), ContentSearchFilter{
 		Pattern: "optimize", Mode: "fts",
 		Sources: []string{"messages"}, Limit: 50,
 	})
@@ -313,9 +357,255 @@ func TestSearchContentFTS(t *testing.T) {
 	assert.Equal(t, "message", got.Matches[0].Location, "fts match Location")
 }
 
+func TestSearchContentTermsAcrossExchange(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "terms-main", "proj", func(s *Session) {
+		s.Agent = "claude"
+		s.UserMessageCount = 2
+	})
+	messages := []Message{
+		{
+			SessionID: "terms-main", Ordinal: 0, Role: "user",
+			Content: "deploy alpha%_\\ marker", Timestamp: "2026-05-20T10:00:00Z",
+		},
+		{
+			SessionID: "terms-main", Ordinal: 1, Role: "assistant",
+			Content: "the beta setting is required", Timestamp: "2026-05-20T10:01:00Z",
+		},
+		{
+			SessionID: "terms-main", Ordinal: 2, Role: "user",
+			Content: "alpha appears again", Timestamp: "2026-05-20T10:02:00Z",
+		},
+		{
+			SessionID: "terms-main", Ordinal: 3, Role: "assistant",
+			Content: "gamma only", Timestamp: "2026-05-20T10:03:00Z",
+		},
+	}
+	require.NoError(t, d.ReplaceSessionMessages(t.Context(), "terms-main", messages))
+
+	got, err := d.SearchContent(t.Context(), ContentSearchFilter{
+		Pattern: "alpha beta", Mode: "terms", Scope: "all", Limit: 50,
+		IncludeOneShot: true,
+	})
+	require.NoError(t, err)
+	require.Len(t, got.Matches, 1)
+	match := got.Matches[0]
+	assert.Equal(t, "terms-main", match.SessionID)
+	assert.Equal(t, 0, match.Ordinal)
+	assert.Equal(t, [2]int{0, 1}, match.OrdinalRange)
+	assert.Contains(t, match.Snippet, "alpha")
+	assert.Contains(t, match.Snippet, "beta")
+	assert.False(t, match.Subordinate)
+
+	literal, err := d.SearchContent(t.Context(), ContentSearchFilter{
+		Pattern: `alpha%_\ beta`, Mode: "terms", Scope: "all", Limit: 50,
+		IncludeOneShot: true,
+	})
+	require.NoError(t, err)
+	require.Len(t, literal.Matches, 1, "wildcard characters must be literal")
+
+	missing, err := d.SearchContent(t.Context(), ContentSearchFilter{
+		Pattern: "alpha missing", Mode: "terms", Scope: "all", Limit: 50,
+		IncludeOneShot: true,
+	})
+	require.NoError(t, err)
+	assert.Empty(t, missing.Matches)
+}
+
+func TestSearchContentTermsRequiresOneExchange(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "terms-split", "proj", func(s *Session) {
+		s.UserMessageCount = 2
+	})
+	require.NoError(t, d.ReplaceSessionMessages(t.Context(), "terms-split", []Message{
+		{SessionID: "terms-split", Ordinal: 0, Role: "user", Content: "first mentions alpha"},
+		{SessionID: "terms-split", Ordinal: 1, Role: "assistant", Content: "plain reply"},
+		{SessionID: "terms-split", Ordinal: 2, Role: "user", Content: "second mentions beta"},
+	}))
+
+	got, err := d.SearchContent(t.Context(), ContentSearchFilter{
+		Pattern: "alpha beta", Mode: "terms", Limit: 50, IncludeOneShot: true,
+	})
+	require.NoError(t, err)
+	assert.Empty(t, got.Matches,
+		"terms in different exchanges of one session must not match")
+}
+
+func TestSearchContentTermsIgnoresAssistantPrelude(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "terms-prelude", "proj", func(s *Session) {
+		s.UserMessageCount = 1
+	})
+	require.NoError(t, d.ReplaceSessionMessages(t.Context(), "terms-prelude", []Message{
+		{SessionID: "terms-prelude", Ordinal: 0, Role: "assistant", Content: "prelude alpha"},
+		{SessionID: "terms-prelude", Ordinal: 1, Role: "assistant", Content: "carries beta too"},
+		{SessionID: "terms-prelude", Ordinal: 2, Role: "user", Content: "asks about alpha"},
+		{SessionID: "terms-prelude", Ordinal: 3, Role: "assistant", Content: "plain answer"},
+	}))
+
+	// An exchange is a user message plus its ensuing assistant run, so the
+	// assistant rows before the first user message form no exchange even when
+	// every term occurs among them.
+	got, err := d.SearchContent(t.Context(), ContentSearchFilter{
+		Pattern: "alpha beta", Mode: "terms", Limit: 50, IncludeOneShot: true,
+	})
+	require.NoError(t, err)
+	assert.Empty(t, got.Matches,
+		"assistant messages before the first user message must not match")
+
+	anchored, err := d.SearchContent(t.Context(), ContentSearchFilter{
+		Pattern: "alpha asks", Mode: "terms", Limit: 50, IncludeOneShot: true,
+	})
+	require.NoError(t, err)
+	require.Len(t, anchored.Matches, 1, "the user-anchored exchange still matches")
+	assert.Equal(t, 2, anchored.Matches[0].Ordinal)
+}
+
+func TestSearchContentTermsSnippetStaysBoundedForDistantTerms(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "terms-long", "proj", func(s *Session) {
+		s.UserMessageCount = 2
+	})
+	require.NoError(t, d.ReplaceSessionMessages(t.Context(), "terms-long", []Message{
+		{
+			SessionID: "terms-long", Ordinal: 0, Role: "user",
+			Content: "alpha " + strings.Repeat("filler ", 400),
+		},
+		{
+			SessionID: "terms-long", Ordinal: 1, Role: "assistant",
+			Content: strings.Repeat("padding ", 400) + "beta",
+		},
+	}))
+
+	got, err := d.SearchContent(t.Context(), ContentSearchFilter{
+		Pattern: "alpha beta", Mode: "terms", Limit: 50, IncludeOneShot: true,
+	})
+	require.NoError(t, err)
+	require.Len(t, got.Matches, 1)
+	snippet := got.Matches[0].Snippet
+	assert.True(t, strings.HasPrefix(snippet, "alpha filler"), snippet)
+	assert.True(t, strings.HasSuffix(snippet, "padding beta"), snippet)
+	assert.Contains(t, snippet, " ... ")
+	// Two windows of at most 60 bytes of context per side, one separator.
+	assert.LessOrEqual(t, len(snippet), 260)
+}
+
+func TestSearchContentTermsScopeAndStablePaging(t *testing.T) {
+	d := testDB(t)
+	for _, session := range []struct {
+		id        string
+		ended     string
+		sidechain bool
+	}{
+		{id: "terms-top-new", ended: "2026-05-20T12:00:00Z"},
+		{id: "terms-side-newest", ended: "2026-05-20T13:00:00Z", sidechain: true},
+		{id: "terms-top-old", ended: "2026-05-20T11:00:00Z"},
+	} {
+		insertSession(t, d, session.id, "proj", func(s *Session) {
+			s.Agent = "claude"
+			s.UserMessageCount = 2
+			s.EndedAt = &session.ended
+		})
+		msgs := []Message{
+			{
+				SessionID: session.id, Ordinal: 0, Role: "user", Content: "alpha",
+				Timestamp: session.ended, IsSidechain: session.sidechain,
+			},
+			{
+				SessionID: session.id, Ordinal: 1, Role: "assistant", Content: "beta",
+				Timestamp: session.ended, IsSidechain: session.sidechain,
+			},
+		}
+		require.NoError(t, d.ReplaceSessionMessages(t.Context(), session.id, msgs))
+	}
+
+	all, err := d.SearchContent(t.Context(), ContentSearchFilter{
+		Pattern: "alpha beta", Mode: "terms", Scope: "all", Limit: 50,
+		IncludeOneShot: true,
+	})
+	require.NoError(t, err)
+	require.Len(t, all.Matches, 3)
+	assert.Equal(t, []string{"terms-top-new", "terms-top-old", "terms-side-newest"},
+		[]string{all.Matches[0].SessionID, all.Matches[1].SessionID, all.Matches[2].SessionID})
+	assert.False(t, all.Matches[0].Subordinate)
+	assert.True(t, all.Matches[2].Subordinate)
+
+	top, err := d.SearchContent(t.Context(), ContentSearchFilter{
+		Pattern: "alpha beta", Mode: "terms", Scope: "top", Limit: 1,
+		IncludeOneShot: true,
+	})
+	require.NoError(t, err)
+	require.Len(t, top.Matches, 1)
+	assert.Equal(t, "terms-top-new", top.Matches[0].SessionID)
+	require.NotZero(t, top.NextCursor)
+
+	next, err := d.SearchContent(t.Context(), ContentSearchFilter{
+		Pattern: "alpha beta", Mode: "terms", Scope: "top", Limit: 1,
+		Cursor: top.NextCursor, IncludeOneShot: true,
+	})
+	require.NoError(t, err)
+	require.Len(t, next.Matches, 1)
+	assert.Equal(t, "terms-top-old", next.Matches[0].SessionID)
+	assert.Zero(t, next.NextCursor)
+}
+
+func TestSearchContentExactSessionAndBranchFilters(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "exact-parent", "proj", func(s *Session) {
+		s.Agent = "claude"
+		s.UserMessageCount = 2
+	})
+	for _, session := range []struct{ id, branch string }{
+		{id: "exact-main", branch: "main"},
+		{id: "exact-feature", branch: "feature/memory"},
+	} {
+		insertSession(t, d, session.id, "proj", func(s *Session) {
+			s.Agent = "claude"
+			s.GitBranch = session.branch
+			s.UserMessageCount = 2
+		})
+		require.NoError(t, d.ReplaceSessionMessages(t.Context(), session.id, []Message{
+			{SessionID: session.id, Ordinal: 0, Role: "user", Content: "EXACTNEEDLE"},
+		}))
+	}
+
+	got, err := d.SearchContent(t.Context(), ContentSearchFilter{
+		Pattern: "EXACTNEEDLE", Mode: "substring", SessionID: "exact-feature",
+		GitBranchExact: "feature/memory", IncludeOneShot: true, Limit: 50,
+	})
+	require.NoError(t, err)
+	require.Len(t, got.Matches, 1)
+	assert.Equal(t, "exact-feature", got.Matches[0].SessionID)
+
+	none, err := d.SearchContent(t.Context(), ContentSearchFilter{
+		Pattern: "EXACTNEEDLE", Mode: "substring", SessionID: "exact-feature",
+		GitBranchExact: "main", IncludeOneShot: true, Limit: 50,
+	})
+	require.NoError(t, err)
+	assert.Empty(t, none.Matches)
+
+	insertSession(t, d, "exact-child", "proj", func(s *Session) {
+		s.Agent = "claude"
+		s.GitBranch = "feature/memory"
+		s.UserMessageCount = 1
+		s.ParentSessionID = Ptr("exact-parent")
+		s.RelationshipType = "subagent"
+	})
+	require.NoError(t, d.ReplaceSessionMessages(t.Context(), "exact-child", []Message{
+		{SessionID: "exact-child", Ordinal: 0, Role: "user", Content: "EXACTNEEDLE child"},
+	}))
+	child, err := d.SearchContent(t.Context(), ContentSearchFilter{
+		Pattern: "EXACTNEEDLE", Mode: "substring", SessionID: "exact-child",
+		GitBranchExact: "feature/memory", IncludeOneShot: true, Limit: 50,
+	})
+	require.NoError(t, err)
+	require.Len(t, child.Matches, 1, "an exact ID must bypass sidebar-child hiding")
+	assert.Equal(t, "exact-child", child.Matches[0].SessionID)
+}
+
 func TestSearchContentFTSPhraseSnippetFallsBackToFirstToken(t *testing.T) {
 	d := testDB(t)
-	if !d.HasFTS() {
+	if !d.HasFTS(t.Context()) {
 		t.Skip("fts5 not available")
 	}
 	body := strings.Repeat("prefix ", 30) + "foo-bar lives here"
@@ -323,7 +613,7 @@ func TestSearchContentFTSPhraseSnippetFallsBackToFirstToken(t *testing.T) {
 		{"user", body},
 	})
 
-	got, err := d.SearchContent(context.Background(), ContentSearchFilter{
+	got, err := d.SearchContent(t.Context(), ContentSearchFilter{
 		Pattern: `"foo bar"`, Mode: "fts",
 		Sources: []string{"messages"}, Limit: 50,
 	})
@@ -334,7 +624,7 @@ func TestSearchContentFTSPhraseSnippetFallsBackToFirstToken(t *testing.T) {
 
 func TestSearchContentFTSInvalidQuery(t *testing.T) {
 	d := testDB(t)
-	if !d.HasFTS() {
+	if !d.HasFTS(t.Context()) {
 		t.Skip("fts5 not available")
 	}
 	seedSearchSession(t, d, "f2", "proj", [][2]string{
@@ -342,32 +632,32 @@ func TestSearchContentFTSInvalidQuery(t *testing.T) {
 	})
 	// A lone double quote is an unbalanced FTS phrase, so SQLite raises a
 	// generic syntax error that must be classified as user input, not a 500.
-	_, err := d.SearchContent(context.Background(), ContentSearchFilter{
+	_, err := d.SearchContent(t.Context(), ContentSearchFilter{
 		Pattern: `"`, Mode: "fts",
 		Sources: []string{"messages"}, Limit: 50,
 	})
 	var inputErr *SearchInputError
-	require.True(t, errors.As(err, &inputErr),
+	require.ErrorAs(t, err, &inputErr,
 		"malformed FTS query error = %v, want *SearchInputError", err)
 }
 
 func TestSearchContentFTSUnavailable(t *testing.T) {
 	d := testDB(t)
-	if !d.HasFTS() {
+	if !d.HasFTS(t.Context()) {
 		t.Skip("fts5 not available")
 	}
 	// Drop the FTS table so HasFTS reports unavailable; the FTS search must
 	// then fail with an internal (non-input) error rather than being
 	// misclassified as an invalid user query (HTTP 400).
-	_, err := d.getWriter().Exec("DROP TABLE IF EXISTS messages_fts")
+	_, err := d.getWriter().Exec(t.Context(), "DROP TABLE IF EXISTS messages_fts")
 	require.NoError(t, err, "drop messages_fts")
-	_, err = d.SearchContent(context.Background(), ContentSearchFilter{
+	_, err = d.SearchContent(t.Context(), ContentSearchFilter{
 		Pattern: "x", Mode: "fts",
 		Sources: []string{"messages"}, Limit: 50,
 	})
 	require.Error(t, err, "expected error when FTS is unavailable")
 	var inputErr *SearchInputError
-	assert.False(t, errors.As(err, &inputErr),
+	assert.NotErrorAs(t, err, &inputErr,
 		"FTS-unavailable misclassified as input error: %v", err)
 }
 
@@ -380,18 +670,20 @@ func TestSearchContentExcludeSystem(t *testing.T) {
 	// Plain content (no legacy system-prefix string) so the exclusion is
 	// driven solely by the persisted is_system flag, not SystemPrefixSQL.
 	msgs := []Message{
-		{SessionID: "s3", Ordinal: 0, Role: "user",
+		{
+			SessionID: "s3", Ordinal: 0, Role: "user",
 			Content: "ordinary message holding NEEDLE", IsSystem: true,
-			Timestamp: "2026-05-20T12:00:00Z"},
+			Timestamp: "2026-05-20T12:00:00Z",
+		},
 	}
-	require.NoError(t, d.ReplaceSessionMessages("s3", msgs),
+	require.NoError(t, d.ReplaceSessionMessages(t.Context(), "s3", msgs),
 		"ReplaceSessionMessages")
-	withSys, err := d.SearchContent(context.Background(), ContentSearchFilter{
+	withSys, err := d.SearchContent(t.Context(), ContentSearchFilter{
 		Pattern: "NEEDLE", Mode: "substring", Sources: []string{"messages"}, Limit: 50,
 	})
 	require.NoError(t, err, "SearchContent with system")
 	assert.Len(t, withSys.Matches, 1, "default should include system messages")
-	noSys, err := d.SearchContent(context.Background(), ContentSearchFilter{
+	noSys, err := d.SearchContent(t.Context(), ContentSearchFilter{
 		Pattern: "NEEDLE", Mode: "substring", Sources: []string{"messages"},
 		ExcludeSystem: true, Limit: 50,
 	})
@@ -416,15 +708,15 @@ func TestSearchContentExcludesAutomatedByDefault(t *testing.T) {
 		SessionID: "auto", Ordinal: 0, Role: "user",
 		Content: "automated NEEDLE run", Timestamp: "2026-05-20T12:00:00Z",
 	}}
-	require.NoError(t, d.ReplaceSessionMessages("auto", msgs),
+	require.NoError(t, d.ReplaceSessionMessages(t.Context(), "auto", msgs),
 		"ReplaceSessionMessages")
-	def, err := d.SearchContent(context.Background(), ContentSearchFilter{
+	def, err := d.SearchContent(t.Context(), ContentSearchFilter{
 		Pattern: "NEEDLE", Mode: "substring", Sources: []string{"messages"}, Limit: 50,
 	})
 	require.NoError(t, err, "SearchContent")
 	assert.Empty(t, def.Matches,
 		"automated session should be excluded by default")
-	inc, err := d.SearchContent(context.Background(), ContentSearchFilter{
+	inc, err := d.SearchContent(t.Context(), ContentSearchFilter{
 		Pattern: "NEEDLE", Mode: "substring", Sources: []string{"messages"},
 		IncludeAutomated: true, Limit: 50,
 	})
@@ -444,15 +736,15 @@ func TestSearchContentExcludesOneShotByDefault(t *testing.T) {
 		SessionID: "one", Ordinal: 0, Role: "user",
 		Content: "leaked NEEDLE token", Timestamp: "2026-05-20T12:00:00Z",
 	}}
-	require.NoError(t, d.ReplaceSessionMessages("one", msgs),
+	require.NoError(t, d.ReplaceSessionMessages(t.Context(), "one", msgs),
 		"ReplaceSessionMessages")
-	def, err := d.SearchContent(context.Background(), ContentSearchFilter{
+	def, err := d.SearchContent(t.Context(), ContentSearchFilter{
 		Pattern: "NEEDLE", Mode: "substring", Sources: []string{"messages"}, Limit: 50,
 	})
 	require.NoError(t, err, "SearchContent")
 	assert.Empty(t, def.Matches,
 		"one-shot session should be excluded by default")
-	inc, err := d.SearchContent(context.Background(), ContentSearchFilter{
+	inc, err := d.SearchContent(t.Context(), ContentSearchFilter{
 		Pattern: "NEEDLE", Mode: "substring", Sources: []string{"messages"},
 		IncludeOneShot: true, Limit: 50,
 	})
@@ -482,9 +774,9 @@ func TestSearchContentToolResultDedup(t *testing.T) {
 			}},
 		}},
 	}}
-	require.NoError(t, d.ReplaceSessionMessages("dup", msgs),
+	require.NoError(t, d.ReplaceSessionMessages(t.Context(), "dup", msgs),
 		"ReplaceSessionMessages")
-	got, err := d.SearchContent(context.Background(), ContentSearchFilter{
+	got, err := d.SearchContent(t.Context(), ContentSearchFilter{
 		Pattern: "DUPNEEDLE", Mode: "substring",
 		Sources: []string{"tool_result"}, Limit: 50,
 	})
@@ -501,13 +793,13 @@ func TestSearchContentCursorPagination(t *testing.T) {
 		{"user", "beta NEEDLE two"},
 		{"user", "gamma NEEDLE three"},
 	})
-	first, err := d.SearchContent(context.Background(), ContentSearchFilter{
+	first, err := d.SearchContent(t.Context(), ContentSearchFilter{
 		Pattern: "NEEDLE", Mode: "substring", Sources: []string{"messages"}, Limit: 2,
 	})
 	require.NoError(t, err, "SearchContent page1")
 	require.Len(t, first.Matches, 2, "page1 matches")
 	require.Equal(t, 2, first.NextCursor, "page1 cursor")
-	second, err := d.SearchContent(context.Background(), ContentSearchFilter{
+	second, err := d.SearchContent(t.Context(), ContentSearchFilter{
 		Pattern: "NEEDLE", Mode: "substring", Sources: []string{"messages"},
 		Limit: 2, Cursor: first.NextCursor,
 	})
@@ -532,10 +824,10 @@ func TestSearchContentMultiSourceWithProjectFilter(t *testing.T) {
 				InputJSON: `{"command":"FINDME"}`, ResultContent: "out FINDME",
 			}},
 		}}
-		require.NoError(t, d.ReplaceSessionMessages(id, msgs),
+		require.NoError(t, d.ReplaceSessionMessages(t.Context(), id, msgs),
 			"ReplaceSessionMessages %s", id)
 	}
-	got, err := d.SearchContent(context.Background(), ContentSearchFilter{
+	got, err := d.SearchContent(t.Context(), ContentSearchFilter{
 		Pattern: "FINDME", Mode: "substring",
 		Sources: []string{"messages", "tool_input", "tool_result"},
 		Project: "alpha", Limit: 50,
@@ -546,6 +838,36 @@ func TestSearchContentMultiSourceWithProjectFilter(t *testing.T) {
 		assert.Equal(t, "a", m.SessionID, "session leaked")
 		assert.Equal(t, "alpha", m.Project, "project leaked")
 	}
+}
+
+func TestSearchContentDateFilterUsesRequestedTimezone(t *testing.T) {
+	d := testDB(t)
+	for _, row := range []struct {
+		id, started, ended string
+	}{
+		{"new-york-previous-day", "2024-06-16T01:00:00Z", "2024-06-16T02:00:00Z"},
+		{"new-york-requested-day", "2024-06-16T05:00:00Z", "2024-06-16T06:00:00Z"},
+	} {
+		insertSession(t, d, row.id, "proj", func(s *Session) {
+			s.Agent = "claude"
+			s.StartedAt = new(row.started)
+			s.EndedAt = new(row.ended)
+			s.UserMessageCount = 2
+		})
+		insertMessages(t, d, Message{
+			SessionID: row.id, Ordinal: 0, Role: "user",
+			Content: "TIMEZONE_NEEDLE", Timestamp: row.started,
+		})
+	}
+
+	got, err := d.SearchContent(t.Context(), ContentSearchFilter{
+		Pattern: "TIMEZONE_NEEDLE", Mode: "substring",
+		Sources: []string{"messages"}, Date: "2024-06-16",
+		Timezone: "America/New_York", Limit: 50,
+	})
+	require.NoError(t, err, "SearchContent")
+	require.Len(t, got.Matches, 1)
+	assert.Equal(t, "new-york-requested-day", got.Matches[0].SessionID)
 }
 
 func TestSnippetWindowRuneBoundaries(t *testing.T) {
@@ -577,14 +899,395 @@ func TestFTSSnippetCentersOnPhrase(t *testing.T) {
 
 	t.Run("phrase present centers on phrase", func(t *testing.T) {
 		f := ContentSearchFilter{Pattern: `"error handler"`, Mode: "fts"}
-		assert.Contains(t, f.ftsSnippet(body), "error handler",
+		assert.Contains(t, f.ftsSnippet(body, ""), "error handler",
 			"snippet did not center on the phrase")
 	})
 	t.Run("phrase absent falls back to first token", func(t *testing.T) {
 		// No contiguous "error handler" substring, so centering falls back to
 		// the first token "error", windowing its early occurrence.
 		f := ContentSearchFilter{Pattern: `"error nonexistent"`, Mode: "fts"}
-		assert.Contains(t, f.ftsSnippet(body), "error in the early",
+		assert.Contains(t, f.ftsSnippet(body, ""), "error in the early",
 			"fallback snippet not centered on first token")
 	})
+}
+
+// seedUnitSession inserts a session (lineage-configurable via opts) plus full
+// Message rows, for derived-unit citation tests that need
+// is_system/is_sidechain/tool fields beyond seedSearchSession's role/content
+// pairs. SessionID and a per-ordinal timestamp are filled in when unset.
+func seedUnitSession(
+	t *testing.T, d *DB, id string, opts func(*Session), msgs []Message,
+) {
+	t.Helper()
+	insertSession(t, d, id, "proj", func(s *Session) {
+		s.Agent = "claude"
+		s.UserMessageCount = 2
+		if opts != nil {
+			opts(s)
+		}
+	})
+	for i := range msgs {
+		msgs[i].SessionID = id
+		if msgs[i].Timestamp == "" {
+			msgs[i].Timestamp = fmt.Sprintf("2026-05-20T12:00:%02dZ", i)
+		}
+	}
+	require.NoError(t, d.ReplaceSessionMessages(t.Context(), id, msgs),
+		"ReplaceSessionMessages %s", id)
+}
+
+// matchesByOrdinal indexes a page's matches by anchor ordinal, requiring the
+// ordinals to be unique.
+func matchesByOrdinal(t *testing.T, page ContentSearchPage) map[int]ContentMatch {
+	t.Helper()
+	out := make(map[int]ContentMatch, len(page.Matches))
+	for _, m := range page.Matches {
+		_, dup := out[m.Ordinal]
+		require.False(t, dup, "duplicate match ordinal %d", m.Ordinal)
+		out[m.Ordinal] = m
+	}
+	return out
+}
+
+// TestSearchContentSubstringDerivedRunRange pins the derived
+// conversation-unit citation on substring rows: every match in one assistant
+// run carries the run's full range (spanning a non-member system row), an
+// embeddable user row and a system row are their own units, and ExcludeSystem
+// changes nothing but which rows match.
+func TestSearchContentSubstringDerivedRunRange(t *testing.T) {
+	d := testDB(t)
+	seedUnitSession(t, d, "run1", nil, []Message{
+		{Ordinal: 0, Role: "user", Content: "the RUNHIT question"},
+		{Ordinal: 1, Role: "assistant", Content: "RUNHIT step one"},
+		{Ordinal: 2, Role: "user", Content: "sys RUNHIT note", IsSystem: true},
+		{Ordinal: 3, Role: "assistant", Content: "RUNHIT step two"},
+		{Ordinal: 4, Role: "assistant", Content: "RUNHIT step three"},
+		{Ordinal: 5, Role: "user", Content: "next question"},
+	})
+	got, err := d.SearchContent(t.Context(), ContentSearchFilter{
+		Pattern: "RUNHIT", Mode: "substring",
+		Sources: []string{"messages"}, Limit: 50,
+	})
+	require.NoError(t, err, "SearchContent")
+	require.Len(t, got.Matches, 5, "matches")
+	byOrd := matchesByOrdinal(t, got)
+	assert.Equal(t, [2]int{0, 0}, byOrd[0].OrdinalRange, "user row is its own unit")
+	assert.Equal(t, [2]int{2, 2}, byOrd[2].OrdinalRange, "system row is its own unit")
+	for _, o := range []int{1, 3, 4} {
+		m := byOrd[o]
+		assert.Equal(t, [2]int{1, 4}, m.OrdinalRange, "run member %d", o)
+		assert.Equal(t, o, m.Ordinal, "anchor ordinal %d", o)
+		assert.False(t, m.Subordinate, "top-level run member %d", o)
+		assert.False(t, m.Sidechain, "non-sidechain run member %d", o)
+		assert.Empty(t, m.Relationship, "top-level relationship %d", o)
+		assert.Empty(t, m.ParentSessionID, "top-level parent %d", o)
+	}
+
+	// ExcludeSystem drops the system row but leaves the derived ranges of the
+	// surviving rows unchanged.
+	ex, err := d.SearchContent(t.Context(), ContentSearchFilter{
+		Pattern: "RUNHIT", Mode: "substring",
+		Sources: []string{"messages"}, ExcludeSystem: true, Limit: 50,
+	})
+	require.NoError(t, err, "SearchContent ExcludeSystem")
+	require.Len(t, ex.Matches, 4, "ExcludeSystem matches")
+	exByOrd := matchesByOrdinal(t, ex)
+	assert.NotContains(t, exByOrd, 2, "system row excluded")
+	assert.Equal(t, [2]int{0, 0}, exByOrd[0].OrdinalRange)
+	for _, o := range []int{1, 3, 4} {
+		assert.Equal(t, [2]int{1, 4}, exByOrd[o].OrdinalRange,
+			"ExcludeSystem run member %d", o)
+	}
+}
+
+// TestSearchContentSubstringSidechainRunSubordinate pins the sidechain rules:
+// a sidechain run's members are Subordinate + Sidechain, and the sidechain
+// flip bounds both the sidechain run and the following top-level run.
+func TestSearchContentSubstringSidechainRunSubordinate(t *testing.T) {
+	d := testDB(t)
+	seedUnitSession(t, d, "side1", nil, []Message{
+		{Ordinal: 0, Role: "user", Content: "the question"},
+		{Ordinal: 1, Role: "assistant", Content: "SIDEHIT step a", IsSidechain: true},
+		{Ordinal: 2, Role: "assistant", Content: "SIDEHIT step b", IsSidechain: true},
+		{Ordinal: 3, Role: "assistant", Content: "main MAINHIT answer"},
+	})
+	side, err := d.SearchContent(t.Context(), ContentSearchFilter{
+		Pattern: "SIDEHIT", Mode: "substring",
+		Sources: []string{"messages"}, Limit: 50,
+	})
+	require.NoError(t, err, "SearchContent sidechain")
+	require.Len(t, side.Matches, 2, "sidechain matches")
+	for _, m := range side.Matches {
+		assert.Equal(t, [2]int{1, 2}, m.OrdinalRange, "sidechain run range")
+		assert.True(t, m.Subordinate, "sidechain run is subordinate")
+		assert.True(t, m.Sidechain, "anchor sidechain flag")
+		assert.Empty(t, m.Relationship, "no session lineage")
+	}
+	main, err := d.SearchContent(t.Context(), ContentSearchFilter{
+		Pattern: "MAINHIT", Mode: "substring",
+		Sources: []string{"messages"}, Limit: 50,
+	})
+	require.NoError(t, err, "SearchContent main")
+	require.Len(t, main.Matches, 1, "main matches")
+	m := main.Matches[0]
+	assert.Equal(t, [2]int{3, 3}, m.OrdinalRange,
+		"sidechain flip bounds the top-level run")
+	assert.False(t, m.Subordinate, "top-level run")
+	assert.False(t, m.Sidechain, "top-level anchor")
+}
+
+// TestSearchContentSubstringSubagentLineage pins session-level lineage on
+// lexical rows: a match inside a subagent session is Subordinate with
+// Relationship and ParentSessionID populated from the sessions join.
+func TestSearchContentSubstringSubagentLineage(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "parent", "proj", func(s *Session) {
+		s.Agent = "claude"
+		s.UserMessageCount = 2
+	})
+	seedUnitSession(t, d, "child", func(s *Session) {
+		s.ParentSessionID = Ptr("parent")
+		s.RelationshipType = "subagent"
+	}, []Message{
+		{Ordinal: 0, Role: "user", Content: "subagent prompt"},
+		{Ordinal: 1, Role: "assistant", Content: "SUBHIT answer"},
+	})
+	got, err := d.SearchContent(t.Context(), ContentSearchFilter{
+		Pattern: "SUBHIT", Mode: "substring",
+		Sources: []string{"messages"}, IncludeChildren: true, Limit: 50,
+	})
+	require.NoError(t, err, "SearchContent")
+	require.Len(t, got.Matches, 1, "matches")
+	m := got.Matches[0]
+	assert.Equal(t, [2]int{1, 1}, m.OrdinalRange, "single-member run")
+	assert.True(t, m.Subordinate, "subagent session is subordinate")
+	assert.Equal(t, "subagent", m.Relationship, "Relationship")
+	assert.Equal(t, "parent", m.ParentSessionID, "ParentSessionID")
+	assert.False(t, m.Sidechain, "anchor not sidechain")
+}
+
+// TestSearchContentToolDerivedRunRange pins derivation for tool_input and
+// canonical tool_result rows: the anchor is the tool call's message row, so
+// both locations carry the enclosing run's range while the wire Role stays
+// the hard-coded "assistant".
+func TestSearchContentToolDerivedRunRange(t *testing.T) {
+	d := testDB(t)
+	seedUnitSession(t, d, "tool1", nil, []Message{
+		{Ordinal: 0, Role: "user", Content: "the question"},
+		{
+			Ordinal: 1, Role: "assistant", Content: "running the tool",
+			ToolCalls: []ToolCall{{
+				ToolName: "Bash", Category: "Bash", ToolUseID: "tu1",
+				InputJSON:     `{"command":"TOOLHIT"}`,
+				ResultContent: "output RESHIT data",
+			}},
+		},
+		{Ordinal: 2, Role: "assistant", Content: "continuing the answer"},
+		{Ordinal: 3, Role: "user", Content: "thanks"},
+	})
+	in, err := d.SearchContent(t.Context(), ContentSearchFilter{
+		Pattern: "TOOLHIT", Mode: "substring",
+		Sources: []string{"tool_input"}, Limit: 50,
+	})
+	require.NoError(t, err, "tool_input search")
+	require.Len(t, in.Matches, 1, "tool_input matches")
+	assert.Equal(t, "assistant", in.Matches[0].Role, "wire role stays assistant")
+	assert.Equal(t, 1, in.Matches[0].Ordinal, "anchor ordinal")
+	assert.Equal(t, [2]int{1, 2}, in.Matches[0].OrdinalRange,
+		"tool_input anchor classified from the real message row")
+
+	res, err := d.SearchContent(t.Context(), ContentSearchFilter{
+		Pattern: "RESHIT", Mode: "substring",
+		Sources: []string{"tool_result"}, Limit: 50,
+	})
+	require.NoError(t, err, "tool_result search")
+	require.Len(t, res.Matches, 1, "tool_result matches")
+	assert.Equal(t, [2]int{1, 2}, res.Matches[0].OrdinalRange,
+		"canonical tool_result anchor classified from the real message row")
+}
+
+// TestSearchContentToolAnchorUsesRealRowRole pins the role-sensitive anchor
+// classification: a tool call hanging off a user-role message keeps the
+// hard-coded "assistant" wire role, but derivation must classify the anchor
+// by the REAL row's role — an embeddable user row is its own unit, never an
+// assistant run member.
+func TestSearchContentToolAnchorUsesRealRowRole(t *testing.T) {
+	d := testDB(t)
+	seedUnitSession(t, d, "toolu", nil, []Message{
+		{Ordinal: 0, Role: "user", Content: "prompt"},
+		{
+			Ordinal: 1, Role: "user", Content: "user-attached call",
+			ToolCalls: []ToolCall{{
+				ToolName: "Bash", Category: "Bash", ToolUseID: "tuu",
+				InputJSON: `{"command":"UHIT"}`,
+			}},
+		},
+		{Ordinal: 2, Role: "assistant", Content: "assistant reply"},
+	})
+	got, err := d.SearchContent(t.Context(), ContentSearchFilter{
+		Pattern: "UHIT", Mode: "substring",
+		Sources: []string{"tool_input"}, Limit: 50,
+	})
+	require.NoError(t, err, "SearchContent")
+	require.Len(t, got.Matches, 1, "matches")
+	m := got.Matches[0]
+	assert.Equal(t, "assistant", m.Role, "wire role stays assistant")
+	assert.Equal(t, [2]int{1, 1}, m.OrdinalRange,
+		"user-role anchor row is its own unit")
+}
+
+// TestSearchContentToolResultEventsDerived pins the events branches: an
+// orphaned event (no message row at its ordinal) still returns its match
+// (row cardinality must not change) with the [o, o] fallback and session
+// lineage, while an event whose message row sits inside a run gets the run's
+// range via the post-scan anchor lookup.
+func TestSearchContentToolResultEventsDerived(t *testing.T) {
+	d := testDB(t)
+
+	insertSession(t, d, "boss", "proj", func(s *Session) {
+		s.Agent = "claude"
+		s.UserMessageCount = 2
+	})
+	insertSession(t, d, "evorph", "proj", func(s *Session) {
+		s.Agent = "claude"
+		s.UserMessageCount = 2
+		s.ParentSessionID = Ptr("boss")
+		s.RelationshipType = "subagent"
+	})
+	_, err := d.getWriter().Exec(t.Context(), `INSERT INTO tool_result_events
+		(session_id, tool_call_message_ordinal, tool_use_id, source, status,
+		 content, content_length, timestamp, event_index)
+		VALUES ('evorph', 7, 'tux', 'stdout', 'success',
+		 'ORPHHIT event content', 21, '2026-05-20T12:00:00Z', 0)`)
+	require.NoError(t, err, "insert orphan event")
+
+	seedUnitSession(t, d, "evrun", nil, []Message{
+		{Ordinal: 0, Role: "user", Content: "the question"},
+		{
+			Ordinal: 1, Role: "assistant", Content: "running",
+			ToolCalls: []ToolCall{{
+				ToolName: "Bash", Category: "Bash", ToolUseID: "tu1",
+				InputJSON: `{"command":"x"}`,
+				ResultEvents: []ToolResultEvent{{
+					ToolUseID: "tu1", Source: "stdout", Status: "success",
+					Content: "EVHIT streamed output", EventIndex: 0,
+				}},
+			}},
+		},
+		{Ordinal: 2, Role: "assistant", Content: "wrapping up"},
+	})
+
+	orph, err := d.SearchContent(t.Context(), ContentSearchFilter{
+		Pattern: "ORPHHIT", Mode: "substring",
+		Sources: []string{"tool_result"}, IncludeChildren: true, Limit: 50,
+	})
+	require.NoError(t, err, "orphan search")
+	require.Len(t, orph.Matches, 1, "orphaned event row must not be dropped")
+	m := orph.Matches[0]
+	assert.Equal(t, 7, m.Ordinal, "event ordinal")
+	assert.Equal(t, [2]int{7, 7}, m.OrdinalRange, "missing anchor falls back to [o, o]")
+	assert.False(t, m.Sidechain, "missing anchor has no sidechain flag")
+	assert.True(t, m.Subordinate, "session lineage still applies")
+	assert.Equal(t, "subagent", m.Relationship, "Relationship from sessions join")
+	assert.Equal(t, "boss", m.ParentSessionID, "ParentSessionID from sessions join")
+
+	ev, err := d.SearchContent(t.Context(), ContentSearchFilter{
+		Pattern: "EVHIT", Mode: "substring",
+		Sources: []string{"tool_result"}, Limit: 50,
+	})
+	require.NoError(t, err, "event search")
+	require.Len(t, ev.Matches, 1, "event matches")
+	assert.Equal(t, 1, ev.Matches[0].Ordinal, "anchor ordinal")
+	assert.Equal(t, [2]int{1, 2}, ev.Matches[0].OrdinalRange,
+		"event with a message row inside a run gets the run's range")
+}
+
+// TestSearchContentRegexDerivedRange spot-checks that regex mode routes
+// through the shared derivation pass.
+func TestSearchContentRegexDerivedRange(t *testing.T) {
+	d := testDB(t)
+	seedUnitSession(t, d, "rx1", nil, []Message{
+		{Ordinal: 0, Role: "user", Content: "the question"},
+		{Ordinal: 1, Role: "assistant", Content: "RXHIT alpha"},
+		{Ordinal: 2, Role: "assistant", Content: "RXHIT beta"},
+	})
+	got, err := d.SearchContent(t.Context(), ContentSearchFilter{
+		Pattern: `RXHIT [a-z]+`, Mode: "regex",
+		Sources: []string{"messages"}, Limit: 50,
+	})
+	require.NoError(t, err, "SearchContent regex")
+	require.Len(t, got.Matches, 2, "regex matches")
+	for _, m := range got.Matches {
+		assert.Equal(t, [2]int{1, 2}, m.OrdinalRange, "derived run range")
+	}
+}
+
+// TestSearchContentFTSDerivedRange spot-checks that fts mode routes through
+// the shared derivation pass.
+func TestSearchContentFTSDerivedRange(t *testing.T) {
+	d := testDB(t)
+	if !d.HasFTS(t.Context()) {
+		t.Skip("fts5 not available")
+	}
+	seedUnitSession(t, d, "fx1", nil, []Message{
+		{Ordinal: 0, Role: "user", Content: "the question"},
+		{Ordinal: 1, Role: "assistant", Content: "ftshit alpha step"},
+		{Ordinal: 2, Role: "assistant", Content: "ftshit beta step"},
+	})
+	got, err := d.SearchContent(t.Context(), ContentSearchFilter{
+		Pattern: "ftshit", Mode: "fts",
+		Sources: []string{"messages"}, Limit: 50,
+	})
+	require.NoError(t, err, "SearchContent fts")
+	require.Len(t, got.Matches, 2, "fts matches")
+	for _, m := range got.Matches {
+		assert.Equal(t, [2]int{1, 2}, m.OrdinalRange, "derived run range")
+		assert.False(t, m.Subordinate, "top-level run")
+	}
+}
+
+func TestNormalizeExcludeSessionIDs(t *testing.T) {
+	assert.Nil(t, NormalizeExcludeSessionIDs(nil))
+	assert.Nil(t, NormalizeExcludeSessionIDs([]string{"", "  "}))
+	assert.Equal(t, []string{"keep", "other"},
+		NormalizeExcludeSessionIDs([]string{" keep ", "", "keep", "other"}))
+}
+
+func TestAppendExcludeSessionIDs(t *testing.T) {
+	where, args := AppendExcludeSessionIDs("message_count > 0", nil, "id", nil)
+	assert.Equal(t, "message_count > 0", where)
+	assert.Nil(t, args)
+
+	where, args = AppendExcludeSessionIDs("message_count > 0", []any{"p"}, "id",
+		[]string{"live", "live", " other "})
+	assert.Equal(t, "message_count > 0 AND id NOT IN (?,?)", where)
+	assert.Equal(t, []any{"p", "live", "other"}, args)
+}
+
+func TestSearchContentExcludeSessionIDs(t *testing.T) {
+	d := testDB(t)
+	seedSearchSession(t, d, "keep", "proj", [][2]string{
+		{"user", "needle in keep"},
+		{"assistant", "ok"},
+	})
+	seedSearchSession(t, d, "drop", "proj", [][2]string{
+		{"user", "needle in drop"},
+		{"assistant", "ok"},
+	})
+
+	all, err := d.SearchContent(t.Context(), ContentSearchFilter{
+		Pattern: "needle", Mode: "substring",
+		Sources: []string{"messages"}, Limit: 50,
+	})
+	require.NoError(t, err)
+	require.Len(t, all.Matches, 2)
+
+	got, err := d.SearchContent(t.Context(), ContentSearchFilter{
+		Pattern: "needle", Mode: "substring",
+		Sources: []string{"messages"}, Limit: 1,
+		ExcludeSessionIDs: []string{"drop", " drop "},
+	})
+	require.NoError(t, err)
+	require.Len(t, got.Matches, 1, "excluded id must not consume the page")
+	assert.Equal(t, "keep", got.Matches[0].SessionID)
 }

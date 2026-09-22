@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -43,6 +44,8 @@ type doctorDBInspection struct {
 	AntigravityCLISummary    int
 	AntigravityUnknownSchema int
 	AntigravityCountsErr     error
+	MissingSecretScans       int
+	MissingSecretScansErr    error
 }
 
 type doctorSyncReport struct {
@@ -50,6 +53,7 @@ type doctorSyncReport struct {
 	doctorDBInspection
 	TempFiles           []string
 	AgentRoots          []doctorAgentRoot
+	TraeEncryptedRoots  []string
 	DebugLines          []string
 	DebugLogErr         error
 	HasResyncFailureLog bool
@@ -81,23 +85,26 @@ func newDoctorSyncCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return runDoctorSync(cmd.OutOrStdout(), cfg)
+			return runDoctorSync(cmd.Context(), cmd.OutOrStdout(), cfg)
 		},
 	}
 }
 
-func runDoctorSync(w io.Writer, cfg config.Config) error {
-	report := collectDoctorSyncReport(cfg)
+func runDoctorSync(ctx context.Context, w io.Writer, cfg config.Config) error {
+	report := collectDoctorSyncReport(ctx, cfg)
 	writeDoctorSyncReport(w, report)
 	return nil
 }
 
-func collectDoctorSyncReport(cfg config.Config) doctorSyncReport {
-	report := doctorSyncReport{Config: cfg}
+func collectDoctorSyncReport(ctx context.Context, cfg config.Config) doctorSyncReport {
+	report := doctorSyncReport{
+		Config: cfg,
 
-	report.doctorDBInspection = inspectDoctorDB(cfg.DBPath)
-	report.TempFiles = listDoctorResyncTempFiles(cfg.DBPath)
-	report.AgentRoots = collectDoctorAgentRoots(cfg)
+		doctorDBInspection: inspectDoctorDB(ctx, cfg.DBPath),
+		TempFiles:          listDoctorResyncTempFiles(cfg.DBPath),
+		AgentRoots:         collectDoctorAgentRoots(cfg),
+	}
+	report.TraeEncryptedRoots = collectDoctorTraeEncryptedRoots(ctx, report.AgentRoots)
 	report.DebugLines, report.DebugLogErr = readDoctorDebugLines(
 		filepath.Join(cfg.DataDir, "debug.log"),
 	)
@@ -107,7 +114,7 @@ func collectDoctorSyncReport(cfg config.Config) doctorSyncReport {
 	return report
 }
 
-func inspectDoctorDB(path string) doctorDBInspection {
+func inspectDoctorDB(ctx context.Context, path string) doctorDBInspection {
 	var insp doctorDBInspection
 	info, err := os.Stat(path)
 	if err != nil {
@@ -118,7 +125,7 @@ func inspectDoctorDB(path string) doctorDBInspection {
 	}
 	insp.DBExists = true
 	if info.IsDir() {
-		insp.DBError = fmt.Errorf("database path is a directory")
+		insp.DBError = errors.New("database path is a directory")
 		return insp
 	}
 
@@ -130,15 +137,15 @@ func inspectDoctorDB(path string) doctorDBInspection {
 	defer conn.Close()
 
 	var version int
-	if err := conn.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
+	if err := conn.QueryRowContext(ctx, "PRAGMA user_version").Scan(&version); err != nil {
 		insp.DBError = err
 		return insp
 	}
 	insp.DBReadable = true
 	insp.UserVersion = &version
 
-	rows, err := conn.Query(
-		"SELECT data_version, COUNT(*) FROM sessions " +
+	rows, err := conn.QueryContext(ctx,
+		"SELECT data_version, COUNT(*) FROM sessions "+
 			"GROUP BY data_version ORDER BY data_version",
 	)
 	if err != nil {
@@ -163,13 +170,13 @@ func inspectDoctorDB(path string) doctorDBInspection {
 	// One scan collects both Antigravity operator counts: antigravity-cli
 	// summary-mode sessions (transcript fidelity) and sessions on an
 	// unrecognized schema across both Antigravity agents (decode confidence).
-	row := conn.QueryRow(
-		"SELECT " +
-			"COUNT(*) FILTER (WHERE agent = 'antigravity-cli'), " +
-			"COUNT(*) FILTER (WHERE agent = 'antigravity-cli' " +
-			"AND transcript_fidelity = 'summary'), " +
-			"COUNT(*) FILTER (WHERE agent IN ('antigravity', 'antigravity-cli') " +
-			"AND source_version LIKE 'agy-schema:%') " +
+	row := conn.QueryRowContext(ctx,
+		"SELECT "+
+			"COUNT(*) FILTER (WHERE agent = 'antigravity-cli'), "+
+			"COUNT(*) FILTER (WHERE agent = 'antigravity-cli' "+
+			"AND transcript_fidelity = 'summary'), "+
+			"COUNT(*) FILTER (WHERE agent IN ('antigravity', 'antigravity-cli') "+
+			"AND source_version LIKE 'agy-schema:%') "+
 			"FROM sessions",
 	)
 	var total, summary, unknownSchema int
@@ -180,15 +187,37 @@ func inspectDoctorDB(path string) doctorDBInspection {
 	insp.AntigravityCLITotal = total
 	insp.AntigravityCLISummary = summary
 	insp.AntigravityUnknownSchema = unknownSchema
+
+	// Sessions with current quality signals but no persisted secret
+	// scan: the signature of a findings write that failed mid-sequence
+	// under a binary predating the findings-before-signals write
+	// ordering. The filtered signals backfill deliberately does not
+	// revisit them (see db.BackfillSignals), so surface them here.
+	if err := conn.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM sessions
+		 WHERE quality_signal_version >= ?
+		   AND secrets_rules_version = ''
+		   AND message_count > 0
+		   AND deleted_at IS NULL`,
+		db.CurrentQualitySignalVersion,
+	).Scan(&insp.MissingSecretScans); err != nil {
+		insp.MissingSecretScansErr = err
+		return insp
+	}
 	return insp
 }
 
+// doctorReadOnlyDSN builds a read-only sqlite3 DSN. The file: scheme is
+// required for mattn/go-sqlite3 to honor mode=ro (a bare path silently opens
+// read-write), and the path is percent-encoded so `%`, `?`, or `#` in a real
+// path cannot be misparsed as URI syntax.
 func doctorReadOnlyDSN(path string) string {
 	params := url.Values{}
 	params.Set("mode", "ro")
 	params.Set("_busy_timeout", "5000")
 	params.Set("_foreign_keys", "ON")
-	return path + "?" + params.Encode()
+	escaped := (&url.URL{Path: path}).EscapedPath()
+	return "file:" + escaped + "?" + params.Encode()
 }
 
 func listDoctorResyncTempFiles(dbPath string) []string {
@@ -307,11 +336,30 @@ func writeDoctorSyncReport(w io.Writer, report doctorSyncReport) {
 	writeDoctorSessionCounts(w, report)
 	writeDoctorSummaryMode(w, report)
 	writeDoctorUnknownSchema(w, report)
+	writeDoctorMissingSecretScans(w, report)
+	writeDoctorTraeEncryptedLayouts(w, report)
 	writeDoctorTempFiles(w, report.TempFiles)
 	writeDoctorAgentRoots(w, report.AgentRoots)
 	writeDoctorDebugEvidence(w, report)
 	fmt.Fprintf(w, "Likely cause: %s\n",
 		doctorLikelyCause(report, currentVersion))
+}
+
+func writeDoctorTraeEncryptedLayouts(w io.Writer, report doctorSyncReport) {
+	for _, root := range report.TraeEncryptedRoots {
+		fmt.Fprintf(w, "Trae: unsupported encrypted transcript layout detected at %s\n", root)
+		fmt.Fprintln(w, "  -> legacy inline-message parsing is supported; modern encrypted transcripts are not readable")
+	}
+}
+
+func collectDoctorTraeEncryptedRoots(ctx context.Context, roots []doctorAgentRoot) []string {
+	var detected []string
+	for _, root := range roots {
+		if root.Agent == parser.AgentTrae && root.Exists && parser.TraeEncryptedLayoutDetected(ctx, root.Path) {
+			detected = append(detected, root.Path)
+		}
+	}
+	return detected
 }
 
 func doctorStartupDecision(
@@ -379,6 +427,25 @@ func writeDoctorUnknownSchema(w io.Writer, report doctorSyncReport) {
 			"  -> a newer Antigravity build changed the schema; "+
 			"the decode is heuristic and may be incomplete\n",
 		report.AntigravityUnknownSchema)
+}
+
+// writeDoctorMissingSecretScans surfaces sessions whose quality
+// signals are current but whose secret findings were never persisted.
+// It stays silent on a clean archive or when the count query failed.
+// Detection is partial by design: a session whose earlier findings
+// write succeeded before a later one failed keeps a stale non-empty
+// rules version and is indistinguishable from a legitimately old scan.
+func writeDoctorMissingSecretScans(w io.Writer, report doctorSyncReport) {
+	if report.MissingSecretScansErr != nil ||
+		report.MissingSecretScans == 0 {
+		return
+	}
+	fmt.Fprintf(w,
+		"%d session(s) have current quality signals but no persisted "+
+			"secret scan\n"+
+			"  -> a findings write likely failed under an older version; "+
+			"run \"agentsview secrets scan\" to rescan and persist findings\n",
+		report.MissingSecretScans)
 }
 
 func writeDoctorTempFiles(w io.Writer, files []string) {
@@ -453,7 +520,10 @@ func doctorLikelyCause(
 		return "SQLite user_version is stale; inspect debug.log for resync aborts or failures"
 	}
 	if *report.UserVersion > currentVersion {
-		return "SQLite user_version is newer than this binary. Run \"agentsview update\" or install the latest AgentsView release before serving or syncing"
+		return fmt.Sprintf(
+			"SQLite user_version is newer than this binary. Use an AgentsView build with data version %d or newer, or restore an archive backup compatible with data version %d",
+			*report.UserVersion, currentVersion,
+		)
 	}
 	return "data-version resync is not expected; Running initial sync... is normal incremental startup work"
 }

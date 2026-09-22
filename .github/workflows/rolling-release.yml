@@ -52,8 +52,11 @@ jobs:
           rm -rf internal/web/dist
           cp -r frontend/dist internal/web/dist
 
-      - name: Restore pricing snapshot
-        run: go run ./internal/pricing/cmd/litellm-snapshot -restore
+      # `make pricing-snapshot` also stages the go-sqlite3 amalgamation
+      # header that the sqlite-vec cgo bindings include, which a bare
+      # `go build` cannot find.
+      - name: Restore pricing snapshot and stage the sqlite header
+        run: make pricing-snapshot
 
       - name: Build
         shell: bash
@@ -61,6 +64,7 @@ jobs:
           GOOS: linux
           GOARCH: amd64
           CGO_ENABLED: "1"
+          CGO_CFLAGS: -O2 -g -I${{ github.workspace }}/.sqlite-include
         run: |
           VERSION=$(git describe --tags --always)
           COMMIT=${GITHUB_SHA::8}
@@ -114,8 +118,11 @@ jobs:
           rm -rf internal/web/dist
           cp -r frontend/dist internal/web/dist
 
-      - name: Restore pricing snapshot
-        run: go run ./internal/pricing/cmd/litellm-snapshot -restore
+      # `make pricing-snapshot` also stages the go-sqlite3 amalgamation
+      # header that the sqlite-vec cgo bindings include, which a bare
+      # `go build` cannot find.
+      - name: Restore pricing snapshot and stage the sqlite header
+        run: make pricing-snapshot
 
       - name: Setup MinGW
         uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884  # v2
@@ -131,6 +138,7 @@ jobs:
           GOOS: windows
           GOARCH: amd64
           CGO_ENABLED: "1"
+          CGO_CFLAGS: -O2 -g -I${{ github.workspace }}/.sqlite-include
         run: |
           VERSION=$(git describe --tags --always)
           COMMIT=${GITHUB_SHA::8}

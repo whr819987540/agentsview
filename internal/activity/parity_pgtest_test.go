@@ -1,24 +1,23 @@
-//go:build pgtest
+//go:build pgtest || chtest
 
 // This parity test proves that GetActivityReport returns an identical
-// activity.Report from all three storage backends (SQLite, PostgreSQL,
-// DuckDB) given the same underlying data. One SQLite fixture is built, then
-// pushed to PostgreSQL and DuckDB through the production push paths
-// (postgres.Sync / duckdb.Sync). All three stores are queried with the same
-// filter and date and the resulting reports are deep-compared.
+// activity.Report from the storage backends (SQLite, PostgreSQL, DuckDB,
+// ClickHouse) given the same underlying data. One SQLite fixture is built,
+// then pushed through the production push paths. Backends that are not
+// configured for this run are skipped: PostgreSQL needs TEST_PG_URL,
+// ClickHouse needs TEST_CLICKHOUSE_URL. DuckDB is always compared.
 //
 // It lives in internal/activity as an EXTERNAL test package
 // (activity_test) rather than inside any backend package: postgres, duckdb,
-// and db all import activity, so an internal activity test that imported
-// them would form an import cycle. An external _test package is compiled
-// separately and may import all three backends -- activity_test -> {db,
-// postgres, duckdb} -> activity is acyclic. The pgtest build tag keeps it
-// out of the package's default, backend-free test runs.
+// clickhouse, and db all import activity, so an internal activity test that
+// imported them would form an import cycle. An external _test package is
+// compiled separately and may import all backends. The pgtest and chtest
+// tags keep it out of the package's default, backend-free test runs.
 package activity_test
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/v2"
 	"os"
 	"path/filepath"
 	"sort"
@@ -28,9 +27,13 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"go.kenn.io/agentsview/internal/activity"
+	clickhousestore "go.kenn.io/agentsview/internal/clickhouse"
+	"go.kenn.io/agentsview/internal/clickhouse/chtest"
 	"go.kenn.io/agentsview/internal/db"
 	duckdbstore "go.kenn.io/agentsview/internal/duckdb"
+	"go.kenn.io/agentsview/internal/money"
 	postgresstore "go.kenn.io/agentsview/internal/postgres"
+	"go.kenn.io/agentsview/internal/storage"
 )
 
 // parityDate is a calendar day safely in the past relative to any realistic
@@ -58,11 +61,20 @@ type parityFixtureSession struct {
 	// token_usage with the given outputTokens so they contribute cost.
 	events       []parityEvent
 	outputTokens int
+	// relationship overrides the session's relationship_type ("" means
+	// "root"); parent sets parent_session_id when non-empty. Subagent and
+	// fork sessions must count in every backend's report so the cost
+	// totals match daily usage.
+	relationship string
+	parent       string
 }
 
 type parityEvent struct {
 	role string
 	ts   string
+	// toolCompletedAt adds one tool execution whose start is this message's
+	// timestamp and whose completion is a non-transcript activity event.
+	toolCompletedAt string
 	// model and outputTokens override the session defaults for this one
 	// assistant message. They exist so the fixture can inject an
 	// ineligible (synthetic-model) usage row that every backend must
@@ -120,8 +132,10 @@ func parityFixture() []parityFixtureSession {
 				// tokens. If any backend (notably DuckDB, which inlines its own
 				// usage CTE) failed to exclude it, that backend's totals would
 				// diverge and the deep-compare below would fail.
-				{role: "assistant", ts: parityDate + "T14:06:00Z",
-					model: "<synthetic>", outputTokens: 9999},
+				{
+					role: "assistant", ts: parityDate + "T14:06:00Z",
+					model: "<synthetic>", outputTokens: 9999,
+				},
 			},
 		},
 		{
@@ -135,16 +149,20 @@ func parityFixture() []parityFixtureSession {
 			id: "parity-d", project: "gamma", model: "model-x",
 			outputTokens: 500,
 			events: []parityEvent{
-				{role: "assistant", ts: parityDate + "T11:00:00Z",
-					claudeMessageID: "dup-m", claudeRequestID: "dup-r"},
+				{
+					role: "assistant", ts: parityDate + "T11:00:00Z",
+					claudeMessageID: "dup-m", claudeRequestID: "dup-r",
+				},
 			},
 		},
 		{
 			id: "parity-e", project: "gamma", model: "model-x",
 			outputTokens: 9000,
 			events: []parityEvent{
-				{role: "assistant", ts: parityDate + "T11:00:00.123Z",
-					claudeMessageID: "dup-m", claudeRequestID: "dup-r"},
+				{
+					role: "assistant", ts: parityDate + "T11:00:00.123Z",
+					claudeMessageID: "dup-m", claudeRequestID: "dup-r",
+				},
 			},
 		},
 		{
@@ -157,6 +175,91 @@ func parityFixture() []parityFixtureSession {
 				{role: "assistant", ts: parityDate + "T12:00:00Z"},
 			},
 		},
+		{
+			// Tool completion is stored outside the transcript. Every backend
+			// must include it in activity without adding a message row.
+			id: "parity-tool", project: "tools", model: "model-x",
+			events: []parityEvent{
+				{role: "user", ts: parityDate + "T15:00:00Z"},
+				{
+					role: "assistant", ts: parityDate + "T15:01:00Z",
+					toolCompletedAt: parityDate + "T15:02:00Z",
+				},
+			},
+		},
+		{
+			// A completion between transcript messages resets the gap cap before
+			// the later message without double-counting the message interval.
+			id: "parity-tool-inline", project: "tools", model: "model-x",
+			events: []parityEvent{
+				{role: "user", ts: parityDate + "T15:10:00Z"},
+				{
+					role: "assistant", ts: parityDate + "T15:11:00Z",
+					toolCompletedAt: parityDate + "T15:20:00Z",
+				},
+				{role: "assistant", ts: parityDate + "T15:21:00Z"},
+			},
+		},
+		{
+			// A completion just after the report range closes the final message;
+			// aggregation clips the interval at the range boundary. The session
+			// summary predates the terminal event, as real provider metadata can.
+			id: "parity-tool-boundary", project: "tools", model: "model-x",
+			events: []parityEvent{
+				{
+					role: "assistant", ts: parityDate + "T23:59:00Z",
+					toolCompletedAt: "2026-06-15T00:01:00Z",
+				},
+			},
+		},
+		{
+			// Subagent of parity-a: a usage-only single message. Its tokens
+			// must count in every backend (the report includes subagent
+			// sessions so its cost matches daily usage) and its session row
+			// must appear in BySession.
+			id: "parity-sub", project: "alpha", model: "model-x",
+			outputTokens: 250, relationship: "subagent", parent: "parity-a",
+			events: []parityEvent{
+				{role: "assistant", ts: parityDate + "T10:03:30Z"},
+			},
+		},
+		{
+			// Fork of parity-a with a unique-keyed usage row: a rewound
+			// branch's messages are real spend that daily usage counts, so
+			// every backend must count its tokens and list its session row.
+			id: "parity-fork", project: "alpha", model: "model-x",
+			outputTokens: 9000, relationship: "fork", parent: "parity-a",
+			events: []parityEvent{
+				{role: "assistant", ts: parityDate + "T10:09:00Z"},
+			},
+		},
+		{
+			// Fork replaying parity-a's dedup key (same Claude pair as the
+			// parity-d/parity-e pair but scoped to this fork): its usage row
+			// must collapse in every backend's dedup, contributing a session
+			// row but no tokens or cost.
+			id: "parity-fork-replay", project: "gamma", model: "model-x",
+			outputTokens: 7777, relationship: "fork", parent: "parity-d",
+			events: []parityEvent{
+				{
+					role: "assistant", ts: parityDate + "T11:00:02Z",
+					claudeMessageID: "dup-m", claudeRequestID: "dup-r",
+				},
+			},
+		},
+		{
+			// Candidate starts on both sides of the report boundary. The first
+			// row is just outside the safe left pruning bound; the last successor
+			// is beyond the right bound and must still close its predecessor.
+			id: "parity-edge", project: "edges", model: "model-x",
+			events: []parityEvent{
+				{role: "user", ts: "2026-06-13T23:54:59Z"},
+				{role: "assistant", ts: "2026-06-13T23:59:30Z"},
+				{role: "user", ts: parityDate + "T00:00:30Z"},
+				{role: "user", ts: parityDate + "T23:59:00Z"},
+				{role: "assistant", ts: "2026-06-15T00:20:00Z"},
+			},
+		},
 	}
 }
 
@@ -166,35 +269,43 @@ func parityFixture() []parityFixtureSession {
 // would push.
 func seedParitySQLite(t *testing.T) *db.DB {
 	t.Helper()
-	local, err := db.Open(filepath.Join(t.TempDir(), "parity.sqlite"))
+	local, err := db.Open(t.Context(), filepath.Join(t.TempDir(), "parity.sqlite"))
 	require.NoError(t, err, "opening sqlite fixture")
 	t.Cleanup(func() { require.NoError(t, local.Close()) })
 
 	// Explicit pricing for both models so all three backends price the same
 	// token amounts identically (the syncs copy model_pricing to PG/DuckDB).
 	require.NoError(t, local.UpsertModelPricing([]db.ModelPricing{
-		{ModelPattern: "model-x", InputPerMTok: 3, OutputPerMTok: 15,
-			CacheCreationPerMTok: 3.75, CacheReadPerMTok: 0.3},
-		{ModelPattern: "model-y", InputPerMTok: 1, OutputPerMTok: 5,
-			CacheCreationPerMTok: 1.25, CacheReadPerMTok: 0.1},
+		{
+			ModelPattern: "model-x", InputPerMTok: money.MustParseDollars("3"), OutputPerMTok: money.MustParseDollars("15"),
+			CacheCreationPerMTok: money.MustParseDollars("3.75"), CacheReadPerMTok: money.MustParseDollars("0.3"),
+		},
+		{
+			ModelPattern: "model-y", InputPerMTok: money.MustParseDollars("1"), OutputPerMTok: money.MustParseDollars("5"),
+			CacheCreationPerMTok: money.MustParseDollars("1.25"), CacheReadPerMTok: money.MustParseDollars("0.1"),
+		},
 	}), "seeding pricing")
 
 	var writes []db.SessionBatchWrite
 	for _, fs := range parityFixture() {
 		writes = append(writes, paritySessionWrite(fs))
 	}
-	_, err = local.WriteSessionBatchAtomic(writes)
+	_, err = local.WriteSessionBatchAtomic(t.Context(), writes)
 	require.NoError(t, err, "writing fixture sessions")
 	return local
 }
 
 // paritySessionWrite turns one fixture session into a SessionBatchWrite. The
-// session window spans its first and last event; assistant messages carry the
-// model and token_usage so they feed the usage path.
+// session window spans its first and last transcript event; assistant messages
+// carry the model and token_usage so they feed the usage path.
 func paritySessionWrite(fs parityFixtureSession) db.SessionBatchWrite {
 	first := fs.events[0].ts
 	last := fs.events[len(fs.events)-1].ts
 	firstMsg := "parity " + fs.id
+	relationship := fs.relationship
+	if relationship == "" {
+		relationship = "root"
+	}
 	sess := db.Session{
 		ID:               fs.id,
 		Project:          fs.project,
@@ -207,8 +318,12 @@ func paritySessionWrite(fs parityFixtureSession) db.SessionBatchWrite {
 		LocalModifiedAt:  &first,
 		MessageCount:     len(fs.events),
 		UserMessageCount: 1,
-		RelationshipType: "root",
+		RelationshipType: relationship,
 		DataVersion:      1,
+	}
+	if fs.parent != "" {
+		parent := fs.parent
+		sess.ParentSessionID = &parent
 	}
 	msgs := make([]db.Message, 0, len(fs.events))
 	for i, ev := range fs.events {
@@ -244,6 +359,26 @@ func paritySessionWrite(fs parityFixtureSession) db.SessionBatchWrite {
 			m.OutputTokens = outputTokens
 			m.HasOutputTokens = true
 		}
+		if ev.toolCompletedAt != "" {
+			m.HasToolUse = true
+			m.ToolCalls = []db.ToolCall{{
+				SessionID: fs.id,
+				ToolName:  "sample_tool",
+				Category:  "Other",
+				ToolUseID: fs.id + "-tool",
+				CallIndex: 0,
+				ResultEvents: []db.ToolResultEvent{
+					{
+						ToolUseID: fs.id + "-tool", Source: "tool_execution",
+						Status: "started", Timestamp: ev.ts, EventIndex: 0,
+					},
+					{
+						ToolUseID: fs.id + "-tool", Source: "tool_execution",
+						Status: "completed", Timestamp: ev.toolCompletedAt, EventIndex: 1,
+					},
+				},
+			}}
+		}
 		msgs = append(msgs, m)
 	}
 	return db.SessionBatchWrite{
@@ -270,7 +405,7 @@ func pushParityPostgres(
 
 	ps, err := postgresstore.New(
 		pgURL, paritySchema, local, "parity-machine", true,
-		postgresstore.SyncOptions{},
+		storage.PusherOptions{},
 	)
 	require.NoError(t, err, "creating pg sync")
 	t.Cleanup(func() { require.NoError(t, ps.Close()) })
@@ -297,24 +432,53 @@ func dropParitySchema(t *testing.T, pgURL string) {
 }
 
 // pushParityDuckDB pushes the SQLite fixture to a DuckDB mirror via the
-// production Sync and returns a read-only DuckDB store over the same
-// connection.
+// production Push entry point and returns a read-only DuckDB store over
+// the built mirror file.
 func pushParityDuckDB(
 	t *testing.T, ctx context.Context, local *db.DB,
 ) *duckdbstore.Store {
 	t.Helper()
 	target := filepath.Join(t.TempDir(), "parity.duckdb")
-	syncer, err := duckdbstore.New(
-		target, local, "parity-machine", duckdbstore.SyncOptions{})
-	require.NoError(t, err, "creating duckdb sync")
-	t.Cleanup(func() { require.NoError(t, syncer.Close()) })
-
-	res, err := syncer.Push(ctx, true, nil)
+	res, err := duckdbstore.Push(
+		ctx, target, local, "parity-machine",
+		storage.MirrorPushOptions{}, true, nil,
+	)
 	require.NoError(t, err, "pushing to duckdb")
 	require.Equal(t, len(parityFixture()), res.SessionsPushed,
 		"duckdb sessions pushed")
 
-	return duckdbstore.NewStoreFromDB(syncer.DB())
+	store, err := duckdbstore.NewStore(ctx, target)
+	require.NoError(t, err, "opening duckdb store")
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	return store
+}
+
+// pushParityClickHouse pushes the SQLite fixture to a fresh ClickHouse
+// database via the production Sync and returns a read-only store. It
+// returns nil when TEST_CLICKHOUSE_URL is unset so PostgreSQL-only runs
+// do not skip.
+func pushParityClickHouse(
+	t *testing.T, ctx context.Context, local *db.DB,
+) *clickhousestore.Store {
+	t.Helper()
+	if os.Getenv("TEST_CLICKHOUSE_URL") == "" {
+		return nil
+	}
+	dsn, database := chtest.FreshDatabase(t)
+	target := clickhousestore.Target{URL: dsn, Database: database}
+	syncer, err := clickhousestore.New(
+		ctx, target, local, "parity-machine", storage.PusherOptions{},
+	)
+	require.NoError(t, err, "creating clickhouse sync")
+	t.Cleanup(func() { require.NoError(t, syncer.Close()) })
+	res, err := syncer.Push(ctx, true, nil)
+	require.NoError(t, err, "pushing to clickhouse")
+	require.Equal(t, len(parityFixture()), res.SessionsPushed,
+		"clickhouse sessions pushed")
+	store, err := clickhousestore.NewStore(ctx, target)
+	require.NoError(t, err, "opening clickhouse store")
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	return store
 }
 
 // canonicalizeReport sorts the report's order-unspecified slices by a stable
@@ -353,10 +517,16 @@ func TestGetActivityReportParityAcrossBackends(t *testing.T) {
 	ctx := context.Background()
 	local := seedParitySQLite(t)
 
-	// Materialize PG first: it skips the whole test when TEST_PG_URL is unset,
-	// so we avoid building the DuckDB mirror needlessly on a skip.
-	pgStore := pushParityPostgres(t, ctx, local)
+	var pgStore *postgresstore.Store
+	if os.Getenv("TEST_PG_URL") != "" {
+		pgStore = pushParityPostgres(t, ctx, local)
+	}
+	chStore := pushParityClickHouse(t, ctx, local)
+	if pgStore == nil && chStore == nil {
+		t.Skip("TEST_PG_URL and TEST_CLICKHOUSE_URL are unset; skipping cross-backend parity")
+	}
 	duckStore := pushParityDuckDB(t, ctx, local)
+	assertCandidateParity(t, ctx, local, pgStore, duckStore, chStore)
 
 	fixedNow, err := time.Parse(time.RFC3339, "2030-01-01T00:00:00Z")
 	require.NoError(t, err, "parsing fixed now")
@@ -368,24 +538,29 @@ func TestGetActivityReportParityAcrossBackends(t *testing.T) {
 		// A single past day -> minute (5m) buckets; carries the full fixture
 		// activity and the fixture-sanity assertions below.
 		{"day-minute", activity.QueryInput{
-			Preset: "day", Date: parityDate, Timezone: "UTC"}},
+			Preset: "day", Date: parityDate, Timezone: "UTC",
+		}},
 		// A 3-day range -> hourly buckets.
 		{"three-day-hourly", activity.QueryInput{
 			Preset: "custom", Timezone: "UTC",
-			From: "2026-06-12T00:00:00Z", To: "2026-06-15T00:00:00Z"}},
+			From: "2026-06-12T00:00:00Z", To: "2026-06-15T00:00:00Z",
+		}},
 		// A 30-day range -> daily calendar buckets.
 		{"thirty-day-daily", activity.QueryInput{
 			Preset: "custom", Timezone: "UTC",
-			From: "2026-05-16T00:00:00Z", To: "2026-06-15T00:00:00Z"}},
+			From: "2026-05-16T00:00:00Z", To: "2026-06-15T00:00:00Z",
+		}},
 		// A custom sub-day window that slices into the fixture's morning.
 		{"custom-subday", activity.QueryInput{
 			Preset: "custom", Timezone: "UTC",
-			From: parityDate + "T09:30:00Z", To: parityDate + "T15:00:00Z"}},
+			From: parityDate + "T09:30:00Z", To: parityDate + "T15:00:00Z",
+		}},
 		// A NY month spanning the March 8 2026 DST transition. The fixture has
 		// no March activity, so this asserts every backend produces identical
 		// empty aggregation over identical DST-aware calendar bucket boundaries.
 		{"dst-month-ny", activity.QueryInput{
-			Preset: "month", Date: "2026-03-14", Timezone: "America/New_York"}},
+			Preset: "month", Date: "2026-03-14", Timezone: "America/New_York",
+		}},
 	}
 
 	for _, tc := range cases {
@@ -395,12 +570,166 @@ func TestGetActivityReportParityAcrossBackends(t *testing.T) {
 			filter := db.AnalyticsFilter{Timezone: tc.input.Timezone}
 
 			sqliteReport := assertParityForCase(t, ctx, q, filter,
-				local, pgStore, duckStore)
+				local, pgStore, duckStore, chStore)
 
 			if tc.name == "day-minute" {
 				assertDayMinuteFixtureSanity(t, sqliteReport)
 			}
 		})
+	}
+}
+
+func TestGetActivityReportIncludesTerminalAfterSessionEndAcrossBackends(
+	t *testing.T,
+) {
+	ctx := context.Background()
+	local := seedParitySQLite(t)
+	var pgStore *postgresstore.Store
+	if os.Getenv("TEST_PG_URL") != "" {
+		pgStore = pushParityPostgres(t, ctx, local)
+	}
+	chStore := pushParityClickHouse(t, ctx, local)
+	if pgStore == nil && chStore == nil {
+		t.Skip("TEST_PG_URL and TEST_CLICKHOUSE_URL are unset; skipping cross-backend parity")
+	}
+	duckStore := pushParityDuckDB(t, ctx, local)
+
+	q, err := activity.ResolveQuery(activity.QueryInput{
+		Preset: "day", Date: "2026-06-15", Timezone: "UTC",
+	}, time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC))
+	require.NoError(t, err)
+	filter := db.AnalyticsFilter{Timezone: "UTC"}
+
+	sqliteReport, err := local.GetActivityReport(ctx, filter, q)
+	require.NoError(t, err)
+	duckReport, err := duckStore.GetActivityReport(ctx, filter, q)
+	require.NoError(t, err)
+
+	reports := []struct {
+		name   string
+		report activity.Report
+	}{
+		{name: "sqlite", report: sqliteReport},
+		{name: "duckdb", report: duckReport},
+	}
+	if pgStore != nil {
+		pgReport, err := pgStore.GetActivityReport(ctx, filter, q)
+		require.NoError(t, err)
+		reports = append(reports, struct {
+			name   string
+			report activity.Report
+		}{name: "postgres", report: pgReport})
+	}
+	if chStore != nil {
+		chReport, err := chStore.GetActivityReport(ctx, filter, q)
+		require.NoError(t, err)
+		reports = append(reports, struct {
+			name   string
+			report activity.Report
+		}{name: "clickhouse", report: chReport})
+	}
+	for _, backend := range reports {
+		t.Run(backend.name, func(t *testing.T) {
+			bySession := make(map[string]activity.SessionRow,
+				len(backend.report.BySession))
+			for _, session := range backend.report.BySession {
+				bySession[session.SessionID] = session
+			}
+			require.Contains(t, bySession, "parity-tool-boundary")
+			row := bySession["parity-tool-boundary"]
+			require.NotNil(t, row.AgentMinutes)
+			require.InDelta(t, 1.0, *row.AgentMinutes, 1e-9,
+				"terminal completion after ended_at must close next-day activity")
+		})
+	}
+}
+
+func assertCandidateParity(
+	t *testing.T, ctx context.Context,
+	local *db.DB, pgStore *postgresstore.Store, duckStore *duckdbstore.Store,
+	chStore *clickhousestore.Store,
+) {
+	t.Helper()
+	q, err := activity.ResolveQuery(activity.QueryInput{
+		Preset: "day", Date: parityDate, Timezone: "UTC",
+	}, time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC))
+	require.NoError(t, err)
+
+	fixture := parityFixture()
+	ids := make([]string, 0, len(fixture))
+	events := make([]activity.ActivityEvent, 0)
+	for _, session := range fixture {
+		ids = append(ids, session.id)
+		for ordinal, event := range session.events {
+			model := ""
+			if event.role == "assistant" {
+				model = session.model
+				if event.model != "" {
+					model = event.model
+				}
+			}
+			events = append(events, activity.ActivityEvent{
+				SessionID: session.id, Ordinal: ordinal, Role: event.role,
+				Timestamp: event.ts, Model: model,
+			})
+		}
+	}
+	want := activity.PairActivityEvents(
+		events, q.RangeStart, q.EffectiveEnd,
+		time.Duration(q.GapCapSeconds)*time.Second,
+	)
+	want = append(want, activity.IntervalCandidate{
+		SessionID:    "parity-tool",
+		StartOrdinal: 1,
+		EndOrdinal:   1,
+		Start:        time.Date(2026, 6, 14, 15, 1, 0, 0, time.UTC),
+		End:          time.Date(2026, 6, 14, 15, 2, 0, 0, time.UTC),
+		ClosingRole:  "tool",
+		PriorModel:   "model-x",
+	}, activity.IntervalCandidate{
+		SessionID:    "parity-tool-inline",
+		StartOrdinal: 1,
+		EndOrdinal:   2,
+		Start:        time.Date(2026, 6, 14, 15, 20, 0, 0, time.UTC),
+		End:          time.Date(2026, 6, 14, 15, 21, 0, 0, time.UTC),
+		ClosingRole:  "assistant",
+		ClosingModel: "model-x",
+		PriorModel:   "model-x",
+	}, activity.IntervalCandidate{
+		SessionID:    "parity-tool-boundary",
+		StartOrdinal: 0,
+		EndOrdinal:   0,
+		Start:        time.Date(2026, 6, 14, 23, 59, 0, 0, time.UTC),
+		End:          time.Date(2026, 6, 15, 0, 1, 0, 0, time.UTC),
+		ClosingRole:  "tool",
+		PriorModel:   "model-x",
+	})
+	sort.Slice(want, func(i, j int) bool {
+		if !want[i].Start.Equal(want[j].Start) {
+			return want[i].Start.Before(want[j].Start)
+		}
+		if want[i].SessionID != want[j].SessionID {
+			return want[i].SessionID < want[j].SessionID
+		}
+		return want[i].StartOrdinal < want[j].StartOrdinal
+	})
+	collect := func(source activity.CandidateSource) []activity.IntervalCandidate {
+		t.Helper()
+		var candidates []activity.IntervalCandidate
+		require.NoError(t, source(ctx, func(candidate activity.IntervalCandidate) error {
+			candidates = append(candidates, candidate)
+			return nil
+		}))
+		return candidates
+	}
+
+	require.Equal(t, want, collect(local.ActivityReportCandidateSource(ids, q)))
+	if pgStore != nil {
+		require.Equal(t, want, collect(pgStore.ActivityReportCandidateSource(ids, q)))
+	}
+	require.Equal(t, want, collect(duckStore.ActivityReportCandidateSource(ids, q)))
+	if chStore != nil {
+		require.Equal(t, want, collect(chStore.ActivityReportCandidateSource(ids, q)))
 	}
 }
 
@@ -412,59 +741,89 @@ func assertParityForCase(
 	t *testing.T, ctx context.Context, q activity.Query,
 	filter db.AnalyticsFilter,
 	local *db.DB, pgStore *postgresstore.Store, duckStore *duckdbstore.Store,
+	chStore *clickhousestore.Store,
 ) activity.Report {
 	t.Helper()
 
 	sqliteReport, err := local.GetActivityReport(ctx, filter, q)
 	require.NoError(t, err, "sqlite GetActivityReport")
-	pgReport, err := pgStore.GetActivityReport(ctx, filter, q)
-	require.NoError(t, err, "pg GetActivityReport")
 	duckReport, err := duckStore.GetActivityReport(ctx, filter, q)
 	require.NoError(t, err, "duckdb GetActivityReport")
 
 	require.False(t, sqliteReport.Partial, "past range must be complete")
 
 	canonicalizeReport(&sqliteReport)
-	canonicalizeReport(&pgReport)
 	canonicalizeReport(&duckReport)
 
-	require.Equal(t, sqliteReport, pgReport,
-		"SQLite and PostgreSQL activity reports diverge")
 	require.Equal(t, sqliteReport, duckReport,
 		"SQLite and DuckDB activity reports diverge")
+	if pgStore != nil {
+		pgReport, err := pgStore.GetActivityReport(ctx, filter, q)
+		require.NoError(t, err, "pg GetActivityReport")
+		canonicalizeReport(&pgReport)
+		require.Equal(t, sqliteReport, pgReport,
+			"SQLite and PostgreSQL activity reports diverge")
+	}
+	if chStore != nil {
+		chReport, err := chStore.GetActivityReport(ctx, filter, q)
+		require.NoError(t, err, "clickhouse GetActivityReport")
+		canonicalizeReport(&chReport)
+		require.Equal(t, sqliteReport, chReport,
+			"SQLite and ClickHouse activity reports diverge")
+	}
 	return sqliteReport
 }
 
 // assertDayMinuteFixtureSanity checks the day-minute report actually exercises
-// the fixture: a full day with peak concurrency 2, six sessions, non-zero cost,
-// and exactly 4800 output tokens. The token total proves the synthetic-model
-// usage row (9999 tokens) is excluded and the dedup pair collapses to its
-// earlier 500-token row -- not merely that the backends agree on a wrong number
-// -- so the deep-compare above extends those guarantees, plus the zero-cost
-// primary-model fallback, to PG and DuckDB.
+// the fixture: a full day with peak concurrency 2, thirteen sessions, non-zero
+// cost, and exactly 22550 output tokens. The token total proves the
+// synthetic-model usage row (9999 tokens) is excluded, the dedup pair
+// keeps its complete 9000-token snapshot with earlier attribution, the
+// subagent's and unique fork's tokens count, and the replaying fork's do not --
+// not merely that the backends agree on a wrong number. The deep-compare above
+// extends those guarantees, plus the zero-cost primary-model fallback, to PG
+// and DuckDB.
 func assertDayMinuteFixtureSanity(t *testing.T, r activity.Report) {
 	t.Helper()
 	require.False(t, r.Partial, "fixture day must be a full day")
 	require.Equal(t, 2, r.Peak.Agents, "fixture must reach peak concurrency 2")
-	require.Equal(t, 6, r.Totals.Sessions, "fixture session count")
-	require.Greater(t, r.Totals.Cost, 0.0, "fixture must exercise cost")
+	require.Equal(t, 13, r.Totals.Sessions, "fixture session count")
+	require.Positive(t, r.Totals.Cost.Microdollars, "fixture must exercise cost")
 	// 2400 (parity-a) + 1600 (parity-b) + 300 (parity-c; synthetic 9999 row
-	// excluded) + 500 (parity-d wins the dedup) + 0 (parity-e deduped away;
-	// parity-f zero-cost) = 4800.
-	require.Equal(t, 4800, r.Totals.OutputTokens,
-		"synthetic row excluded and the dedup pair collapses to its earlier row")
+	// excluded) + 9000 (parity-d receives parity-e's complete snapshot) +
+	// 0 (parity-e deduped away;
+	// parity-f zero-cost) + 250 (parity-sub) + 9000 (parity-fork, unique)
+	// + 0 (parity-fork-replay deduped away) = 22550.
+	require.Equal(t, 22550, r.Totals.OutputTokens,
+		"synthetic row excluded, dedup collapses, subagent and unique fork count")
 
 	bySession := map[string]activity.SessionRow{}
 	for _, s := range r.BySession {
 		bySession[s.SessionID] = s
 	}
+	require.Contains(t, bySession, "parity-sub",
+		"subagent session must appear in the report")
+	require.Contains(t, bySession, "parity-fork",
+		"fork session must appear in the report")
+	require.Equal(t, 9000, bySession["parity-fork"].OutputTokens,
+		"unique fork usage counts toward the report")
+	require.Contains(t, bySession, "parity-fork-replay",
+		"replaying fork still appears as a session row")
+	require.Equal(t, 0, bySession["parity-fork-replay"].OutputTokens,
+		"replayed fork usage dedups away")
 	require.Contains(t, bySession, "parity-d")
 	require.Contains(t, bySession, "parity-e")
 	require.Contains(t, bySession, "parity-f")
-	require.Equal(t, 500, bySession["parity-d"].OutputTokens,
-		"dedup keeps the earlier whole-second duplicate's tokens")
+	require.Equal(t, 9000, bySession["parity-d"].OutputTokens,
+		"complete snapshot is attributed to the earlier session")
 	require.Equal(t, 0, bySession["parity-e"].OutputTokens,
 		"the later fractional duplicate is dropped")
 	require.Equal(t, "model-x", bySession["parity-f"].PrimaryModel,
 		"zero-cost usage still reports its known model as primary")
+	require.NotNil(t, bySession["parity-tool-inline"].AgentMinutes)
+	require.InDelta(t, 7.0, *bySession["parity-tool-inline"].AgentMinutes, 1e-9,
+		"inline completion resets the gap cap before the final message")
+	require.NotNil(t, bySession["parity-tool-boundary"].AgentMinutes)
+	require.InDelta(t, 1.0, *bySession["parity-tool-boundary"].AgentMinutes, 1e-9,
+		"post-range completion closes the final in-range message")
 }

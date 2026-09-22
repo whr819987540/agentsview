@@ -35,9 +35,9 @@ const (
 	// sidecar); differences are expected and not parser drift.
 	DiffNeedsRetry DiffClass = "transient_needs_retry"
 	// DiffSkipped: a stored session whose source was never re-parsed.
-	// Reason says why: source missing (archive-only), remote session,
-	// trashed, import-only agent, database-backed agent, not sampled
-	// (--limit), or not discovered.
+	// Reason says why: source missing (archive-only), policy-preserved by the
+	// CWD filter, remote session, trashed, import-only agent, database-backed
+	// agent, not sampled (--limit), or not discovered.
 	DiffSkipped DiffClass = "skipped"
 	// DiffRaced: the comparison detected a non-informational change, but
 	// the on-disk source file's mtime advanced past the snapshot's stored
@@ -127,6 +127,9 @@ const (
 	// column is deliberately not compared: it is rewritten from the
 	// mutable worktree_project_mappings table, so its parser-owned input
 	// (cwd) is compared instead.
+	FieldAgentLabel           = "agent_label"
+	FieldEntrypoint           = "entrypoint"
+	FieldSessionKind          = "session_kind"
 	FieldCwd                  = "cwd"
 	FieldGitBranch            = "git_branch"
 	FieldParentSessionID      = "parent_session_id"

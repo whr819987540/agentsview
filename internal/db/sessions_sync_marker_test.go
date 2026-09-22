@@ -1,0 +1,477 @@
+//go:build fts5
+
+package db
+
+import (
+	"encoding/json"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+type usageVersion struct {
+	revision string
+	marker   string
+}
+
+func readUsageVersion(t *testing.T, database *DB, id string) usageVersion {
+	t.Helper()
+	var got usageVersion
+	require.NoError(t, database.getReader().QueryRow(t.Context(),
+		`SELECT transcript_revision, sync_marker FROM sessions WHERE id = ?`, id,
+	).Scan(&got.revision, &got.marker))
+	return got
+}
+
+func freezeUsageVersionSignals(t *testing.T, database *DB, id string) usageVersion {
+	t.Helper()
+	_, err := database.getWriter().Exec(t.Context(),
+		`UPDATE sessions
+		 SET created_at = '2026-07-01T10:00:00.000Z',
+		     local_modified_at = '2026-07-01T10:00:00.000Z',
+		     started_at = NULL, ended_at = NULL, file_mtime = 0
+		 WHERE id = ?`, id,
+	)
+	require.NoError(t, err)
+	return readUsageVersion(t, database, id)
+}
+
+func usageVersionMessage(id string, tokenUsage string) Message {
+	return Message{
+		SessionID: id, Ordinal: 0, Role: "assistant", Content: "answer",
+		ContentLength: len("answer"), Model: "model-x",
+		TokenUsage: json.RawMessage(tokenUsage),
+	}
+}
+
+func TestMessageMutationAdvancesUsageVersion(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(*testing.T, *DB, string, Message)
+		write func(*testing.T, *DB, string, Message)
+	}{
+		{
+			name: "InsertMessages",
+			setup: func(t *testing.T, d *DB, id string, _ Message) {
+				t.Helper()
+
+				insertSession(t, d, id, "proj")
+			},
+			write: func(t *testing.T, d *DB, _ string, changed Message) {
+				t.Helper()
+
+				require.NoError(t, d.InsertMessages(t.Context(), []Message{changed}))
+			},
+		},
+		{
+			name: "WriteSessionIncremental",
+			setup: func(t *testing.T, d *DB, id string, _ Message) {
+				t.Helper()
+
+				insertSession(t, d, id, "proj")
+			},
+			write: func(t *testing.T, d *DB, id string, changed Message) {
+				t.Helper()
+
+				_, err := d.WriteSessionIncremental(t.Context(),
+					id, []Message{changed}, IncrementalSessionUpdate{},
+				)
+				require.NoError(t, err)
+			},
+		},
+		{
+			name: "ReplaceSessionMessages",
+			setup: func(t *testing.T, d *DB, id string, original Message) {
+				t.Helper()
+
+				insertSession(t, d, id, "proj")
+				insertMessages(t, d, original)
+			},
+			write: func(t *testing.T, d *DB, id string, changed Message) {
+				t.Helper()
+
+				require.NoError(t, d.ReplaceSessionMessages(t.Context(), id, []Message{changed}))
+			},
+		},
+		{
+			name: "ReplaceSessionContent",
+			setup: func(t *testing.T, d *DB, id string, original Message) {
+				t.Helper()
+
+				insertSession(t, d, id, "proj")
+				insertMessages(t, d, original)
+			},
+			write: func(t *testing.T, d *DB, id string, changed Message) {
+				t.Helper()
+
+				require.NoError(t, d.ReplaceSessionContent(t.Context(),
+					id, []Message{changed}, SessionSignalUpdate{}, nil,
+				))
+			},
+		},
+		{
+			name: "WriteSessionBatch",
+			setup: func(t *testing.T, d *DB, id string, original Message) {
+				t.Helper()
+
+				insertSession(t, d, id, "proj")
+				insertMessages(t, d, original)
+			},
+			write: func(t *testing.T, d *DB, id string, changed Message) {
+				t.Helper()
+
+				result, err := d.WriteSessionBatch([]SessionBatchWrite{{
+					Session:  Session{ID: id, Project: "proj", Machine: "m", Agent: "a"},
+					Messages: []Message{changed}, ReplaceMessages: true,
+				}})
+				require.NoError(t, err)
+				require.Equal(t, 1, result.WrittenSessions)
+			},
+		},
+		{
+			name: "WriteSessionBatchAtomic",
+			setup: func(t *testing.T, d *DB, id string, original Message) {
+				t.Helper()
+
+				insertSession(t, d, id, "proj")
+				insertMessages(t, d, original)
+			},
+			write: func(t *testing.T, d *DB, id string, changed Message) {
+				t.Helper()
+
+				result, err := d.WriteSessionBatchAtomic(t.Context(), []SessionBatchWrite{{
+					Session:  Session{ID: id, Project: "proj", Machine: "m", Agent: "a"},
+					Messages: []Message{changed}, ReplaceMessages: true,
+				}})
+				require.NoError(t, err)
+				require.Equal(t, 1, result.WrittenSessions)
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			database := testDB(t)
+			id := "usage-version-" + tc.name
+			original := usageVersionMessage(id, `{"input_tokens":1}`)
+			changed := usageVersionMessage(id, `{"input_tokens":2}`)
+			tc.setup(t, database, id, original)
+			before := freezeUsageVersionSignals(t, database, id)
+
+			tc.write(t, database, id, changed)
+
+			after := readUsageVersion(t, database, id)
+			assert.NotEqual(t, before.revision, after.revision)
+			assert.Greater(t, after.marker, before.marker)
+		})
+	}
+}
+
+func TestMessageNoOpPreservesUsageVersion(t *testing.T) {
+	database := testDB(t)
+	id := "usage-noop-replacement"
+	msg := usageVersionMessage(id, `{"input_tokens":1}`)
+	insertSession(t, database, id, "proj")
+	insertMessages(t, database, msg)
+	before := freezeUsageVersionSignals(t, database, id)
+
+	require.NoError(t, database.ReplaceSessionMessages(t.Context(), id, []Message{msg}))
+
+	assert.Equal(t, before, readUsageVersion(t, database, id))
+}
+
+func TestSyncMarkerMaintainedByTriggers(t *testing.T) {
+	database := testDB(t)
+	ctx := t.Context()
+
+	sess := Session{
+		ID: "sm-1", Project: "p", Machine: "m", Agent: "claude-code",
+		CreatedAt: "2026-07-01T10:00:00.000Z",
+	}
+	require.NoError(t, database.UpsertSession(ctx, sess))
+
+	// UpsertSession does not write created_at (it relies on the schema
+	// DEFAULT for new rows), so backdate it directly the way
+	// TestListSessionsModifiedBetween does, which also exercises the
+	// AFTER UPDATE OF created_at trigger.
+	_, err := database.getWriter().ExecContext(ctx,
+		`UPDATE sessions SET created_at = ? WHERE id = ?`, sess.CreatedAt, "sm-1")
+	require.NoError(t, err)
+
+	var marker string
+	require.NoError(t, database.getReader().QueryRowContext(ctx,
+		`SELECT sync_marker FROM sessions WHERE id = ?`, "sm-1").Scan(&marker))
+	assert.Equal(t, "2026-07-01T10:00:00.000Z", marker)
+
+	// Bumping a later signal advances the marker.
+	_, err = database.getWriter().ExecContext(ctx,
+		`UPDATE sessions SET ended_at = '2026-07-02T09:30:00.000Z' WHERE id = ?`, "sm-1")
+	require.NoError(t, err)
+	require.NoError(t, database.getReader().QueryRowContext(ctx,
+		`SELECT sync_marker FROM sessions WHERE id = ?`, "sm-1").Scan(&marker))
+	assert.Equal(t, "2026-07-02T09:30:00.000Z", marker)
+
+	// file_mtime (ns) participates and wins when newest.
+	_, err = database.getWriter().ExecContext(ctx,
+		`UPDATE sessions SET file_mtime = 1783069200500000000 WHERE id = ?`, "sm-1")
+	require.NoError(t, err)
+	require.NoError(t, database.getReader().QueryRowContext(ctx,
+		`SELECT sync_marker FROM sessions WHERE id = ?`, "sm-1").Scan(&marker))
+	assert.Equal(t, "2026-07-03T09:00:00.500Z", marker)
+}
+
+// TestReplaceSessionUsageEventsAdvancesSyncMarker pins the push-visibility
+// contract for usage-only rewrites: ReplaceSessionUsageEvents must bump
+// local_modified_at so the sync_marker trigger fires and both push targets
+// (PostgreSQL and the DuckDB mirror) re-select the session, even when no
+// session file changed (e.g. a pricing-driven recompute).
+func TestReplaceSessionUsageEventsAdvancesSyncMarker(t *testing.T) {
+	database := testDB(t)
+	ctx := t.Context()
+
+	backdate := func(id string) {
+		t.Helper()
+		_, err := database.getWriter().ExecContext(ctx,
+			`UPDATE sessions SET created_at = '2026-07-01T10:00:00.000Z',
+				local_modified_at = '2026-07-01T10:00:00.000Z'
+			 WHERE id = ?`, id)
+		require.NoError(t, err)
+	}
+	readMarker := func(id string) string {
+		t.Helper()
+		var marker string
+		require.NoError(t, database.getReader().QueryRowContext(ctx,
+			`SELECT sync_marker FROM sessions WHERE id = ?`, id).Scan(&marker))
+		return marker
+	}
+
+	require.NoError(t, database.UpsertSession(ctx, Session{
+		ID: "sm-usage", Project: "p", Machine: "m", Agent: "claude-code",
+	}))
+	backdate("sm-usage")
+	require.Equal(t, "2026-07-01T10:00:00.000Z", readMarker("sm-usage"))
+
+	require.NoError(t, database.ReplaceSessionUsageEvents(ctx, "sm-usage",
+		[]UsageEvent{{Source: "session", Model: "model-x", OutputTokens: 5}}))
+	assert.Greater(t, readMarker("sm-usage"), "2026-07-01T10:00:00.000Z",
+		"replacing usage events must advance sync_marker")
+
+	// A deletion-only rewrite (no new events) is a change too.
+	backdate("sm-usage")
+	require.NoError(t, database.ReplaceSessionUsageEvents(ctx, "sm-usage", nil))
+	assert.Greater(t, readMarker("sm-usage"), "2026-07-01T10:00:00.000Z",
+		"clearing usage events must advance sync_marker")
+}
+
+// TestLinkSubagentSessionsAdvancesSyncMarker pins the push-visibility
+// contract for subagent linking: LinkSubagentSessions writes
+// parent_session_id and relationship_type — both mirrored columns, neither
+// a sync_marker signal — so it must bump local_modified_at, or linking an
+// older session after a push target's cutoff would never re-push it
+// (PostgreSQL and the DuckDB mirror alike).
+func TestLinkSubagentSessionsAdvancesSyncMarker(t *testing.T) {
+	database := testDB(t)
+	ctx := t.Context()
+
+	backdate := func(id string) {
+		t.Helper()
+		_, err := database.getWriter().ExecContext(ctx,
+			`UPDATE sessions SET created_at = '2026-07-01T10:00:00.000Z',
+				local_modified_at = '2026-07-01T10:00:00.000Z'
+			 WHERE id = ?`, id)
+		require.NoError(t, err)
+	}
+	readMarker := func(id string) string {
+		t.Helper()
+		var marker string
+		require.NoError(t, database.getReader().QueryRowContext(ctx,
+			`SELECT sync_marker FROM sessions WHERE id = ?`, id).Scan(&marker))
+		return marker
+	}
+
+	require.NoError(t, database.UpsertSession(ctx, Session{
+		ID: "sm-parent", Project: "p", Machine: "m", Agent: "claude-code",
+	}))
+	require.NoError(t, database.UpsertSession(ctx, Session{
+		ID: "sm-child", Project: "p", Machine: "m", Agent: "claude-code",
+	}))
+	insertMessages(t, database, Message{
+		SessionID:     "sm-parent",
+		Ordinal:       0,
+		Role:          "assistant",
+		Content:       "[Task: run subagent]",
+		ContentLength: 20,
+		HasToolUse:    true,
+		ToolCalls: []ToolCall{{
+			SessionID:         "sm-parent",
+			ToolName:          "Task",
+			Category:          "Task",
+			ToolUseID:         "toolu_link1",
+			SubagentSessionID: "sm-child",
+		}},
+	})
+	backdate("sm-child")
+	require.Equal(t, "2026-07-01T10:00:00.000Z", readMarker("sm-child"))
+
+	require.NoError(t, database.LinkSubagentSessions())
+
+	var parentID, relationship string
+	require.NoError(t, database.getReader().QueryRowContext(ctx,
+		`SELECT parent_session_id, relationship_type
+		 FROM sessions WHERE id = ?`, "sm-child").
+		Scan(&parentID, &relationship))
+	require.Equal(t, "sm-parent", parentID)
+	require.Equal(t, "subagent", relationship)
+	assert.Greater(t, readMarker("sm-child"), "2026-07-01T10:00:00.000Z",
+		"linking a subagent session must advance its sync_marker")
+}
+
+// TestSetToolCallSubagentSessionAdvancesSyncMarker pins the same contract
+// for the single-link write path: the linkage lands in mirrored data
+// (tool_calls.subagent_session_id and transcript_revision) without
+// touching a sync_marker signal, so an actual change must bump
+// local_modified_at, while a no-op call must not.
+func TestSetToolCallSubagentSessionAdvancesSyncMarker(t *testing.T) {
+	database := testDB(t)
+	ctx := t.Context()
+
+	backdate := func(id string) {
+		t.Helper()
+		_, err := database.getWriter().ExecContext(ctx,
+			`UPDATE sessions SET created_at = '2026-07-01T10:00:00.000Z',
+				local_modified_at = '2026-07-01T10:00:00.000Z'
+			 WHERE id = ?`, id)
+		require.NoError(t, err)
+	}
+	readMarker := func(id string) string {
+		t.Helper()
+		var marker string
+		require.NoError(t, database.getReader().QueryRowContext(ctx,
+			`SELECT sync_marker FROM sessions WHERE id = ?`, id).Scan(&marker))
+		return marker
+	}
+
+	require.NoError(t, database.UpsertSession(ctx, Session{
+		ID: "sm-link", Project: "p", Machine: "m", Agent: "claude-code",
+	}))
+	insertMessages(t, database, Message{
+		SessionID:     "sm-link",
+		Ordinal:       0,
+		Role:          "assistant",
+		Content:       "[Task: run subagent]",
+		ContentLength: 20,
+		HasToolUse:    true,
+		ToolCalls: []ToolCall{{
+			SessionID: "sm-link",
+			ToolName:  "Task",
+			Category:  "Task",
+			ToolUseID: "toolu_sm1",
+		}},
+	})
+	backdate("sm-link")
+
+	require.NoError(t, database.SetToolCallSubagentSession(ctx,
+		"sm-link", "toolu_sm1", "sm-linked-child"))
+	assert.Greater(t, readMarker("sm-link"), "2026-07-01T10:00:00.000Z",
+		"a new subagent linkage must advance sync_marker")
+
+	backdate("sm-link")
+	require.NoError(t, database.SetToolCallSubagentSession(ctx,
+		"sm-link", "toolu_sm1", "sm-linked-child"))
+	assert.Equal(t, "2026-07-01T10:00:00.000Z", readMarker("sm-link"),
+		"an unchanged linkage must not advance sync_marker")
+}
+
+func TestListSessionsForMirrorWindowInclusiveLowerBoundUnboundedAbove(t *testing.T) {
+	database := testDB(t)
+	ctx := t.Context()
+	sessions := []Session{
+		{ID: "w-1", Project: "p", Machine: "m", Agent: "a", CreatedAt: "2026-07-01T10:00:00.000Z"},
+		{ID: "w-2", Project: "p", Machine: "m", Agent: "a", CreatedAt: "2026-07-01T10:00:00.001Z"},
+		{ID: "w-3", Project: "p", Machine: "m", Agent: "a", CreatedAt: "2026-07-01T09:59:59.999Z"},
+		// w-future simulates a clock-skewed signal: its marker sits far past
+		// any realistic wall-clock cutoff and must still be selected, since
+		// the window is [since, +inf) with no upper bound.
+		{ID: "w-future", Project: "p", Machine: "m", Agent: "a", CreatedAt: "2099-01-01T00:00:00.000Z"},
+	}
+	for _, s := range sessions {
+		require.NoError(t, database.UpsertSession(ctx, s))
+	}
+	// UpsertSession relies on the schema DEFAULT for created_at on new rows,
+	// so backdate it directly (same pattern as TestListSessionsModifiedBetween)
+	// to get deterministic sync_marker values via the AFTER UPDATE OF trigger.
+	for _, s := range sessions {
+		_, err := database.getWriter().ExecContext(ctx,
+			`UPDATE sessions SET created_at = ? WHERE id = ?`, s.CreatedAt, s.ID)
+		require.NoError(t, err)
+	}
+
+	// Inclusive lower bound: a session whose marker EQUALS since must be
+	// selected, and there is no upper bound to exclude the far-future marker.
+	got, err := database.ListSessionsForMirrorWindow(ctx,
+		"2026-07-01T10:00:00.000Z", nil, nil)
+	require.NoError(t, err)
+	ids := make([]string, 0, len(got))
+	for _, s := range got {
+		ids = append(ids, s.ID)
+	}
+	assert.ElementsMatch(t, []string{"w-1", "w-2", "w-future"}, ids)
+
+	// An empty since lists everything; project filters apply.
+	all, err := database.ListSessionsForMirrorWindow(ctx, "", nil, nil)
+	require.NoError(t, err)
+	assert.Len(t, all, 4)
+	none, err := database.ListSessionsForMirrorWindow(ctx, "", []string{"other"}, nil)
+	require.NoError(t, err)
+	assert.Empty(t, none)
+}
+
+// TestSyncMarkerMalformedCreatedAtIsDropped pins the no-raw-fallback
+// contract (see syncMarkerSchemaSQL): a malformed created_at must never
+// participate in the marker MAX. Letters sort above digits, so a raw
+// fallback would let "garbage" beat every normalized "2026-..." timestamp,
+// poison the session's marker, and permanently advance the push cutoff
+// past all future real changes.
+func TestSyncMarkerMalformedCreatedAtIsDropped(t *testing.T) {
+	database := testDB(t)
+	ctx := t.Context()
+
+	readMarker := func(id string) string {
+		t.Helper()
+		var marker string
+		require.NoError(t, database.getReader().QueryRowContext(ctx,
+			`SELECT sync_marker FROM sessions WHERE id = ?`, id).Scan(&marker))
+		return marker
+	}
+
+	// Malformed created_at with no other signal: the marker is empty, so
+	// the session is invisible to incremental windows (a full rebuild
+	// still covers it), matching the PG push's window semantics.
+	require.NoError(t, database.UpsertSession(ctx,
+		Session{ID: "sm-malformed", Project: "p", Machine: "m", Agent: "claude-code"}))
+	_, err := database.getWriter().ExecContext(ctx,
+		`UPDATE sessions SET created_at = ? WHERE id = ?`, "garbage", "sm-malformed")
+	require.NoError(t, err)
+	assert.Empty(t, readMarker("sm-malformed"),
+		"a malformed created_at must not become the marker via a raw fallback")
+
+	// Malformed created_at plus a valid ended_at: the marker equals the
+	// normalized ended_at instead of the lexically larger raw string.
+	require.NoError(t, database.UpsertSession(ctx,
+		Session{ID: "sm-mixed", Project: "p", Machine: "m", Agent: "claude-code"}))
+	_, err = database.getWriter().ExecContext(ctx,
+		`UPDATE sessions SET created_at = 'garbage',
+			ended_at = '2026-07-02T09:30:00.000Z' WHERE id = ?`, "sm-mixed")
+	require.NoError(t, err)
+	assert.Equal(t, "2026-07-02T09:30:00.000Z", readMarker("sm-mixed"))
+
+	// The backfill twin applies the same rule.
+	_, err = database.getWriter().ExecContext(ctx,
+		`UPDATE sessions SET sync_marker = NULL WHERE id IN ('sm-malformed', 'sm-mixed')`)
+	require.NoError(t, err)
+	_, err = database.getWriter().ExecContext(ctx, backfillSyncMarkerSQL)
+	require.NoError(t, err)
+	assert.Empty(t, readMarker("sm-malformed"))
+	assert.Equal(t, "2026-07-02T09:30:00.000Z", readMarker("sm-mixed"))
+}

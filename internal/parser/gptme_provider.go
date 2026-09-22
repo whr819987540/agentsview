@@ -2,7 +2,7 @@ package parser
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -27,11 +27,9 @@ func (f gptmeProviderFactory) Capabilities() Capabilities {
 func (f gptmeProviderFactory) NewProvider(cfg ProviderConfig) Provider {
 	cfg = cfg.Clone()
 	return &gptmeProvider{
-		ProviderBase: ProviderBase{
-			Def:    cloneAgentDef(f.def),
-			Caps:   gptmeProviderCapabilities(),
-			Config: cfg,
-		},
+		Def:     cloneAgentDef(f.def),
+		Caps:    gptmeProviderCapabilities(),
+		Config:  cfg,
 		sources: newGptmeSourceSet(cfg.Roots),
 	}
 }
@@ -47,6 +45,15 @@ func (p *gptmeProvider) Discover(ctx context.Context) ([]SourceRef, error) {
 		return nil, err
 	}
 	return p.filterSources(sources), nil
+}
+
+func (p *gptmeProvider) DiscoverEach(ctx context.Context, yield func(SourceRef) error) error {
+	return p.sources.DiscoverEach(ctx, func(source SourceRef) error {
+		if !p.isSource(source) {
+			return nil
+		}
+		return yield(source)
+	})
 }
 
 func (p *gptmeProvider) WatchPlan(ctx context.Context) (WatchPlan, error) {
@@ -195,7 +202,7 @@ func (p *gptmeProvider) Parse(
 		return ParseOutcome{}, err
 	}
 	if !ok {
-		return ParseOutcome{}, fmt.Errorf("gptme source path unavailable")
+		return ParseOutcome{}, errors.New("gptme source path unavailable")
 	}
 	machine := firstNonEmptyJSONLString(req.Machine, p.Config.Machine)
 	sess, msgs, err := p.parseSession(path, machine)
@@ -267,6 +274,7 @@ func gptmeProviderCapabilities() Capabilities {
 	return Capabilities{
 		Source: SourceCapabilities{
 			DiscoverSources:      CapabilitySupported,
+			StreamingDiscovery:   CapabilitySupported,
 			WatchSources:         CapabilitySupported,
 			ClassifyChangedPath:  CapabilitySupported,
 			FindSource:           CapabilitySupported,

@@ -1,14 +1,28 @@
 package service
 
 import (
+	"encoding/json/v2"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/export"
+	"go.kenn.io/agentsview/internal/money"
 	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/parsertest"
 )
+
+func TestUsageSummaryResultEmitsEmptyProjectsMap(t *testing.T) {
+	b, err := json.Marshal(UsageSummaryResult{
+		SchemaVersion: export.UsageDailySchemaVersion,
+		Projects:      map[string]export.ProjectMapEntry{},
+	})
+	require.NoError(t, err)
+
+	assert.Contains(t, string(b), `"projects":{}`)
+}
 
 func TestComputeCacheStats_SavingsPassThrough(t *testing.T) {
 	t.Parallel()
@@ -18,24 +32,24 @@ func TestComputeCacheStats_SavingsPassThrough(t *testing.T) {
 	// future refactor that drops the field trips a test.
 	cases := []struct {
 		name string
-		in   float64
+		in   money.Money
 	}{
-		{"positive", 4.65},
-		{"negative", -0.75},
-		{"zero", 0},
+		{"positive", money.MustParseDollars("4.65")},
+		{"negative", money.MustParseDollars("-0.75")},
+		{"zero", money.Money{}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			cs := computeCacheStats(db.UsageTotals{CacheSavings: tc.in})
-			assert.InDelta(t, tc.in, cs.SavingsVsUncached, 1e-9)
+			assert.Equal(t, tc.in, cs.SavingsVsUncached)
 		})
 	}
 }
 
 func TestComputeCacheStats_ZeroTotalsIsZero(t *testing.T) {
 	cs := computeCacheStats(db.UsageTotals{})
-	assert.Zero(t, cs.SavingsVsUncached)
+	assert.Equal(t, money.Money{}, cs.SavingsVsUncached)
 	assert.Zero(t, cs.HitRate)
 }
 

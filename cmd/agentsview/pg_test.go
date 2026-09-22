@@ -14,16 +14,16 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/parser"
-	"go.kenn.io/agentsview/internal/postgres"
+	"go.kenn.io/agentsview/internal/storage"
 )
 
 func loadPGServeConfigForTest(t *testing.T, args ...string) (config.Config, string, error) {
 	t.Helper()
-	cmd := newPGServeCommand()
+	cmd := newReplicaServeCommand(pgReplica{})
 	if err := cmd.Flags().Parse(args); err != nil {
 		return config.Config{}, "", err
 	}
-	return loadPGServeConfig(cmd)
+	return loadReplicaServeConfig(cmd)
 }
 
 func restoreTestLogger(t *testing.T) {
@@ -40,8 +40,10 @@ func restoreTestLogger(t *testing.T) {
 func clearConfiguredAgentEnvVars(t *testing.T) {
 	t.Helper()
 	for _, def := range parser.Registry {
-		if def.EnvVar != "" {
-			t.Setenv(def.EnvVar, "")
+		for _, name := range []string{def.EnvVar, def.NativeEnvVar, def.DefaultRootEnvVar} {
+			if name != "" {
+				t.Setenv(name, "")
+			}
 		}
 	}
 }
@@ -126,8 +128,7 @@ func TestPGServeConfigAcceptsManagedCaddyFlags(t *testing.T) {
 	require.NoError(t, err, "loadPGServeConfigForTest")
 	assert.Equal(t, "caddy", cfg.Proxy.Mode)
 	assert.Equal(t, "https://viewer.example.test:8443", cfg.PublicURL)
-	assert.Equal(t,
-		"https://app.example.test,https://viewer.example.test:8443",
+	assert.Equal(t, "https://app.example.test,https://viewer.example.test:8443",
 		strings.Join(cfg.PublicOrigins, ","))
 	assert.Equal(t, "/usr/local/bin/caddy", cfg.Proxy.Bin)
 	assert.Equal(t, "0.0.0.0", cfg.Proxy.BindHost)
@@ -160,7 +161,7 @@ url = "postgres://archive"
 
 	var err error
 	out := captureStdout(t, func() {
-		err = runPGPush(PGPushConfig{}, "archive")
+		err = runReplicaPush(pgReplica{}, ReplicaPushConfig{}, "archive")
 	})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "pg connection to archive permits plaintext")
@@ -187,7 +188,7 @@ machine_name = "workbox"
 url = "postgres://archive"
 `)
 
-	err := runPGStatus("archive", PGStatusConfig{})
+	err := runReplicaStatus(t.Context(), pgReplica{}, "archive", ReplicaStatusConfig{})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "pg connection to archive permits plaintext")
 	assert.Contains(t, err.Error(), "allow_insecure = true under [pg] or [pg.NAME]")
@@ -213,7 +214,7 @@ url = "postgres://archive"
 		0o600,
 	))
 
-	err := runPGStatus("archive", PGStatusConfig{})
+	err := runReplicaStatus(t.Context(), pgReplica{}, "archive", ReplicaStatusConfig{})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "pg connection to archive permits plaintext")
 	assert.Contains(t, err.Error(), "allow_insecure = true under [pg] or [pg.NAME]")
@@ -240,7 +241,7 @@ machine_name = "workbox"
 url = "postgres://archive"
 `)
 
-	err := runPGPush(PGPushConfig{AllTargets: true}, "")
+	err := runReplicaPush(pgReplica{}, ReplicaPushConfig{AllTargets: true}, "")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "2 pg target(s) failed")
 	assert.Contains(t, err.Error(), "work (default): expanding url: environment variable(s) not set: BROKEN_WORK_TARGET")
@@ -266,7 +267,7 @@ machine_name = "workbox"
 url = "postgres://archive"
 `)
 
-	err := runPGStatus("", PGStatusConfig{AllTargets: true})
+	err := runReplicaStatus(t.Context(), pgReplica{}, "", ReplicaStatusConfig{AllTargets: true})
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "2 pg target(s) failed")
 	assert.Contains(t, err.Error(), "work (default): expanding url: environment variable(s) not set: BROKEN_WORK_TARGET")
@@ -320,7 +321,7 @@ url = "postgres://archive"
 func TestRunPGServeRejectsInvalidManagedCaddyConfigBeforePGSetup(t *testing.T) {
 	dataDir := t.TempDir()
 
-	cmd := exec.Command(os.Args[0], "-test.run=TestRunPGServeHelperProcess", "--",
+	cmd := exec.CommandContext(t.Context(), os.Args[0], "-test.run=TestRunPGServeHelperProcess", "--",
 		"--host", "0.0.0.0",
 		"--public-url", "https://viewer.example.test",
 		"--proxy", "caddy",
@@ -339,7 +340,7 @@ func TestRunPGServeRejectsInvalidManagedCaddyConfigBeforePGSetup(t *testing.T) {
 func TestRunPGServeNonLoopbackWithoutProxyFallsThroughToPGConfig(t *testing.T) {
 	dataDir := t.TempDir()
 
-	cmd := exec.Command(os.Args[0], "-test.run=TestRunPGServeHelperProcess", "--",
+	cmd := exec.CommandContext(t.Context(), os.Args[0], "-test.run=TestRunPGServeHelperProcess", "--",
 		"--host", "0.0.0.0",
 		"--port", "8081",
 	)
@@ -371,17 +372,17 @@ func TestRunPGServeHelperProcess(t *testing.T) {
 	}
 	require.NotEqual(t, -1, sep, "missing argument separator")
 
-	cmd := newPGServeCommand()
+	cmd := newReplicaServeCommand(pgReplica{})
 	require.NoError(t, cmd.Flags().Parse(args[sep+1:]))
-	cfg, basePath, err := loadPGServeConfig(cmd)
+	cfg, basePath, err := loadReplicaServeConfig(cmd)
 	require.NoError(t, err)
-	runPGServe(cfg, basePath)
+	runReplicaServe(pgReplica{}, cfg, basePath)
 }
 
 func TestWritePGPushSummaryIncludesSkippedConflicts(t *testing.T) {
 	var out bytes.Buffer
 
-	writePGPushSummary(&out, postgres.PushResult{
+	writeReplicaPushSummary(&out, "PostgreSQL", storage.PushResult{
 		SessionsPushed:   3,
 		MessagesPushed:   9,
 		SkippedConflicts: 2,
@@ -395,16 +396,92 @@ func TestWritePGPushSummaryIncludesSkippedConflicts(t *testing.T) {
 		"Warning: skipped 2 session(s) owned by another PostgreSQL push marker")
 }
 
+func TestWritePGPushSummaryVectorPhase(t *testing.T) {
+	tests := []struct {
+		name        string
+		vectors     storage.VectorPushResult
+		wantContain []string
+		wantAbsent  []string
+	}{
+		{
+			name: "counters",
+			vectors: storage.VectorPushResult{
+				SessionsPushed:    2,
+				SessionsUnchanged: 5,
+				DocsPushed:        7,
+				ChunksPushed:      9,
+			},
+			wantContain: []string{
+				"Vectors: 2 session(s) pushed, 5 unchanged, 7 docs, 9 chunks",
+			},
+			wantAbsent: []string{"skipped", "Warning: skipped"},
+		},
+		{
+			name: "skipped with reason",
+			vectors: storage.VectorPushResult{
+				Skipped:       true,
+				SkippedReason: "pgvector extension unavailable",
+			},
+			wantContain: []string{"Vectors: skipped (pgvector extension unavailable)"},
+		},
+		{
+			name:       "skipped without reason prints nothing",
+			vectors:    storage.VectorPushResult{Skipped: true},
+			wantAbsent: []string{"Vectors:"},
+		},
+		{
+			name: "conflicts warning",
+			vectors: storage.VectorPushResult{
+				SessionsPushed: 1,
+				Conflicts:      3,
+			},
+			wantContain: []string{
+				"Vectors: 1 session(s) pushed, 0 unchanged, 0 docs, 0 chunks",
+				"Warning: skipped 3 vector session(s) owned by another PostgreSQL push marker",
+			},
+		},
+		{
+			name: "deferred warning",
+			vectors: storage.VectorPushResult{
+				SessionsPushed:   1,
+				SessionsDeferred: 2,
+			},
+			wantContain: []string{
+				"Vectors: 1 session(s) pushed, 0 unchanged, 0 docs, 0 chunks",
+				"Warning: deferred vectors for 2 session(s); the next generation-wide reconciliation sends them",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var out bytes.Buffer
+			writeReplicaPushSummary(&out, "PostgreSQL", storage.PushResult{
+				SessionsPushed: 1,
+				MessagesPushed: 1,
+				Duration:       time.Second,
+				Vectors:        tt.vectors,
+			})
+			got := out.String()
+			for _, want := range tt.wantContain {
+				assert.Contains(t, got, want)
+			}
+			for _, absent := range tt.wantAbsent {
+				assert.NotContains(t, got, absent)
+			}
+		})
+	}
+}
+
 func TestWritePGPushSummaryReportsErrorCount(t *testing.T) {
 	tests := []struct {
 		name        string
-		result      postgres.PushResult
+		result      storage.PushResult
 		wantContain []string
 		wantAbsent  []string
 	}{
 		{
 			name: "conflicts with errors",
-			result: postgres.PushResult{
+			result: storage.PushResult{
 				SessionsPushed:   3,
 				MessagesPushed:   9,
 				SkippedConflicts: 2,
@@ -418,7 +495,7 @@ func TestWritePGPushSummaryReportsErrorCount(t *testing.T) {
 		},
 		{
 			name: "conflicts without errors omits error count",
-			result: postgres.PushResult{
+			result: storage.PushResult{
 				SessionsPushed:   3,
 				MessagesPushed:   9,
 				SkippedConflicts: 2,
@@ -431,7 +508,7 @@ func TestWritePGPushSummaryReportsErrorCount(t *testing.T) {
 		},
 		{
 			name: "errors without conflicts",
-			result: postgres.PushResult{
+			result: storage.PushResult{
 				SessionsPushed: 5,
 				MessagesPushed: 12,
 				Errors:         1,
@@ -442,7 +519,7 @@ func TestWritePGPushSummaryReportsErrorCount(t *testing.T) {
 		},
 		{
 			name: "clean run omits error count",
-			result: postgres.PushResult{
+			result: storage.PushResult{
 				SessionsPushed: 5,
 				MessagesPushed: 12,
 				Duration:       2 * time.Second,
@@ -454,7 +531,7 @@ func TestWritePGPushSummaryReportsErrorCount(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var out bytes.Buffer
-			writePGPushSummary(&out, tt.result)
+			writeReplicaPushSummary(&out, "PostgreSQL", tt.result)
 			got := out.String()
 			for _, want := range tt.wantContain {
 				assert.Contains(t, got, want)
@@ -463,5 +540,55 @@ func TestWritePGPushSummaryReportsErrorCount(t *testing.T) {
 				assert.NotContains(t, got, absent)
 			}
 		})
+	}
+}
+
+// TestPGPushProgressPrinterKeepsCompletedStages pins the stage-aware
+// renderer: reports within a stage rerender one line in place, and a stage
+// transition finishes the line with a newline so completed stages stay in
+// the scrollback instead of being overwritten by the next stage.
+func TestPGPushProgressPrinterKeepsCompletedStages(t *testing.T) {
+	out := captureStdout(t, func() {
+		writeProgress := newReplicaPushProgressPrinter()
+		writeProgress(storage.PushProgress{Phase: "preparing"})
+		writeProgress(storage.PushProgress{Phase: "preparing"})
+		writeProgress(storage.PushProgress{
+			Phase: "preparing", SessionsDone: 500, SessionsTotal: 1000,
+		})
+		writeProgress(storage.PushProgress{
+			Phase: "preparing", SessionsDone: 1000, SessionsTotal: 1000,
+		})
+		writeProgress(storage.PushProgress{
+			SessionsDone: 1, SessionsTotal: 9, MessagesDone: 5,
+		})
+		writeProgress(storage.PushProgress{
+			Phase: "vectors", VectorSessionsDone: 1,
+			VectorSessionsTotal: 2, VectorChunksPushed: 3,
+		})
+	})
+
+	lines := strings.Split(out, "\n")
+	require.Len(t, lines, 4, "one line per stage: %q", out)
+
+	// Within a line, in-place rerenders are separated by carriage returns;
+	// the text a terminal leaves visible is the segment after the last one.
+	// Every render carries a wall-clock elapsed suffix, so assert on the
+	// stable prefix and the suffix shape rather than the exact duration.
+	visible := func(line string) string {
+		parts := strings.Split(line, "\r")
+		return strings.TrimSuffix(parts[len(parts)-1], "\x1b[K")
+	}
+	wantPrefixes := []string{
+		"Preparing push (sync state, metadata, fingerprints)...",
+		"Preparing... 1000/1000 sessions fingerprinted",
+		"Pushing... 1/9 sessions, 5 messages",
+		"Pushing vectors... 1/2 sessions scanned, 3 chunks",
+	}
+	for i, want := range wantPrefixes {
+		got := visible(lines[i])
+		assert.True(t, strings.HasPrefix(got, want),
+			"line %d: %q must start with %q", i, got, want)
+		assert.Regexp(t, ` \([0-9a-z.]+ elapsed\)$`, got,
+			"line %d must end with an elapsed suffix", i)
 	}
 }

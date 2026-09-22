@@ -2,6 +2,7 @@ package parser
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -30,12 +31,10 @@ func (f antigravityCLIProviderFactory) Capabilities() Capabilities {
 func (f antigravityCLIProviderFactory) NewProvider(cfg ProviderConfig) Provider {
 	cfg = cfg.Clone()
 	return &antigravityCLIProvider{
-		ProviderBase: ProviderBase{
-			Def:    cloneAgentDef(f.def),
-			Caps:   antigravityCLIProviderCapabilities(),
-			Config: cfg,
-		},
-		sources: newAntigravityCLISourceSet(cfg.Roots),
+		Def:     cloneAgentDef(f.def),
+		Caps:    antigravityCLIProviderCapabilities(),
+		Config:  cfg,
+		sources: newAntigravityCLISourceSet(cfg),
 	}
 }
 
@@ -46,6 +45,10 @@ type antigravityCLIProvider struct {
 
 func (p *antigravityCLIProvider) Discover(ctx context.Context) ([]SourceRef, error) {
 	return p.sources.Discover(ctx)
+}
+
+func (p *antigravityCLIProvider) DiscoverEach(ctx context.Context, yield func(SourceRef) error) error {
+	return p.sources.DiscoverEach(ctx, yield)
 }
 
 func (p *antigravityCLIProvider) WatchPlan(ctx context.Context) (WatchPlan, error) {
@@ -83,7 +86,7 @@ func (p *antigravityCLIProvider) Parse(
 	}
 	src, ok := p.sources.sourceFromRef(req.Source)
 	if !ok {
-		return ParseOutcome{}, fmt.Errorf("antigravity cli source path unavailable")
+		return ParseOutcome{}, errors.New("antigravity cli source path unavailable")
 	}
 	if _, err := os.Stat(src.Path); err != nil {
 		if os.IsNotExist(err) {
@@ -96,9 +99,18 @@ func (p *antigravityCLIProvider) Parse(
 		return ParseOutcome{}, fmt.Errorf("stat %s: %w", src.Path, err)
 	}
 	machine := firstNonEmptyJSONLString(req.Machine, p.Config.Machine)
+	cwd := ""
+	if req.Source.CwdResolution.State == SourceCwdResolved {
+		cwd = req.Source.CwdResolution.Path
+	}
+	if req.Source.CwdResolution.State == SourceCwdRemote {
+		ctx = WithoutFilesystemProjectDiscovery(ctx)
+	}
 	sess, msgs, usageEvents, status, err := p.parseSessionWithStatus(
+		ctx,
 		src.Path,
 		req.Source.ProjectHint,
+		cwd,
 		machine,
 	)
 	if err != nil {
@@ -134,21 +146,31 @@ func (p *antigravityCLIProvider) Parse(
 }
 
 type antigravityCLISource struct {
-	Root    string
-	Path    string
-	ID      string
-	Project string
+	Root      string
+	Path      string
+	ID        string
+	Project   string
+	Workspace string
 }
 
 type antigravityCLISourceSet struct {
-	roots []string
+	roots       []string
+	remote      bool
+	remoteRoots map[string]bool
 }
 
-func newAntigravityCLISourceSet(roots []string) antigravityCLISourceSet {
-	roots = cleanJSONLRoots(roots)
-	return antigravityCLISourceSet{
-		roots: roots,
+func newAntigravityCLISourceSet(cfg ProviderConfig) antigravityCLISourceSet {
+	s := antigravityCLISourceSet{
+		roots:       cleanJSONLRoots(cfg.Roots),
+		remote:      cfg.PathRewriter != nil,
+		remoteRoots: make(map[string]bool),
 	}
+	for root, machine := range cfg.SourceMachines {
+		if machine != "" && machine != cfg.Machine {
+			s.remoteRoots[filepath.Clean(root)] = true
+		}
+	}
+	return s
 }
 
 func (s antigravityCLISourceSet) Discover(ctx context.Context) ([]SourceRef, error) {
@@ -174,6 +196,59 @@ func (s antigravityCLISourceSet) Discover(ctx context.Context) ([]SourceRef, err
 	return sources, nil
 }
 
+func (s antigravityCLISourceSet) DiscoverEach(ctx context.Context, yield func(SourceRef) error) error {
+	for _, root := range s.roots {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		projects, err := newDiscoveryDiskMapForContext(ctx)
+		if err != nil {
+			return err
+		}
+		if err := projects.loadJSONL(
+			ctx, filepath.Join(root, "history.jsonl"), "conversationId", "workspace",
+		); err != nil {
+			return errors.Join(err, projects.close())
+		}
+		for id, workspace := range antigravityProjectMapFromLastConversations(
+			filepath.Join(root, "cache", "last_conversations.json"),
+		) {
+			if err := projects.put(ctx, id, workspace, true); err != nil {
+				return errors.Join(err, projects.close())
+			}
+		}
+		for _, subdir := range []string{"conversations", "implicit"} {
+			dir := filepath.Join(root, subdir)
+			err := streamDirectoryEntries(ctx, dir, func(entry os.DirEntry) error {
+				if entry.IsDir() {
+					return nil
+				}
+				_, ext, ok := antigravityCLIPathID(entry.Name())
+				if !ok || subdir == "implicit" && ext != ".pb" {
+					return nil
+				}
+				path := filepath.Join(dir, entry.Name())
+				rawID, ok := antigravityCLISessionIDForPath(root, path)
+				if !ok {
+					return nil
+				}
+				project, _, err := projects.get(ctx, strings.TrimPrefix(rawID, antigravityImplicitTag))
+				if err != nil {
+					return err
+				}
+				return yield(s.newSourceRef(root, path, rawID, project, project))
+			})
+			if err != nil {
+				return errors.Join(err, projects.close())
+			}
+		}
+		if err := projects.close(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // discoverSessions enumerates conversations/*.db, conversations/*.pb, and
 // implicit/*.pb under the CLI root and tags each with its workspace (resolved
 // via history.jsonl). It owns the on-disk discovery the package-level
@@ -186,18 +261,15 @@ func (s antigravityCLISourceSet) discoverSessions(root string) []DiscoveredFile 
 }
 
 // discoverSessionsAndProjects enumerates sessions and also returns the project
-// map it built from history.jsonl, so callers can thread the same map into
-// per-source resolution instead of rebuilding it (the map is a full read and
-// per-line parse of history.jsonl).
+// map it built from the current cache plus legacy history, so callers can
+// thread the same map into per-source resolution instead of rebuilding it.
 func (s antigravityCLISourceSet) discoverSessionsAndProjects(
 	root string,
 ) ([]DiscoveredFile, map[string]string) {
 	if root == "" {
 		return nil, nil
 	}
-	projects := buildAntigravityProjectMap(
-		filepath.Join(root, "history.jsonl"),
-	)
+	projects := buildAntigravityCLIProjectMap(root)
 	var files []DiscoveredFile
 	for _, sub := range []string{"conversations", "implicit"} {
 		dir := filepath.Join(root, sub)
@@ -269,7 +341,7 @@ func (s antigravityCLISourceSet) findSourceFile(root, id string) string {
 }
 
 func (s antigravityCLISourceSet) WatchPlan(context.Context) (WatchPlan, error) {
-	roots := make([]WatchRoot, 0, len(s.roots)*4)
+	roots := make([]WatchRoot, 0, len(s.roots)*5)
 	for _, root := range s.roots {
 		roots = append(roots,
 			WatchRoot{
@@ -289,6 +361,12 @@ func (s antigravityCLISourceSet) WatchPlan(context.Context) (WatchPlan, error) {
 				Recursive:    false,
 				IncludeGlobs: []string{"history.jsonl"},
 				DebounceKey:  string(AgentAntigravityCLI) + ":history:" + root,
+			},
+			WatchRoot{
+				Path:         filepath.Join(root, "cache"),
+				Recursive:    false,
+				IncludeGlobs: []string{"last_conversations.json"},
+				DebounceKey:  string(AgentAntigravityCLI) + ":workspace-cache:" + root,
 			},
 			WatchRoot{
 				Path:         filepath.Join(root, "implicit"),
@@ -352,12 +430,10 @@ func (s antigravityCLISourceSet) FindSource(
 		if path == "" {
 			continue
 		}
-		project := ""
+		var project string
 		id := strings.TrimPrefix(req.RawSessionID, antigravityImplicitTag)
 		if projects[root] == nil {
-			projects[root] = buildAntigravityProjectMap(
-				filepath.Join(root, "history.jsonl"),
-			)
+			projects[root] = buildAntigravityCLIProjectMap(root)
 		}
 		project = projects[root][id]
 		if source, ok := s.sourceRef(root, path, project, false); ok {
@@ -376,7 +452,7 @@ func (s antigravityCLISourceSet) Fingerprint(
 	}
 	src, ok := s.sourceFromRef(source)
 	if !ok {
-		return SourceFingerprint{}, fmt.Errorf("antigravity cli source path unavailable")
+		return SourceFingerprint{}, errors.New("antigravity cli source path unavailable")
 	}
 	key := firstNonEmptyJSONLString(source.FingerprintKey, source.Key, src.Path)
 	info, err := AntigravityCLIFileInfo(src.Path)
@@ -386,7 +462,7 @@ func (s antigravityCLISourceSet) Fingerprint(
 		}
 		return SourceFingerprint{}, err
 	}
-	hash, err := antigravityCLICompositeHash(src.Path, src.ID)
+	hash, err := antigravityCLICompositeHash(src.Path, src.ID, src.Workspace)
 	if err != nil {
 		return SourceFingerprint{}, err
 	}
@@ -427,6 +503,9 @@ func (s antigravityCLISourceSet) sourcesForChangedPath(
 	root = filepath.Clean(root)
 	path := filepath.Clean(req.Path)
 	if samePath(path, filepath.Join(root, "history.jsonl")) {
+		return s.sourcesForHistoryChange(root, req)
+	}
+	if samePath(path, filepath.Join(root, "cache", "last_conversations.json")) {
 		return s.sourcesForHistoryChange(root, req)
 	}
 	if sourcePath, id, ok := antigravityCLISourcePathForEvent(root, path); ok {
@@ -511,10 +590,11 @@ func (s antigravityCLISourceSet) sourceRef(
 	if !allowMissing && !IsRegularFile(path) {
 		return SourceRef{}, false
 	}
+	workspace := s.projectForID(root, strings.TrimPrefix(id, antigravityImplicitTag))
 	if project == "" {
-		project = s.projectForID(root, strings.TrimPrefix(id, antigravityImplicitTag))
+		project = workspace
 	}
-	return s.newSourceRef(root, path, id, project), true
+	return s.newSourceRef(root, path, id, project, workspace), true
 }
 
 // sourceRefWithProjects is sourceRef but resolves a missing project from a
@@ -534,32 +614,57 @@ func (s antigravityCLISourceSet) sourceRefWithProjects(
 	if !allowMissing && !IsRegularFile(path) {
 		return SourceRef{}, false
 	}
+	workspace := projects[strings.TrimPrefix(id, antigravityImplicitTag)]
 	if project == "" {
-		project = projects[strings.TrimPrefix(id, antigravityImplicitTag)]
+		project = workspace
 	}
-	return s.newSourceRef(root, path, id, project), true
+	return s.newSourceRef(root, path, id, project, workspace), true
 }
 
 func (s antigravityCLISourceSet) newSourceRef(
-	root, path, id, project string,
+	root, path, id, project, workspace string,
 ) SourceRef {
+	cwd := normalizeAntigravityCLIWorkspace(workspace)
+	resolution := SourceCwdResolution{}
+	if s.remote || s.remoteRoot(root) {
+		resolution.State = SourceCwdRemote
+	} else if workspace != "" && cwd == "" {
+		resolution.State = SourceCwdAmbiguous
+	} else if cwd != "" {
+		resolution = SourceCwdResolution{State: SourceCwdResolved, Path: cwd}
+	}
 	return SourceRef{
 		Provider:       AgentAntigravityCLI,
-		Key:            path,
+		Key:            id,
 		DisplayPath:    path,
 		FingerprintKey: path,
 		ProjectHint:    project,
+		CwdResolution:  resolution,
 		Opaque: antigravityCLISource{
-			Root:    root,
-			Path:    path,
-			ID:      id,
-			Project: project,
+			Root:      root,
+			Path:      path,
+			ID:        id,
+			Project:   project,
+			Workspace: workspace,
 		},
 	}
 }
 
+func (s antigravityCLISourceSet) remoteRoot(root string) bool {
+	clean := filepath.Clean(root)
+	if s.remoteRoots[clean] {
+		return true
+	}
+	for configured := range s.remoteRoots {
+		if samePath(configured, clean) {
+			return true
+		}
+	}
+	return false
+}
+
 func (s antigravityCLISourceSet) projectForID(root, id string) string {
-	return buildAntigravityProjectMap(filepath.Join(root, "history.jsonl"))[id]
+	return buildAntigravityCLIProjectMap(root)[id]
 }
 
 func antigravityCLISourcePathForEvent(root, path string) (string, string, bool) {
@@ -654,7 +759,7 @@ func antigravityCLISessionIDForPath(root, path string) (string, bool) {
 
 func antigravityCLIWatchRootMatches(root, watchRoot string) bool {
 	watchRoot = filepath.Clean(watchRoot)
-	for _, subdir := range []string{"brain", "conversations", "implicit"} {
+	for _, subdir := range []string{"brain", "cache", "conversations", "implicit"} {
 		if samePath(watchRoot, filepath.Join(root, subdir)) {
 			return true
 		}
@@ -664,11 +769,13 @@ func antigravityCLIWatchRootMatches(root, watchRoot string) bool {
 
 func antigravityCLIProviderCapabilities() Capabilities {
 	source := jsonlFileProviderSourceCapabilities()
+	source.StreamingDiscovery = CapabilitySupported
 	source.ForceReplaceOnParse = CapabilitySupported
 	return Capabilities{
 		Source: source,
 		Content: ContentCapabilities{
 			FirstMessage:         CapabilitySupported,
+			Cwd:                  CapabilitySupported,
 			Thinking:             CapabilitySupported,
 			ToolCalls:            CapabilitySupported,
 			ToolResults:          CapabilitySupported,

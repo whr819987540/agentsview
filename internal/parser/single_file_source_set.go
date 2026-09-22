@@ -41,6 +41,7 @@ func (m singleFileMatch) toSource(root string) singleFileSource {
 type singleFileConfig struct {
 	// discoverFiles returns the source files under one root.
 	discoverFiles func(root string) []singleFileMatch
+	discoverEach  func(context.Context, string, func(singleFileMatch) error) error
 	// watchRoots returns the provider WatchPlan roots for the configured roots.
 	watchRoots func(roots []string) []WatchRoot
 	// classifyPath maps a stored or changed path (including a sidecar event) to
@@ -61,6 +62,11 @@ type singleFileConfig struct {
 	// yields nothing, instead of emitting SkipNoSession. Providers whose parse
 	// drives session removal through exclusions (cowork) set this.
 	alwaysComplete bool
+	// storedSourceHintScope is the optional stored-source-hint-scope hook
+	// (WithFileStoredSourceHintScope). When unset, StoredSourceHintScopes
+	// resolves to nothing and the engine keeps its existing exact-file
+	// ownership scope.
+	storedSourceHintScope func(root, path string) (StoredSourceHintScope, bool)
 }
 
 type SingleFileOption func(*singleFileConfig)
@@ -69,6 +75,12 @@ func WithFileDiscovery(
 	fn func(root string) []singleFileMatch,
 ) SingleFileOption {
 	return func(c *singleFileConfig) { c.discoverFiles = fn }
+}
+
+func WithStreamingFileDiscovery(
+	fn func(context.Context, string, func(singleFileMatch) error) error,
+) SingleFileOption {
+	return func(c *singleFileConfig) { c.discoverEach = fn }
 }
 
 func WithFileWatchRoots(
@@ -101,6 +113,17 @@ func WithFileParse(
 	return func(c *singleFileConfig) { c.parseFile = fn }
 }
 
+// WithFileStoredSourceHintScope registers the optional stored-source-hint
+// scope hook that maps a changed or stored path back to the bounded
+// stored-source scope the source owns. Cline enables it with its session
+// directory; other single-file providers leave it unset and keep their
+// existing exact-file ownership.
+func WithFileStoredSourceHintScope(
+	fn func(root, path string) (StoredSourceHintScope, bool),
+) SingleFileOption {
+	return func(c *singleFileConfig) { c.storedSourceHintScope = fn }
+}
+
 // WithAlwaysCompleteResultSet reports the result set as complete even when a
 // parse yields no sessions, instead of skipping. Used by providers whose parse
 // removes sessions via exclusions.
@@ -118,7 +141,7 @@ func NewSingleFileSourceSet(
 		opt(&cfg)
 	}
 	switch {
-	case cfg.discoverFiles == nil:
+	case cfg.discoverFiles == nil && cfg.discoverEach == nil:
 		panic("single-file source set: missing WithFileDiscovery")
 	case cfg.watchRoots == nil:
 		panic("single-file source set: missing WithFileWatchRoots")
@@ -149,27 +172,70 @@ var _ SourceSet = singleFileSourceSet{}
 func (s singleFileSourceSet) Discover(
 	ctx context.Context,
 ) ([]SourceRef, error) {
-	var sources []SourceRef
-	seen := make(map[string]struct{})
+	return collectDiscoveredSources(ctx, s.DiscoverEach)
+}
+
+func (s singleFileSourceSet) DiscoverEach(
+	ctx context.Context, yield func(SourceRef) error,
+) error {
 	for _, root := range s.roots {
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return err
+		}
+		if s.cfg.discoverEach != nil {
+			if err := s.cfg.discoverEach(ctx, root, func(match singleFileMatch) error {
+				if match.Path == "" {
+					return nil
+				}
+				return yield(s.sourceRef(root, match))
+			}); err != nil {
+				return err
+			}
+			continue
 		}
 		for _, match := range s.cfg.discoverFiles(root) {
 			if match.Path == "" {
 				continue
 			}
-			addJSONLSource(s.sourceRef(root, match), &sources, seen)
+			if err := yield(s.sourceRef(root, match)); err != nil {
+				return err
+			}
 		}
 	}
-	sortJSONLSources(sources)
-	return sources, nil
+	return nil
 }
 
 func (s singleFileSourceSet) WatchPlan(
 	context.Context,
 ) (WatchPlan, error) {
 	return WatchPlan{Roots: s.cfg.watchRoots(s.roots)}, nil
+}
+
+func (s singleFileSourceSet) WatchRoots(
+	ctx context.Context,
+) ([]WatchRoot, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return watchRootMetadata(s.cfg.watchRoots(s.roots)), nil
+}
+
+// StoredSourceHintScopes implements StoredSourceHintScopeProvider for
+// single-file providers with the optional WithFileStoredSourceHintScope hook
+// (Cline). Sources without the hook return nothing so the engine keeps its
+// existing exact-file ownership scope.
+func (s singleFileSourceSet) StoredSourceHintScopes(
+	req ChangedPathRequest,
+) []StoredSourceHintScope {
+	if s.cfg.storedSourceHintScope == nil {
+		return nil
+	}
+	for _, root := range s.roots {
+		if scope, ok := s.cfg.storedSourceHintScope(root, req.Path); ok {
+			return []StoredSourceHintScope{scope}
+		}
+	}
+	return nil
 }
 
 func (s singleFileSourceSet) SourcesForChangedPath(

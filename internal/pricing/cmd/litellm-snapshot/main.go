@@ -3,20 +3,26 @@ package main
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
+	"encoding/json/v2"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
+	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
 
+	"go.kenn.io/agentsview/internal/money"
 	"go.kenn.io/agentsview/internal/pricing/catalog"
 )
 
@@ -24,24 +30,40 @@ var defaultOutputPath = filepath.FromSlash(
 	"internal/pricing/snapshot/litellm_snapshot.json.gz",
 )
 
+func mustRate(dollars string) money.Money {
+	rate, err := money.ParseDollars(dollars)
+	if err != nil {
+		panic(err)
+	}
+	return rate
+}
+
 const (
-	defaultSnapshotRef     = "97c961ef945546cf463faed5de0d5521b302adcf"
-	defaultSnapshotSHA256  = "bef918527f538fed72c8f17b711dfbced1ca7f8964d3624174b3d101c6e21435"
-	defaultSnapshotBranch  = "litellm-pricing-snapshot"
-	defaultSnapshotFile    = "litellm_snapshot.json.gz"
-	defaultSnapshotBaseURL = "https://raw.githubusercontent.com/kenn-io/agentsview"
+	defaultSnapshotRef      = "9b749891c4e15f302ffec7cd30029bbe5774cf84"
+	defaultSnapshotSHA256   = "f899bb4d8f99cf19e4c63b929d8ba17eafef27e231c000af13bd3d0c8ba6e3d9"
+	defaultSnapshotBranch   = "litellm-pricing-snapshot"
+	defaultSnapshotFile     = "litellm_snapshot.json.gz"
+	defaultSnapshotBaseURL  = "https://raw.githubusercontent.com/kenn-io/agentsview"
+	defaultLiteLLMSourceRef = "418c7c6012d7c39a9d4a28c72cabe1995595ad2b"
 )
 
-const maxSnapshotCompressedBytes = 1 << 20
-const maxSnapshotJSONBytes = 8 << 20
-const maxSnapshotModels = 100_000
+var immutableGitRefPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
+
+const (
+	maxSnapshotCompressedBytes = 1 << 20
+	maxSnapshotJSONBytes       = 8 << 20
+	maxSnapshotModels          = 100_000
+)
 
 type snapshotBundle struct {
-	Version string                 `json:"version"`
-	Models  []catalog.ModelPricing `json:"models"`
+	Version   string                 `json:"version"`
+	SourceRef string                 `json:"source_ref"`
+	Models    []catalog.ModelPricing `json:"models"`
 }
 
 func main() {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
 	outPath := flag.String("out", defaultOutputPath, "output snapshot file path")
 	validatePath := flag.String("validate", "", "validate a snapshot file and exit")
 	restore := flag.Bool("restore", false, "restore a snapshot from a git artifact commit")
@@ -50,6 +72,11 @@ func main() {
 	restoreSHA256 := flag.String("sha256", defaultSnapshotSHA256, "expected snapshot SHA256")
 	restoreBranch := flag.String("branch", defaultSnapshotBranch, "artifact branch to fetch when ref is missing")
 	restoreURL := flag.String("url", defaultSnapshotURL(), "snapshot URL to use when git restore is unavailable")
+	litellmSourceRef := flag.String(
+		"litellm-ref",
+		defaultLiteLLMSourceRef,
+		"immutable LiteLLM commit used to generate the snapshot",
+	)
 	flag.Parse()
 
 	if *validatePath != "" {
@@ -60,7 +87,7 @@ func main() {
 		return
 	}
 	if *restore {
-		if err := restoreSnapshotFile(
+		if err := restoreSnapshotFile(ctx,
 			*outPath,
 			*restoreRef,
 			*restoreFile,
@@ -73,7 +100,13 @@ func main() {
 		return
 	}
 
-	prices, err := catalog.FetchLiteLLMPricing()
+	if !immutableGitRefPattern.MatchString(*litellmSourceRef) {
+		panic("litellm-ref must be a full lowercase commit SHA")
+	}
+	prices, err := catalog.FetchLiteLLMPricingAtRef(
+		ctx,
+		*litellmSourceRef,
+	)
 	if err != nil {
 		panic(err)
 	}
@@ -90,8 +123,9 @@ func main() {
 
 	version := computeVersion(modelsJSON)
 	bundle := snapshotBundle{
-		Version: version,
-		Models:  prices,
+		Version:   version,
+		SourceRef: *litellmSourceRef,
+		Models:    prices,
 	}
 
 	raw, err := json.Marshal(bundle)
@@ -132,7 +166,7 @@ func validateSnapshotFile(path string) error {
 		return fmt.Errorf("stat snapshot: %w", err)
 	}
 	if info.Size() == 0 {
-		return fmt.Errorf("empty snapshot")
+		return errors.New("empty snapshot")
 	}
 	if info.Size() > maxSnapshotCompressedBytes {
 		return fmt.Errorf(
@@ -163,24 +197,30 @@ func validateSnapshotFile(path string) error {
 		return fmt.Errorf("parsing snapshot json: %w", err)
 	}
 	if snapshot.Version == "" {
-		return fmt.Errorf("missing snapshot version")
+		return errors.New("missing snapshot version")
+	}
+	if !immutableGitRefPattern.MatchString(snapshot.SourceRef) {
+		return errors.New("missing immutable LiteLLM source ref")
 	}
 	if len(snapshot.Models) == 0 {
-		return fmt.Errorf("missing snapshot models")
+		return errors.New("missing snapshot models")
 	}
 	if len(snapshot.Models) > maxSnapshotModels {
 		return fmt.Errorf("snapshot models exceed %d entries", maxSnapshotModels)
 	}
 	for _, model := range snapshot.Models {
 		if strings.TrimSpace(model.ModelPattern) == "" {
-			return fmt.Errorf("snapshot contains model with empty pattern")
+			return errors.New("snapshot contains model with empty pattern")
+		}
+		if err := catalog.NormalizePricingBands(model.ModelPattern, model.Bands); err != nil {
+			return err
 		}
 	}
 
 	return nil
 }
 
-func restoreSnapshotFile(
+func restoreSnapshotFile(ctx context.Context,
 	outPath,
 	ref,
 	snapshotPath,
@@ -189,13 +229,13 @@ func restoreSnapshotFile(
 	snapshotURL string,
 ) error {
 	if ref == "" {
-		return fmt.Errorf("missing artifact ref")
+		return errors.New("missing artifact ref")
 	}
 	if snapshotPath == "" {
-		return fmt.Errorf("missing artifact snapshot path")
+		return errors.New("missing artifact snapshot path")
 	}
 	if expectedSHA256 == "" {
-		return fmt.Errorf("missing expected snapshot SHA256")
+		return errors.New("missing expected snapshot SHA256")
 	}
 
 	if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
@@ -230,16 +270,16 @@ func restoreSnapshotFile(
 	}
 	defer os.Remove(tmp)
 
-	if err := restoreSnapshotFileFromGit(tmp, ref, snapshotPath, branch); err != nil {
+	if err := restoreSnapshotFileFromGit(ctx, tmp, ref, snapshotPath, branch); err != nil {
 		if snapshotURL == "" {
 			return err
 		}
 		if removeErr := os.Remove(tmp); removeErr != nil && !os.IsNotExist(removeErr) {
 			return fmt.Errorf("removing failed git snapshot: %w", removeErr)
 		}
-		if downloadErr := downloadSnapshotFile(tmp, snapshotURL); downloadErr != nil {
+		if downloadErr := downloadSnapshotFile(ctx, tmp, snapshotURL); downloadErr != nil {
 			return fmt.Errorf(
-				"restoring snapshot from git failed: %w; downloading snapshot failed: %v",
+				"restoring snapshot from git failed: %w; downloading snapshot failed: %w",
 				err,
 				downloadErr,
 			)
@@ -274,8 +314,8 @@ func restoreSnapshotFile(
 	return nil
 }
 
-func restoreSnapshotFileFromGit(tmp, ref, snapshotPath, branch string) error {
-	if err := ensureGitCommit(ref, branch); err != nil {
+func restoreSnapshotFileFromGit(ctx context.Context, tmp, ref, snapshotPath, branch string) error {
+	if err := ensureGitCommit(ctx, ref, branch); err != nil {
 		return err
 	}
 
@@ -284,7 +324,7 @@ func restoreSnapshotFileFromGit(tmp, ref, snapshotPath, branch string) error {
 		return fmt.Errorf("creating temp snapshot: %w", err)
 	}
 	var stderr bytes.Buffer
-	cmd := exec.Command("git", "show", ref+":"+snapshotPath)
+	cmd := exec.CommandContext(ctx, "git", "show", ref+":"+snapshotPath)
 	cmd.Stdout = file
 	cmd.Stderr = &stderr
 	runErr := cmd.Run()
@@ -303,9 +343,13 @@ func restoreSnapshotFileFromGit(tmp, ref, snapshotPath, branch string) error {
 	return nil
 }
 
-func downloadSnapshotFile(tmp, snapshotURL string) error {
+func downloadSnapshotFile(ctx context.Context, tmp, snapshotURL string) error {
 	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Get(snapshotURL)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, snapshotURL, nil)
+	if err != nil {
+		return fmt.Errorf("creating snapshot request: %w", err)
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("requesting snapshot: %w", err)
 	}
@@ -337,13 +381,13 @@ func downloadSnapshotFile(tmp, snapshotURL string) error {
 	return nil
 }
 
-func ensureGitCommit(ref, branch string) error {
-	if gitCommand("cat-file", "-e", ref+"^{commit}") == nil {
+func ensureGitCommit(ctx context.Context, ref, branch string) error {
+	if gitCommand(ctx, "cat-file", "-e", ref+"^{commit}") == nil {
 		return nil
 	}
 
-	if err := fetchGitRef(ref); err == nil {
-		if gitCommand("cat-file", "-e", ref+"^{commit}") == nil {
+	if err := fetchGitRef(ctx, ref); err == nil {
+		if gitCommand(ctx, "cat-file", "-e", ref+"^{commit}") == nil {
 			return nil
 		}
 	}
@@ -352,17 +396,17 @@ func ensureGitCommit(ref, branch string) error {
 		return fmt.Errorf("artifact ref %s is not available locally", ref)
 	}
 
-	if err := fetchGitRef(branch + ":refs/remotes/origin/" + branch); err != nil {
+	if err := fetchGitRef(ctx, branch+":refs/remotes/origin/"+branch); err != nil {
 		return err
 	}
-	if err := gitCommand("cat-file", "-e", ref+"^{commit}"); err != nil {
+	if err := gitCommand(ctx, "cat-file", "-e", ref+"^{commit}"); err != nil {
 		return fmt.Errorf("artifact ref %s is not available after fetch: %w", ref, err)
 	}
 	return nil
 }
 
-func fetchGitRef(refspec string) error {
-	cmd := exec.Command("git", "fetch", "--depth=1", "origin", refspec)
+func fetchGitRef(ctx context.Context, refspec string) error {
+	cmd := exec.CommandContext(ctx, "git", "fetch", "--depth=1", "origin", refspec)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf(
@@ -375,8 +419,8 @@ func fetchGitRef(refspec string) error {
 	return nil
 }
 
-func gitCommand(args ...string) error {
-	cmd := exec.Command("git", args...)
+func gitCommand(ctx context.Context, args ...string) error {
+	cmd := exec.CommandContext(ctx, "git", args...)
 	return cmd.Run()
 }
 
@@ -414,155 +458,164 @@ func appendModelOverlay(models []catalog.ModelPricing) []catalog.ModelPricing {
 
 	overlay := map[string]catalog.ModelPricing{
 		"claude-opus-4-6": {
-			ModelPattern:         "claude-opus-4-6",
-			InputPerMTok:         5.0,
-			OutputPerMTok:        25.0,
-			CacheCreationPerMTok: 6.25,
-			CacheReadPerMTok:     0.50,
+			ModelPattern:           "claude-opus-4-6",
+			InputPerMTok:           mustRate("5.0"),
+			OutputPerMTok:          mustRate("25.0"),
+			CacheCreationPerMTok:   mustRate("6.25"),
+			CacheCreation1hPerMTok: mustRate("10.0"),
+			CacheReadPerMTok:       mustRate("0.50"),
 		},
 		"claude-opus-4-7": {
-			ModelPattern:         "claude-opus-4-7",
-			InputPerMTok:         5.0,
-			OutputPerMTok:        25.0,
-			CacheCreationPerMTok: 6.25,
-			CacheReadPerMTok:     0.50,
+			ModelPattern:           "claude-opus-4-7",
+			InputPerMTok:           mustRate("5.0"),
+			OutputPerMTok:          mustRate("25.0"),
+			CacheCreationPerMTok:   mustRate("6.25"),
+			CacheCreation1hPerMTok: mustRate("10.0"),
+			CacheReadPerMTok:       mustRate("0.50"),
 		},
 		"claude-opus-4-8": {
-			ModelPattern:         "claude-opus-4-8",
-			InputPerMTok:         5.0,
-			OutputPerMTok:        25.0,
-			CacheCreationPerMTok: 6.25,
-			CacheReadPerMTok:     0.50,
+			ModelPattern:           "claude-opus-4-8",
+			InputPerMTok:           mustRate("5.0"),
+			OutputPerMTok:          mustRate("25.0"),
+			CacheCreationPerMTok:   mustRate("6.25"),
+			CacheCreation1hPerMTok: mustRate("10.0"),
+			CacheReadPerMTok:       mustRate("0.50"),
 		},
 		"claude-opus-4-20250514": {
-			ModelPattern:         "claude-opus-4-20250514",
-			InputPerMTok:         15.0,
-			OutputPerMTok:        75.0,
-			CacheCreationPerMTok: 18.75,
-			CacheReadPerMTok:     1.50,
+			ModelPattern:           "claude-opus-4-20250514",
+			InputPerMTok:           mustRate("15.0"),
+			OutputPerMTok:          mustRate("75.0"),
+			CacheCreationPerMTok:   mustRate("18.75"),
+			CacheCreation1hPerMTok: mustRate("30.0"),
+			CacheReadPerMTok:       mustRate("1.50"),
 		},
 		"claude-fable-5": {
-			ModelPattern:         "claude-fable-5",
-			InputPerMTok:         10.0,
-			OutputPerMTok:        50.0,
-			CacheCreationPerMTok: 12.50,
-			CacheReadPerMTok:     1.00,
+			ModelPattern:           "claude-fable-5",
+			InputPerMTok:           mustRate("10.0"),
+			OutputPerMTok:          mustRate("50.0"),
+			CacheCreationPerMTok:   mustRate("12.50"),
+			CacheCreation1hPerMTok: mustRate("20.0"),
+			CacheReadPerMTok:       mustRate("1.00"),
 		},
 		"claude-sonnet-4-6": {
-			ModelPattern:         "claude-sonnet-4-6",
-			InputPerMTok:         3.0,
-			OutputPerMTok:        15.0,
-			CacheCreationPerMTok: 3.75,
-			CacheReadPerMTok:     0.30,
+			ModelPattern:           "claude-sonnet-4-6",
+			InputPerMTok:           mustRate("3.0"),
+			OutputPerMTok:          mustRate("15.0"),
+			CacheCreationPerMTok:   mustRate("3.75"),
+			CacheCreation1hPerMTok: mustRate("6.0"),
+			CacheReadPerMTok:       mustRate("0.30"),
 		},
 		"claude-sonnet-4-20250514": {
-			ModelPattern:         "claude-sonnet-4-20250514",
-			InputPerMTok:         3.0,
-			OutputPerMTok:        15.0,
-			CacheCreationPerMTok: 3.75,
-			CacheReadPerMTok:     0.30,
+			ModelPattern:           "claude-sonnet-4-20250514",
+			InputPerMTok:           mustRate("3.0"),
+			OutputPerMTok:          mustRate("15.0"),
+			CacheCreationPerMTok:   mustRate("3.75"),
+			CacheCreation1hPerMTok: mustRate("6.0"),
+			CacheReadPerMTok:       mustRate("0.30"),
 		},
 		"claude-sonnet-4-5-20250514": {
-			ModelPattern:         "claude-sonnet-4-5-20250514",
-			InputPerMTok:         3.0,
-			OutputPerMTok:        15.0,
-			CacheCreationPerMTok: 3.75,
-			CacheReadPerMTok:     0.30,
+			ModelPattern:           "claude-sonnet-4-5-20250514",
+			InputPerMTok:           mustRate("3.0"),
+			OutputPerMTok:          mustRate("15.0"),
+			CacheCreationPerMTok:   mustRate("3.75"),
+			CacheCreation1hPerMTok: mustRate("6.0"),
+			CacheReadPerMTok:       mustRate("0.30"),
 		},
 		"claude-haiku-4-5-20251001": {
-			ModelPattern:         "claude-haiku-4-5-20251001",
-			InputPerMTok:         1.0,
-			OutputPerMTok:        5.0,
-			CacheCreationPerMTok: 1.25,
-			CacheReadPerMTok:     0.10,
+			ModelPattern:           "claude-haiku-4-5-20251001",
+			InputPerMTok:           mustRate("1.0"),
+			OutputPerMTok:          mustRate("5.0"),
+			CacheCreationPerMTok:   mustRate("1.25"),
+			CacheCreation1hPerMTok: mustRate("2.0"),
+			CacheReadPerMTok:       mustRate("0.10"),
 		},
 		"claude-haiku-3-5-20241022": {
-			ModelPattern:         "claude-haiku-3-5-20241022",
-			InputPerMTok:         0.80,
-			OutputPerMTok:        4.0,
-			CacheCreationPerMTok: 1.0,
-			CacheReadPerMTok:     0.08,
+			ModelPattern:           "claude-haiku-3-5-20241022",
+			InputPerMTok:           mustRate("0.80"),
+			OutputPerMTok:          mustRate("4.0"),
+			CacheCreationPerMTok:   mustRate("1.0"),
+			CacheCreation1hPerMTok: mustRate("1.6"),
+			CacheReadPerMTok:       mustRate("0.08"),
 		},
 		"gpt-5.5": {
 			ModelPattern:     "gpt-5.5",
-			InputPerMTok:     5.0,
-			OutputPerMTok:    30.0,
-			CacheReadPerMTok: 0.50,
+			InputPerMTok:     mustRate("5.0"),
+			OutputPerMTok:    mustRate("30.0"),
+			CacheReadPerMTok: mustRate("0.50"),
 		},
 		"gpt-5.4": {
 			ModelPattern:     "gpt-5.4",
-			InputPerMTok:     2.50,
-			OutputPerMTok:    15.0,
-			CacheReadPerMTok: 0.25,
+			InputPerMTok:     mustRate("2.50"),
+			OutputPerMTok:    mustRate("15.0"),
+			CacheReadPerMTok: mustRate("0.25"),
 		},
 		"gpt-5.4-mini": {
 			ModelPattern:     "gpt-5.4-mini",
-			InputPerMTok:     0.75,
-			OutputPerMTok:    4.50,
-			CacheReadPerMTok: 0.075,
+			InputPerMTok:     mustRate("0.75"),
+			OutputPerMTok:    mustRate("4.50"),
+			CacheReadPerMTok: mustRate("0.075"),
 		},
 		"gpt-5.4-nano": {
 			ModelPattern:     "gpt-5.4-nano",
-			InputPerMTok:     0.20,
-			OutputPerMTok:    1.25,
-			CacheReadPerMTok: 0.02,
+			InputPerMTok:     mustRate("0.20"),
+			OutputPerMTok:    mustRate("1.25"),
+			CacheReadPerMTok: mustRate("0.02"),
 		},
 		"gpt-5.3-codex": {
 			ModelPattern:     "gpt-5.3-codex",
-			InputPerMTok:     1.75,
-			OutputPerMTok:    14.0,
-			CacheReadPerMTok: 0.175,
+			InputPerMTok:     mustRate("1.75"),
+			OutputPerMTok:    mustRate("14.0"),
+			CacheReadPerMTok: mustRate("0.175"),
 		},
 		"gpt-5.2-codex": {
 			ModelPattern:     "gpt-5.2-codex",
-			InputPerMTok:     1.75,
-			OutputPerMTok:    14.0,
-			CacheReadPerMTok: 0.175,
+			InputPerMTok:     mustRate("1.75"),
+			OutputPerMTok:    mustRate("14.0"),
+			CacheReadPerMTok: mustRate("0.175"),
 		},
 		"gpt-5.1-codex-max": {
 			ModelPattern:     "gpt-5.1-codex-max",
-			InputPerMTok:     1.25,
-			OutputPerMTok:    10.0,
-			CacheReadPerMTok: 0.125,
+			InputPerMTok:     mustRate("1.25"),
+			OutputPerMTok:    mustRate("10.0"),
+			CacheReadPerMTok: mustRate("0.125"),
 		},
 		"mistral-large": {
 			ModelPattern:  "mistral-large",
-			InputPerMTok:  4.0,
-			OutputPerMTok: 4.0,
+			InputPerMTok:  mustRate("4.0"),
+			OutputPerMTok: mustRate("4.0"),
 		},
 		"mistral-large-3": {
 			ModelPattern:         "mistral-large-3",
-			InputPerMTok:         4.0,
-			OutputPerMTok:        4.0,
-			CacheCreationPerMTok: 4.0,
-			CacheReadPerMTok:     0.30,
+			InputPerMTok:         mustRate("4.0"),
+			OutputPerMTok:        mustRate("4.0"),
+			CacheCreationPerMTok: mustRate("4.0"),
+			CacheReadPerMTok:     mustRate("0.30"),
 		},
 		"mistral-medium": {
 			ModelPattern:  "mistral-medium",
-			InputPerMTok:  2.75,
-			OutputPerMTok: 2.75,
+			InputPerMTok:  mustRate("2.75"),
+			OutputPerMTok: mustRate("2.75"),
 		},
 		"mistral-medium-3": {
 			ModelPattern:  "mistral-medium-3",
-			InputPerMTok:  2.75,
-			OutputPerMTok: 2.75,
+			InputPerMTok:  mustRate("2.75"),
+			OutputPerMTok: mustRate("2.75"),
 		},
 		"mistral-medium-3.5": {
 			ModelPattern:         "mistral-medium-3.5",
-			InputPerMTok:         1.5,
-			OutputPerMTok:        7.5,
-			CacheCreationPerMTok: 1.5,
-			CacheReadPerMTok:     0.25,
+			InputPerMTok:         mustRate("1.5"),
+			OutputPerMTok:        mustRate("7.5"),
+			CacheCreationPerMTok: mustRate("1.5"),
+			CacheReadPerMTok:     mustRate("0.25"),
 		},
 		"openrouter/owl-alpha": {
 			ModelPattern:  "openrouter/owl-alpha",
-			InputPerMTok:  0,
-			OutputPerMTok: 0,
+			InputPerMTok:  mustRate("0"),
+			OutputPerMTok: mustRate("0"),
 		},
 	}
 
-	out := make([]catalog.ModelPricing, len(models))
-	copy(out, models)
+	out := slices.Clone(models)
 	for modelPattern, price := range overlay {
 		if _, ok := present[modelPattern]; ok {
 			continue

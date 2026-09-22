@@ -2,6 +2,7 @@ package duckdb
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"math"
 	"slices"
@@ -9,7 +10,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ccoveille/go-safecast/v2"
+
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/export"
+	"go.kenn.io/agentsview/internal/money"
 	pricingpkg "go.kenn.io/agentsview/internal/pricing"
 	"go.kenn.io/agentsview/internal/signals"
 )
@@ -59,7 +64,7 @@ type duckAnalyticsSession struct {
 func (s *Store) analyticsSessions(
 	ctx context.Context, f db.AnalyticsFilter,
 ) ([]duckAnalyticsSession, error) {
-	return s.analyticsSessionsFiltered(ctx, f, true, true)
+	return s.analyticsSessionsFiltered(ctx, f, true, true, "", nil)
 }
 
 // analyticsSessionsFiltered loads candidate sessions, optionally applying
@@ -72,6 +77,7 @@ func (s *Store) analyticsSessions(
 func (s *Store) analyticsSessionsFiltered(
 	ctx context.Context, f db.AnalyticsFilter,
 	includeDate, includeTime bool,
+	extraPred string, extraArgs []any,
 ) ([]duckAnalyticsSession, error) {
 	if includeTime && f.HasTimeFilter() && strings.TrimSpace(f.Model) != "" {
 		return s.analyticsSessionsModelTimeFiltered(ctx, f, includeDate)
@@ -79,6 +85,10 @@ func (s *Store) analyticsSessionsFiltered(
 	where, args := duckBuildAnalyticsWhere(
 		f, "COALESCE(s.started_at, s.created_at)", "s.",
 		includeDate, includeTime)
+	if extraPred != "" {
+		where += " AND " + extraPred
+		args = append(args, extraArgs...)
+	}
 	rows, err := s.queryContext(ctx, `
 		SELECT id, project, machine, agent, first_message,
 			COALESCE(display_name, session_name) AS display_name,
@@ -138,7 +148,7 @@ func (s *Store) analyticsSessionsFiltered(
 func (s *Store) analyticsSessionsModelTimeFiltered(
 	ctx context.Context, f db.AnalyticsFilter, includeDate bool,
 ) ([]duckAnalyticsSession, error) {
-	sessions, err := s.analyticsSessionsFiltered(ctx, f, includeDate, false)
+	sessions, err := s.analyticsSessionsFiltered(ctx, f, includeDate, false, "", nil)
 	if err != nil {
 		return nil, err
 	}
@@ -175,10 +185,11 @@ func duckBuildAnalyticsWhere(
 	q := func(col string) string { return tablePrefix + col }
 	preds := []string{
 		q("message_count") + " > 0",
-		// Mirror the SQLite analytics filter: count subagents only on
-		// opt-in sum/count surfaces; fork rows stay excluded always. The
-		// shared helper qualifies the column with tablePrefix directly.
-		db.RelationshipExclusionSQL(f.IncludeSubagents, tablePrefix),
+		// Mirror the SQLite analytics filter: subagent and fork rows are
+		// excluded unless the filter opts in (sum/count surfaces for
+		// subagents, the activity report for both). The shared helper
+		// qualifies the column with tablePrefix directly.
+		db.RelationshipExclusionSQL(f.IncludeSubagents, f.IncludeForks, tablePrefix),
 		q("deleted_at") + " IS NULL",
 	}
 	var args []any
@@ -818,6 +829,7 @@ func (s *Store) GetAnalyticsSummary(
 	if err != nil {
 		return db.AnalyticsSummary{}, fmt.Errorf("querying duckdb analytics summary: %w", err)
 	}
+	defer rows.Close()
 	resp := db.AnalyticsSummary{Agents: map[string]*db.AgentSummary{}}
 	if !rows.Next() {
 		rows.Close()
@@ -1079,7 +1091,8 @@ func (s *Store) queryActivityBuckets(
 		message_rows AS (
 			SELECT `+bucketExpr+` AS bucket,
 				COUNT(*) AS messages,
-				COUNT(*) FILTER (WHERE m.role = 'user' AND m.is_system = FALSE) AS user_messages,
+				COUNT(*) FILTER (WHERE m.role = 'user' AND m.is_system = FALSE
+					AND COALESCE(m.source_subtype, '') != 'tool_result') AS user_messages,
 				COUNT(*) FILTER (WHERE m.role = 'assistant') AS assistant_messages,
 				COUNT(*) FILTER (WHERE m.has_thinking = TRUE) AS thinking_messages
 			FROM filtered_sessions fs
@@ -1556,7 +1569,7 @@ func (s *Store) GetAnalyticsHourOfWeek(
 func (s *Store) getAnalyticsHourOfWeekFilteredByModel(
 	ctx context.Context, f db.AnalyticsFilter,
 ) (db.HourOfWeekResponse, error) {
-	sessions, err := s.analyticsSessionsFiltered(ctx, f, true, false)
+	sessions, err := s.analyticsSessionsFiltered(ctx, f, true, false, "", nil)
 	if err != nil {
 		return db.HourOfWeekResponse{}, err
 	}
@@ -1732,7 +1745,8 @@ func (s *Store) analyticsAutonomyBuckets(
 	}
 	rows, err := s.queryContext(ctx, `
 		SELECT session_id,
-			SUM(CASE WHEN role = 'user' AND is_system = FALSE THEN 1 ELSE 0 END) AS user_count,
+			SUM(CASE WHEN role = 'user' AND is_system = FALSE
+				AND COALESCE(source_subtype, '') != 'tool_result' THEN 1 ELSE 0 END) AS user_count,
 			SUM(CASE WHEN role = 'assistant' AND has_tool_use = TRUE THEN 1 ELSE 0 END) AS tool_count
 		FROM messages
 		WHERE session_id IN (`+strings.Join(placeholders, ",")+`)
@@ -1783,8 +1797,9 @@ func duckQueryChunked(ids []string, fn func(chunk []string) error) error {
 func (s *Store) GetAnalyticsTools(
 	ctx context.Context, f db.AnalyticsFilter,
 ) (db.ToolsAnalyticsResponse, error) {
+	sessionPred, sessionArgs := duckAnalyticsToolSessionWindow(f)
 	sessions, err := s.analyticsSessionsFiltered(
-		ctx, f, false, false,
+		ctx, f, false, false, sessionPred, sessionArgs,
 	)
 	if err != nil {
 		return db.ToolsAnalyticsResponse{}, err
@@ -1796,25 +1811,19 @@ func (s *Store) GetAnalyticsTools(
 		ids = append(ids, r.id)
 	}
 	if len(ids) == 0 {
-		return db.ToolsAnalyticsResponse{}, nil
+		return db.BuildToolsAnalytics(nil), nil
 	}
-	cats := map[string]int{}
-	agents := map[string]map[string]int{}
-	trends := map[string]map[string]int{}
-	total := 0
-	type toolRow struct {
-		sessionID string
-		category  string
-		count     int
-		date      string
-	}
-	var toolRows []toolRow
+	var toolRows []db.ToolAnalyticsRow
 	err = duckQueryChunked(ids, func(chunk []string) error {
 		ph, args := duckInPlaceholders(chunk)
 		modelPred, modelArgs := duckAnalyticsCSVPredicate("m.model", f.Model)
 		args = append(args, modelArgs...)
-		query := `SELECT tc.session_id, tc.category, COUNT(*),
-				m.timestamp
+		from, to := duckAnalyticsWindowBounds(f)
+		windowPred, windowArgs := duckAnalyticsMessageWindowPred("m.timestamp", from, to)
+		args = append(args, windowArgs...)
+		query := `SELECT tc.session_id, tc.category,
+				TRIM(COALESCE(tc.tool_name, '')), COUNT(*),
+				MAX(m.timestamp)
 				FROM tool_calls tc
 				LEFT JOIN messages m
 					ON m.session_id = tc.session_id
@@ -1824,18 +1833,21 @@ func (s *Store) GetAnalyticsTools(
 			query += `
 				AND ` + modelPred
 		}
+		query += duckAnalyticsAndClause(windowPred)
 		query += `
-				GROUP BY tc.session_id, tc.category, m.timestamp`
+				GROUP BY tc.session_id, tc.category,
+					TRIM(COALESCE(tc.tool_name, '')), date_trunc('minute', m.timestamp)`
+		observeAnalyticsQuery(query)
 		rows, qErr := s.queryContext(ctx, query, args...)
 		if qErr != nil {
 			return qErr
 		}
 		defer rows.Close()
 		for rows.Next() {
-			var sid, cat string
+			var sid, cat, toolName string
 			var ts any
 			var count int
-			if err := rows.Scan(&sid, &cat, &count, &ts); err != nil {
+			if err := rows.Scan(&sid, &cat, &toolName, &count, &ts); err != nil {
 				return err
 			}
 			r, ok := meta[sid]
@@ -1848,11 +1860,13 @@ func (s *Store) GetAnalyticsTools(
 			if !keep {
 				continue
 			}
-			toolRows = append(toolRows, toolRow{
-				sessionID: sid,
-				category:  cat,
-				count:     count,
-				date:      date,
+			toolRows = append(toolRows, db.ToolAnalyticsRow{
+				SessionID: sid,
+				Category:  cat,
+				ToolName:  toolName,
+				Agent:     r.agent,
+				Count:     count,
+				Date:      date,
 			})
 		}
 		return rows.Err()
@@ -1860,56 +1874,16 @@ func (s *Store) GetAnalyticsTools(
 	if err != nil {
 		return db.ToolsAnalyticsResponse{}, err
 	}
-	for _, tr := range toolRows {
-		r, ok := meta[tr.sessionID]
-		if !ok {
-			continue
-		}
-		total += tr.count
-		cats[tr.category] += tr.count
-		if agents[r.agent] == nil {
-			agents[r.agent] = map[string]int{}
-		}
-		agents[r.agent][tr.category] += tr.count
-		week := bucketAnalyticsDate(tr.date, "week")
-		if trends[week] == nil {
-			trends[week] = map[string]int{}
-		}
-		trends[week][tr.category] += tr.count
-	}
-	resp := db.ToolsAnalyticsResponse{TotalCalls: total}
-	for cat, count := range cats {
-		resp.ByCategory = append(resp.ByCategory, db.ToolCategoryCount{
-			Category: cat, Count: count, Pct: round1(float64(count) / float64(max(total, 1)) * 100),
-		})
-	}
-	sort.Slice(resp.ByCategory, func(i, j int) bool {
-		if resp.ByCategory[i].Count != resp.ByCategory[j].Count {
-			return resp.ByCategory[i].Count > resp.ByCategory[j].Count
-		}
-		return resp.ByCategory[i].Category < resp.ByCategory[j].Category
-	})
-	for _, agent := range sortedKeys(agents) {
-		breakdown := db.ToolAgentBreakdown{Agent: agent}
-		for cat, count := range agents[agent] {
-			breakdown.Total += count
-			breakdown.Categories = append(breakdown.Categories, db.ToolCategoryCount{Category: cat, Count: count})
-		}
-		for i := range breakdown.Categories {
-			breakdown.Categories[i].Pct = round1(float64(breakdown.Categories[i].Count) / float64(max(breakdown.Total, 1)) * 100)
-		}
-		resp.ByAgent = append(resp.ByAgent, breakdown)
-	}
-	for _, date := range sortedKeys(trends) {
-		resp.Trend = append(resp.Trend, db.ToolTrendEntry{Date: date, ByCat: trends[date]})
-	}
-	return resp, nil
+	return db.BuildToolsAnalytics(toolRows), nil
 }
 
+// GetAnalyticsSkills returns skill usage analytics. granularity picks
+// the trend bucket size (day, week, or month); empty defaults to week.
 func (s *Store) GetAnalyticsSkills(
-	ctx context.Context, f db.AnalyticsFilter,
+	ctx context.Context, f db.AnalyticsFilter, granularity string,
 ) (db.SkillsAnalyticsResponse, error) {
-	sessions, err := s.analyticsSessionsFiltered(ctx, f, false, false)
+	sessionPred, sessionArgs := duckAnalyticsToolSessionWindow(f)
+	sessions, err := s.analyticsSessionsFiltered(ctx, f, false, false, sessionPred, sessionArgs)
 	if err != nil {
 		return db.SkillsAnalyticsResponse{}, err
 	}
@@ -1920,7 +1894,9 @@ func (s *Store) GetAnalyticsSkills(
 		ids = append(ids, r.id)
 	}
 	if len(ids) == 0 {
-		return db.BuildSkillsAnalytics(nil), nil
+		return db.BuildSkillsAnalytics(
+			nil, f.From, f.To, granularity,
+		), nil
 	}
 
 	var skillRows []db.SkillAnalyticsRow
@@ -1928,18 +1904,21 @@ func (s *Store) GetAnalyticsSkills(
 		ph, args := duckInPlaceholders(chunk)
 		modelPred, modelArgs := duckAnalyticsCSVPredicate("m.model", f.Model)
 		args = append(args, modelArgs...)
+		from, to := duckAnalyticsWindowBounds(f)
+		windowPred, windowArgs := duckAnalyticsMessageWindowPred("m.timestamp", from, to)
+		args = append(args, windowArgs...)
 		rows, qErr := s.queryContext(ctx,
 			`SELECT tc.session_id, TRIM(COALESCE(tc.skill_name, '')),
-				COUNT(*), m.timestamp
+				COUNT(*), MAX(m.timestamp)
 				FROM tool_calls tc
 				LEFT JOIN messages m
 					ON m.session_id = tc.session_id
 					AND m.id = tc.message_id
 				WHERE tc.session_id IN `+ph+`
 					AND TRIM(COALESCE(tc.skill_name, '')) != ''
-					`+duckAnalyticsAndClause(modelPred)+`
+					`+duckAnalyticsAndClause(modelPred)+duckAnalyticsAndClause(windowPred)+`
 				GROUP BY tc.session_id, TRIM(COALESCE(tc.skill_name, '')),
-					m.timestamp`, args...)
+					date_trunc('minute', m.timestamp)`, args...)
 		if qErr != nil {
 			return qErr
 		}
@@ -1976,7 +1955,9 @@ func (s *Store) GetAnalyticsSkills(
 	if err != nil {
 		return db.SkillsAnalyticsResponse{}, err
 	}
-	return db.BuildSkillsAnalytics(skillRows), nil
+	return db.BuildSkillsAnalytics(
+		skillRows, f.From, f.To, granularity,
+	), nil
 }
 
 func (s *Store) GetAnalyticsVelocity(
@@ -2645,7 +2626,7 @@ func (s *Store) duckPopulateFrustrationMarkers(
 	}
 	q := `SELECT session_id, content, is_system
 		FROM messages
-		WHERE role = 'user' AND session_id IN (` +
+		WHERE role = 'user' AND COALESCE(source_subtype, '') <> 'tool_result' AND session_id IN (` +
 		strings.Join(placeholders, ",") + `)`
 	msgRows, err := s.queryContext(ctx, q, args...)
 	if err != nil {
@@ -2696,13 +2677,14 @@ func (s *Store) duckSignalMessages(
 			for sessionID, scopedRows := range scope.MessagesBySession() {
 				for _, row := range scopedRows {
 					out[sessionID] = append(out[sessionID], db.SignalMessage{
-						SessionID:  row.SessionID,
-						Ordinal:    row.Ordinal,
-						Role:       row.Role,
-						Content:    row.Content,
-						Timestamp:  row.Timestamp,
-						IsSystem:   row.IsSystem,
-						HasToolUse: row.HasToolUse,
+						SessionID:     row.SessionID,
+						Ordinal:       row.Ordinal,
+						Role:          row.Role,
+						SourceSubtype: row.SourceSubtype,
+						Content:       row.Content,
+						Timestamp:     row.Timestamp,
+						IsSystem:      row.IsSystem,
+						HasToolUse:    row.HasToolUse,
 					})
 				}
 			}
@@ -2710,14 +2692,14 @@ func (s *Store) duckSignalMessages(
 		return out, nil
 	}
 	placeholders := make([]string, len(rows))
-	args := make([]any, len(rows))
+	args := make([]any, 0, len(rows))
 	for i, r := range rows {
 		placeholders[i] = "?"
-		args[i] = r.ID
+		args = append(args, r.ID)
 	}
 	filterModels := duckAnalyticsCSVValues(f.Model)
 	q := `SELECT session_id, ordinal, role, content,
-			timestamp, is_system, has_tool_use
+			timestamp, is_system, has_tool_use, COALESCE(source_subtype, '')
 		FROM messages
 		WHERE session_id IN (` + strings.Join(placeholders, ",") + `)`
 	if len(filterModels) == 1 {
@@ -2744,7 +2726,7 @@ func (s *Store) duckSignalMessages(
 		if err := msgRows.Scan(
 			&m.SessionID, &m.Ordinal, &m.Role,
 			&m.Content, &ts,
-			&m.IsSystem, &m.HasToolUse,
+			&m.IsSystem, &m.HasToolUse, &m.SourceSubtype,
 		); err != nil {
 			return nil, fmt.Errorf("scanning duckdb signal message: %w", err)
 		}
@@ -2892,43 +2874,147 @@ func (s *Store) GetTrendsTerms(
 }
 
 type duckRates struct {
-	input         float64
-	output        float64
-	cacheCreation float64
-	cacheRead     float64
+	input           money.Money
+	output          money.Money
+	cacheCreation   money.Money
+	cacheCreation1h money.Money
+	cacheRead       money.Money
+	updatedAt       *time.Time
+	source          export.PricingRowSource
+	bands           []export.PricingBand
 }
 
 func (s *Store) loadPricing(ctx context.Context) (map[string]duckRates, error) {
 	rows, err := s.queryContext(ctx, `
-		SELECT model_pattern, input_per_mtok, output_per_mtok,
-			cache_creation_per_mtok, cache_read_per_mtok
-		FROM model_pricing`)
+		SELECT p.model_pattern, p.input_microdollars_per_mtok,
+			p.output_microdollars_per_mtok,
+			p.cache_creation_microdollars_per_mtok,
+			p.cache_creation_1h_microdollars_per_mtok,
+			p.cache_read_microdollars_per_mtok, p.updated_at,
+			b.above_input_tokens, b.input_microdollars_per_mtok,
+			b.output_microdollars_per_mtok,
+			b.cache_creation_microdollars_per_mtok,
+			b.cache_creation_1h_microdollars_per_mtok,
+			b.cache_read_microdollars_per_mtok, b.updated_at
+		FROM model_pricing p
+		LEFT JOIN model_pricing_bands b ON b.model_pattern = p.model_pattern
+		ORDER BY p.model_pattern, b.above_input_tokens`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	out := duckFallbackPricingMap()
+	out := map[string]duckRates{}
+	count := 0
 	for rows.Next() {
 		var model string
 		var rates duckRates
-		if err := rows.Scan(&model, &rates.input, &rates.output, &rates.cacheCreation, &rates.cacheRead); err != nil {
+		var updatedAt string
+		var threshold, input, output, cacheCreation, cacheCreation1h,
+			cacheRead sql.NullInt64
+		var bandUpdatedAt sql.NullString
+		if err := rows.Scan(
+			&model, &rates.input, &rates.output,
+			&rates.cacheCreation, &rates.cacheCreation1h,
+			&rates.cacheRead, &updatedAt,
+			&threshold, &input, &output, &cacheCreation, &cacheCreation1h,
+			&cacheRead, &bandUpdatedAt,
+		); err != nil {
 			return nil, err
 		}
 		if strings.HasPrefix(model, "_") {
 			continue
 		}
-		out[model] = rates
+		stored, exists := out[model]
+		if !exists {
+			if parsed, err := time.Parse(time.RFC3339Nano, updatedAt); err == nil {
+				t := parsed.UTC()
+				rates.updatedAt = &t
+			}
+			stored = rates
+			count++
+		}
+		if threshold.Valid {
+			aboveInputTokens, err := safecast.Convert[int](threshold.Int64)
+			if err != nil {
+				return nil, fmt.Errorf(
+					"converting duckdb pricing threshold for %q: %w",
+					model, err,
+				)
+			}
+			var parsedUpdatedAt *time.Time
+			if parsed, err := time.Parse(
+				time.RFC3339Nano, bandUpdatedAt.String,
+			); err == nil {
+				t := parsed.UTC()
+				parsedUpdatedAt = &t
+			}
+			stored.bands = append(stored.bands, export.PricingBand{
+				AboveInputTokens:    aboveInputTokens,
+				InputPerMTok:        money.Money{Microdollars: input.Int64},
+				OutputPerMTok:       money.Money{Microdollars: output.Int64},
+				CacheWritePerMTok:   money.Money{Microdollars: cacheCreation.Int64},
+				CacheWrite1hPerMTok: money.Money{Microdollars: cacheCreation1h.Int64},
+				CacheReadPerMTok:    money.Money{Microdollars: cacheRead.Int64},
+				UpdatedAt:           parsedUpdatedAt,
+			})
+		}
+		out[model] = stored
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	for model, custom := range s.customPricing {
-		out[model] = duckRates{
-			input: custom.Input, output: custom.Output,
-			cacheCreation: custom.CacheCreation, cacheRead: custom.CacheRead,
+	if count == 0 {
+		out = duckFallbackPricingMap()
+	} else {
+		fallback := duckFallbackPricingMap()
+		for model, rates := range out {
+			rates.source = duckPricingSource(model, rates, fallback)
+			out[model] = rates
 		}
 	}
+	for model, custom := range s.customPricing {
+		rates := duckRates{
+			input:  money.Money{Microdollars: custom.InputMicrodollarsPerMTok},
+			output: money.Money{Microdollars: custom.OutputMicrodollarsPerMTok},
+			cacheCreation: money.Money{
+				Microdollars: custom.CacheCreationMicrodollarsPerMTok,
+			},
+			cacheCreation1h: money.Money{
+				Microdollars: custom.CacheCreation1hMicrodollarsPerMTok,
+			},
+			cacheRead: money.Money{
+				Microdollars: custom.CacheReadMicrodollarsPerMTok,
+			},
+		}
+		rates.source = duckCustomPricingSource()
+		out[model] = rates
+	}
 	return out, nil
+}
+
+func (s *Store) loadPricingResolver(
+	ctx context.Context,
+) (*export.PricingResolver, error) {
+	pricing, err := s.loadPricing(ctx)
+	if err != nil {
+		return nil, err
+	}
+	document, err := scanDuckGenAIPricing(s.queryRowContext(ctx, `
+		SELECT version, source_ref, source, data_json, updated_at
+		FROM genai_pricing WHERE singleton = 1`))
+	if err != nil {
+		return nil, err
+	}
+	genAI, err := duckGenAIEffectivePricingRow(document)
+	if err != nil {
+		return nil, err
+	}
+	rows := duckPricingRows(pricing)
+	return export.NewPricingResolver(append(rows, genAI)), nil
+}
+
+func duckCustomPricingSource() export.PricingRowSource {
+	return export.PricingRowSourceCustom
 }
 
 func duckFallbackPricingMap() map[string]duckRates {
@@ -2939,11 +3025,90 @@ func duckFallbackPricingMap() map[string]duckRates {
 			continue
 		}
 		out[p.ModelPattern] = duckRates{
-			input:         p.InputPerMTok,
-			output:        p.OutputPerMTok,
-			cacheCreation: p.CacheCreationPerMTok,
-			cacheRead:     p.CacheReadPerMTok,
+			input:           p.InputPerMTok,
+			output:          p.OutputPerMTok,
+			cacheCreation:   p.CacheCreationPerMTok,
+			cacheCreation1h: p.CacheCreation1hPerMTok,
+			cacheRead:       p.CacheReadPerMTok,
+			source:          export.PricingRowSourceEmbedded,
+			bands:           duckCatalogPricingBands(p.Bands),
 		}
+	}
+	return out
+}
+
+func duckPricingSource(
+	model string, rates duckRates, fallback map[string]duckRates,
+) export.PricingRowSource {
+	if f, ok := fallback[model]; ok &&
+		f.input == rates.input &&
+		f.output == rates.output &&
+		f.cacheCreation == rates.cacheCreation &&
+		f.cacheCreation1h == rates.cacheCreation1h &&
+		f.cacheRead == rates.cacheRead &&
+		duckPricingBandsEqual(f.bands, rates.bands) {
+		return export.PricingRowSourceEmbedded
+	}
+	return export.PricingRowSourceFetched
+}
+
+func duckCatalogPricingBands(
+	bands []pricingpkg.PricingBand,
+) []export.PricingBand {
+	out := make([]export.PricingBand, len(bands))
+	for i, band := range bands {
+		out[i] = export.PricingBand{
+			AboveInputTokens:    band.AboveInputTokens,
+			InputPerMTok:        band.InputPerMTok,
+			OutputPerMTok:       band.OutputPerMTok,
+			CacheWritePerMTok:   band.CacheCreationPerMTok,
+			CacheWrite1hPerMTok: band.CacheCreation1hPerMTok,
+			CacheReadPerMTok:    band.CacheReadPerMTok,
+		}
+	}
+	return out
+}
+
+func duckPricingBandsEqual(a, b []export.PricingBand) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i].AboveInputTokens != b[i].AboveInputTokens ||
+			a[i].InputPerMTok != b[i].InputPerMTok ||
+			a[i].OutputPerMTok != b[i].OutputPerMTok ||
+			a[i].CacheWritePerMTok != b[i].CacheWritePerMTok ||
+			a[i].CacheWrite1hPerMTok != b[i].CacheWrite1hPerMTok ||
+			a[i].CacheReadPerMTok != b[i].CacheReadPerMTok {
+			return false
+		}
+	}
+	return true
+}
+
+func duckPricingRows(
+	in map[string]duckRates,
+) []export.EffectivePricingRow {
+	out := make([]export.EffectivePricingRow, 0, len(in))
+	fallback := duckFallbackPricingMap()
+	for pattern, rates := range in {
+		source := rates.source
+		if source == "" {
+			source = duckPricingSource(pattern, rates, fallback)
+		}
+		out = append(out, export.EffectivePricingRow{
+			ModelPattern: pattern,
+			Rates: export.ModelRates{
+				InputPerMTok:        rates.input,
+				OutputPerMTok:       rates.output,
+				CacheWritePerMTok:   rates.cacheCreation,
+				CacheWrite1hPerMTok: rates.cacheCreation1h,
+				CacheReadPerMTok:    rates.cacheRead,
+				UpdatedAt:           rates.updatedAt,
+				Source:              source,
+				Bands:               append([]export.PricingBand(nil), rates.bands...),
+			},
+		})
 	}
 	return out
 }
@@ -2959,6 +3124,55 @@ func duckUsagePaddedUTCBound(ts string, hours int) string {
 		return ts
 	}
 	return t.Add(time.Duration(hours) * time.Hour).Format(time.RFC3339)
+}
+
+func duckAnalyticsWindowBounds(f db.AnalyticsFilter) (string, string) {
+	var from, to string
+	if f.From != "" {
+		from = duckUsagePaddedUTCBound(f.From+"T00:00:00Z", -14)
+	}
+	if f.To != "" {
+		to = duckUsagePaddedUTCBound(f.To+"T23:59:59Z", 14)
+		if t, err := time.Parse(time.RFC3339, to); err == nil {
+			to = t.Add(time.Second).Format(time.RFC3339)
+		}
+	}
+	return from, to
+}
+
+func duckAnalyticsMessageWindowPred(col, from, to string) (string, []any) {
+	var preds []string
+	var args []any
+	if from != "" {
+		preds = append(preds, col+" >= CAST(? AS TIMESTAMP)")
+		args = append(args, from)
+	}
+	if to != "" {
+		preds = append(preds, col+" < CAST(? AS TIMESTAMP)")
+		args = append(args, to)
+	}
+	if len(preds) == 0 {
+		return "", nil
+	}
+	return "(" + col + " IS NULL OR (" + strings.Join(preds, " AND ") + "))", args
+}
+
+var analyticsQueryObserver func(string)
+
+func observeAnalyticsQuery(query string) {
+	if analyticsQueryObserver != nil {
+		analyticsQueryObserver(query)
+	}
+}
+
+func duckAnalyticsToolSessionWindow(f db.AnalyticsFilter) (string, []any) {
+	from, to := duckAnalyticsWindowBounds(f)
+	sessionPred, args := duckAnalyticsMessageWindowPred("COALESCE(s.started_at, s.created_at)", from, to)
+	if sessionPred == "" {
+		return "", nil
+	}
+	messagePred, messageArgs := duckAnalyticsMessageWindowPred("wm.timestamp", from, to)
+	return "(" + sessionPred + " OR EXISTS (SELECT 1 FROM messages wm WHERE wm.session_id = s.id AND " + messagePred + "))", append(args, messageArgs...)
 }
 
 func duckUsageBoundsForFilter(f db.UsageFilter) duckUsageBounds {
@@ -2992,7 +3206,23 @@ func appendDuckUsageCSVFilter(
 	if csv == "" {
 		return where, args
 	}
-	vals := strings.Split(csv, ",")
+	parts := strings.Split(csv, ",")
+	vals := make([]string, 0, len(parts))
+	for _, value := range parts {
+		trimmed := strings.TrimSpace(value)
+		if trimmed != "" {
+			vals = append(vals, trimmed)
+		}
+	}
+	return appendDuckUsageValuesFilter(where, args, col, vals, include)
+}
+
+func appendDuckUsageValuesFilter(
+	where string, args []any, col string, vals []string, include bool,
+) (string, []any) {
+	if len(vals) == 0 {
+		return where, args
+	}
 	op := "IN"
 	if !include {
 		op = "NOT IN"
@@ -3003,20 +3233,13 @@ func appendDuckUsageCSVFilter(
 		} else {
 			where += "\n\t\t\tAND " + col + " != ?"
 		}
-		args = append(args, strings.TrimSpace(vals[0]))
+		args = append(args, vals[0])
 		return where, args
 	}
-	ph := make([]string, 0, len(vals))
-	for _, v := range vals {
-		trimmed := strings.TrimSpace(v)
-		if trimmed == "" {
-			continue
-		}
-		ph = append(ph, "?")
-		args = append(args, trimmed)
-	}
-	if len(ph) == 0 {
-		return where, args
+	ph := make([]string, len(vals))
+	for i, value := range vals {
+		ph[i] = "?"
+		args = append(args, value)
 	}
 	where += "\n\t\t\tAND " + col + " " + op +
 		" (" + strings.Join(ph, ",") + ")"
@@ -3034,14 +3257,18 @@ func appendDuckUsageSessionFilterClauses(
 	where string, args []any, f db.UsageFilter, sessionID string,
 ) (string, []any) {
 	where, args = appendDuckUsageCSVFilter(where, args, "s.agent", f.Agent, true)
-	where, args = appendDuckUsageCSVFilter(where, args, "s.project", f.Project, true)
+	where, args = appendDuckUsageValuesFilter(
+		where, args, "s.project", f.ProjectFilterLabels(), true,
+	)
 	where, args = appendDuckUsageCSVFilter(where, args, "s.machine", f.Machine, true)
 	if f.GitBranch != "" {
 		var clause string
 		clause, args = db.BranchPairClauseArgs("s.project", "s.git_branch", f.GitBranch, args)
 		where += "\n\t\t\tAND " + clause
 	}
-	where, args = appendDuckUsageCSVFilter(where, args, "s.project", f.ExcludeProject, false)
+	where, args = appendDuckUsageValuesFilter(
+		where, args, "s.project", f.ExcludedProjectFilterLabels(), false,
+	)
 	where, args = appendDuckUsageCSVFilter(where, args, "s.agent", f.ExcludeAgent, false)
 	if sessionID != "" {
 		where += "\n\t\t\tAND s.id = ?"
@@ -3089,7 +3316,9 @@ SELECT
 	NULL AS message_ordinal,
 	'cursor' AS source,
 	cu.occurred_at AS ts,
+	cu.occurred_at AS pricing_ts,
 	cu.model AS model,
+	'' AS provider_id,
 	'' AS token_json,
 	'' AS claude_message_id,
 	'' AS claude_request_id,
@@ -3099,7 +3328,9 @@ SELECT
 	cu.output_tokens AS output_tokens,
 	cu.cache_write_tokens AS cache_create,
 	cu.cache_read_tokens AS cache_read,
-	cu.charged_cents / 100.0 AS cost_usd,
+	0 AS reasoning_tokens,
+	cu.charged_microdollars AS cost_microdollars,
+	'cursor-reported' AS cost_source,
 	'' AS project,
 	'cursor' AS agent,
 	'' AS machine,
@@ -3169,13 +3400,16 @@ func duckUsageRawSQL(f db.UsageFilter, sessionID string) (string, []any) {
 	query := fmt.Sprintf(`
 		SELECT m.session_id AS session_id, m.ordinal AS message_ordinal,
 			'message' AS source, COALESCE(m.timestamp, s.started_at) AS ts,
-			m.model AS model, m.token_usage AS token_json,
+			m.timestamp AS pricing_ts,
+			m.model AS model, m.provider_id AS provider_id, m.token_usage AS token_json,
 			m.claude_message_id AS claude_message_id,
 			m.claude_request_id AS claude_request_id,
 			m.source_uuid AS source_uuid,
 			'' AS usage_dedup_key,
-			0 AS input_tokens, 0 AS output_tokens,
-			0 AS cache_create, 0 AS cache_read, NULL AS cost_usd,
+				0 AS input_tokens, 0 AS output_tokens,
+				0 AS cache_create, 0 AS cache_read,
+				COALESCE(TRY_CAST(json_extract_string(m.token_usage, '$.reasoning_tokens') AS BIGINT), 0) AS reasoning_tokens,
+				NULL AS cost_microdollars, '' AS cost_source,
 			s.project AS project, s.agent AS agent, s.machine AS machine,
 			s.user_message_count AS user_message_count, s.is_automated AS is_automated,
 			COALESCE(s.display_name, s.session_name, s.first_message, s.project, s.id) AS display_name,
@@ -3187,17 +3421,20 @@ func duckUsageRawSQL(f db.UsageFilter, sessionID string) (string, []any) {
 		UNION ALL
 		SELECT ue.session_id AS session_id, ue.message_ordinal AS message_ordinal,
 			ue.source AS source, COALESCE(ue.occurred_at, s.started_at) AS ts,
-			ue.model AS model, '' AS token_json,
+			ue.occurred_at AS pricing_ts,
+			ue.model AS model, ue.provider_id AS provider_id, '' AS token_json,
 			'' AS claude_message_id, '' AS claude_request_id,
 			'' AS source_uuid,
 			CASE
 				WHEN ue.dedup_key != '' THEN ue.session_id || ':' || ue.source || ':' || ue.dedup_key
 				ELSE ue.session_id || ':' || ue.source || ':id:' || CAST(ue.id AS VARCHAR)
 			END AS usage_dedup_key,
-			ue.input_tokens AS input_tokens, ue.output_tokens AS output_tokens,
-			ue.cache_creation_input_tokens AS cache_create,
-			ue.cache_read_input_tokens AS cache_read,
-			ue.cost_usd AS cost_usd,
+				ue.input_tokens AS input_tokens, ue.output_tokens AS output_tokens,
+				ue.cache_creation_input_tokens AS cache_create,
+				ue.cache_read_input_tokens AS cache_read,
+				ue.reasoning_tokens AS reasoning_tokens,
+				ue.cost_microdollars AS cost_microdollars,
+				ue.cost_source AS cost_source,
 			s.project AS project, s.agent AS agent, s.machine AS machine,
 			s.user_message_count AS user_message_count, s.is_automated AS is_automated,
 			COALESCE(s.display_name, s.session_name, s.first_message, s.project, s.id) AS display_name,
@@ -3251,7 +3488,8 @@ func duckCursorUsageRowsSQLForBounds(
 	// Cursor usage rows carry no project or git branch and bypass the session
 	// filter, so any filter they cannot satisfy (project, machine, branch)
 	// must exclude them entirely rather than let them leak into totals.
-	if f.Project != "" || f.ExcludeProject != "" ||
+	if len(f.ProjectFilterLabels()) > 0 ||
+		len(f.ExcludedProjectFilterLabels()) > 0 ||
 		f.Machine != "" || f.GitBranch != "" || f.MinUserMessages > 0 ||
 		f.ExcludeOneShot || hasTermFilter ||
 		f.ActiveSince != "" {
@@ -3293,7 +3531,8 @@ func duckCursorUsageRowsSQLForBounds(
 
 func duckDailyUsageRawSQL(f db.UsageFilter) (string, []any) {
 	bounds := duckUsageBoundsForFilter(f)
-	sessionRowsSQL, sessionArgs := duckUsageRawSQL(f, "")
+	sessionRowsSQL, sessionArgs := duckUsageRawSQL(
+		duckUsageSnapshotInputFilter(f), "")
 	cursorRowsSQL, cursorArgs, ok := duckCursorUsageRowsSQLForBounds(f, bounds)
 	if !ok {
 		return sessionRowsSQL, sessionArgs
@@ -3315,24 +3554,73 @@ func duckUsageLocalDateSQL(f db.UsageFilter) (string, any) {
 			ref = t
 		}
 	}
-	_, offset := ref.In(time.Local).Zone()
+	_, offset := ref.In(time.Local).Zone() //nolint:forbidigo // Usage report dates follow the local timezone when no timezone is selected.
 	return "COALESCE(strftime(ts + (? * INTERVAL 1 SECOND), '%Y-%m-%d'), '')", offset
 }
 
 func duckUsageCTE(f db.UsageFilter, sessionID string) (string, []any) {
-	rawSQL, args := duckUsageRawSQL(f, sessionID)
-	return duckUsageCTEFromRaw(f, rawSQL, args)
+	rawSQL, args := duckUsageRawSQL(
+		duckUsageSnapshotInputFilter(f), sessionID)
+	return duckUsageCTEFromRaw(f, rawSQL, args, true)
 }
 
 func duckDailyUsageCTE(f db.UsageFilter) (string, []any) {
 	rawSQL, args := duckDailyUsageRawSQL(f)
-	return duckUsageCTEFromRaw(f, rawSQL, args)
+	return duckUsageCTEFromRaw(f, rawSQL, args, true)
+}
+
+func duckUsageSnapshotInputFilter(f db.UsageFilter) db.UsageFilter {
+	return db.UsageFilter{From: f.From, To: f.To, Timezone: f.Timezone}
+}
+
+// duckSQLString quotes a SQL string literal. Alias names come from the
+// curated pricing tables, not from stored session data.
+func duckSQLString(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+}
+
+// duckPriceModelCaseSQL renders runtime-alias canonicalization as SQL so
+// each usage row carries the fixed or timestamp-selected model whose
+// rates apply.
+func duckPriceModelCaseSQL() string {
+	var b strings.Builder
+	b.WriteString("CASE\n")
+	for _, alias := range pricingpkg.FixedPricingAliases() {
+		modelExpr := "regexp_replace(model, '^.*/', '')"
+		if alias.Exact {
+			modelExpr = "model"
+		}
+		fmt.Fprintf(&b,
+			"\t\tWHEN %s = %s THEN %s\n",
+			modelExpr, duckSQLString(alias.Name), duckSQLString(alias.Canonical),
+		)
+	}
+	aliases := pricingpkg.DateAliasedModels()
+	quoted := make([]string, 0, len(aliases))
+	for _, alias := range aliases {
+		quoted = append(quoted, duckSQLString(alias))
+	}
+	cutoff := pricingpkg.KimiModelEraCutoff.UTC().Format("2006-01-02 15:04:05")
+	fmt.Fprintf(&b, `		WHEN regexp_replace(model, '^.*/', '') IN (%[1]s)
+			AND (pricing_ts IS NULL OR pricing_ts >= TIMESTAMP '%[2]s')
+			THEN %[3]s
+		WHEN regexp_replace(model, '^.*/', '') IN (%[1]s)
+			THEN %[4]s
+		ELSE model
+	END`,
+		strings.Join(quoted, ", "), cutoff,
+		duckSQLString(pricingpkg.KimiK3Canonical),
+		duckSQLString(pricingpkg.KimiK26Canonical),
+	)
+	return b.String()
 }
 
 func duckUsageCTEFromRaw(
 	f db.UsageFilter, rawSQL string, args []any,
+	preferCompleteClaudeSnapshots bool,
 ) (string, []any) {
 	localDateSQL, localDateArg := duckUsageLocalDateSQL(f)
+	priceModelSQL := duckPriceModelCaseSQL()
 	// Apply the local-date window BEFORE deduping so an out-of-range
 	// duplicate (pulled in by the padded UTC bounds) cannot win
 	// dedup_rank = 1 and suppress the in-range row. Mirrors the
@@ -3346,6 +3634,97 @@ func duckUsageCTEFromRaw(
 	if f.To != "" {
 		datePred += " AND local_date <= ?"
 		dateArgs = append(dateArgs, f.To)
+	}
+	snapshotCTE := ""
+	rankedSource := "usage_windowed"
+	var snapshotFilterArgs []any
+	if preferCompleteClaudeSnapshots {
+		snapshotFilter := "TRUE"
+		snapshotFilter, snapshotFilterArgs = appendDuckUsageSourceFilterClauses(
+			snapshotFilter, snapshotFilterArgs, "survivor.model", f)
+		snapshotFilter, snapshotFilterArgs = appendDuckUsageSessionFilterClauses(
+			snapshotFilter, snapshotFilterArgs, f, "")
+		snapshotCTE = `,
+		usage_snapshot_ranked AS (
+			SELECT *,
+				CASE
+					WHEN claude_message_id != '' AND claude_request_id != ''
+						THEN FIRST_VALUE(session_id) OVER (
+							PARTITION BY claude_message_id, claude_request_id
+							ORDER BY ts ASC, session_id ASC,
+								COALESCE(message_ordinal, -1) ASC
+						)
+					ELSE session_id
+				END AS snapshot_attribution_session_id,
+				CASE
+					WHEN claude_message_id != '' AND claude_request_id != ''
+						THEN ROW_NUMBER() OVER (
+							PARTITION BY claude_message_id, claude_request_id
+							ORDER BY output_tokens_norm DESC, ts DESC,
+								session_id DESC,
+								COALESCE(message_ordinal, -1) DESC
+						)
+					ELSE 1
+				END AS snapshot_rank,
+				CASE
+					WHEN claude_message_id != '' AND claude_request_id != ''
+						THEN SUM(output_tokens_norm) OVER (
+							PARTITION BY claude_message_id, claude_request_id
+						) - MAX(output_tokens_norm) OVER (
+							PARTITION BY claude_message_id, claude_request_id
+						)
+					ELSE 0
+				END AS snapshot_deduplicated_output_tokens,
+				CASE
+					WHEN claude_message_id != '' AND claude_request_id != ''
+						THEN MAX(web_search_requests_norm) OVER (
+							PARTITION BY claude_message_id, claude_request_id
+						)
+					ELSE web_search_requests_norm
+				END AS snapshot_web_search_requests
+			FROM usage_windowed
+		),
+		usage_snapshot_survivors AS (
+			SELECT ranked.* EXCLUDE (
+				snapshot_rank, session_id, snapshot_attribution_session_id,
+				web_search_requests_norm, snapshot_web_search_requests,
+				project, agent, machine, user_message_count, is_automated,
+				display_name, started_at, activity_at
+			),
+				ranked.snapshot_attribution_session_id AS session_id,
+				ranked.snapshot_web_search_requests AS web_search_requests_norm,
+				CASE WHEN attributed.id IS NULL THEN ranked.project
+					ELSE attributed.project END AS project,
+				CASE WHEN attributed.id IS NULL THEN ranked.agent
+					ELSE attributed.agent END AS agent,
+				CASE WHEN attributed.id IS NULL THEN ranked.machine
+					ELSE attributed.machine END AS machine,
+				CASE WHEN attributed.id IS NULL THEN ranked.user_message_count
+					ELSE attributed.user_message_count END AS user_message_count,
+				CASE WHEN attributed.id IS NULL THEN ranked.is_automated
+					ELSE attributed.is_automated END AS is_automated,
+				CASE WHEN attributed.id IS NULL THEN ranked.display_name ELSE COALESCE(
+					attributed.display_name, attributed.session_name,
+					attributed.first_message, attributed.project, attributed.id
+				) END AS display_name,
+				CASE WHEN attributed.id IS NULL THEN ranked.started_at
+					ELSE attributed.started_at END AS started_at,
+				CASE WHEN attributed.id IS NULL THEN ranked.activity_at ELSE COALESCE(
+					attributed.ended_at, attributed.started_at,
+					attributed.created_at
+				) END AS activity_at
+			FROM usage_snapshot_ranked ranked
+			LEFT JOIN sessions attributed
+				ON attributed.id = ranked.snapshot_attribution_session_id
+			WHERE ranked.snapshot_rank = 1
+		),
+		usage_snapshot_filtered AS (
+			SELECT survivor.*
+			FROM usage_snapshot_survivors survivor
+			LEFT JOIN sessions s ON s.id = survivor.session_id
+			WHERE survivor.session_id = '' OR (` + snapshotFilter + `)
+		)`
+		rankedSource = "usage_snapshot_filtered"
 	}
 	query := fmt.Sprintf(`
 		WITH usage_raw AS (
@@ -3368,11 +3747,29 @@ func duckUsageCTEFromRaw(
 					WHEN source = 'session' THEN GREATEST(cache_create, 0)
 					ELSE LEAST(GREATEST(cache_create, 0), %[4]d)
 				END AS cache_create_norm,
-				CASE
-					WHEN source = 'message' THEN LEAST(GREATEST(COALESCE(TRY_CAST(json_extract_string(token_json, '$.cache_read_input_tokens') AS BIGINT), 0), 0), %[4]d)
-					WHEN source = 'session' THEN GREATEST(cache_read, 0)
-					ELSE LEAST(GREATEST(cache_read, 0), %[4]d)
-				END AS cache_read_norm,
+					-- 1h-TTL subset of cache_create_norm from the nested
+					-- Anthropic breakdown; only message rows carry it.
+					CASE
+						WHEN source = 'message' THEN LEAST(GREATEST(COALESCE(TRY_CAST(json_extract_string(token_json, '$.cache_creation.ephemeral_1h_input_tokens') AS BIGINT), 0), 0), %[4]d)
+						ELSE 0
+					END AS cache_create_1h_norm,
+					CASE
+						WHEN source = 'message' THEN LEAST(GREATEST(COALESCE(TRY_CAST(json_extract_string(token_json, '$.cache_read_input_tokens') AS BIGINT), 0), 0), %[4]d)
+						WHEN source = 'session' THEN GREATEST(cache_read, 0)
+						ELSE LEAST(GREATEST(cache_read, 0), %[4]d)
+					END AS cache_read_norm,
+					CASE
+						WHEN source = 'message' THEN LEAST(GREATEST(COALESCE(TRY_CAST(json_extract_string(token_json, '$.reasoning_tokens') AS BIGINT), 0), 0), %[4]d)
+						WHEN source = 'session' THEN GREATEST(reasoning_tokens, 0)
+						ELSE LEAST(GREATEST(reasoning_tokens, 0), %[4]d)
+					END AS reasoning_tokens_norm,
+					-- Anthropic bills server-side web search per request on
+					-- top of tokens. Only per-message rows carry a usage
+					-- blob; usage events never report server tool use.
+					CASE
+						WHEN source = 'message' THEN GREATEST(COALESCE(TRY_CAST(json_extract_string(token_json, '$.server_tool_use.web_search_requests') AS BIGINT), 0), 0)
+						ELSE 0
+					END AS web_search_requests_norm,
 				CASE
 					WHEN claude_message_id != '' AND claude_request_id != ''
 						THEN 'claude:' || claude_message_id || ':' || claude_request_id
@@ -3384,29 +3781,33 @@ func duckUsageCTEFromRaw(
 						COALESCE(CAST(message_ordinal AS VARCHAR), '') || ':' ||
 						COALESCE(CAST(ts AS VARCHAR), '') || ':' || model
 				END AS dedup_group,
-				%[2]s AS local_date
+				%[2]s AS local_date,
+				%[5]s AS price_model
 			FROM usage_raw
 		),
 		usage_windowed AS (
 			SELECT *
 			FROM usage_normalized
 			WHERE %[3]s
-		),
+		)%[6]s,
 		usage_ranked AS (
 			SELECT *,
 				ROW_NUMBER() OVER (
 					PARTITION BY dedup_group
-					ORDER BY ts ASC, session_id ASC, COALESCE(message_ordinal, -1) ASC
+					ORDER BY ts ASC, session_id ASC,
+						COALESCE(message_ordinal, -1) ASC
 				) AS dedup_rank
-			FROM usage_windowed
+			FROM %[7]s
 		),
 		usage_localized AS (
 			SELECT *
 			FROM usage_ranked
 			WHERE dedup_rank = 1
-		)`, rawSQL, localDateSQL, datePred, db.MaxPlausibleTokens)
+		)`, rawSQL, localDateSQL, datePred, db.MaxPlausibleTokens,
+		priceModelSQL, snapshotCTE, rankedSource)
 	args = append(args, localDateArg)
 	args = append(args, dateArgs...)
+	args = append(args, snapshotFilterArgs...)
 	return query, args
 }
 
@@ -3415,136 +3816,545 @@ type duckUsageBucket struct {
 	outputTok int
 	cacheCr   int
 	cacheRd   int
-	cost      float64
+	cost      money.Money
 }
 
 type duckUsageAggregateRow struct {
-	date            string
-	sessionID       string
-	project         string
-	agent           string
-	model           string
-	displayName     string
-	startedAt       string
-	inputTok        int
-	outputTok       int
-	cacheCr         int
-	cacheRd         int
-	billableInput   int
-	billableOutput  int
-	billableCacheCr int
-	billableCacheRd int
-	explicitCost    float64
+	date           string
+	ts             string
+	pricingTS      string
+	sessionID      string
+	project        string
+	agent          string
+	machine        string
+	model          string
+	providerID     string
+	priceModel     string
+	source         string
+	messageOrdinal sql.NullInt64
+	displayName    string
+	startedAt      string
+	inputTok       int
+	outputTok      int
+	cacheCr        int
+	cacheCr1h      int
+	cacheRd        int
+	billableInput  int
+	// Output-rate billable tokens. SQL folds reasoning-only rows into this
+	// value before grouping because reasoning is otherwise a row-level choice.
+	billableOutput        int
+	billableReason        int
+	billableCacheCr       int
+	billableCacheCr1h     int
+	billableCacheRd       int
+	billableWebSearch     int
+	explicitCost          int64
+	reportedCostRows      int
+	authoritativeCost     int64
+	authoritativeCostRows int
+	snapshotDedupOutput   int
+}
+
+type duckSessionUsageRow struct {
+	sessionID         string
+	messageOrdinal    sql.NullInt64
+	source            string
+	ts                string
+	pricingTS         string
+	model             string
+	providerID        string
+	inputTok          int
+	outputTok         int
+	cacheCr           int
+	cacheCr1h         int
+	cacheRd           int
+	reasoningTok      int
+	webSearchRequests int
+	cost              sql.NullInt64
+	costSource        string
+}
+
+func duckUsageLookupModel(model, ts string) string {
+	timestamp, _ := parseAnalyticsTime(ts)
+	if canonical := pricingpkg.CanonicalModelForDate(model, timestamp); canonical != "" {
+		return canonical
+	}
+	return model
+}
+
+func duckUsagePricingTimestamp(ts string) time.Time {
+	timestamp, _ := parseAnalyticsTime(ts)
+	return timestamp
+}
+
+func duckSessionUsageLookupModel(r duckSessionUsageRow) string {
+	return duckUsageLookupModel(r.model, r.pricingTS)
 }
 
 func duckUsageAggregateCost(
 	model string,
-	inputTok, outputTok, cacheCr, cacheRd int,
-	billableInput, billableOutput, billableCacheCr, billableCacheRd int,
-	explicitCost float64,
-	pricing map[string]duckRates,
-) (float64, float64, bool, bool) {
-	if explicitCost == 0 &&
-		inputTok == 0 && outputTok == 0 && cacheCr == 0 && cacheRd == 0 {
-		return 0, 0, true, false
-	}
-	rates, priced := pricingpkg.Resolve(pricing, model)
-	cost := explicitCost +
-		(float64(billableInput)*rates.input+
-			float64(billableOutput)*rates.output+
-			float64(billableCacheCr)*rates.cacheCreation+
-			float64(billableCacheRd)*rates.cacheRead)/1_000_000
-	readDelta := float64(cacheRd) * (rates.input - rates.cacheRead) / 1_000_000
-	createDelta := float64(cacheCr) * (rates.input - rates.cacheCreation) / 1_000_000
-	return cost, readDelta + createDelta, priced || explicitCost != 0, true
+	inputTok, outputTok, cacheCr, cacheCr1h, cacheRd int,
+	billableInput, billableOutput, billableReasoning, billableCacheCr, billableCacheCr1h, billableCacheRd int,
+	billableWebSearchRequests int,
+	explicitCost int64,
+	hasReportedCost bool,
+	requestScoped bool,
+	pricing *export.PricingResolver,
+) (money.Money, money.Money, bool, bool, error) {
+	return duckUsageAggregateResolvedCost(
+		model, model, "", time.Time{},
+		inputTok, outputTok, cacheCr, cacheCr1h, cacheRd,
+		billableInput, billableOutput, billableReasoning,
+		billableCacheCr, billableCacheCr1h, billableCacheRd,
+		billableWebSearchRequests,
+		explicitCost, hasReportedCost, requestScoped, pricing)
 }
 
-func (s *Store) dailyUsageAggregateRows(
-	ctx context.Context, f db.UsageFilter,
-) ([]duckUsageAggregateRow, error) {
+// duckUsageAggregateResolvedCost prices one deduped usage row.
+// billableWebSearchRequests is the Anthropic per-request web search fee's
+// input; the SQL zeroes it for rows that carry their own reported cost, the
+// same way it zeroes the billable token counts, so a reported cost is never
+// topped up with a fee it already settles.
+func duckUsageAggregateResolvedCost(
+	reportedModel, canonicalModel, providerID string, pricingTimestamp time.Time,
+	inputTok, outputTok, cacheCr, cacheCr1h, cacheRd int,
+	billableInput, billableOutput, billableReasoning, billableCacheCr, billableCacheCr1h, billableCacheRd int,
+	billableWebSearchRequests int,
+	explicitCost int64,
+	hasReportedCost bool,
+	requestScoped bool,
+	pricing *export.PricingResolver,
+) (money.Money, money.Money, bool, bool, error) {
+	pricedModel, lookup := pricing.ResolveAt(
+		reportedModel, canonicalModel, pricingTimestamp,
+	)
+	var err error
+	hasBillableTokens := billableInput != 0 || billableOutput != 0 ||
+		billableReasoning != 0 || billableCacheCr != 0 || billableCacheRd != 0
+	hasComputedUsage := hasBillableTokens || billableWebSearchRequests > 0
+	if !hasReportedCost &&
+		explicitCost == 0 &&
+		inputTok == 0 && outputTok == 0 && cacheCr == 0 && cacheRd == 0 &&
+		!hasBillableTokens && billableWebSearchRequests == 0 {
+		pricing.RecordResolvedComputed(reportedModel, pricedModel, lookup)
+		return money.Money{}, money.Money{}, true, false, nil
+	}
+	if !hasReportedCost {
+		pricedModel, lookup, err = pricing.ResolveBilledAt(
+			providerID, reportedModel, canonicalModel, pricingTimestamp)
+		if err != nil {
+			return money.Money{}, money.Money{}, false, false, err
+		}
+	}
+	rates := lookup.Rates
+	computed, err := rates.CostForTokensScoped(
+		requestScoped,
+		billableInput, billableOutput, billableReasoning,
+		billableCacheCr, billableCacheCr1h, billableCacheRd)
+	if err != nil {
+		return money.Money{}, money.Money{}, false, false,
+			fmt.Errorf("pricing duckdb usage for model %q: %w", reportedModel, err)
+	}
+	computed, err = export.AddWebSearchFee(
+		computed, billableWebSearchRequests)
+	if err != nil {
+		return money.Money{}, money.Money{}, false, false,
+			fmt.Errorf("pricing duckdb usage for model %q: %w", reportedModel, err)
+	}
+	cost, err := money.Add(
+		money.Money{Microdollars: explicitCost}, computed)
+	if err != nil {
+		return money.Money{}, money.Money{}, false, false,
+			fmt.Errorf("summing duckdb usage for model %q: %w", reportedModel, err)
+	}
+	if hasReportedCost {
+		pricing.RecordResolvedReported(reportedModel, pricedModel, lookup)
+	}
+	if hasComputedUsage {
+		duckRecordComputedUsagePricing(
+			pricing, reportedModel, pricedModel, lookup, requestScoped,
+			billableInput, billableCacheCr, billableCacheRd,
+		)
+	}
+	selectedRates := rates
+	if requestScoped {
+		selectedRates = rates.RatesForTokens(inputTok, cacheCr, cacheRd)
+	}
+	savingsRates := selectedRates
+	if hasReportedCost && (cacheCr != 0 || cacheRd != 0) {
+		_, savingsLookup, err := pricing.ResolveBilledAt(
+			providerID, reportedModel, canonicalModel, pricingTimestamp)
+		if err != nil {
+			return money.Money{}, money.Money{}, false, false,
+				fmt.Errorf("pricing duckdb reported usage cache savings for model %q: %w", reportedModel, err)
+		}
+		savingsRates = savingsLookup.Rates
+		if requestScoped {
+			savingsRates = savingsRates.RatesForTokens(inputTok, cacheCr, cacheRd)
+		}
+	}
+	readRate, err := money.Sub(
+		savingsRates.InputPerMTok, savingsRates.CacheReadPerMTok)
+	if err != nil {
+		return money.Money{}, money.Money{}, false, false,
+			fmt.Errorf("deriving duckdb cache read rate for model %q: %w", reportedModel, err)
+	}
+	creationRate, err := money.Sub(
+		savingsRates.InputPerMTok, savingsRates.CacheWritePerMTok)
+	if err != nil {
+		return money.Money{}, money.Money{}, false, false,
+			fmt.Errorf("deriving duckdb cache creation rate for model %q: %w", reportedModel, err)
+	}
+	creation1hRate, err := money.Sub(
+		savingsRates.InputPerMTok, savingsRates.EffectiveCacheWrite1hPerMTok())
+	if err != nil {
+		return money.Money{}, money.Money{}, false, false,
+			fmt.Errorf("deriving duckdb 1h cache creation rate for model %q: %w", reportedModel, err)
+	}
+	if cacheCr1h > cacheCr {
+		cacheCr1h = cacheCr
+	}
+	savings, err := money.SignedCostPerMillion([]money.RatedTokens{
+		{Tokens: int64(cacheRd), Rate: readRate},
+		{Tokens: int64(cacheCr - cacheCr1h), Rate: creationRate},
+		{Tokens: int64(cacheCr1h), Rate: creation1hRate},
+	})
+	if err != nil {
+		return money.Money{}, money.Money{}, false, false,
+			fmt.Errorf("pricing duckdb cache savings for model %q: %w", reportedModel, err)
+	}
+	priced := lookup.OK
+	if !hasBillableTokens && hasReportedCost {
+		priced = true
+	}
+	return cost, savings, priced, true, nil
+}
+
+func duckRecordComputedUsagePricing(
+	pricing *export.PricingResolver,
+	reportedModel, pricedModel string,
+	lookup export.PricingLookup,
+	requestScoped bool,
+	inputTokens, cacheWriteTokens, cacheReadTokens int,
+) {
+	if requestScoped {
+		pricing.RecordResolvedComputedRequest(
+			reportedModel, pricedModel, lookup,
+			inputTokens, cacheWriteTokens, cacheReadTokens)
+		return
+	}
+	pricing.RecordResolvedComputedAggregate(reportedModel, pricedModel, lookup)
+}
+
+func duckSessionUsageRowCost(
+	r duckSessionUsageRow, pricing *export.PricingResolver,
+) (money.Money, bool, bool, error) {
+	if r.cost.Valid && r.costSource != db.CopilotReportedCostSource {
+		return money.Money{Microdollars: r.cost.Int64}, true, true, nil
+	}
+	if r.inputTok == 0 && r.outputTok == 0 && r.reasoningTok == 0 &&
+		r.cacheCr == 0 && r.cacheRd == 0 && r.webSearchRequests == 0 {
+		return money.Money{}, true, false, nil
+	}
+	_, lookup := pricing.ResolveAt(
+		r.model, duckSessionUsageLookupModel(r),
+		duckUsagePricingTimestamp(r.pricingTS),
+	)
+	if !lookup.OK {
+		fee, feeErr := export.WebSearchFee(r.webSearchRequests)
+		if feeErr != nil {
+			return money.Money{}, false, false, feeErr
+		}
+		return fee, false, true, nil
+	}
+	_, lookup, err := pricing.ResolveBilledAt(
+		r.providerID, r.model, duckSessionUsageLookupModel(r),
+		duckUsagePricingTimestamp(r.pricingTS))
+	if err != nil {
+		return money.Money{}, false, false, err
+	}
+	requestScoped := db.UsageSourceIsRequestScoped(r.source) || r.messageOrdinal.Valid
+	cost, err := lookup.Rates.CostForTokensScoped(
+		requestScoped,
+		r.inputTok, r.outputTok, r.reasoningTok, r.cacheCr, r.cacheCr1h,
+		r.cacheRd,
+	)
+	if err != nil {
+		return money.Money{}, false, false,
+			fmt.Errorf("pricing duckdb session usage for model %q: %w", r.model, err)
+	}
+	cost, err = export.AddWebSearchFee(cost, r.webSearchRequests)
+	if err != nil {
+		return money.Money{}, false, false,
+			fmt.Errorf("pricing duckdb session usage for model %q: %w", r.model, err)
+	}
+	return cost, true, true, nil
+}
+
+func duckSessionUsageBreakdownEntry(
+	r duckSessionUsageRow,
+	ordinal int,
+	cost money.Money,
+	priced bool,
+) db.SessionUsageBreakdownEntry {
+	entry := db.SessionUsageBreakdownEntry{
+		Ordinal:                  ordinal,
+		Source:                   r.source,
+		Label:                    duckSessionUsageBreakdownLabel(r),
+		Timestamp:                r.ts,
+		Model:                    r.model,
+		InputTokens:              r.inputTok,
+		OutputTokens:             r.outputTok,
+		CacheCreationInputTokens: r.cacheCr,
+		CacheReadInputTokens:     r.cacheRd,
+		WebSearchRequests:        r.webSearchRequests,
+		Cost:                     cost,
+		HasCost:                  priced,
+	}
+	if r.messageOrdinal.Valid {
+		messageOrdinal := int(r.messageOrdinal.Int64)
+		entry.MessageOrdinal = &messageOrdinal
+	}
+	return entry
+}
+
+func duckSessionUsageBreakdownLabel(r duckSessionUsageRow) string {
+	var ordinal *int
+	if r.messageOrdinal.Valid {
+		v := int(r.messageOrdinal.Int64)
+		ordinal = &v
+	}
+	return db.SessionUsageBreakdownLabel(ordinal, r.source)
+}
+
+func (s *Store) forEachDailyUsageAggregateRow(
+	ctx context.Context,
+	f db.UsageFilter,
+	visit func(duckUsageAggregateRow) error,
+) error {
 	cte, args := duckDailyUsageCTE(f)
+	machineSelect := "'' AS machine"
+	machineOrder := ""
+	if f.Breakdowns {
+		machineSelect = "machine"
+		machineOrder = ", machine ASC"
+	}
+	// Keep one result per deduplicated usage row. CostForTokens quantizes each
+	// row to whole microdollars; grouping token counts before that boundary can
+	// turn several unrepresentable sub-microdollar rows into stored cost.
 	query := cte + `
-		SELECT local_date, project, agent, model,
-			SUM(input_tokens_norm) AS input_tokens,
-			SUM(output_tokens_norm) AS output_tokens,
-			SUM(cache_create_norm) AS cache_creation_tokens,
-			SUM(cache_read_norm) AS cache_read_tokens,
-			SUM(CASE WHEN cost_usd IS NULL THEN input_tokens_norm ELSE 0 END) AS billable_input_tokens,
-			SUM(CASE WHEN cost_usd IS NULL THEN output_tokens_norm ELSE 0 END) AS billable_output_tokens,
-			SUM(CASE WHEN cost_usd IS NULL THEN cache_create_norm ELSE 0 END) AS billable_cache_creation_tokens,
-			SUM(CASE WHEN cost_usd IS NULL THEN cache_read_norm ELSE 0 END) AS billable_cache_read_tokens,
-			COALESCE(SUM(cost_usd), 0) AS explicit_cost
+		SELECT session_id, local_date, project, agent, ` + machineSelect + `, model, provider_id, price_model,
+			source, message_ordinal, ts, pricing_ts,
+			input_tokens_norm AS input_tokens,
+			output_tokens_norm AS output_tokens,
+			cache_create_norm AS cache_creation_tokens,
+			cache_create_1h_norm AS cache_creation_1h_tokens,
+			cache_read_norm AS cache_read_tokens,
+			CASE WHEN cost_microdollars IS NULL OR cost_source = 'copilot-reported' THEN input_tokens_norm ELSE 0 END AS billable_input_tokens,
+			CASE
+				WHEN cost_microdollars IS NOT NULL AND cost_source != 'copilot-reported' THEN 0
+				WHEN output_tokens_norm = 0 THEN reasoning_tokens_norm
+				ELSE output_tokens_norm
+			END AS billable_output_tokens,
+			CAST(0 AS BIGINT) AS billable_reasoning_tokens,
+			CASE WHEN cost_microdollars IS NULL OR cost_source = 'copilot-reported' THEN cache_create_norm ELSE 0 END AS billable_cache_creation_tokens,
+			CASE WHEN cost_microdollars IS NULL OR cost_source = 'copilot-reported' THEN cache_create_1h_norm ELSE 0 END AS billable_cache_creation_1h_tokens,
+			CASE WHEN cost_microdollars IS NULL OR cost_source = 'copilot-reported' THEN cache_read_norm ELSE 0 END AS billable_cache_read_tokens,
+			CASE WHEN cost_microdollars IS NULL OR cost_source = 'copilot-reported' THEN web_search_requests_norm ELSE 0 END AS billable_web_search_requests,
+			CASE WHEN cost_microdollars IS NOT NULL AND cost_source != 'copilot-reported' THEN cost_microdollars ELSE 0 END AS explicit_cost,
+			CASE WHEN cost_microdollars IS NOT NULL AND cost_source != 'copilot-reported' THEN 1 ELSE 0 END AS reported_cost_rows,
+			CASE WHEN cost_microdollars IS NOT NULL AND cost_source = 'copilot-reported' THEN cost_microdollars ELSE 0 END AS authoritative_cost,
+			CASE WHEN cost_microdollars IS NOT NULL AND cost_source = 'copilot-reported' THEN 1 ELSE 0 END AS authoritative_cost_rows
 		FROM usage_localized
-		GROUP BY local_date, project, agent, model
-		ORDER BY local_date ASC, project ASC, agent ASC, model ASC`
+		ORDER BY session_id ASC, local_date ASC, project ASC, agent ASC` + machineOrder + `, model ASC, price_model ASC, ts ASC, COALESCE(message_ordinal, -1) ASC, source ASC, usage_dedup_key ASC`
 	rows, err := s.queryContext(ctx, query, args...)
 	if err != nil {
-		return nil, fmt.Errorf("querying duckdb daily usage aggregates: %w", err)
+		return fmt.Errorf("querying duckdb daily usage aggregates: %w", err)
 	}
 	defer rows.Close()
-	var out []duckUsageAggregateRow
 	for rows.Next() {
 		var r duckUsageAggregateRow
+		var ts, pricingTS any
 		if err := rows.Scan(
-			&r.date, &r.project, &r.agent, &r.model,
-			&r.inputTok, &r.outputTok, &r.cacheCr, &r.cacheRd,
-			&r.billableInput, &r.billableOutput,
-			&r.billableCacheCr, &r.billableCacheRd,
-			&r.explicitCost,
+			&r.sessionID, &r.date, &r.project, &r.agent, &r.machine, &r.model,
+			&r.providerID,
+			&r.priceModel, &r.source, &r.messageOrdinal, &ts, &pricingTS,
+			&r.inputTok, &r.outputTok, &r.cacheCr, &r.cacheCr1h, &r.cacheRd,
+			&r.billableInput, &r.billableOutput, &r.billableReason,
+			&r.billableCacheCr, &r.billableCacheCr1h, &r.billableCacheRd,
+			&r.billableWebSearch,
+			&r.explicitCost, &r.reportedCostRows,
+			&r.authoritativeCost, &r.authoritativeCostRows,
 		); err != nil {
-			return nil, fmt.Errorf("scanning duckdb daily usage aggregate: %w", err)
+			return fmt.Errorf("scanning duckdb daily usage aggregate: %w", err)
 		}
-		out = append(out, r)
+		r.ts = formatDBTime(ts)
+		r.pricingTS = formatDBTime(pricingTS)
+		if err := visit(r); err != nil {
+			return err
+		}
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterating duckdb daily usage aggregates: %w", err)
+	}
+	return nil
 }
 
 func (s *Store) GetDailyUsage(
 	ctx context.Context, f db.UsageFilter,
 ) (db.DailyUsageResult, error) {
-	pricing, err := s.loadPricing(ctx)
-	if err != nil {
-		return db.DailyUsageResult{}, err
-	}
-	rows, err := s.dailyUsageAggregateRows(ctx, f)
+	rateResolver, err := s.loadPricingResolver(ctx)
 	if err != nil {
 		return db.DailyUsageResult{}, err
 	}
 	type usageAccumKey struct {
-		date    string
-		project string
-		agent   string
-		model   string
+		date       string
+		project    string
+		agent      string
+		machine    string
+		model      string
+		providerID string
 	}
 	accum := map[usageAccumKey]*duckUsageBucket{}
-	totalSavings := 0.0
-	for _, r := range rows {
-		key := usageAccumKey{date: r.date, project: r.project, agent: r.agent, model: r.model}
+	type sessionCost struct {
+		estimated     map[usageAccumKey]money.Money
+		authoritative *money.Money
+	}
+	sessionCosts := map[string]sessionCost{}
+	useAuthoritativeCost := f.Model == "" && f.ExcludeModel == ""
+	projectLabels := map[string]bool{}
+	var seenSessions map[string]db.UsageSessionInfo
+	if !f.SkipSessionCounts {
+		seenSessions = map[string]db.UsageSessionInfo{}
+	}
+	var totalSavings money.Money
+	err = s.forEachDailyUsageAggregateRow(ctx, f, func(r duckUsageAggregateRow) error {
+		key := usageAccumKey{
+			date: r.date, project: r.project, agent: r.agent,
+			machine: r.machine, model: r.model, providerID: r.providerID,
+		}
+		if r.project != "" {
+			projectLabels[r.project] = true
+		}
+		if seenSessions != nil && r.sessionID != "" {
+			seenSessions[r.sessionID] = db.UsageSessionInfo{
+				Project: r.project,
+				Agent:   r.agent,
+			}
+		}
 		b := accum[key]
 		if b == nil {
 			b = &duckUsageBucket{}
 			accum[key] = b
 		}
-		cost, savings, _, _ := duckUsageAggregateCost(
-			r.model,
-			r.inputTok, r.outputTok, r.cacheCr, r.cacheRd,
-			r.billableInput, r.billableOutput,
-			r.billableCacheCr, r.billableCacheRd,
+		cost, savings, _, _, priceErr := duckUsageAggregateResolvedCost(
+			r.model, r.priceModel, r.providerID, duckUsagePricingTimestamp(r.pricingTS),
+			r.inputTok, r.outputTok, r.cacheCr, r.cacheCr1h, r.cacheRd,
+			r.billableInput, r.billableOutput, r.billableReason,
+			r.billableCacheCr, r.billableCacheCr1h, r.billableCacheRd,
+			r.billableWebSearch,
 			r.explicitCost,
-			pricing,
+			r.reportedCostRows > 0,
+			db.UsageSourceIsRequestScoped(r.source) || r.messageOrdinal.Valid,
+			rateResolver,
 		)
-		totalSavings += savings
+		if priceErr != nil {
+			return priceErr
+		}
+		totalSavings, priceErr = money.Add(totalSavings, savings)
+		if priceErr != nil {
+			return fmt.Errorf("summing duckdb cache savings: %w", priceErr)
+		}
 		b.inputTok += r.inputTok
 		b.outputTok += r.outputTok
 		b.cacheCr += r.cacheCr
 		b.cacheRd += r.cacheRd
-		b.cost += cost
+		sc := sessionCosts[r.sessionID]
+		if sc.estimated == nil {
+			sc.estimated = map[usageAccumKey]money.Money{}
+		}
+		sc.estimated[key], priceErr = money.Add(sc.estimated[key], cost)
+		if priceErr != nil {
+			return fmt.Errorf("summing duckdb usage: %w", priceErr)
+		}
+		if useAuthoritativeCost && r.authoritativeCostRows > 0 {
+			v := money.Money{Microdollars: r.authoritativeCost}
+			sc.authoritative = &v
+			rateResolver.RecordUnattributedReported()
+		}
+		sessionCosts[r.sessionID] = sc
+		return nil
+	})
+	if err != nil {
+		return db.DailyUsageResult{}, err
+	}
+	sessionIDs := make([]string, 0, len(sessionCosts))
+	for sessionID := range sessionCosts {
+		sessionIDs = append(sessionIDs, sessionID)
+	}
+	sort.Strings(sessionIDs)
+	for _, sessionID := range sessionIDs {
+		sc := sessionCosts[sessionID]
+		if sc.authoritative != nil {
+			keys := make([]usageAccumKey, 0, len(sc.estimated))
+			for key := range sc.estimated {
+				keys = append(keys, key)
+			}
+			sort.Slice(keys, func(i, j int) bool {
+				a, b := keys[i], keys[j]
+				if a.date != b.date {
+					return a.date < b.date
+				}
+				if a.project != b.project {
+					return a.project < b.project
+				}
+				if a.agent != b.agent {
+					return a.agent < b.agent
+				}
+				if a.machine != b.machine {
+					return a.machine < b.machine
+				}
+				return a.model < b.model
+			})
+			weights := make([]money.Money, len(keys))
+			for i, key := range keys {
+				weights[i] = sc.estimated[key]
+			}
+			costs := export.AllocateCostByWeight(*sc.authoritative, weights)
+			for i, key := range keys {
+				b := accum[key]
+				if b == nil {
+					b = &duckUsageBucket{}
+					accum[key] = b
+				}
+				b.cost, err = money.Add(b.cost, costs[i])
+				if err != nil {
+					return db.DailyUsageResult{}, fmt.Errorf(
+						"summing allocated duckdb usage cost: %w", err)
+				}
+			}
+		} else {
+			for key, cost := range sc.estimated {
+				b := accum[key]
+				if b == nil {
+					b = &duckUsageBucket{}
+					accum[key] = b
+				}
+				b.cost, err = money.Add(b.cost, cost)
+				if err != nil {
+					return db.DailyUsageResult{}, fmt.Errorf(
+						"summing estimated duckdb usage cost: %w", err)
+				}
+			}
+		}
 	}
 
 	type dayMaps struct {
-		models   map[string]duckUsageBucket
-		projects map[string]duckUsageBucket
-		agents   map[string]duckUsageBucket
+		models    map[string]duckUsageBucket
+		projects  map[string]duckUsageBucket
+		agents    map[string]duckUsageBucket
+		machines  map[string]duckUsageBucket
+		totalCost money.Money
 	}
 	days := map[string]*dayMaps{}
 	for key, b := range accum {
@@ -3554,13 +4364,28 @@ func (s *Store) GetDailyUsage(
 				models:   map[string]duckUsageBucket{},
 				projects: map[string]duckUsageBucket{},
 				agents:   map[string]duckUsageBucket{},
+				machines: map[string]duckUsageBucket{},
 			}
 			days[key.date] = day
 		}
-		addUsageBucket(day.models, key.model, *b)
+		if err := addUsageBucket(day.models, key.model, *b); err != nil {
+			return db.DailyUsageResult{}, err
+		}
+		day.totalCost, err = money.Add(day.totalCost, b.cost)
+		if err != nil {
+			return db.DailyUsageResult{}, fmt.Errorf(
+				"summing duckdb daily cost: %w", err)
+		}
 		if f.Breakdowns {
-			addUsageBucket(day.projects, key.project, *b)
-			addUsageBucket(day.agents, key.agent, *b)
+			if err := addUsageBucket(day.projects, key.project, *b); err != nil {
+				return db.DailyUsageResult{}, err
+			}
+			if err := addUsageBucket(day.agents, key.agent, *b); err != nil {
+				return db.DailyUsageResult{}, err
+			}
+			if err := addUsageBucket(day.machines, key.machine, *b); err != nil {
+				return db.DailyUsageResult{}, err
+			}
 		}
 	}
 
@@ -3579,16 +4404,16 @@ func (s *Store) GetDailyUsage(
 			entry.OutputTokens += b.outputTok
 			entry.CacheCreationTokens += b.cacheCr
 			entry.CacheReadTokens += b.cacheRd
-			entry.TotalCost += b.cost
 			entry.ModelBreakdowns = append(entry.ModelBreakdowns, db.ModelBreakdown{
 				ModelName:           model,
 				InputTokens:         b.inputTok,
 				OutputTokens:        b.outputTok,
 				CacheCreationTokens: b.cacheCr,
 				CacheReadTokens:     b.cacheRd,
-				Cost:                roundCost(b.cost),
+				Cost:                b.cost,
 			})
 		}
+		entry.TotalCost = day.totalCost
 		if f.Breakdowns {
 			for _, project := range sortedUsageBucketKeys(day.projects) {
 				b := day.projects[project]
@@ -3598,7 +4423,7 @@ func (s *Store) GetDailyUsage(
 					OutputTokens:        b.outputTok,
 					CacheCreationTokens: b.cacheCr,
 					CacheReadTokens:     b.cacheRd,
-					Cost:                roundCost(b.cost),
+					Cost:                b.cost,
 				})
 			}
 			for _, agent := range sortedUsageBucketKeys(day.agents) {
@@ -3609,20 +4434,37 @@ func (s *Store) GetDailyUsage(
 					OutputTokens:        b.outputTok,
 					CacheCreationTokens: b.cacheCr,
 					CacheReadTokens:     b.cacheRd,
-					Cost:                roundCost(b.cost),
+					Cost:                b.cost,
 				})
 			}
+			for _, machine := range sortedUsageBucketKeys(day.machines) {
+				b := day.machines[machine]
+				entry.MachineBreakdowns = append(
+					entry.MachineBreakdowns,
+					db.MachineBreakdown{
+						MachineName:         machine,
+						InputTokens:         b.inputTok,
+						OutputTokens:        b.outputTok,
+						CacheCreationTokens: b.cacheCr,
+						CacheReadTokens:     b.cacheRd,
+						Cost:                b.cost,
+					},
+				)
+			}
 		}
-		entry.TotalCost = roundCost(entry.TotalCost)
 		result.Daily = append(result.Daily, entry)
 		result.Totals.InputTokens += entry.InputTokens
 		result.Totals.OutputTokens += entry.OutputTokens
 		result.Totals.CacheCreationTokens += entry.CacheCreationTokens
 		result.Totals.CacheReadTokens += entry.CacheReadTokens
-		result.Totals.TotalCost += entry.TotalCost
+		result.Totals.TotalCost, err = money.Add(
+			result.Totals.TotalCost, entry.TotalCost)
+		if err != nil {
+			return db.DailyUsageResult{}, fmt.Errorf(
+				"summing duckdb usage total: %w", err)
+		}
 	}
-	result.Totals.CacheSavings = roundCost(totalSavings)
-	result.Totals.TotalCost = roundCost(result.Totals.TotalCost)
+	result.Totals.CacheSavings = totalSavings
 
 	var aiCredits float64
 	for key, b := range accum {
@@ -3635,24 +4477,40 @@ func (s *Store) GetDailyUsage(
 	if result.Daily == nil {
 		result.Daily = []db.DailyUsageEntry{}
 	}
-	if !f.SkipSessionCounts {
-		counts, err := s.GetUsageSessionCounts(ctx, f)
-		if err != nil {
-			return db.DailyUsageResult{}, err
-		}
-		result.SessionCounts = counts
+	result.SchemaVersion = export.UsageDailySchemaVersion
+	pricingBlock, err := rateResolver.BuildBlock()
+	if err != nil {
+		return db.DailyUsageResult{}, fmt.Errorf(
+			"building pricing block: %w", err)
 	}
+	result.Pricing = &pricingBlock
+	projects, err := s.BuildProjectIdentityMap(ctx, sortedBoolKeys(projectLabels))
+	if err != nil {
+		return db.DailyUsageResult{}, err
+	}
+	result.Projects = export.ProjectMapForWire(projects)
+	if seenSessions != nil {
+		result.SessionCounts = db.NewUsageSessionCounts(seenSessions)
+	}
+	db.SanitizeDailyUsageProjectLabelsWithCatalog(&result, projects)
 	return result, nil
 }
 
-func addUsageBucket(m map[string]duckUsageBucket, key string, b duckUsageBucket) {
+func addUsageBucket(
+	m map[string]duckUsageBucket, key string, b duckUsageBucket,
+) error {
 	cur := m[key]
 	cur.inputTok += b.inputTok
 	cur.outputTok += b.outputTok
 	cur.cacheCr += b.cacheCr
 	cur.cacheRd += b.cacheRd
-	cur.cost += b.cost
+	var err error
+	cur.cost, err = money.Add(cur.cost, b.cost)
+	if err != nil {
+		return fmt.Errorf("summing duckdb usage breakdown cost: %w", err)
+	}
 	m[key] = cur
+	return nil
 }
 
 func sortedUsageBucketKeys(m map[string]duckUsageBucket) []string {
@@ -3663,8 +4521,8 @@ func sortedUsageBucketKeys(m map[string]duckUsageBucket) []string {
 	sort.Slice(out, func(i, j int) bool {
 		left := m[out[i]]
 		right := m[out[j]]
-		if left.cost != right.cost {
-			return left.cost > right.cost
+		if left.cost.Microdollars != right.cost.Microdollars {
+			return left.cost.Microdollars > right.cost.Microdollars
 		}
 		return out[i] < out[j]
 	})
@@ -3680,48 +4538,137 @@ func sortedBoolKeys(m map[string]bool) []string {
 	return out
 }
 
-func roundCost(v float64) float64 { return math.Round(v*1_000_000) / 1_000_000 }
-
-func (s *Store) sessionUsageAggregateRows(
-	ctx context.Context, f db.UsageFilter, sessionID string,
-) ([]duckUsageAggregateRow, error) {
+func (s *Store) forEachSessionUsageAggregateRow(
+	ctx context.Context,
+	f db.UsageFilter,
+	sessionID string,
+	visit func(duckUsageAggregateRow) error,
+) error {
 	cte, args := duckUsageCTE(f, sessionID)
+	// Top-session and session-usage callers aggregate these rows in Go only
+	// after each row has been quantized to whole microdollars.
 	query := cte + `
-		SELECT session_id, project, agent, model,
-			ANY_VALUE(display_name) AS display_name,
-			ANY_VALUE(started_at) AS started_at,
-			SUM(input_tokens_norm) AS input_tokens,
-			SUM(output_tokens_norm) AS output_tokens,
-			SUM(cache_create_norm) AS cache_creation_tokens,
-			SUM(cache_read_norm) AS cache_read_tokens,
-			SUM(CASE WHEN cost_usd IS NULL THEN input_tokens_norm ELSE 0 END) AS billable_input_tokens,
-			SUM(CASE WHEN cost_usd IS NULL THEN output_tokens_norm ELSE 0 END) AS billable_output_tokens,
-			SUM(CASE WHEN cost_usd IS NULL THEN cache_create_norm ELSE 0 END) AS billable_cache_creation_tokens,
-			SUM(CASE WHEN cost_usd IS NULL THEN cache_read_norm ELSE 0 END) AS billable_cache_read_tokens,
-			COALESCE(SUM(cost_usd), 0) AS explicit_cost
+		SELECT session_id, project, agent, model, provider_id, price_model, source, message_ordinal, ts,
+			pricing_ts, display_name, started_at,
+			input_tokens_norm AS input_tokens,
+			output_tokens_norm AS output_tokens,
+			snapshot_deduplicated_output_tokens,
+			cache_create_norm AS cache_creation_tokens,
+			cache_create_1h_norm AS cache_creation_1h_tokens,
+			cache_read_norm AS cache_read_tokens,
+			CASE WHEN cost_microdollars IS NULL OR cost_source = 'copilot-reported' THEN input_tokens_norm ELSE 0 END AS billable_input_tokens,
+			CASE
+				WHEN cost_microdollars IS NOT NULL AND cost_source != 'copilot-reported' THEN 0
+				WHEN output_tokens_norm = 0 THEN reasoning_tokens_norm
+				ELSE output_tokens_norm
+			END AS billable_output_tokens,
+			CAST(0 AS BIGINT) AS billable_reasoning_tokens,
+			CASE WHEN cost_microdollars IS NULL OR cost_source = 'copilot-reported' THEN cache_create_norm ELSE 0 END AS billable_cache_creation_tokens,
+			CASE WHEN cost_microdollars IS NULL OR cost_source = 'copilot-reported' THEN cache_create_1h_norm ELSE 0 END AS billable_cache_creation_1h_tokens,
+			CASE WHEN cost_microdollars IS NULL OR cost_source = 'copilot-reported' THEN cache_read_norm ELSE 0 END AS billable_cache_read_tokens,
+			CASE WHEN cost_microdollars IS NULL OR cost_source = 'copilot-reported' THEN web_search_requests_norm ELSE 0 END AS billable_web_search_requests,
+			CASE WHEN cost_microdollars IS NOT NULL AND cost_source != 'copilot-reported' THEN cost_microdollars ELSE 0 END AS explicit_cost,
+			CASE WHEN cost_microdollars IS NOT NULL AND cost_source != 'copilot-reported' THEN 1 ELSE 0 END AS reported_cost_rows,
+			CASE WHEN cost_microdollars IS NOT NULL AND cost_source = 'copilot-reported' THEN cost_microdollars ELSE 0 END AS authoritative_cost,
+			CASE WHEN cost_microdollars IS NOT NULL AND cost_source = 'copilot-reported' THEN 1 ELSE 0 END AS authoritative_cost_rows
 		FROM usage_localized
-		GROUP BY session_id, project, agent, model
-		ORDER BY session_id ASC, model ASC`
+		ORDER BY session_id ASC, model ASC, price_model ASC, ts ASC,
+			COALESCE(message_ordinal, -1) ASC, source ASC, usage_dedup_key ASC`
 	rows, err := s.queryContext(ctx, query, args...)
 	if err != nil {
-		return nil, fmt.Errorf("querying duckdb session usage aggregates: %w", err)
+		return fmt.Errorf("querying duckdb session usage aggregates: %w", err)
 	}
 	defer rows.Close()
-	var out []duckUsageAggregateRow
 	for rows.Next() {
 		var r duckUsageAggregateRow
-		var startedAt any
+		var ts, pricingTS, startedAt any
 		if err := rows.Scan(
-			&r.sessionID, &r.project, &r.agent, &r.model,
+			&r.sessionID, &r.project, &r.agent, &r.model, &r.providerID,
+			&r.priceModel, &r.source, &r.messageOrdinal, &ts, &pricingTS,
 			&r.displayName, &startedAt,
-			&r.inputTok, &r.outputTok, &r.cacheCr, &r.cacheRd,
-			&r.billableInput, &r.billableOutput,
-			&r.billableCacheCr, &r.billableCacheRd,
-			&r.explicitCost,
+			&r.inputTok, &r.outputTok, &r.snapshotDedupOutput,
+			&r.cacheCr, &r.cacheCr1h, &r.cacheRd,
+			&r.billableInput, &r.billableOutput, &r.billableReason,
+			&r.billableCacheCr, &r.billableCacheCr1h, &r.billableCacheRd,
+			&r.billableWebSearch,
+			&r.explicitCost, &r.reportedCostRows,
+			&r.authoritativeCost, &r.authoritativeCostRows,
 		); err != nil {
-			return nil, fmt.Errorf("scanning duckdb session usage aggregate: %w", err)
+			return fmt.Errorf("scanning duckdb session usage aggregate: %w", err)
 		}
+		r.ts = formatDBTime(ts)
+		r.pricingTS = formatDBTime(pricingTS)
 		r.startedAt = formatDBTime(startedAt)
+		if err := visit(r); err != nil {
+			return err
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterating duckdb session usage aggregates: %w", err)
+	}
+	return nil
+}
+
+// sessionUsageRowCount counts the deduped usage rows that would
+// contribute breakdown entries, mirroring duckSessionUsageRowCost's
+// contributes rule (a non-copilot-reported explicit cost or any
+// nonzero token counter) without shipping the rows.
+func (s *Store) sessionUsageRowCount(
+	ctx context.Context, sessionID string,
+) (int, error) {
+	cte, args := duckUsageCTE(db.UsageFilter{}, sessionID)
+	query := cte + `
+		SELECT COUNT(*)
+		FROM usage_localized
+		WHERE (cost_microdollars IS NOT NULL AND cost_source != 'copilot-reported')
+			OR input_tokens_norm != 0
+			OR output_tokens_norm != 0
+			OR cache_create_norm != 0
+			OR cache_read_norm != 0
+			OR reasoning_tokens_norm != 0
+			OR web_search_requests_norm != 0`
+	var count int
+	if err := s.queryRowContext(ctx, query, args...).
+		Scan(&count); err != nil {
+		return 0, fmt.Errorf(
+			"counting duckdb session usage rows: %w", err)
+	}
+	return count, nil
+}
+
+func (s *Store) sessionUsageRows(
+	ctx context.Context, sessionID string,
+) ([]duckSessionUsageRow, error) {
+	cte, args := duckUsageCTE(db.UsageFilter{}, sessionID)
+	query := cte + `
+		SELECT session_id, message_ordinal, source, ts, pricing_ts, model, provider_id,
+			input_tokens_norm, output_tokens_norm,
+			cache_create_norm, cache_create_1h_norm, cache_read_norm,
+			reasoning_tokens_norm, web_search_requests_norm,
+			cost_microdollars, cost_source
+		FROM usage_localized
+		ORDER BY ts ASC, session_id ASC,
+			COALESCE(message_ordinal, -1) ASC,
+			source ASC,
+			usage_dedup_key ASC`
+	rows, err := s.queryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("querying duckdb session usage rows: %w", err)
+	}
+	defer rows.Close()
+	var out []duckSessionUsageRow
+	for rows.Next() {
+		var r duckSessionUsageRow
+		var ts, pricingTS any
+		if err := rows.Scan(
+			&r.sessionID, &r.messageOrdinal, &r.source, &ts, &pricingTS, &r.model, &r.providerID,
+			&r.inputTok, &r.outputTok, &r.cacheCr, &r.cacheCr1h, &r.cacheRd,
+			&r.reasoningTok, &r.webSearchRequests, &r.cost, &r.costSource,
+		); err != nil {
+			return nil, fmt.Errorf("scanning duckdb session usage row: %w", err)
+		}
+		r.ts = formatDBTime(ts)
+		r.pricingTS = formatDBTime(pricingTS)
 		out = append(out, r)
 	}
 	return out, rows.Err()
@@ -3730,86 +4677,103 @@ func (s *Store) sessionUsageAggregateRows(
 func (s *Store) GetTopSessionsByCost(
 	ctx context.Context, f db.UsageFilter, limit int,
 ) ([]db.TopSessionEntry, error) {
-	if limit <= 0 {
-		limit = 20
-	}
-	pricing, err := s.loadPricing(ctx)
-	if err != nil {
-		return nil, err
-	}
-	rows, err := s.sessionUsageAggregateRows(ctx, f, "")
+	rateResolver, err := s.loadPricingResolver(ctx)
 	if err != nil {
 		return nil, err
 	}
 	type acc struct {
-		row    db.TopSessionEntry
-		tokens int
-		cost   float64
+		row               db.TopSessionEntry
+		tokens            int
+		cost              money.Money
+		authoritativeCost *money.Money
 	}
 	bySession := map[string]*acc{}
-	for _, r := range rows {
-		a := bySession[r.sessionID]
-		if a == nil {
-			a = &acc{row: db.TopSessionEntry{
-				SessionID: r.sessionID, DisplayName: r.displayName,
-				Agent: r.agent, Project: r.project, StartedAt: r.startedAt,
-			}}
-			bySession[r.sessionID] = a
-		}
-		cost, _, _, _ := duckUsageAggregateCost(
-			r.model,
-			r.inputTok, r.outputTok, r.cacheCr, r.cacheRd,
-			r.billableInput, r.billableOutput,
-			r.billableCacheCr, r.billableCacheRd,
-			r.explicitCost,
-			pricing,
-		)
-		a.tokens += r.inputTok + r.outputTok + r.cacheCr + r.cacheRd
-		a.cost += cost
+	err = s.forEachSessionUsageAggregateRow(
+		ctx, f, "", func(r duckUsageAggregateRow) error {
+			a := bySession[r.sessionID]
+			if a == nil {
+				a = &acc{row: db.TopSessionEntry{
+					SessionID: r.sessionID, DisplayName: r.displayName,
+					Agent: r.agent, Project: r.project, StartedAt: r.startedAt,
+				}}
+				bySession[r.sessionID] = a
+			}
+			cost, _, _, _, priceErr := duckUsageAggregateResolvedCost(
+				r.model, r.priceModel, r.providerID, duckUsagePricingTimestamp(r.pricingTS),
+				r.inputTok, r.outputTok, r.cacheCr, r.cacheCr1h, r.cacheRd,
+				r.billableInput, r.billableOutput, r.billableReason,
+				r.billableCacheCr, r.billableCacheCr1h, r.billableCacheRd,
+				r.billableWebSearch,
+				r.explicitCost,
+				r.reportedCostRows > 0,
+				db.UsageSourceIsRequestScoped(r.source) || r.messageOrdinal.Valid,
+				rateResolver,
+			)
+			if priceErr != nil {
+				return priceErr
+			}
+			a.row.InputTokens += r.inputTok
+			a.row.OutputTokens += r.outputTok
+			a.row.CacheCreationTokens += r.cacheCr
+			a.row.CacheReadTokens += r.cacheRd
+			a.tokens += r.inputTok + r.outputTok + r.cacheCr + r.cacheRd
+			a.cost, priceErr = money.Add(a.cost, cost)
+			if priceErr != nil {
+				return fmt.Errorf("summing duckdb top-session cost: %w", priceErr)
+			}
+			if f.Model == "" && f.ExcludeModel == "" && r.authoritativeCostRows > 0 {
+				v := money.Money{Microdollars: r.authoritativeCost}
+				a.authoritativeCost = &v
+			}
+			return nil
+		})
+	if err != nil {
+		return nil, err
 	}
 	out := make([]db.TopSessionEntry, 0, len(bySession))
 	for _, a := range bySession {
 		a.row.TotalTokens = a.tokens
-		a.row.Cost = roundCost(a.cost)
+		if a.authoritativeCost != nil {
+			a.row.Cost = *a.authoritativeCost
+		} else {
+			a.row.Cost = a.cost
+		}
 		out = append(out, a.row)
 	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].Cost != out[j].Cost {
-			return out[i].Cost > out[j].Cost
-		}
-		return out[i].SessionID < out[j].SessionID
-	})
-	if len(out) > limit {
-		out = out[:limit]
-	}
-	return out, nil
+	return db.SortAndLimitTopSessions(
+		out, limit, f.TopSessionsSort, f.TopSessionsTokenTypes,
+	), nil
 }
 
 func (s *Store) GetUsageSessionCounts(
 	ctx context.Context, f db.UsageFilter,
 ) (db.UsageSessionCounts, error) {
-	rows, err := s.sessionUsageAggregateRows(ctx, f, "")
+	cte, args := duckUsageCTE(f, "")
+	rows, err := s.queryContext(ctx, cte+`
+		SELECT DISTINCT session_id, project, agent
+		FROM usage_localized
+		WHERE session_id != ''
+		ORDER BY session_id`, args...)
 	if err != nil {
-		return db.UsageSessionCounts{}, err
+		return db.UsageSessionCounts{}, fmt.Errorf(
+			"querying duckdb usage session counts: %w", err)
 	}
-	type sessionInfo struct {
-		project string
-		agent   string
-	}
-	seen := map[string]sessionInfo{}
-	for _, r := range rows {
-		seen[r.sessionID] = sessionInfo{
-			project: r.project,
-			agent:   r.agent,
+	defer rows.Close()
+	seen := map[string]db.UsageSessionInfo{}
+	for rows.Next() {
+		var sessionID string
+		var info db.UsageSessionInfo
+		if err := rows.Scan(&sessionID, &info.Project, &info.Agent); err != nil {
+			return db.UsageSessionCounts{}, fmt.Errorf(
+				"scanning duckdb usage session count: %w", err)
 		}
+		seen[sessionID] = info
 	}
-	out := db.UsageSessionCounts{ByProject: map[string]int{}, ByAgent: map[string]int{}}
-	for _, r := range seen {
-		out.Total++
-		out.ByProject[r.project]++
-		out.ByAgent[r.agent]++
+	if err := rows.Err(); err != nil {
+		return db.UsageSessionCounts{}, fmt.Errorf(
+			"iterating duckdb usage session counts: %w", err)
 	}
-	return out, nil
+	return db.NewUsageSessionCounts(seen), nil
 }
 
 // appendDuckUsageMatchingActivityClauses requires the session to have at
@@ -3863,7 +4827,7 @@ func (s *Store) GetUsageMatchingSessionCount(
 		where, args = appendDuckUsageMatchingActivityClauses(where, args, f)
 
 		var count int
-		err := s.duck.QueryRowContext(ctx, `
+		err := s.queryRowContext(ctx, `
 			SELECT COUNT(*)
 			FROM sessions s WHERE `+where, args...).Scan(&count)
 		if err != nil {
@@ -3873,7 +4837,7 @@ func (s *Store) GetUsageMatchingSessionCount(
 	}
 
 	query, args := duckMatchingUsageRawSQL(f)
-	rows, err := s.duck.QueryContext(ctx, query, args...)
+	rows, err := s.queryContext(ctx, query, args...)
 	if err != nil {
 		return 0, fmt.Errorf("querying matching usage sessions: %w", err)
 	}
@@ -3907,55 +4871,137 @@ func (s *Store) GetUsageMatchingSessionCount(
 }
 
 func (s *Store) GetSessionUsage(
-	ctx context.Context, sessionID string,
+	ctx context.Context, sessionID string, includeBreakdown bool,
 ) (*db.SessionUsage, error) {
 	sess, err := s.GetSession(ctx, sessionID)
 	if err != nil || sess == nil {
 		return nil, err
 	}
-	pricing, err := s.loadPricing(ctx)
+	rateResolver, err := s.loadPricingResolver(ctx)
 	if err != nil {
 		return nil, err
 	}
-	rows, err := s.sessionUsageAggregateRows(ctx, db.UsageFilter{}, sessionID)
+	var breakdownRows []duckSessionUsageRow
+	breakdownCount := 0
+	if includeBreakdown {
+		breakdownRows, err = s.sessionUsageRows(ctx, sessionID)
+	} else {
+		breakdownCount, err = s.sessionUsageRowCount(ctx, sessionID)
+	}
 	if err != nil {
 		return nil, err
 	}
 	models := map[string]bool{}
 	unpriced := map[string]bool{}
-	totalCost := 0.0
+	var totalCost money.Money
+	var authoritativeCost *money.Money
+	var hasComputedCost, hasReportedCost bool
+	deduplicatedOutputTokens := 0
+	// hasRows is "any contributing row processed" and feeds cost
+	// aggregation only. HasTokenData is computed from the session
+	// flags alone (sess.HasTotalOutputTokens || sess.HasPeakContextTokens),
+	// exactly like SQLite and Postgres; no row-derived term may
+	// contribute, so neither cost-only rows nor token-bearing rows
+	// can flip it when the session flags are false.
 	hasRows := false
-	for _, r := range rows {
-		hasRows = true
-		models[r.model] = true
-		cost, _, priced, contributes := duckUsageAggregateCost(
-			r.model,
-			r.inputTok, r.outputTok, r.cacheCr, r.cacheRd,
-			r.billableInput, r.billableOutput,
-			r.billableCacheCr, r.billableCacheRd,
-			r.explicitCost,
-			pricing,
-		)
+	err = s.forEachSessionUsageAggregateRow(
+		ctx, db.UsageFilter{}, sessionID,
+		func(r duckUsageAggregateRow) error {
+			deduplicatedOutputTokens += r.snapshotDedupOutput
+			if r.authoritativeCostRows > 0 {
+				v := money.Money{Microdollars: r.authoritativeCost}
+				authoritativeCost = &v
+			}
+			cost, _, priced, contributes, priceErr := duckUsageAggregateResolvedCost(
+				r.model, r.priceModel, r.providerID, duckUsagePricingTimestamp(r.pricingTS),
+				r.inputTok, r.outputTok, r.cacheCr, r.cacheCr1h, r.cacheRd,
+				r.billableInput, r.billableOutput, r.billableReason,
+				r.billableCacheCr, r.billableCacheCr1h, r.billableCacheRd,
+				r.billableWebSearch,
+				r.explicitCost,
+				r.reportedCostRows > 0,
+				db.UsageSourceIsRequestScoped(r.source) || r.messageOrdinal.Valid,
+				rateResolver,
+			)
+			if priceErr != nil {
+				return priceErr
+			}
+			// Cost-only copilot-reported carrier rows never contribute, so
+			// they must not surface as token data or a model, matching the
+			// SQLite and PostgreSQL session usage paths.
+			if !contributes {
+				return nil
+			}
+			hasRows = true
+			models[r.model] = true
+			totalCost, priceErr = money.Add(totalCost, cost)
+			if priceErr != nil {
+				return fmt.Errorf("summing duckdb session usage: %w", priceErr)
+			}
+			if r.reportedCostRows > 0 {
+				hasReportedCost = true
+			}
+			if r.billableInput != 0 || r.billableOutput != 0 ||
+				r.billableReason != 0 || r.billableCacheCr != 0 ||
+				r.billableCacheRd != 0 || r.billableWebSearch > 0 {
+				hasComputedCost = true
+			}
+			if !priced {
+				unpriced[r.model] = true
+			}
+			return nil
+		})
+	if err != nil {
+		return nil, err
+	}
+	breakdown := make([]db.SessionUsageBreakdownEntry, 0, len(breakdownRows))
+	for _, r := range breakdownRows {
+		cost, priced, contributes, priceErr := duckSessionUsageRowCost(r, rateResolver)
+		if priceErr != nil {
+			return nil, priceErr
+		}
 		if !contributes {
 			continue
 		}
-		totalCost += cost
-		if !priced {
-			unpriced[r.model] = true
+		breakdown = append(breakdown, duckSessionUsageBreakdownEntry(
+			r, len(breakdown)+1, cost, priced))
+	}
+	if authoritativeCost != nil && len(breakdown) > 0 {
+		weights := make([]money.Money, len(breakdown))
+		for i := range breakdown {
+			weights[i] = breakdown[i].Cost
 		}
+		costs := export.AllocateCostByWeight(*authoritativeCost, weights)
+		for i := range breakdown {
+			breakdown[i].Cost = costs[i]
+			breakdown[i].HasCost = true
+		}
+	}
+	if includeBreakdown {
+		breakdownCount = len(breakdown)
 	}
 	out := &db.SessionUsage{
 		SessionID: sessionID, Agent: sess.Agent, Project: sess.Project,
-		TotalOutputTokens: sess.TotalOutputTokens,
+		TotalOutputTokens: max(sess.TotalOutputTokens-deduplicatedOutputTokens, 0),
 		PeakContextTokens: sess.PeakContextTokens,
-		HasTokenData:      hasRows || sess.HasTotalOutputTokens || sess.HasPeakContextTokens,
+		HasTokenData:      sess.HasTotalOutputTokens || sess.HasPeakContextTokens,
 		Models:            sortedBoolKeys(models),
 		UnpricedModels:    sortedBoolKeys(unpriced),
+		BreakdownCount:    breakdownCount,
+		Breakdown:         breakdown,
 	}
-	if len(unpriced) == 0 && hasRows {
+	if authoritativeCost != nil {
 		out.HasCost = true
-		out.CostUSD = roundCost(totalCost)
-		out.AICredits = db.AICreditsFromCost(sess.Agent, out.CostUSD)
+		out.Cost = *authoritativeCost
+		out.CostSource = export.CostSourceReported
+	} else if len(unpriced) == 0 && hasRows {
+		out.HasCost = true
+		out.Cost = totalCost
+		out.CostSource = export.CombinedCostSource(hasComputedCost, hasReportedCost)
 	}
+	if out.HasCost {
+		out.AICredits = db.AICreditsFromCost(sess.Agent, out.Cost)
+	}
+	out.CostUSD = db.CostUSDFromCost(out.HasCost, out.Cost)
 	return out, nil
 }

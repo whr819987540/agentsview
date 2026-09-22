@@ -6,10 +6,7 @@
     setLocale,
     type SupportedLocale,
   } from "../../i18n/index.js";
-  import OptionTypeahead, {
-    type TypeaheadOption,
-  } from "../layout/OptionTypeahead.svelte";
-  import SettingsSection from "./SettingsSection.svelte";
+  import { Typeahead, type TypeaheadOption } from "@kenn-io/kit-ui";
 
   function currentLocale(): SupportedLocale {
     return chooseInitialLocale();
@@ -30,6 +27,26 @@
       name: "zh-TW",
       label: m.settings_language_traditional_chinese(),
     },
+    {
+      name: "ko",
+      label: m.settings_language_korean(),
+    },
+    {
+      name: "fr",
+      label: m.settings_language_french(),
+    },
+    {
+      name: "ja",
+      label: m.settings_language_japanese(),
+    },
+    {
+      name: "az",
+      label: m.settings_language_azerbaijani(),
+    },
+    {
+      name: "es",
+      label: m.settings_language_spanish(),
+    },
   ]);
 
   function handleLocaleSelect(value: string) {
@@ -40,24 +57,18 @@
   }
 </script>
 
-<SettingsSection
-  title={m.settings_language_title()}
-  description={m.settings_language_description()}
-  allowOverflow
->
-  <div class="setting-row">
-    <span class="setting-label">{m.settings_language_label()}</span>
-    <OptionTypeahead
-      options={localeOptions}
-      value={selectedLocale}
-      fallbackLabel={m.settings_language_english()}
-      placeholder={m.settings_language_label()}
-      title={m.settings_language_label()}
-      emptyLabel={m.settings_language_no_results()}
-      onselect={handleLocaleSelect}
-    />
-  </div>
-</SettingsSection>
+<div class="setting-row">
+  <span class="setting-label">{m.settings_language_label()}</span>
+  <Typeahead
+    options={localeOptions}
+    value={selectedLocale}
+    fallbackLabel={m.settings_language_english()}
+    placeholder={m.settings_language_label()}
+    title={m.settings_language_label()}
+    emptyLabel={m.settings_language_no_results()}
+    onselect={handleLocaleSelect}
+  />
+</div>
 
 <style>
   .setting-row {

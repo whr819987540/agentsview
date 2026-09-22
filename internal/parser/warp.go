@@ -1,8 +1,11 @@
 package parser
 
 import (
+	"context"
 	"database/sql"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -27,52 +30,93 @@ type WarpSessionMeta struct {
 func ListWarpSessionMeta(
 	dbPath string,
 ) ([]WarpSessionMeta, error) {
+	var metas []WarpSessionMeta
+	err := ForEachWarpSessionMeta(
+		context.Background(), dbPath, false,
+		func(meta WarpSessionMeta) error {
+			metas = append(metas, meta)
+			return nil
+		},
+	)
+	return metas, err
+}
+
+func ForEachWarpSessionMeta(
+	ctx context.Context, dbPath string, stableSnapshot bool, yield func(WarpSessionMeta) error,
+) error {
 	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
-		return nil, nil
+		return nil
 	}
 
-	db, err := openWarpDB(dbPath)
+	db, err := openWarpDB(dbPath, stableSnapshot)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer db.Close()
 
-	rows, err := db.Query(
+	rows, err := db.QueryContext(ctx,
 		`SELECT conversation_id, last_modified_at
 		 FROM agent_conversations`,
 	)
 	if err != nil {
-		return nil, fmt.Errorf(
+		return fmt.Errorf(
 			"listing warp conversations: %w", err,
 		)
 	}
 	defer rows.Close()
 
-	var metas []WarpSessionMeta
 	for rows.Next() {
 		var id string
 		var lastModified string
 		if err := rows.Scan(
 			&id, &lastModified,
 		); err != nil {
-			return nil, fmt.Errorf(
+			return fmt.Errorf(
 				"scanning warp session meta: %w", err,
 			)
 		}
 		mtime := parseWarpTimestamp(lastModified).UnixNano()
-		metas = append(metas, WarpSessionMeta{
+		observeStreamingDiscoveryBuffer(ctx, 1)
+		if err := yield(WarpSessionMeta{
 			SessionID:   id,
-			VirtualPath: dbPath + "#" + id,
+			VirtualPath: VirtualSourcePath(dbPath, id),
 			FileMtime:   mtime,
-		})
+		}); err != nil {
+			return err
+		}
 	}
-	return metas, rows.Err()
+	return rows.Err()
+}
+
+func warpSessionMeta(
+	ctx context.Context, dbPath, sessionID string, stableSnapshot bool,
+) (WarpSessionMeta, bool, error) {
+	db, err := openWarpDB(dbPath, stableSnapshot)
+	if err != nil {
+		return WarpSessionMeta{}, false, err
+	}
+	defer db.Close()
+	var lastModified string
+	err = db.QueryRowContext(ctx, `
+		SELECT last_modified_at FROM agent_conversations
+		WHERE conversation_id = ?
+	`, sessionID).Scan(&lastModified)
+	if errors.Is(err, sql.ErrNoRows) {
+		return WarpSessionMeta{}, false, nil
+	}
+	if err != nil {
+		return WarpSessionMeta{}, false, err
+	}
+	return WarpSessionMeta{
+		SessionID: sessionID, VirtualPath: VirtualSourcePath(dbPath, sessionID),
+		FileMtime: parseWarpTimestamp(lastModified).UnixNano(),
+	}, true, nil
 }
 
 // parseWarpSession parses a single conversation by ID from
 // the Warp database.
 func parseWarpSession(
-	dbPath, conversationID, machine string,
+	ctx context.Context, dbPath, conversationID, machine string, stableSnapshot bool,
 ) (*ParsedSession, []ParsedMessage, error) {
 	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
 		return nil, nil, fmt.Errorf(
@@ -80,13 +124,13 @@ func parseWarpSession(
 		)
 	}
 
-	db, err := openWarpDB(dbPath)
+	db, err := openWarpDB(dbPath, stableSnapshot)
 	if err != nil {
 		return nil, nil, err
 	}
 	defer db.Close()
 
-	c, err := loadOneWarpConversation(db, conversationID)
+	c, err := loadOneWarpConversation(ctx, db, conversationID)
 	if err != nil {
 		return nil, nil, fmt.Errorf(
 			"loading warp conversation %s: %w",
@@ -94,13 +138,14 @@ func parseWarpSession(
 		)
 	}
 
-	return buildWarpSession(db, c, dbPath, machine)
+	return buildWarpSession(ctx, db, c, dbPath, machine)
 }
 
-func openWarpDB(dbPath string) (*sql.DB, error) {
-	dsn := dbPath +
-		"?mode=ro&_journal_mode=WAL&_busy_timeout=3000"
-	db, err := sql.Open("sqlite3", dsn)
+func openWarpDB(dbPath string, stableSnapshot bool) (*sql.DB, error) {
+	db, err := openSQLiteReadOnly(dbPath, sqliteReadOptions{
+		stableSnapshot: stableSnapshot,
+		busyTimeoutMS:  3000,
+	})
 	if err != nil {
 		return nil, fmt.Errorf(
 			"opening warp db %s: %w", dbPath, err,
@@ -117,9 +162,9 @@ type warpConversationRow struct {
 }
 
 func loadOneWarpConversation(
-	db *sql.DB, conversationID string,
+	ctx context.Context, db *sql.DB, conversationID string,
 ) (warpConversationRow, error) {
-	row := db.QueryRow(`
+	row := db.QueryRowContext(ctx, `
 		SELECT conversation_id,
 		       COALESCE(conversation_data, '{}'),
 		       last_modified_at
@@ -145,9 +190,9 @@ type warpExchangeRow struct {
 }
 
 func loadWarpExchanges(
-	db *sql.DB, conversationID string,
+	ctx context.Context, db *sql.DB, conversationID string,
 ) ([]warpExchangeRow, error) {
-	rows, err := db.Query(`
+	rows, err := db.QueryContext(ctx, `
 		SELECT exchange_id, start_ts,
 		       COALESCE(input, '[]'),
 		       COALESCE(model_id, ''),
@@ -177,11 +222,12 @@ func loadWarpExchanges(
 }
 
 func buildWarpSession(
+	ctx context.Context,
 	db *sql.DB,
 	c warpConversationRow,
 	dbPath, machine string,
 ) (*ParsedSession, []ParsedMessage, error) {
-	exchanges, err := loadWarpExchanges(db, c.id)
+	exchanges, err := loadWarpExchanges(ctx, db, c.id)
 	if err != nil {
 		return nil, nil, fmt.Errorf(
 			"loading exchanges for %s: %w", c.id, err,
@@ -251,7 +297,7 @@ func buildWarpSession(
 
 	// Extract project from working directory.
 	if cwd != "" {
-		project = ExtractProjectFromCwd(cwd)
+		project = ExtractProjectFromCwdWithBranchContext(ctx, cwd, "")
 	}
 	if project == "" {
 		project = "unknown"
@@ -278,7 +324,7 @@ func buildWarpSession(
 		MessageCount:     len(parsed),
 		UserMessageCount: userCount,
 		File: FileInfo{
-			Path:  dbPath + "#" + c.id,
+			Path:  VirtualSourcePath(dbPath, c.id),
 			Mtime: parseWarpTimestamp(c.lastModifiedAt).UnixNano(),
 		},
 	}
@@ -315,6 +361,10 @@ type warpToolStats struct {
 	UseComputer        int
 }
 
+type warpToolCount struct {
+	Count int `json:"count"`
+}
+
 func parseWarpConversationMeta(data string) warpConversationMeta {
 	var meta warpConversationMeta
 	if data == "" || data == "{}" {
@@ -328,21 +378,19 @@ func parseWarpConversationMeta(data string) warpConversationMeta {
 				BYOKTokens int `json:"byok_tokens"`
 			} `json:"token_usage"`
 			ToolUsage struct {
-				RunCommand     struct{ Count int } `json:"run_command_stats"`
-				ReadFiles      struct{ Count int } `json:"read_files_stats"`
-				SearchCodebase struct{ Count int } `json:"search_codebase_stats"`
-				Grep           struct{ Count int } `json:"grep_stats"`
-				FileGlob       struct{ Count int } `json:"file_glob_stats"`
-				ApplyFileDiff  struct {
-					Count int `json:"count"`
-				} `json:"apply_file_diff_stats"`
-				WriteLongRunning  struct{ Count int } `json:"write_to_long_running_shell_command_stats"`
-				ReadMCPResource   struct{ Count int } `json:"read_mcp_resource_stats"`
-				CallMCPTool       struct{ Count int } `json:"call_mcp_tool_stats"`
-				SuggestPlan       struct{ Count int } `json:"suggest_plan_stats"`
-				SuggestCreatePlan struct{ Count int } `json:"suggest_create_plan_stats"`
-				ReadShellOutput   struct{ Count int } `json:"read_shell_command_output_stats"`
-				UseComputer       struct{ Count int } `json:"use_computer_stats"`
+				RunCommand        warpToolCount `json:"run_command_stats"`
+				ReadFiles         warpToolCount `json:"read_files_stats"`
+				SearchCodebase    warpToolCount `json:"search_codebase_stats"`
+				Grep              warpToolCount `json:"grep_stats"`
+				FileGlob          warpToolCount `json:"file_glob_stats"`
+				ApplyFileDiff     warpToolCount `json:"apply_file_diff_stats"`
+				WriteLongRunning  warpToolCount `json:"write_to_long_running_shell_command_stats"`
+				ReadMCPResource   warpToolCount `json:"read_mcp_resource_stats"`
+				CallMCPTool       warpToolCount `json:"call_mcp_tool_stats"`
+				SuggestPlan       warpToolCount `json:"suggest_plan_stats"`
+				SuggestCreatePlan warpToolCount `json:"suggest_create_plan_stats"`
+				ReadShellOutput   warpToolCount `json:"read_shell_command_output_stats"`
+				UseComputer       warpToolCount `json:"use_computer_stats"`
 			} `json:"tool_usage_metadata"`
 		} `json:"conversation_usage_metadata"`
 	}
@@ -438,7 +486,7 @@ func extractWarpQueryText(input string) string {
 		return ""
 	}
 
-	var items []json.RawMessage
+	var items []jsontext.Value
 	if err := json.Unmarshal([]byte(input), &items); err != nil {
 		return ""
 	}

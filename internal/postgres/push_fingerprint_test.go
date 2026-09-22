@@ -1,7 +1,6 @@
 package postgres
 
 import (
-	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -10,7 +9,7 @@ import (
 
 func TestReadPushSessionMessageComparisonsNoSessions(t *testing.T) {
 	comparisons, err := readPushSessionMessageComparisons(
-		context.Background(), nil, nil,
+		t.Context(), nil, nil,
 	)
 	require.NoError(t, err)
 	require.NotNil(t, comparisons)
@@ -22,6 +21,7 @@ func TestReadPushSessionMessageComparisonsNoSessions(t *testing.T) {
 	assert.Empty(t, comparisons.MessageTokenFingerprint)
 	assert.Empty(t, comparisons.ToolCallAggregates)
 	assert.Empty(t, comparisons.ToolCallFingerprint)
+	assert.Empty(t, comparisons.ToolResultFingerprint)
 	assert.Empty(t, comparisons.UsageEventFingerprint)
 }
 
@@ -37,6 +37,7 @@ func TestShouldSkipSessionMessagesGuardsCountAndNilMaps(t *testing.T) {
 		MessageTokenFingerprint: map[string]string{"sess": ""},
 		ToolCallAggregates:      map[string]pushToolCallAggregate{"sess": {}},
 		ToolCallFingerprint:     map[string]string{"sess": ""},
+		ToolResultFingerprint:   map[string]string{"sess": ""},
 		UsageEventFingerprint:   map[string]string{"sess": ""},
 	}
 	localFP := pushLocalMessageFingerprint{Sum: 1, Max: 1, Min: 1}
@@ -68,10 +69,9 @@ func TestComparisonAggregates(t *testing.T) {
 
 	msgAgg, toolAgg, ok = comparisonAggregates("sess", comparisons)
 	require.True(t, ok)
-	assert.Equal(t,
-		pushMessageAggregate{
-			Count: 3, Sum: 9, Max: 5, Min: 1, SysFP: "0,2",
-		},
+	assert.Equal(t, pushMessageAggregate{
+		Count: 3, Sum: 9, Max: 5, Min: 1, SysFP: "0,2",
+	},
 		msgAgg,
 	)
 	assert.Equal(t, pushToolCallAggregate{Count: 2, Sum: 11}, toolAgg)

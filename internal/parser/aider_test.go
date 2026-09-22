@@ -45,18 +45,15 @@ func TestParseAiderRunsPerRun(t *testing.T) {
 
 	// Run 0: header 14:01:00, first prompt "add a retry to the webhook",
 	// two user prompts ("add a retry..." and "Step 1").
-	assert.Equal(t,
-		time.Date(2026, 6, 9, 14, 1, 0, 0, time.UTC), r0.Session.StartedAt)
+	assert.Equal(t, time.Date(2026, 6, 9, 14, 1, 0, 0, time.UTC), r0.Session.StartedAt)
 	assert.Equal(t, r0.Session.StartedAt, r0.Session.EndedAt,
 		"a run has no separate end time")
 	assert.Contains(t, r0.Session.FirstMessage, "add a retry to the webhook")
 	assert.Equal(t, 2, r0.Session.UserMessageCount)
 
 	// Run 1: header 15:30:00, its own first prompt and message stream.
-	assert.Equal(t,
-		time.Date(2026, 6, 9, 15, 30, 0, 0, time.UTC), r1.Session.StartedAt)
-	assert.Contains(t,
-		r1.Session.FirstMessage, "make the timeout configurable")
+	assert.Equal(t, time.Date(2026, 6, 9, 15, 30, 0, 0, time.UTC), r1.Session.StartedAt)
+	assert.Contains(t, r1.Session.FirstMessage, "make the timeout configurable")
 	assert.Equal(t, 1, r1.Session.UserMessageCount)
 
 	// The message streams are per-run, not flattened: run 1 must not carry
@@ -100,8 +97,7 @@ func TestParseAiderRunSingle(t *testing.T) {
 	require.NotNil(t, sess)
 	require.NotEmpty(t, msgs)
 	assert.Contains(t, sess.FirstMessage, "make the timeout configurable")
-	assert.Equal(t,
-		time.Date(2026, 6, 9, 15, 30, 0, 0, time.UTC), sess.StartedAt)
+	assert.Equal(t, time.Date(2026, 6, 9, 15, 30, 0, 0, time.UTC), sess.StartedAt)
 
 	// The trailing header-only run (index 2) yields no session.
 	sess2, msgs2, err := parseAiderRun(fixtureAider(), 2, "m")
@@ -389,8 +385,10 @@ func TestParseAiderTimestamp(t *testing.T) {
 			want: time.Date(2026, 6, 9, 14, 1, 0, 0, time.UTC),
 			ok:   true,
 		},
-		{"trailing space tolerated", "2026-06-09 14:01:00 ",
-			time.Date(2026, 6, 9, 14, 1, 0, 0, time.UTC), true},
+		{
+			"trailing space tolerated", "2026-06-09 14:01:00 ",
+			time.Date(2026, 6, 9, 14, 1, 0, 0, time.UTC), true,
+		},
 		{"garbage rejected", "not a date", time.Time{}, false},
 		{"empty rejected", "", time.Time{}, false},
 	}
@@ -445,11 +443,13 @@ func TestParseAiderTurnsToolAndEditedFiles(t *testing.T) {
 		roles[i] = m.Role
 	}
 	// user, assistant prose, then the tool block surfaced as assistant.
-	assert.Equal(t,
-		[]RoleType{RoleUser, RoleAssistant, RoleAssistant}, roles)
+	assert.Equal(t, []RoleType{RoleUser, RoleAssistant, RoleAssistant}, roles)
 	assert.Equal(t, "fix the bug", msgs[0].Content)
 	assert.Contains(t, msgs[1].Content, "Here is the fix.")
+	assert.Empty(t, msgs[1].SourceSubtype)
 	assert.Contains(t, msgs[2].Content, "Applied edit to src/a.py")
+	assert.Equal(t, SourceSubtypeToolResult, msgs[2].SourceSubtype,
+		"the tool block is tool output even though it is surfaced as assistant text")
 
 	// Dedup; dry-run and skip lines contribute nothing.
 	assert.Equal(t, []string{"src/a.py", "src/b.py"}, touched)
@@ -500,8 +500,7 @@ func TestParseAiderRunsEmptyAndGarbage(t *testing.T) {
 			repo := filepath.Join(dir, c.name)
 			require.NoError(t, os.MkdirAll(repo, 0o755))
 			path := filepath.Join(repo, ".aider.chat.history.md")
-			require.NoError(t,
-				os.WriteFile(path, []byte(c.content), 0o644))
+			require.NoError(t, os.WriteFile(path, []byte(c.content), 0o644))
 
 			results, err := parseAiderRuns(path, "m")
 			require.NoError(t, err) // never panics, never hard-errors
@@ -588,8 +587,7 @@ func TestAiderShouldSkipProtectedHomeDirsOnlyOnDarwinHomeRoot(t *testing.T) {
 	assert.True(t, aiderShouldSkipProtectedHomeDirs(home, home, "darwin"))
 	assert.False(t, aiderShouldSkipProtectedHomeDirs(home, home, "linux"))
 	assert.False(t, aiderShouldSkipProtectedHomeDirs(home, home, "windows"))
-	assert.False(t,
-		aiderShouldSkipProtectedHomeDirs(filepath.Join(home, "Documents"), home, "darwin"),
+	assert.False(t, aiderShouldSkipProtectedHomeDirs(filepath.Join(home, "Documents"), home, "darwin"),
 		"explicit protected roots are user-scoped opt-ins")
 }
 
@@ -717,4 +715,48 @@ func TestFindAiderSourceFile(t *testing.T) {
 
 	assert.Empty(t, findAiderSourceFile(root, "nonexistent-id"))
 	assert.Empty(t, findAiderSourceFile("", "anything"))
+}
+
+// A run header with trailing whitespace must resolve to one identity
+// everywhere: the canonical full split trims it before hashing, so the
+// single-run scanner and streamed discovery must trim it too, or the
+// same run gets a second session ID and the original is tombstoned
+// during reconciliation.
+func TestAiderTrailingWhitespaceHeaderKeepsOneIdentity(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "project", ".aider.chat.history.md")
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+	content := "# aider chat started at 2024-01-02 03:04:05 \n" +
+		"\n#### first prompt\nfirst answer\n" +
+		"# aider chat started at 2024-01-02 03:04:05 \n" +
+		"\n#### second prompt\nsecond answer\n"
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+
+	full, err := parseAiderRuns(path, "local")
+	require.NoError(t, err)
+	require.Len(t, full, 2)
+
+	for idx, want := range full {
+		sess, _, err := parseAiderRun(path, idx, "local")
+		require.NoError(t, err)
+		require.NotNil(t, sess)
+		assert.Equal(t, want.Session.ID, sess.ID,
+			"single-run scan must derive the same identity as the full split")
+	}
+
+	var streamed []string
+	require.NoError(t, streamAiderRunIndexes(
+		t.Context(), path, "",
+		func(_ int, rawID string) error {
+			streamed = append(streamed, rawID)
+			return nil
+		},
+	))
+	require.Len(t, streamed, 2)
+	for idx, want := range full {
+		assert.Equal(t, want.Session.ID, aiderIDPrefix+streamed[idx],
+			"streamed discovery must derive the same identity as the full split")
+	}
 }

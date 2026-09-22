@@ -1,9 +1,10 @@
 package parser
 
 import (
-	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -38,7 +39,7 @@ func parsePiTestSession(
 	})
 	require.True(t, ok)
 
-	outcome, err := provider.Parse(context.Background(), ParseRequest{
+	outcome, err := provider.Parse(t.Context(), ParseRequest{
 		Source: SourceRef{
 			Provider:       AgentPi,
 			Key:            path,
@@ -79,14 +80,13 @@ func TestPiProviderParsesSessionHeader(t *testing.T) {
 	assert.Equal(t, "my_project", sess.Project, "PRSR-01: project from cwd")
 
 	// branchedFrom basename without extension, prefixed (PRSR-10)
-	assert.Equal(
-		t,
+	assert.Equal(t,
 		"pi:2025-01-01T09-00-00-000Z_parent-uuid",
 		sess.ParentSessionID,
 		"PRSR-10: parent session ID",
 	)
 
-	assert.Greater(t, sess.MessageCount, 0, "PRSR-01: message count > 0")
+	assert.Positive(t, sess.MessageCount, "PRSR-01: message count > 0")
 	assert.False(t, sess.StartedAt.IsZero(), "PRSR-01: StartedAt non-zero")
 
 	_ = msgs // not the focus of this sub-test
@@ -206,7 +206,7 @@ func TestPiProviderParsesUserMessages(t *testing.T) {
 	require.NoError(t, err)
 
 	// First non-toolResult user message at index 0.
-	require.Greater(t, len(msgs), 0, "expected at least one message")
+	require.NotEmpty(t, msgs, "expected at least one message")
 	assertMessage(t, msgs[0], RoleUser, "Fix the login bug")
 	assert.Equal(t, 0, msgs[0].Ordinal, "first user message ordinal == 0")
 
@@ -275,7 +275,7 @@ func TestPiProviderParsesToolResults(t *testing.T) {
 	assert.Equal(t, RoleUser, toolResultMsg.Role, "tool result messages use RoleUser")
 	require.Len(t, toolResultMsg.ToolResults, 1, "PRSR-05: one tool result")
 	assert.Equal(t, "toolu_01", toolResultMsg.ToolResults[0].ToolUseID, "PRSR-05: tool use ID")
-	assert.Greater(t, toolResultMsg.ToolResults[0].ContentLength, 0, "PRSR-05: content length > 0")
+	assert.Positive(t, toolResultMsg.ToolResults[0].ContentLength, "PRSR-05: content length > 0")
 	assert.NotEmpty(t, toolResultMsg.ToolResults[0].ContentRaw, "tool result must populate ContentRaw")
 	decoded := DecodeContent(toolResultMsg.ToolResults[0].ContentRaw)
 	assert.Contains(t, decoded, "package auth", "ContentRaw must decode to tool output text")
@@ -448,7 +448,226 @@ func TestPiProviderParsesBranchedFrom(t *testing.T) {
 			sess.ParentSessionID,
 			"PRSR-10: basename of branchedFrom without .jsonl extension, prefixed",
 		)
+		assert.Equal(t, RelFork, sess.RelationshipType,
+			"legacy branchedFrom lineage is classified as a fork")
 	})
+}
+
+// parsePiLikeTestSession parses content as the given pi-family agent
+// (AgentPi or AgentOMP) so tests can exercise provider-specific header
+// handling such as OMP's parentSession branch lineage. The project is
+// hard-coded so callers need not deal with cwd extraction.
+func parsePiLikeTestSession(
+	t *testing.T, agent AgentType, content string,
+) (*ParsedSession, []ParsedMessage) {
+	t.Helper()
+
+	path := createTestFile(t, "pilike-session.jsonl", content)
+	provider, ok := NewProvider(agent, ProviderConfig{
+		Roots:   []string{filepath.Dir(filepath.Dir(path))},
+		Machine: "local",
+	})
+	require.True(t, ok)
+	outcome, err := provider.Parse(t.Context(), ParseRequest{
+		Source: SourceRef{
+			Provider:       agent,
+			Key:            path,
+			DisplayPath:    path,
+			FingerprintKey: path,
+			ProjectHint:    "my_project",
+			Opaque: JSONLSource{
+				Root: filepath.Dir(filepath.Dir(path)),
+				Path: path,
+			},
+		},
+		Machine: "local",
+	})
+	require.NoError(t, err)
+	require.Len(t, outcome.Results, 1)
+	result := outcome.Results[0].Result
+	return &result.Session, result.Messages
+}
+
+// TestPiProviderParsesOMPParentSession verifies Pi-family parent lineage:
+// parentSession is a fallback, while branchedFrom keeps precedence. Native Pi
+// persisted paths use the same filename identity convention as branchedFrom.
+func TestPiProviderParsesOMPParentSession(t *testing.T) {
+	const ts = `"timestamp":"2026-07-03T06:30:58.508Z"`
+	tests := []struct {
+		name    string
+		agent   AgentType
+		header  string
+		wantPSI string
+	}{
+		{
+			name:    "OMP parentSession only is mapped and prefixed",
+			agent:   AgentOMP,
+			header:  `{"type":"session","version":3,"id":"child",` + ts + `,"cwd":"/repos/x","parentSession":"parent-abc"}`,
+			wantPSI: "omp:parent-abc",
+		},
+		{
+			name:    "OMP branchedFrom wins over parentSession",
+			agent:   AgentOMP,
+			header:  `{"type":"session","version":3,"id":"child",` + ts + `,"cwd":"/repos/x","branchedFrom":"/data/2026-07-03T06-00-00-000Z_parent-file.jsonl","parentSession":"parent-abc"}`,
+			wantPSI: "omp:2026-07-03T06-00-00-000Z_parent-file",
+		},
+		{
+			name:    "OMP with neither field yields empty parent",
+			agent:   AgentOMP,
+			header:  `{"type":"session","version":3,"id":"child",` + ts + `,"cwd":"/repos/x"}`,
+			wantPSI: "",
+		},
+		{
+			name:    "native pi parentSession POSIX path maps by filename",
+			agent:   AgentPi,
+			header:  `{"type":"session","version":3,"id":"child",` + ts + `,"cwd":"/repos/x","parentSession":"/data/2026-07-03T06-00-00-000Z_parent-file.jsonl"}`,
+			wantPSI: "pi:2026-07-03T06-00-00-000Z_parent-file",
+		},
+		{
+			name:    "native pi parentSession Windows path maps by filename",
+			agent:   AgentPi,
+			header:  `{"type":"session","version":3,"id":"child",` + ts + `,"cwd":"/repos/x","parentSession":"C:\\\\data\\\\parent-file.jsonl"}`,
+			wantPSI: "pi:parent-file",
+		},
+		{
+			name:    "native pi branchedFrom wins over parentSession",
+			agent:   AgentPi,
+			header:  `{"type":"session","version":3,"id":"child",` + ts + `,"cwd":"/repos/x","branchedFrom":"/data/2026-07-03T06-00-00-000Z_parent-file.jsonl","parentSession":"/data/other-parent.jsonl"}`,
+			wantPSI: "pi:2026-07-03T06-00-00-000Z_parent-file",
+		},
+		{
+			name:    "native pi with neither field yields empty parent",
+			agent:   AgentPi,
+			header:  `{"type":"session","version":3,"id":"child",` + ts + `,"cwd":"/repos/x"}`,
+			wantPSI: "",
+		},
+		{
+			name:    "pi branchedFrom still maps unchanged",
+			agent:   AgentPi,
+			header:  `{"type":"session","version":3,"id":"child",` + ts + `,"cwd":"/repos/x","branchedFrom":"/data/2026-07-03T06-00-00-000Z_parent-file.jsonl"}`,
+			wantPSI: "pi:2026-07-03T06-00-00-000Z_parent-file",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			content := strings.Join([]string{
+				tt.header,
+				`{"type":"message","id":"msg-1","parentId":null,"timestamp":"2026-07-03T06:31:00.000Z","message":{"role":"user","content":"hello"}}`,
+				"",
+			}, "\n")
+			sess, _ := parsePiLikeTestSession(t, tt.agent, content)
+			assert.Equal(t, tt.wantPSI, sess.ParentSessionID)
+		})
+	}
+}
+
+// TestPiProviderNativeParentSessionUsesHeaderIdentity verifies that native
+// Pi parentSession paths resolve to the parent's persisted header ID when the
+// filename stem and header ID differ.
+func TestPiProviderNativeParentSessionUsesHeaderIdentity(t *testing.T) {
+	root := t.TempDir()
+	parentPath := filepath.Join(root, "2026-07-03T06-00-00-000Z_parent-file.jsonl")
+	childPath := filepath.Join(root, "2026-07-03T06-30-00-000Z_child-file.jsonl")
+	parentPathJSON, err := json.Marshal(parentPath)
+	require.NoError(t, err)
+	parentContent := `{"type":"session","version":3,"id":"header-id-does-not-match-filename","timestamp":"2026-07-03T06:00:00.000Z","cwd":"/repos/x"}` + "\n"
+	childContent := `{"type":"session","version":3,"id":"child","timestamp":"2026-07-03T06:30:00.000Z","cwd":"/repos/x","parentSession":` + string(parentPathJSON) + `}` + "\n"
+	require.NoError(t, os.WriteFile(parentPath, []byte(parentContent), 0o644))
+	require.NoError(t, os.WriteFile(childPath, []byte(childContent), 0o644))
+
+	parent, _, err := parsePiLikeSession(parentPath, "my_project", "local", AgentPi, "pi:")
+	require.NoError(t, err)
+	child, _, err := parsePiLikeSession(childPath, "my_project", "local", AgentPi, "pi:")
+	require.NoError(t, err)
+
+	assert.Equal(t, "pi:header-id-does-not-match-filename", parent.ID)
+	assert.Equal(t, parent.ID, child.ParentSessionID,
+		"native parentSession must resolve to the parent's stored header ID")
+	assert.Empty(t, parent.RelationshipType,
+		"native Pi parent session has no relationship")
+	assert.Equal(t, RelFork, child.RelationshipType,
+		"native Pi parented session is classified as a fork")
+}
+
+// TestPiProviderOMPParentSessionMatchesParentID proves the mapped
+// ParentSessionID resolves: a child OMP session's parentSession header
+// (the parent's raw session ID) maps to exactly the stored ID of the
+// parent session, so lineage links up rather than dangling.
+func TestPiProviderOMPParentSessionMatchesParentID(t *testing.T) {
+	parentContent := strings.Join([]string{
+		`{"type":"session","version":3,"id":"parent-abc","timestamp":"2026-07-03T06:00:00.000Z","cwd":"/repos/x"}`,
+		`{"type":"message","id":"p1","parentId":null,"timestamp":"2026-07-03T06:00:01.000Z","message":{"role":"user","content":"root"}}`,
+		"",
+	}, "\n")
+	childContent := strings.Join([]string{
+		`{"type":"session","version":3,"id":"child-def","timestamp":"2026-07-03T06:30:00.000Z","cwd":"/repos/x","parentSession":"parent-abc"}`,
+		`{"type":"message","id":"c1","parentId":null,"timestamp":"2026-07-03T06:30:01.000Z","message":{"role":"user","content":"branch"}}`,
+		"",
+	}, "\n")
+
+	parent, _ := parsePiLikeTestSession(t, AgentOMP, parentContent)
+	child, _ := parsePiLikeTestSession(t, AgentOMP, childContent)
+
+	assert.Equal(t, "omp:parent-abc", parent.ID)
+	assert.Equal(t, "omp:child-def", child.ID)
+	assert.Equal(t, parent.ID, child.ParentSessionID,
+		"child parentSession must map to the parent's stored session ID")
+}
+
+func TestPiProviderOMPSubagentUsesV1ParentFilenameID(t *testing.T) {
+	root := t.TempDir()
+	projectDir := filepath.Join(root, "project")
+	parentPath := filepath.Join(projectDir, "parent-v1.jsonl")
+	childDir := filepath.Join(projectDir, "parent-v1")
+	childPath := filepath.Join(childDir, "agent-worker.jsonl")
+	require.NoError(t, os.MkdirAll(childDir, 0o755))
+	require.NoError(t, os.WriteFile(parentPath, []byte(strings.Join([]string{
+		`{"type":"session","version":1,"timestamp":"2026-07-03T06:00:00.000Z","cwd":"/repos/x"}`,
+		`{"type":"message","timestamp":"2026-07-03T06:00:01.000Z","message":{"role":"user","content":"root"}}`,
+		"",
+	}, "\n")), 0o644))
+	require.NoError(t, os.WriteFile(childPath, []byte(strings.Join([]string{
+		`{"type":"session","version":3,"id":"child-def","timestamp":"2026-07-03T06:30:00.000Z","cwd":"/repos/x"}`,
+		`{"type":"message","id":"c1","parentId":null,"timestamp":"2026-07-03T06:30:01.000Z","message":{"role":"user","content":"branch"}}`,
+		"",
+	}, "\n")), 0o644))
+
+	child, _, err := parsePiLikeSession(childPath, "my_project", "local", AgentOMP, "omp:")
+	require.NoError(t, err)
+
+	assert.Equal(t, "omp:child-def", child.ID)
+	assert.Equal(t, "omp:parent-v1", child.ParentSessionID)
+	assert.Equal(t, RelSubagent, child.RelationshipType)
+}
+
+func TestPiProviderOMPSubagentFollowsSymlinkedParent(t *testing.T) {
+	root := t.TempDir()
+	projectDir := filepath.Join(root, "project")
+	realParent := filepath.Join(root, "real-parent.jsonl")
+	parentLink := filepath.Join(projectDir, "linked-parent.jsonl")
+	childDir := filepath.Join(projectDir, "linked-parent")
+	childPath := filepath.Join(childDir, "agent-worker.jsonl")
+	require.NoError(t, os.MkdirAll(childDir, 0o755))
+	require.NoError(t, os.WriteFile(realParent, []byte(strings.Join([]string{
+		`{"type":"session","version":3,"id":"real-parent-id","timestamp":"2026-07-03T06:00:00.000Z","cwd":"/repos/x"}`,
+		`{"type":"message","id":"p1","parentId":null,"timestamp":"2026-07-03T06:00:01.000Z","message":{"role":"user","content":"root"}}`,
+		"",
+	}, "\n")), 0o644))
+	if err := os.Symlink(realParent, parentLink); err != nil {
+		t.Skipf("symlink not supported: %v", err)
+	}
+	require.NoError(t, os.WriteFile(childPath, []byte(strings.Join([]string{
+		`{"type":"session","version":3,"id":"child-def","timestamp":"2026-07-03T06:30:00.000Z","cwd":"/repos/x"}`,
+		`{"type":"message","id":"c1","parentId":null,"timestamp":"2026-07-03T06:30:01.000Z","message":{"role":"user","content":"branch"}}`,
+		"",
+	}, "\n")), 0o644))
+
+	child, _, err := parsePiLikeSession(childPath, "my_project", "local", AgentOMP, "omp:")
+	require.NoError(t, err)
+
+	assert.Equal(t, "omp:child-def", child.ID)
+	assert.Equal(t, "omp:real-parent-id", child.ParentSessionID)
+	assert.Equal(t, RelSubagent, child.RelationshipType)
 }
 
 func TestParsePiSession_MessageLineageContinuity(t *testing.T) {
@@ -883,6 +1102,22 @@ func TestPiProviderParsesZeroUsage(t *testing.T) {
 		"input field present => HasContextTokens true even at zero")
 	assert.Equal(t, 0, m.OutputTokens)
 	assert.Equal(t, 0, m.ContextTokens)
+}
+
+func TestPiProviderParsesFlatCacheWriteUsage(t *testing.T) {
+	header := `{"type":"session","id":"cache-write-session","timestamp":"2026-08-06T12:00:00Z","cwd":"/tmp"}` + "\n"
+	assistant := `{"type":"message","id":"assistant-1","timestamp":"2026-08-06T12:00:01Z","message":{"role":"assistant","content":"done","model":"claude-opus-4-5","usage":{"input":10,"output":3,"cacheRead":4,"cacheWrite":2}}}`
+
+	_, messages := runPiParserTest(t, header+assistant)
+	require.Len(t, messages, 1)
+	assert.Equal(t, 16, messages[0].ContextTokens)
+	assert.Equal(t, 3, messages[0].OutputTokens)
+	assert.JSONEq(t, `{
+		"input_tokens": 10,
+		"output_tokens": 3,
+		"cache_read_input_tokens": 4,
+		"cache_creation_input_tokens": 2
+	}`, string(messages[0].TokenUsage))
 }
 
 // TestPiProviderParsesNoUsageNoTokenUsage verifies that messages

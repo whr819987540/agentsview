@@ -4,7 +4,8 @@ package main
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"fmt"
 	"io"
 	"os"
@@ -25,6 +26,7 @@ func newStatsCommand() *cobra.Command {
 	var (
 		since, until, agent, timezone         string
 		includeProjects, excludeProjects      []string
+		includeOneShot, includeAutomated      bool
 		includeGitOutcomes, includeGHOutcomes bool
 	)
 	cmd := &cobra.Command{
@@ -57,21 +59,24 @@ func newStatsCommand() *cobra.Command {
 				ghToken = resolveGitHubToken(cmd.Context())
 			}
 			stats, err := svc.Stats(cmd.Context(), service.StatsFilter{
-				Since:                 since,
-				Until:                 until,
-				Agent:                 agentFilter,
-				IncludeProjects:       includeProjects,
-				ExcludeProjects:       excludeProjects,
-				Timezone:              timezone,
-				IncludeGitOutcomes:    includeGitOutcomes,
-				IncludeGitHubOutcomes: includeGHOutcomes,
-				GHToken:               ghToken,
+				ApplyDefaultVisibility: true,
+				Since:                  since,
+				Until:                  until,
+				Agent:                  agentFilter,
+				IncludeOneShot:         includeOneShot,
+				IncludeAutomated:       includeAutomated,
+				IncludeProjects:        includeProjects,
+				ExcludeProjects:        excludeProjects,
+				Timezone:               timezone,
+				IncludeGitOutcomes:     includeGitOutcomes,
+				IncludeGitHubOutcomes:  includeGHOutcomes,
+				GHToken:                ghToken,
 			})
 			if err != nil {
 				return err
 			}
 			if outputFormat(cmd) == "json" {
-				return json.NewEncoder(cmd.OutOrStdout()).Encode(stats)
+				return json.MarshalEncode(jsontext.NewEncoder(cmd.OutOrStdout()), stats)
 			}
 			return printStatsHuman(cmd.OutOrStdout(), stats)
 		},
@@ -80,6 +85,7 @@ func newStatsCommand() *cobra.Command {
 	registerFormatFlags(cmd.Flags())
 	registerStatsFlags(cmd,
 		&since, &until, &agent, &timezone,
+		&includeOneShot, &includeAutomated,
 		&includeProjects, &excludeProjects,
 		&includeGitOutcomes, &includeGHOutcomes,
 	)
@@ -116,6 +122,7 @@ func resolveGitHubToken(ctx context.Context) string {
 func registerStatsFlags(
 	cmd *cobra.Command,
 	since, until, agent, timezone *string,
+	includeOneShot, includeAutomated *bool,
 	includeProjects, excludeProjects *[]string,
 	includeGitOutcomes, includeGHOutcomes *bool,
 ) {
@@ -126,6 +133,10 @@ func registerStatsFlags(
 		"End of window (YYYY-MM-DD; default: now)")
 	f.StringVar(agent, "agent", "all",
 		"Filter by agent (claude, codex, cursor, ... or 'all')")
+	f.BoolVar(includeOneShot, "include-one-shot", false,
+		"Include one-shot sessions (excluded by default)")
+	f.BoolVar(includeAutomated, "include-automated", false,
+		"Include automated sessions (excluded by default)")
 	f.StringArrayVar(includeProjects, "include-project", nil,
 		"Restrict to these projects (repeatable)")
 	f.StringArrayVar(excludeProjects, "exclude-project", nil,
@@ -149,14 +160,7 @@ func openStatsService(
 	if err != nil {
 		return nil, nil, err
 	}
-	if tr.Mode == transportHTTP && tr.ReadOnly {
-		d, err := openReadOnlyDB(cfg)
-		if err != nil {
-			return nil, nil, fmt.Errorf("opening db: %w", err)
-		}
-		return service.NewDirectBackend(d, nil), func() { d.Close() }, nil
-	}
-	return newService(cfg, tr)
+	return newService(cmd.Context(), cfg, tr)
 }
 
 // printStatsHuman renders a human-readable summary of a SessionStats
@@ -215,7 +219,7 @@ type errWriter struct {
 
 func (e *errWriter) Write(p []byte) (int, error) {
 	if e.err != nil {
-		return len(p), nil
+		return 0, e.err
 	}
 	n, err := e.w.Write(p)
 	if err != nil {
@@ -388,9 +392,9 @@ func printCacheEconomics(w io.Writer, c *db.StatsCacheEconomics) {
 	fmt.Fprintln(w, "Cache economics (claude-only)")
 	fmt.Fprintf(w, "  Overall hit ratio:   %.2f\n",
 		c.CacheHitRatio.Overall)
-	fmt.Fprintf(w, "  $ spent:             $%.2f\n", c.DollarsSpent)
-	fmt.Fprintf(w, "  $ saved vs uncached: $%.2f\n",
-		c.DollarsSavedVsUncached)
+	fmt.Fprintf(w, "  $ spent:             %s\n", fmtCost(c.DollarsSpent))
+	fmt.Fprintf(w, "  $ saved vs uncached: %s\n",
+		fmtCost(c.DollarsSavedVsUncached))
 	fmt.Fprintln(w)
 }
 

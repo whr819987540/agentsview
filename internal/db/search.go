@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -27,6 +29,11 @@ var SystemMsgPrefixes = []string{
 	"<local-command-",
 	"Stop hook feedback:",
 }
+
+const (
+	systemReminderOpenTag  = "<system-reminder>"
+	systemReminderCloseTag = "</system-reminder>"
+)
 
 const (
 	legacyGoalContextPrefix        = "<goal_context>"
@@ -98,9 +105,50 @@ func systemPrefixSQL(
 			"substr(%s, 1, %d) = '%s'", trimmed, len(p), p,
 		))
 	}
+	parts = append(parts, systemReminderTerminalSQL(trimmed, dialect))
 	parts = append(parts, goalContextPrefixSQL(trimmed, dialect))
-	return "NOT (" + roleCol + " = 'user' AND (" +
+	guard := ""
+	if dialect == systemPrefixSQLite {
+		guard = systemPrefixFirstCPGuardSQL(contentCol) + " AND "
+	}
+	return "NOT (" + roleCol + " = 'user' AND " + guard + "(" +
 		strings.Join(parts, " OR ") + "))"
+}
+
+// systemPrefixFirstCPGuardSQL builds a cheap prefilter implied by every
+// prefix branch of systemPrefixSQL: for any branch to match, the raw
+// content's first code point must be a trimmable whitespace character or the
+// first character of one of the known prefixes. unicode() returns the first
+// code point as an integer (NULL for empty content, COALESCEd to 0, which is
+// never in the set), so rows with ordinary content skip the repeated
+// LTRIM/prefix chain after one integer IN test. The guard is AND'ed inside
+// the NOT(...), so a false guard reproduces exactly the all-branches-false
+// result. SQLite-only for now: PG (ascii) and DuckDB (unicode) analogues
+// need their own empty-string audits before the other dialects adopt it.
+func systemPrefixFirstCPGuardSQL(contentCol string) string {
+	seen := make(map[rune]bool)
+	var cps []int
+	add := func(r rune) {
+		if !seen[r] {
+			seen[r] = true
+			cps = append(cps, int(r))
+		}
+	}
+	for _, p := range SystemMsgPrefixes {
+		add([]rune(p)[0])
+	}
+	add([]rune(legacyGoalContextPrefix)[0])
+	add([]rune(codexInternalContextTagPrefix)[0])
+	for _, r := range systemPrefixTrimCutset {
+		add(r)
+	}
+	sort.Ints(cps)
+	items := make([]string, len(cps))
+	for i, cp := range cps {
+		items[i] = strconv.Itoa(cp)
+	}
+	return "COALESCE(unicode(" + contentCol + "), 0) IN (" +
+		strings.Join(items, ", ") + ")"
 }
 
 func systemPrefixSQLTrimmed(contentCol string) string {
@@ -108,6 +156,46 @@ func systemPrefixSQLTrimmed(contentCol string) string {
 		"\u0085\u00A0\u1680" +
 		"\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200A" +
 		"\u2028\u2029\u202F\u205F\u3000\uFEFF')"
+}
+
+func systemReminderTerminalSQL(
+	trimmed string, dialect systemPrefixSQLDialect,
+) string {
+	closePos := sqlPosition(dialect, systemReminderCloseTag, "rest")
+	next := systemPrefixSQLTrimmed(fmt.Sprintf(
+		"substr(rest, (%s) + %d)", closePos, len(systemReminderCloseTag),
+	))
+	terminal := fmt.Sprintf(
+		"(substr(rest, 1, %d) <> '%s' OR %s = 0)",
+		len(systemReminderOpenTag), systemReminderOpenTag, closePos,
+	)
+	classification := terminalRemainderSQL("rest", dialect)
+	seedReminder := fmt.Sprintf(
+		"substr(%s, 1, %d) = '%s'",
+		trimmed, len(systemReminderOpenTag), systemReminderOpenTag,
+	)
+	return fmt.Sprintf(`(%s AND EXISTS (WITH RECURSIVE reminder_remainder(rest) AS (
+SELECT %s
+UNION ALL
+SELECT %s FROM reminder_remainder
+WHERE substr(rest, 1, %d) = '%s' AND %s > 0
+)
+SELECT 1 FROM reminder_remainder
+WHERE %s AND (rest = '' OR %s)
+LIMIT 1))`, seedReminder, trimmed, next,
+		len(systemReminderOpenTag), systemReminderOpenTag, closePos,
+		terminal, classification)
+}
+
+func terminalRemainderSQL(content string, dialect systemPrefixSQLDialect) string {
+	parts := make([]string, 0, len(SystemMsgPrefixes)+1)
+	for _, p := range SystemMsgPrefixes {
+		parts = append(parts, fmt.Sprintf(
+			"substr(%s, 1, %d) = '%s'", content, len(p), p,
+		))
+	}
+	parts = append(parts, goalContextPrefixSQL(content, dialect))
+	return strings.Join(parts, " OR ")
 }
 
 func goalContextPrefixSQL(trimmed string, dialect systemPrefixSQLDialect) string {
@@ -175,10 +263,17 @@ func IsSystemPrefixed(content, role string) bool {
 	if role != "user" {
 		return false
 	}
-	if IsGoalContextPrefixed(content, role) {
+	trimmed := strings.TrimLeft(content, systemPrefixTrimCutset)
+	remainder, stripped := stripLeadingSystemReminderBlocks(trimmed)
+	if stripped {
+		if remainder == "" {
+			return true
+		}
+		trimmed = remainder
+	}
+	if IsGoalContextPrefixed(trimmed, role) {
 		return true
 	}
-	trimmed := strings.TrimLeft(content, systemPrefixTrimCutset)
 	for _, p := range SystemMsgPrefixes {
 		if strings.HasPrefix(trimmed, p) {
 			return true
@@ -187,8 +282,27 @@ func IsSystemPrefixed(content, role string) bool {
 	return false
 }
 
+func stripLeadingSystemReminderBlocks(content string) (string, bool) {
+	rest := strings.TrimLeft(content, systemPrefixTrimCutset)
+	stripped := false
+	for strings.HasPrefix(rest, systemReminderOpenTag) {
+		closeIdx := strings.Index(rest, systemReminderCloseTag)
+		if closeIdx < 0 {
+			return "", false
+		}
+		rest = strings.TrimLeft(
+			rest[closeIdx+len(systemReminderCloseTag):],
+			systemPrefixTrimCutset,
+		)
+		stripped = true
+	}
+	return rest, stripped
+}
+
 // SearchResult holds a session-level match with the best-ranked snippet.
 type SearchResult struct {
+	// WebURL is a client-derived browser link, never persisted.
+	WebURL         string  `json:"web_url,omitempty"`
 	SessionID      string  `json:"session_id"`
 	Project        string  `json:"project"`
 	Agent          string  `json:"agent"`
@@ -201,11 +315,13 @@ type SearchResult struct {
 
 // SearchFilter specifies search parameters.
 type SearchFilter struct {
-	Query   string
-	Project string
-	Sort    string // "relevance" (default) or "recency"
-	Cursor  int    // offset for pagination
-	Limit   int
+	DateFrom string
+	DateTo   string
+	Query    string
+	Project  string
+	Sort     string // "relevance" (default) or "recency"
+	Cursor   int    // offset for pagination
+	Limit    int
 }
 
 // SearchPage holds paginated search results.
@@ -233,7 +349,11 @@ func (db *DB) Search(
 	if f.Limit <= 0 || f.Limit > MaxSearchLimit {
 		f.Limit = DefaultSearchLimit
 	}
-	f.Query = PrepareFTSQuery(f.Query)
+	ftsQuery, err := db.prepareMessageFTSQuery(ctx, f.Query)
+	if err != nil {
+		return SearchPage{}, err
+	}
+	f.Query = ftsQuery.match
 
 	// ORDER BY for the outer query. FTS5 ranks are negative (lower = better),
 	// so rank ASC places message matches (negative rank) before name-only rows
@@ -266,12 +386,24 @@ func (db *DB) Search(
 		nameProjectArgs = []any{f.Project}
 	}
 
+	dateBuilder := NewQueryBuilder(SQLiteQueryDialect(), 0)
+	datePreds := dateBuilder.SessionDateRangePredicates(f.DateFrom, f.DateTo, "", func(col string) string { return "s2." + col })
+	innerWhere = append(innerWhere, datePreds...)
+	ftsArgs = append(ftsArgs, dateBuilder.Args()...)
+	nameDateBuilder := NewQueryBuilder(SQLiteQueryDialect(), 0)
+	var nameProjectClauseSb394 strings.Builder
+	for _, pred := range nameDateBuilder.SessionDateRangePredicates(f.DateFrom, f.DateTo, "", func(col string) string { return "s." + col }) {
+		nameProjectClauseSb394.WriteString(" AND " + pred)
+	}
+	nameProjectClause += nameProjectClauseSb394.String()
+	nameProjectArgs = append(nameProjectArgs, nameDateBuilder.Args()...)
+
 	innerWhereSQL := strings.Join(innerWhere, " AND ")
 	// Strip FTS quoting before substring operations. PrepareFTSQuery wraps
 	// each term in double quotes for FTS (e.g. "fix bug" → `"fix" "bug"`).
 	// LIKE and instr() must use the plain text form so name/content substring
 	// searches work correctly.
-	plainQuery := StripFTSQuotes(f.Query)
+	plainQuery := ftsQuery.plain
 	if plainQuery == "" {
 		return SearchPage{}, nil
 	}
@@ -388,6 +520,7 @@ func (db *DB) Search(
 		innerWhereSQL,     // NOT IN subquery WHERE (%s)
 		orderBy,           // ORDER BY (%s)
 	)
+	query = strings.ReplaceAll(query, "messages_fts", ftsQuery.table)
 
 	// Replace the ROW_NUMBER inner subquery's ? for best_query with args
 	// re-ordered: the first innerWhere param (f.Query) was already included in
@@ -449,19 +582,26 @@ func (db *DB) SearchSession(
 	// SQLite LIKE is case-insensitive for ASCII by default.
 	// LEFT JOIN tool_calls so that a hit in result_content also surfaces
 	// the parent message ordinal; DISTINCT collapses multiple tool calls
-	// on the same message into a single result.
+	// on the same message into a single result. tool_result_events joins in
+	// alongside it because a summary its single event repeats is not stored
+	// on the call, and the frontend renders the event content either way.
 	like := "%" + escapeLike(query) + "%"
 	rows, err := db.getReader().QueryContext(ctx,
 		`SELECT DISTINCT m.ordinal
 		 FROM messages m
 		 LEFT JOIN tool_calls tc ON tc.message_id = m.id
+		 LEFT JOIN tool_result_events tre
+		   ON tre.session_id = tc.session_id
+		   AND tre.tool_call_message_ordinal = m.ordinal
+		   AND tre.call_index = COALESCE(tc.call_index, 0)
 		 WHERE m.session_id = ?
 		   AND m.is_system = 0
 		   AND `+SystemPrefixSQL("m.content", "m.role")+`
 		   AND (m.content LIKE ? ESCAPE '\'
-		        OR tc.result_content LIKE ? ESCAPE '\')
+		        OR tc.result_content LIKE ? ESCAPE '\'
+		        OR tre.content LIKE ? ESCAPE '\')
 		 ORDER BY m.ordinal ASC`,
-		sessionID, like, like,
+		sessionID, like, like, like,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("session search: %w", err)

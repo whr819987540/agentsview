@@ -1,7 +1,7 @@
 package db
 
 import (
-	"context"
+	"encoding/json/v2"
 	"slices"
 	"testing"
 
@@ -25,8 +25,30 @@ func TestPruneFilterZeroValue(t *testing.T) {
 		s.MessageCount = 5
 	})
 
-	_, err := d.FindPruneCandidates(f)
+	_, err := d.FindPruneCandidates(t.Context(), f)
 	requireErrContains(t, err, "at least one filter is required")
+}
+
+func TestSessionFilterIncludesEmptyForProjectMapping(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "empty", "mapping", func(s *Session) { s.MessageCount = 0 })
+	insertSession(t, d, "populated", "mapping", func(s *Session) { s.MessageCount = 2 })
+	for _, includeEmpty := range []bool{false, true} {
+		page, err := d.ListSessions(t.Context(), SessionFilter{
+			ProjectLabels: []string{"mapping"}, IncludeEmpty: includeEmpty,
+		})
+		require.NoError(t, err)
+		ids := make([]string, len(page.Sessions))
+		for i, session := range page.Sessions {
+			ids[i] = session.ID
+		}
+		want := []string{"populated"}
+		if includeEmpty {
+			want = append(want, "empty")
+		}
+		assert.ElementsMatch(t, want, ids)
+		assert.Equal(t, len(want), page.Total)
+	}
 }
 
 func TestSessionFilterDateFields(t *testing.T) {
@@ -865,16 +887,35 @@ func TestIncludeChildrenExcludeOneShotAgent(t *testing.T) {
 	}
 }
 
-func TestActiveSinceUsesEndedAtOverStartedAt(t *testing.T) {
+func TestSessionDateFilterIncludesOverlappingSessions(t *testing.T) {
 	d := testDB(t)
 
-	// Session started in January, ended in June.
-	// A date_from filter for June would miss it (started too early),
-	// but active_since should catch it via ended_at.
-	insertSession(t, d, "s1", "proj", func(s *Session) {
-		s.StartedAt = new("2024-01-15T10:00:00Z")
-		s.EndedAt = new("2024-06-15T10:00:00Z")
-		s.MessageCount = 5
+	insertSession(t, d, "before", "proj", func(s *Session) {
+		s.StartedAt = new("2024-06-16T02:00:00Z")
+		s.EndedAt = new("2024-06-16T03:59:59Z")
+		s.MessageCount = 2
+	})
+	insertSession(t, d, "spanning", "proj", func(s *Session) {
+		s.StartedAt = new("2024-06-16T03:00:00Z")
+		s.EndedAt = new("2024-06-16T10:00:00Z")
+		s.MessageCount = 2
+	})
+	insertSession(t, d, "open", "proj", func(s *Session) {
+		s.StartedAt = new("2024-06-16T02:00:00Z")
+		s.MessageCount = 2
+	})
+	seedMessage(t, d, "open", 1, "user", "2024-06-17T03:59:59Z", "")
+	insertSession(t, d, "after", "proj", func(s *Session) {
+		s.StartedAt = new("2024-06-17T04:00:00Z")
+		s.EndedAt = new("2024-06-17T05:00:00Z")
+		s.MessageCount = 2
+	})
+	insertSession(t, d, "child", "proj", func(s *Session) {
+		s.StartedAt = new("2024-06-17T08:00:00Z")
+		s.EndedAt = new("2024-06-17T09:00:00Z")
+		s.MessageCount = 1
+		s.ParentSessionID = new("spanning")
+		s.RelationshipType = "subagent"
 	})
 
 	tests := []struct {
@@ -883,14 +924,33 @@ func TestActiveSinceUsesEndedAtOverStartedAt(t *testing.T) {
 		want   []string
 	}{
 		{
-			name:   "DateFrom misses due to early StartedAt",
-			filter: SessionFilter{DateFrom: "2024-06-01"},
-			want:   []string{},
+			name: "ExactDate",
+			filter: SessionFilter{
+				Date: "2024-06-16", Timezone: "America/New_York",
+			},
+			want: []string{"spanning", "open"},
 		},
 		{
-			name:   "ActiveSince catches due to later EndedAt",
-			filter: SessionFilter{ActiveSince: "2024-06-01T00:00:00Z"},
-			want:   []string{"s1"},
+			name: "DateRange",
+			filter: SessionFilter{
+				DateFrom: "2024-06-16", DateTo: "2024-06-16",
+				Timezone: "America/New_York",
+			},
+			want: []string{"spanning", "open"},
+		},
+		{
+			name: "DateFrom",
+			filter: SessionFilter{
+				DateFrom: "2024-06-16", Timezone: "America/New_York",
+			},
+			want: []string{"spanning", "open", "after"},
+		},
+		{
+			name: "DateTo",
+			filter: SessionFilter{
+				DateTo: "2024-06-15", Timezone: "America/New_York",
+			},
+			want: []string{"before", "spanning", "open"},
 		},
 	}
 
@@ -899,6 +959,14 @@ func TestActiveSinceUsesEndedAtOverStartedAt(t *testing.T) {
 			requireSessions(t, d, tt.filter, tt.want)
 		})
 	}
+
+	index, err := d.GetSidebarSessionIndex(t.Context(), SessionFilter{
+		Date: "2024-06-16", Timezone: "America/New_York",
+	})
+	require.NoError(t, err, "GetSidebarSessionIndex")
+	requireSidebarIndexIDs(t, index.Sessions, []string{
+		"spanning", "open", "child",
+	})
 }
 
 func TestSessionFilterExcludeOneShot(t *testing.T) {
@@ -960,11 +1028,11 @@ func TestGetMachinesExcludeOneShot(t *testing.T) {
 		s.UserMessageCount = 5
 	})
 
-	all, err := d.GetMachines(context.Background(), false, false)
+	all, err := d.GetMachines(t.Context(), false, false)
 	require.NoError(t, err, "GetMachines includeAll")
 	require.Len(t, all, 2, "includeAll machines")
 
-	filtered, err := d.GetMachines(context.Background(), true, false)
+	filtered, err := d.GetMachines(t.Context(), true, false)
 	require.NoError(t, err, "GetMachines excludeOneShot")
 	require.Len(t, filtered, 1, "excludeOneShot machines")
 	assert.Equal(t, "desktop", filtered[0], "excludeOneShot machine")
@@ -983,14 +1051,14 @@ func TestGetStatsExcludeOneShot(t *testing.T) {
 	})
 
 	// Include all.
-	stats, err := d.GetStats(context.Background(), false, false)
+	stats, err := d.GetStats(t.Context(), false, false)
 	require.NoError(t, err, "GetStats includeAll")
 	assert.Equal(t, 2, stats.SessionCount, "includeAll: session_count")
 	assert.Equal(t, 15, stats.MessageCount, "includeAll: message_count")
 	assert.Equal(t, 2, stats.ProjectCount, "includeAll: project_count")
 
 	// Exclude one-shot.
-	stats, err = d.GetStats(context.Background(), true, false)
+	stats, err = d.GetStats(t.Context(), true, false)
 	require.NoError(t, err, "GetStats excludeOneShot")
 	assert.Equal(t, 1, stats.SessionCount, "excludeOneShot: session_count")
 	assert.Equal(t, 10, stats.MessageCount, "excludeOneShot: message_count")
@@ -1123,7 +1191,7 @@ func TestSidebarSessionIndexExcludeAutomated(t *testing.T) {
 		s.UserMessageCount = 1
 	})
 
-	index, err := d.GetSidebarSessionIndex(context.Background(), SessionFilter{
+	index, err := d.GetSidebarSessionIndex(t.Context(), SessionFilter{
 		ExcludeAutomated: true,
 	})
 	requireNoError(t, err, "GetSidebarSessionIndex")
@@ -1145,12 +1213,55 @@ func TestSidebarSessionIndexIncludeAutomated(t *testing.T) {
 		s.UserMessageCount = 1
 	})
 
-	index, err := d.GetSidebarSessionIndex(context.Background(), SessionFilter{
+	index, err := d.GetSidebarSessionIndex(t.Context(), SessionFilter{
 		ExcludeAutomated: false,
 	})
 	requireNoError(t, err, "GetSidebarSessionIndex")
 	requireSidebarIndexIDs(t, index.Sessions, []string{"normal", "review"})
 	require.Equal(t, 2, index.Total, "total")
+}
+
+func TestSessionReadProgressRevisionUsesTranscriptContent(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "revision", "proj")
+
+	session, err := d.GetSession(t.Context(), "revision")
+	require.NoError(t, err)
+	require.NotNil(t, session)
+	assertJSONTranscriptRevision(t, session, "0")
+
+	require.NoError(t, d.InsertMessages(t.Context(), []Message{{
+		SessionID: "revision", Ordinal: 0, Role: "user",
+		Content: "content", ContentLength: len("content"),
+	}}))
+	updated, err := d.GetSession(t.Context(), "revision")
+	require.NoError(t, err)
+	require.NotNil(t, updated)
+	assertJSONTranscriptRevision(t, updated, "1")
+
+	name := "metadata-only rename"
+	require.NoError(t, d.RenameSession(t.Context(), "revision", &name))
+	renamed, err := d.GetSession(t.Context(), "revision")
+	require.NoError(t, err)
+	require.NotNil(t, renamed)
+	assertJSONTranscriptRevision(t, renamed, "1")
+
+	index, err := d.GetSidebarSessionIndex(t.Context(), SessionFilter{})
+	require.NoError(t, err)
+	require.Len(t, index.Sessions, 1)
+	assertJSONTranscriptRevision(t, index.Sessions[0], "1")
+}
+
+func assertJSONTranscriptRevision(t *testing.T, value any, want string) {
+	t.Helper()
+
+	raw, err := json.Marshal(value)
+	require.NoError(t, err)
+	var fields map[string]any
+	require.NoError(t, json.Unmarshal(raw, &fields))
+	assert.Equal(t, want, fields["transcript_revision"])
+	assert.NotContains(t, fields, "file_hash")
+	assert.NotContains(t, fields, "local_modified_at")
 }
 
 func TestSidebarSessionIndexExcludeOneShotWithAutomatedIncluded(t *testing.T) {
@@ -1171,7 +1282,7 @@ func TestSidebarSessionIndexExcludeOneShotWithAutomatedIncluded(t *testing.T) {
 		s.UserMessageCount = 1
 	})
 
-	index, err := d.GetSidebarSessionIndex(context.Background(), SessionFilter{
+	index, err := d.GetSidebarSessionIndex(t.Context(), SessionFilter{
 		ExcludeOneShot:   true,
 		ExcludeAutomated: false,
 	})
@@ -1207,11 +1318,93 @@ func TestSidebarSessionIndexIncludesChildrenForMatchingRoot(t *testing.T) {
 		s.UserMessageCount = 5
 	})
 
-	index, err := d.GetSidebarSessionIndex(context.Background(), SessionFilter{
+	index, err := d.GetSidebarSessionIndex(t.Context(), SessionFilter{
 		Agent: "claude",
 	})
 	requireNoError(t, err, "GetSidebarSessionIndex")
 	requireSidebarIndexIDs(t, index.Sessions, []string{"root", "sub", "fork"})
+}
+
+func TestSidebarSessionIndexTotalCountsCanonicalRoots(t *testing.T) {
+	d := testDB(t)
+
+	insertSession(t, d, "root", "alpha", func(s *Session) {
+		s.MessageCount = 10
+		s.UserMessageCount = 5
+	})
+	insertSession(t, d, "sub", "child-source", func(s *Session) {
+		s.MessageCount = 2
+		s.UserMessageCount = 1
+		s.ParentSessionID = new("root")
+		s.RelationshipType = "subagent"
+	})
+	insertSession(t, d, "fork", "child-source", func(s *Session) {
+		s.MessageCount = 2
+		s.UserMessageCount = 1
+		s.ParentSessionID = new("sub")
+		s.RelationshipType = "fork"
+	})
+	insertSession(t, d, "orphan", "alpha", func(s *Session) {
+		s.MessageCount = 2
+		s.UserMessageCount = 1
+		s.ParentSessionID = new("missing-parent")
+		s.RelationshipType = "subagent"
+	})
+	insertSession(t, d, "unrelated", "beta", func(s *Session) {
+		s.MessageCount = 5
+		s.UserMessageCount = 2
+	})
+
+	index, err := d.GetSidebarSessionIndex(t.Context(), SessionFilter{
+		Project: "alpha",
+	})
+	require.NoError(t, err, "GetSidebarSessionIndex")
+	requireSidebarIndexIDs(t, index.Sessions, []string{
+		"root", "sub", "fork", "orphan",
+	})
+	assert.Equal(t, 2, index.Total,
+		"only the matching root and promoted orphan are canonical roots")
+}
+
+func TestSidebarSessionIndexPagedExcludesAutomatedDescendants(t *testing.T) {
+	d := testDB(t)
+
+	rootID := "root"
+	insertSession(t, d, rootID, "proj", func(s *Session) {
+		s.EndedAt = new("2024-01-03T00:00:00Z")
+		s.MessageCount = 10
+		s.UserMessageCount = 5
+	})
+	insertSession(t, d, "human-child", "proj", func(s *Session) {
+		s.EndedAt = new("2024-01-02T00:00:00Z")
+		s.MessageCount = 2
+		s.UserMessageCount = 1
+		s.ParentSessionID = &rootID
+		s.RelationshipType = "subagent"
+	})
+	insertSession(t, d, "automated-child", "proj", func(s *Session) {
+		fm := "You are a code reviewer. Review the code."
+		s.FirstMessage = &fm
+		s.EndedAt = new("2024-01-01T00:00:00Z")
+		s.MessageCount = 3
+		s.UserMessageCount = 1
+		s.ParentSessionID = &rootID
+		s.RelationshipType = "subagent"
+	})
+
+	index, err := d.GetSidebarSessionIndex(t.Context(), SessionFilter{
+		ExcludeAutomated: true,
+		Limit:            1,
+	})
+	requireNoError(t, err, "GetSidebarSessionIndex")
+	requireSidebarIndexIDs(t, index.Sessions, []string{"root", "human-child"})
+
+	index, err = d.GetSidebarSessionIndex(t.Context(), SessionFilter{
+		ExcludeAutomated: false,
+		Limit:            1,
+	})
+	requireNoError(t, err, "GetSidebarSessionIndex")
+	requireSidebarIndexIDs(t, index.Sessions, []string{"root", "human-child", "automated-child"})
 }
 
 func TestSidebarSessionIndexStarredIncludesStarredDescendantRoot(t *testing.T) {
@@ -1235,11 +1428,11 @@ func TestSidebarSessionIndexStarredIncludesStarredDescendantRoot(t *testing.T) {
 		s.ParentSessionID = &rootID
 		s.RelationshipType = "subagent"
 	})
-	ok, err := d.StarSession("starred-child")
+	ok, err := d.StarSession(t.Context(), "starred-child")
 	require.NoError(t, err, "StarSession")
 	require.True(t, ok, "starred-child should exist")
 
-	index, err := d.GetSidebarSessionIndex(context.Background(), SessionFilter{
+	index, err := d.GetSidebarSessionIndex(t.Context(), SessionFilter{
 		Starred: true,
 		Limit:   1,
 	})
@@ -1251,7 +1444,7 @@ func TestSidebarSessionIndexStarredIncludesStarredDescendantRoot(t *testing.T) {
 
 func TestSidebarSessionIndexPagedPromotesNestedOrphans(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	insertSession(t, d, "root", "proj", func(s *Session) {
 		s.EndedAt = new("2024-01-20T00:00:00Z")
@@ -1289,7 +1482,7 @@ func TestSidebarSessionIndexPagedPromotesNestedOrphans(t *testing.T) {
 
 func TestSidebarSessionIndexPagedExcludesContinuationWithSoftDeletedParent(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	insertSession(t, d, "root", "proj", func(s *Session) {
 		s.EndedAt = new("2024-01-20T00:00:00Z")
@@ -1301,7 +1494,7 @@ func TestSidebarSessionIndexPagedExcludesContinuationWithSoftDeletedParent(t *te
 		s.MessageCount = 5
 		s.UserMessageCount = 2
 	})
-	require.NoError(t, d.SoftDeleteSession("deleted-parent"), "SoftDeleteSession")
+	require.NoError(t, d.SoftDeleteSession(ctx, "deleted-parent"), "SoftDeleteSession")
 	insertSession(t, d, "continuation-child", "proj", func(s *Session) {
 		s.EndedAt = new("2024-01-18T00:00:00Z")
 		s.MessageCount = 2
@@ -1318,7 +1511,7 @@ func TestSidebarSessionIndexPagedExcludesContinuationWithSoftDeletedParent(t *te
 
 func TestSidebarSessionIndexPagedKeepsContinuationUnderLiveParent(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	insertSession(t, d, "root", "proj", func(s *Session) {
 		s.EndedAt = new("2024-01-20T00:00:00Z")
@@ -1342,7 +1535,7 @@ func TestSidebarSessionIndexPagedKeepsContinuationUnderLiveParent(t *testing.T) 
 
 func TestSidebarIndexDisplayNameResolvesViaCoalesce(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Session has an agent-provided name but no user rename.
 	insertSession(t, d, "s1", "p", func(s *Session) {
@@ -1358,7 +1551,7 @@ func TestSidebarIndexDisplayNameResolvesViaCoalesce(t *testing.T) {
 	assert.Equal(t, "Agent Name", *index.Sessions[0].DisplayName, "COALESCE returns session_name")
 
 	// User renames override session_name.
-	requireNoError(t, d.RenameSession("s1", Ptr("My Name")), "rename")
+	requireNoError(t, d.RenameSession(ctx, "s1", Ptr("My Name")), "rename")
 	index, err = d.GetSidebarSessionIndex(ctx, SessionFilter{})
 	requireNoError(t, err, "sidebar index after rename")
 	require.Len(t, index.Sessions, 1)
@@ -1380,7 +1573,7 @@ func TestSidebarSessionIndexComputesIsTeammate(t *testing.T) {
 		s.UserMessageCount = 2
 	})
 
-	index, err := d.GetSidebarSessionIndex(context.Background(), SessionFilter{})
+	index, err := d.GetSidebarSessionIndex(t.Context(), SessionFilter{})
 	requireNoError(t, err, "GetSidebarSessionIndex")
 
 	rows := sidebarIndexByID(index.Sessions)
@@ -1388,6 +1581,23 @@ func TestSidebarSessionIndexComputesIsTeammate(t *testing.T) {
 		"teammate IsTeammate = false, want true")
 	require.False(t, rows["normal"].IsTeammate,
 		"normal IsTeammate = true, want false")
+}
+
+func TestSidebarSessionIndexCarriesProjectAssignment(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+	displayName := "Named sidebar session"
+	insertSession(t, d, "assigned", "automatic", func(s *Session) {
+		s.DisplayName = &displayName
+	})
+	_, err := d.AssignSessionProject(ctx, "assigned", "manual")
+	require.NoError(t, err)
+
+	index, err := d.GetSidebarSessionIndex(ctx, SessionFilter{})
+	require.NoError(t, err)
+	require.Len(t, index.Sessions, 1)
+	assert.Equal(t, "manual", index.Sessions[0].Project)
+	assert.True(t, index.Sessions[0].ProjectAssigned)
 }
 
 func requireSidebarIndexIDs(
@@ -1455,7 +1665,7 @@ func TestIsAutomatedSetOnUpsert(t *testing.T) {
 		s.UserMessageCount = 1
 	})
 
-	ctx := context.Background()
+	ctx := t.Context()
 	normal, err := d.GetSession(ctx, "normal")
 	require.NoError(t, err, "get normal")
 	assert.False(t, normal.IsAutomated,
@@ -1486,13 +1696,13 @@ func TestListSessionsHasSecret(t *testing.T) {
 	// secret_leak_count is owned solely by the findings path; UpsertSession
 	// (used by insertSession) does NOT persist it, so set it via the findings
 	// API rather than the Session mutator.
-	require.NoError(t, d.ReplaceSessionSecretFindings("leaky", nil, 3, "v"),
+	require.NoError(t, d.ReplaceSessionSecretFindings(t.Context(), "leaky", nil, 3, "v"),
 		"ReplaceSessionSecretFindings")
 	insertSession(t, d, "clean", "proj", func(s *Session) {
 		s.MessageCount = 2
 		s.UserMessageCount = 2
 	})
-	page, err := d.ListSessions(context.Background(), SessionFilter{HasSecret: true})
+	page, err := d.ListSessions(t.Context(), SessionFilter{HasSecret: true})
 	require.NoError(t, err, "ListSessions")
 	require.Len(t, page.Sessions, 1, "HasSecret filter")
 	require.Equal(t, "leaky", page.Sessions[0].ID, "HasSecret filter")
@@ -1501,9 +1711,9 @@ func TestListSessionsHasSecret(t *testing.T) {
 		s.MessageCount = 2
 		s.UserMessageCount = 2
 	})
-	require.NoError(t, d.ReplaceSessionSecretFindings("stale", nil, 2, "old-rules"),
+	require.NoError(t, d.ReplaceSessionSecretFindings(t.Context(), "stale", nil, 2, "old-rules"),
 		"ReplaceSessionSecretFindings stale")
-	current, err := d.ListSessions(context.Background(), SessionFilter{
+	current, err := d.ListSessions(t.Context(), SessionFilter{
 		HasSecret:            true,
 		SecretsRulesVersions: []string{"v"},
 	})
@@ -1523,7 +1733,7 @@ func TestIncrementalUpdateClearsAutomated(t *testing.T) {
 		s.UserMessageCount = 1
 	})
 
-	ctx := context.Background()
+	ctx := t.Context()
 	s, err := d.GetSession(ctx, "s1")
 	require.NoError(t, err, "get before")
 	require.True(t, s.IsAutomated, "should start as automated")

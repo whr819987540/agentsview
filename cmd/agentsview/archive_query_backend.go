@@ -6,11 +6,16 @@ import (
 	"os"
 	"time"
 
+	"go.kenn.io/agentsview/internal/apiclient"
+
 	"go.kenn.io/agentsview/internal/activity"
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/pricing"
+	"go.kenn.io/agentsview/internal/pricingrefresh"
+	"go.kenn.io/agentsview/internal/service"
+	"go.kenn.io/agentsview/internal/servicehttp"
 	"go.kenn.io/agentsview/internal/sync"
 )
 
@@ -26,6 +31,7 @@ type archiveQueryPolicy struct {
 	Offline              bool
 	NoSync               bool
 	AutoStart            bool
+	SkipInitialSync      bool
 	ReadOnlyDaemon       archiveQueryReadOnlyDaemonPolicy
 	DirectReadOnlyAction string
 }
@@ -33,10 +39,22 @@ type archiveQueryPolicy struct {
 type archiveQueryBackend interface {
 	ActivityReport(context.Context, ActivityReportConfig) (activity.Report, error)
 	DailyUsage(context.Context, dailyUsageQuery) (db.DailyUsageResult, error)
-	SessionUsage(context.Context, string) (*sessionUsageOutput, int, error)
+	SessionUsage(context.Context, sessionUsageQuery) (*sessionUsageOutput, int, error)
+	MachineLabels(context.Context) (service.MachineLabelCatalog, error)
+}
+
+// sessionUsageQuery selects the session and the attribution scope for
+// `session usage`. OwnOnly restores the pre-rollup behavior of reporting
+// just the named transcript's own rows. NoSync skips source refreshes while
+// preserving the selected attribution scope.
+type sessionUsageQuery struct {
+	SessionID string
+	OwnOnly   bool
+	NoSync    bool
 }
 
 type dailyUsageQuery struct {
+	Progress       func(string)
 	Filter         db.UsageFilter
 	NoDefaultRange bool
 	Breakdowns     bool
@@ -60,7 +78,7 @@ func resolveArchiveQueryBackendWithConfig(
 	policy archiveQueryPolicy,
 ) (archiveQueryBackend, func(), error) {
 	if !policy.Offline {
-		tr, err := resolveArchiveQueryTransport(&cfg, policy)
+		tr, err := resolveArchiveQueryTransport(ctx, &cfg, policy)
 		if err != nil {
 			return nil, nil, fmt.Errorf("detecting daemon: %w", err)
 		}
@@ -68,6 +86,15 @@ func resolveArchiveQueryBackendWithConfig(
 			switch {
 			case !tr.ReadOnly,
 				policy.ReadOnlyDaemon == archiveQueryUseReadOnlyDaemon:
+				if policy.AutoStart && !policy.SkipInitialSync && !policy.NoSync && !tr.ReadOnly {
+					progress := newResyncProgressPrinter(os.Stderr, time.Now)
+					_, err := postDaemonPush[sync.SyncStats](ctx, tr, cfg.AuthToken,
+						startupSyncOperation, apiclient.DaemonPushRequest{}, progress.Print)
+					progress.Finish()
+					if err != nil {
+						return nil, nil, fmt.Errorf("waiting for startup sync: %w", err)
+					}
+				}
 				return daemonArchiveQueryBackend{tr: tr, authToken: cfg.AuthToken},
 					func() {}, nil
 			case policy.ReadOnlyDaemon == archiveQueryRejectReadOnlyDaemon:
@@ -102,16 +129,20 @@ func resolveArchiveQueryBackendWithConfig(
 }
 
 func resolveArchiveQueryTransport(
+	ctx context.Context,
 	cfg *config.Config,
 	policy archiveQueryPolicy,
 ) (transport, error) {
 	if policy.AutoStart && !policy.NoSync {
-		return ensureTransport(cfg, transportIntentArchiveWrite, 0)
+		// Daily reports can read committed data while sync runs after
+		// readiness. Session-specific commands still need startup ingestion.
+		cfg.SkipInitialSync = policy.SkipInitialSync
+		return ensureTransportContext(ctx, cfg, transportIntentArchiveWrite, 0)
 	}
 	if policy.NoSync {
 		cfg.NoSync = true
 	}
-	return ensureTransport(cfg, transportIntentRead, 0)
+	return ensureTransportContext(ctx, cfg, transportIntentRead, 0)
 }
 
 func directReadOnlyArchiveQueryError(
@@ -145,7 +176,7 @@ func openArchiveQueryDB(
 	readOnly bool,
 ) (*db.DB, *writeOwnerLock, error) {
 	if readOnly {
-		database, err := openReadOnlyDB(cfg)
+		database, err := openReadOnlyDB(ctx, cfg)
 		if err != nil {
 			return nil, nil, fmt.Errorf("opening database: %w", err)
 		}
@@ -185,9 +216,18 @@ func (b daemonArchiveQueryBackend) DailyUsage(
 
 func (b daemonArchiveQueryBackend) SessionUsage(
 	ctx context.Context,
-	sessionID string,
+	query sessionUsageQuery,
 ) (*sessionUsageOutput, int, error) {
-	return httpSessionUsageData(ctx, b.tr.URL, b.authToken, sessionID)
+	return httpSessionUsageData(ctx, b.tr.URL, b.authToken, query)
+}
+
+func (b daemonArchiveQueryBackend) MachineLabels(
+	ctx context.Context,
+) (service.MachineLabelCatalog, error) {
+	return service.MachineLabels(
+		ctx,
+		servicehttp.NewHTTPBackend(b.tr.URL, b.authToken, b.tr.ReadOnly, ""),
+	)
 }
 
 type localArchiveQueryBackend struct {
@@ -216,11 +256,27 @@ func (b localArchiveQueryBackend) DailyUsage(
 		b.database, b.offline, b.cfg.CustomModelPricing,
 	)
 	filter := localDailyUsageFilter(query)
+	var err error
+	filter.Machine, err = db.ResolveMachineFilter(ctx, b.database, filter.Machine)
+	if err != nil {
+		return db.DailyUsageResult{}, err
+	}
 	return b.database.GetDailyUsage(ctx, filter)
+}
+
+func (b localArchiveQueryBackend) MachineLabels(
+	ctx context.Context,
+) (service.MachineLabelCatalog, error) {
+	labels, err := b.database.GetMachineLabels(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return service.MachineLabelCatalog(labels), nil
 }
 
 func localDailyUsageFilter(query dailyUsageQuery) db.UsageFilter {
 	filter := query.Filter
+	filter.Progress = query.Progress
 	filter.Breakdowns = query.Breakdowns
 	filter.SkipSessionCounts = !query.SessionCounts
 	if filter.Timezone == "" {
@@ -237,24 +293,34 @@ func localDailyUsageFilter(query dailyUsageQuery) db.UsageFilter {
 
 func (b localArchiveQueryBackend) SessionUsage(
 	ctx context.Context,
-	sessionID string,
+	query sessionUsageQuery,
 ) (*sessionUsageOutput, int, error) {
 	applyCustomPricing(b.database, b.cfg)
 	ensureUsagePricing(b.database, b.offline, b.cfg.CustomModelPricing)
 
 	resolvedID, known := resolveRawSessionID(
-		ctx, b.database, b.cfg.AgentDirs, sessionID,
+		ctx, b.database, b.cfg.AgentDirs, query.SessionID,
 	)
 
-	if known && !b.skipFreshData {
-		engine := sync.NewEngine(b.database, sync.EngineConfig{
+	if known && !b.skipFreshData && !query.NoSync {
+		engine := sync.NewEngine(ctx, b.database, sync.EngineConfig{
 			AgentDirs:               b.cfg.AgentDirs,
-			Machine:                 "local",
+			SourceMachines:          b.cfg.SourceMachines,
+			ProviderMetadata:        b.cfg.ProviderMetadata,
+			DisabledAgents:          b.cfg.DisabledAgents,
+			IncludeCwdPrefixes:      b.cfg.SyncIncludeCwdPrefixes,
+			ScanProtectedPaths:      b.cfg.ScanProtectedPaths,
+			Machine:                 b.cfg.InstallationID,
 			BlockedResultCategories: b.cfg.ResultContentBlockedCategories,
+			ArchiveContent:          b.cfg.ArchiveContent,
 		})
-		if syncErr := engine.SyncSingleSessionContext(
-			ctx, resolvedID,
-		); syncErr != nil {
+		var syncErr error
+		if query.OwnOnly {
+			syncErr = engine.SyncSingleSessionContext(ctx, resolvedID)
+		} else {
+			syncErr = engine.SyncSessionWithSubagentsContext(ctx, resolvedID)
+		}
+		if syncErr != nil {
 			fmt.Fprintf(os.Stderr,
 				"warning: sync failed: %v\n", syncErr)
 		}
@@ -263,27 +329,36 @@ func (b localArchiveQueryBackend) SessionUsage(
 		engine.Close()
 	}
 
-	u, err := b.database.GetSessionUsage(ctx, resolvedID)
+	load := func() (*db.SessionUsage, error) {
+		if query.OwnOnly {
+			return b.database.GetSessionUsage(ctx, resolvedID, true)
+		}
+		return service.SessionUsageWithSubagents(
+			ctx, b.database, resolvedID, true)
+	}
+
+	u, err := load()
 	if err != nil {
 		return nil, tokenUseExitErr,
 			fmt.Errorf("querying session usage: %w", err)
 	}
 	if u == nil {
-		fmt.Fprintf(os.Stderr, "session not found: %s\n", sessionID)
+		fmt.Fprintf(os.Stderr, "session not found: %s\n", query.SessionID)
 		return nil, tokenUseExitNotFound, nil
 	}
 	if len(u.UnpricedModels) > 0 && !b.offline {
-		refreshed, refErr := refreshPricingIfStale(
-			b.database, pricing.FetchLiteLLMPricing,
-			pricingRefreshCooldown, time.Now(),
+		refreshed, refErr := pricingrefresh.RefreshIfStale(
+			b.database, pricing.FetchCatalog,
+			pricingrefresh.RefreshCooldown, time.Now(),
 		)
 		if refErr != nil {
 			fmt.Fprintf(os.Stderr,
 				"warning: pricing refresh failed: %v\n", refErr)
-		} else if refreshed {
-			if u2, e := b.database.GetSessionUsage(
-				ctx, resolvedID,
-			); e == nil && u2 != nil {
+		}
+		// A degraded refresh (see pricing.FetchCatalog) stores rows and
+		// reports an error at once, so re-read whenever rows changed.
+		if refreshed {
+			if u2, e := load(); e == nil && u2 != nil {
 				u = u2
 			}
 		}

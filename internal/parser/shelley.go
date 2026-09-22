@@ -1,9 +1,12 @@
 package parser
 
 import (
+	"context"
 	"database/sql"
 	"encoding/binary"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
+	"errors"
 	"fmt"
 	"hash"
 	"hash/fnv"
@@ -74,7 +77,7 @@ type shelleyContent struct {
 	Text       string           `json:"Text"`
 	Thinking   string           `json:"Thinking"`
 	ToolName   string           `json:"ToolName"`
-	ToolInput  json.RawMessage  `json:"ToolInput"`
+	ToolInput  jsontext.Value   `json:"ToolInput"`
 	ToolUseID  string           `json:"ToolUseID"`
 	ToolError  bool             `json:"ToolError"`
 	ToolResult []shelleyContent `json:"ToolResult"`
@@ -85,14 +88,13 @@ type shelleyContent struct {
 // shelleyUsage mirrors the serialized llm.Usage stored in
 // messages.usage_data. The token keys are already the AgentsView
 // canonical Anthropic names, so the raw blob is stored verbatim for
-// cost pricing. json.Number keeps decoding tolerant of string- or
-// float-encoded counts.
+// cost pricing. jsontext.Value preserves string- or float-encoded counts.
 type shelleyUsage struct {
-	InputTokens              json.Number `json:"input_tokens"`
-	CacheCreationInputTokens json.Number `json:"cache_creation_input_tokens"`
-	CacheReadInputTokens     json.Number `json:"cache_read_input_tokens"`
-	OutputTokens             json.Number `json:"output_tokens"`
-	Model                    string      `json:"model"`
+	InputTokens              jsontext.Value `json:"input_tokens"`
+	CacheCreationInputTokens jsontext.Value `json:"cache_creation_input_tokens"`
+	CacheReadInputTokens     jsontext.Value `json:"cache_read_input_tokens"`
+	OutputTokens             jsontext.Value `json:"output_tokens"`
+	Model                    string         `json:"model"`
 }
 
 // ShelleyVirtualPath gives each conversation in the shared Shelley DB a
@@ -103,7 +105,7 @@ func ShelleyVirtualPath(dbPath, conversationID string) string {
 
 // ShelleyConversationExists reports whether the Shelley DB has a
 // conversation row with the given ID.
-func ShelleyConversationExists(dbPath, conversationID string) bool {
+func ShelleyConversationExists(ctx context.Context, dbPath, conversationID string) bool {
 	if dbPath == "" || conversationID == "" || !IsRegularFile(dbPath) {
 		return false
 	}
@@ -114,7 +116,7 @@ func ShelleyConversationExists(dbPath, conversationID string) bool {
 	defer conn.Close()
 
 	var found int
-	err = conn.QueryRow(
+	err = conn.QueryRowContext(ctx,
 		`SELECT 1 FROM conversations WHERE conversation_id = ? LIMIT 1`,
 		conversationID,
 	).Scan(&found)
@@ -127,9 +129,9 @@ type ShelleyConversationMeta struct {
 	RawID       string
 	VirtualPath string
 	// FileMtime is the conversation's updated_at as a nanosecond
-	// timestamp. It stays a real (whole-second) timestamp so the
-	// modified-between range queries that drive PG/DuckDB push never
-	// see a Shelley row as "future"; see shelleyChangeMtime.
+	// timestamp. It stays a real (whole-second) timestamp so no
+	// change-detection query ever sees a Shelley row as "future";
+	// see shelleyChangeMtime.
 	FileMtime int64
 	// Fingerprint is a digest over every parser-observed conversation and
 	// message field. It is stored in file_hash and compared in the sync
@@ -145,10 +147,11 @@ type ShelleyConversationMeta struct {
 //
 //   - File.Mtime / ShelleyConversationMeta.FileMtime is the conversation's
 //     updated_at as a real nanosecond timestamp. The sync skip compares it
-//     for equality, but it must also stay a true timestamp because
-//     ListSessionsModifiedBetween filters file_mtime <= now for PG/DuckDB
-//     push; a synthetic future value would drop a just-synced Shelley row
-//     from a same-second push until a later run.
+//     for equality, but it must also stay a true timestamp: a synthetic
+//     future value would inflate the trigger-maintained sync_marker and
+//     make the row a perpetual PG/DuckDB push candidate (the mirror window
+//     is unbounded above), and the parse-diff engine's bounded
+//     ListSessionsModifiedBetween would treat it as future.
 //   - Fingerprint, a digest stored in file_hash, distinguishes any
 //     same-second parser-visible change the timestamp cannot: metadata
 //     edits, appends, in-place rewrites, and even length-preserving edits
@@ -218,8 +221,44 @@ func shelleyFingerprint(h hash.Hash64) string {
 func ListShelleyConversationMetas(
 	conn *sql.DB, dbPath string,
 ) ([]ShelleyConversationMeta, error) {
-	rows, err := conn.Query(
-		`SELECT c.conversation_id, COALESCE(c.slug, ''),
+	var metas []ShelleyConversationMeta
+	err := ForEachShelleyConversationMeta(context.Background(), conn, dbPath, func(meta ShelleyConversationMeta) error {
+		metas = append(metas, meta)
+		return nil
+	})
+	return metas, err
+}
+
+func ForEachShelleyConversationMeta(
+	ctx context.Context, conn *sql.DB, dbPath string,
+	yield func(ShelleyConversationMeta) error,
+) error {
+	return forEachShelleyConversationMetaQuery(ctx, conn, dbPath, "", nil, yield)
+}
+
+// ShelleyConversationMetaByID reads only one conversation's metadata. It is
+// used by per-member fingerprinting so an exact rehydrate never scans or
+// materializes the rest of the archive.
+func ShelleyConversationMetaByID(
+	ctx context.Context, conn *sql.DB, dbPath, conversationID string,
+) (ShelleyConversationMeta, bool, error) {
+	var meta ShelleyConversationMeta
+	found := false
+	err := forEachShelleyConversationMetaQuery(
+		ctx, conn, dbPath, " WHERE c.conversation_id = ?", []any{conversationID},
+		func(candidate ShelleyConversationMeta) error {
+			meta, found = candidate, true
+			return nil
+		},
+	)
+	return meta, found, err
+}
+
+func forEachShelleyConversationMetaQuery(
+	ctx context.Context, conn *sql.DB, dbPath, where string, args []any,
+	yield func(ShelleyConversationMeta) error,
+) error {
+	query := `SELECT c.conversation_id, COALESCE(c.slug, ''),
 		        COALESCE(c.user_initiated, 1),
 		        COALESCE(c.created_at, ''), COALESCE(c.updated_at, ''),
 		        COALESCE(c.cwd, ''), COALESCE(c.parent_conversation_id, ''),
@@ -229,25 +268,26 @@ func ListShelleyConversationMetas(
 		        COALESCE(m.usage_data, ''), COALESCE(m.created_at, '')
 		   FROM conversations c
 		   JOIN messages m ON m.conversation_id = c.conversation_id
-		  ORDER BY c.conversation_id, m.sequence_id`,
-	)
+		` + where + `
+		  ORDER BY c.conversation_id, m.sequence_id`
+	rows, err := conn.QueryContext(ctx, query, args...)
 	if err != nil {
-		return nil, fmt.Errorf("listing shelley conversations: %w", err)
+		return fmt.Errorf("listing shelley conversations: %w", err)
 	}
 	defer rows.Close()
 
 	var (
-		metas []ShelleyConversationMeta
 		curID string
 		conv  shelleyConversationRow
 	)
 	h := fnv.New64a()
-	flush := func() {
+	flush := func() error {
 		// curID is "" before the first row; IsValidSessionID rejects it.
 		if !IsValidSessionID(curID) {
-			return
+			return nil
 		}
-		metas = append(metas, ShelleyConversationMeta{
+		observeStreamingDiscoveryBuffer(ctx, 1)
+		return yield(ShelleyConversationMeta{
 			RawID:       curID,
 			VirtualPath: ShelleyVirtualPath(dbPath, curID),
 			FileMtime:   parseTimestamp(conv.updatedAt).UnixNano(),
@@ -266,18 +306,22 @@ func ListShelleyConversationMetas(
 			&msg.sequenceID, &msg.msgType, &msg.llmData,
 			&msg.userData, &msg.usageData, &msg.createdAt,
 		); err != nil {
-			return nil, fmt.Errorf("scanning shelley conversation meta: %w", err)
+			return fmt.Errorf("scanning shelley conversation meta: %w", err)
 		}
 		rowConv.userInitiated = userInitiated != 0
 		if rowConv.conversationID != curID {
-			flush()
+			if err := flush(); err != nil {
+				return err
+			}
 			curID, conv, h = rowConv.conversationID, rowConv, fnv.New64a()
 			shelleyDigestConversation(h, conv)
 		}
 		shelleyDigestMessage(h, msg)
 	}
-	flush()
-	return metas, rows.Err()
+	if err := flush(); err != nil {
+		return err
+	}
+	return rows.Err()
 }
 
 // ShelleySourceMtime resolves the per-conversation change signal for a
@@ -288,7 +332,7 @@ func ListShelleyConversationMetas(
 // edits.
 // This value is watcher-only and never written to file_mtime or
 // range-filtered, so the sub-second term is harmless here.
-func ShelleySourceMtime(path string) (int64, error) {
+func ShelleySourceMtime(ctx context.Context, path string) (int64, error) {
 	dbPath, conversationID, ok := parseShelleyVirtualPath(path)
 	if !ok {
 		return 0, fmt.Errorf("not a shelley virtual path: %s", path)
@@ -299,7 +343,7 @@ func ShelleySourceMtime(path string) (int64, error) {
 	}
 	defer conn.Close()
 
-	conv, err := loadShelleyConversation(conn, conversationID)
+	conv, err := loadShelleyConversation(ctx, conn, conversationID)
 	if err != nil {
 		return 0, fmt.Errorf(
 			"loading shelley conversation mtime %s: %w",
@@ -307,7 +351,7 @@ func ShelleySourceMtime(path string) (int64, error) {
 		)
 	}
 
-	rows, err := conn.Query(
+	rows, err := conn.QueryContext(ctx,
 		`SELECT COALESCE(sequence_id, 0), COALESCE(type, ''),
 		        COALESCE(llm_data, ''), COALESCE(user_data, ''),
 		        COALESCE(usage_data, ''), COALESCE(created_at, '')
@@ -347,8 +391,7 @@ func OpenShelleyDB(dbPath string) (*sql.DB, error) {
 }
 
 func openShelleyDB(dbPath string) (*sql.DB, error) {
-	dsn := dbPath + "?mode=ro&_journal_mode=WAL&_busy_timeout=3000"
-	db, err := sql.Open("sqlite3", dsn)
+	db, err := openSQLiteReadOnly(dbPath, sqliteReadOptions{busyTimeoutMS: 3000})
 	if err != nil {
 		return nil, fmt.Errorf("opening shelley db %s: %w", dbPath, err)
 	}
@@ -358,17 +401,17 @@ func openShelleyDB(dbPath string) (*sql.DB, error) {
 // parseShelleyConversationFromDB parses one conversation using an
 // already-open connection. Callers parsing multiple conversations should
 // open the DB once and call this in a loop.
-func parseShelleyConversationFromDB(
+func parseShelleyConversationFromDB(ctx context.Context,
 	conn *sql.DB, dbPath, rawID, machine string, dbInfo os.FileInfo,
 ) (*ParseResult, error) {
-	conv, err := loadShelleyConversation(conn, rawID)
-	if err == sql.ErrNoRows {
+	conv, err := loadShelleyConversation(ctx, conn, rawID)
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	messages, fingerprint, err := loadShelleyMessages(conn, conv)
+	messages, fingerprint, err := loadShelleyMessages(ctx, conn, conv)
 	if err != nil {
 		return nil, err
 	}
@@ -392,12 +435,12 @@ type shelleyConversationRow struct {
 	model                string
 }
 
-func loadShelleyConversation(
+func loadShelleyConversation(ctx context.Context,
 	conn *sql.DB, conversationID string,
 ) (shelleyConversationRow, error) {
 	row := shelleyConversationRow{conversationID: conversationID}
 	var userInitiated int64
-	err := conn.QueryRow(
+	err := conn.QueryRowContext(ctx,
 		`SELECT COALESCE(slug, ''), COALESCE(user_initiated, 1),
 		        COALESCE(created_at, ''), COALESCE(updated_at, ''),
 		        COALESCE(cwd, ''), COALESCE(parent_conversation_id, ''),
@@ -425,7 +468,7 @@ type shelleyMessageRow struct {
 	createdAt  string
 }
 
-func loadShelleyMessages(
+func loadShelleyMessages(ctx context.Context,
 	conn *sql.DB, conv shelleyConversationRow,
 ) ([]ParsedMessage, string, error) {
 	// All generations are included, ordered by sequence_id. A generation
@@ -433,7 +476,7 @@ func loadShelleyMessages(
 	// (e.g. distillation); older-generation rows remain as real history
 	// and must not be hidden. sequence_id is unique per conversation
 	// across generations, so it is a safe Ordinal.
-	rows, err := conn.Query(
+	rows, err := conn.QueryContext(ctx,
 		`SELECT COALESCE(sequence_id, 0), COALESCE(type, ''),
 		        COALESCE(llm_data, ''), COALESCE(user_data, ''),
 		        COALESCE(usage_data, ''), COALESCE(created_at, '')
@@ -580,7 +623,7 @@ func decodeShelleyMessage(
 
 // shelleyToolInput returns the raw tool input JSON, normalizing the
 // absent/null cases to an empty string.
-func shelleyToolInput(raw json.RawMessage) string {
+func shelleyToolInput(raw jsontext.Value) string {
 	s := strings.TrimSpace(string(raw))
 	if s == "" || s == "null" {
 		return ""
@@ -665,7 +708,7 @@ func applyShelleyUsage(msg *ParsedMessage, usageData, convModel string) {
 	// against the catalog-priced per-message tokens) needs a dedicated
 	// usage-event path and is left as a follow-up. Standard gateway
 	// models are priced correctly by the catalog today.
-	msg.TokenUsage = json.RawMessage(usageData)
+	msg.TokenUsage = jsontext.Value(usageData)
 	msg.ContextTokens = context
 	msg.OutputTokens = output
 	msg.HasContextTokens = context > 0
@@ -684,13 +727,19 @@ func applyShelleyUsage(msg *ParsedMessage, usageData, convModel string) {
 // shelleyTokenCount tolerantly decodes a token count, mapping
 // empty/garbage/negative values to 0 and bounding implausibly large
 // values so a single corrupt count cannot poison aggregate totals.
-func shelleyTokenCount(n json.Number) int {
-	if n == "" {
+func shelleyTokenCount(n jsontext.Value) int {
+	if len(n) == 0 {
 		return 0
 	}
-	v, err := n.Int64()
+	raw := string(n)
+	if n.Kind() == jsontext.KindString {
+		if err := json.Unmarshal(n, &raw); err != nil {
+			return 0
+		}
+	}
+	v, err := strconv.ParseInt(raw, 10, 64)
 	if err != nil {
-		f, ferr := n.Float64()
+		f, ferr := strconv.ParseFloat(raw, 64)
 		if ferr != nil {
 			return 0
 		}

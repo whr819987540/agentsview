@@ -3,6 +3,8 @@ package parser
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -31,11 +33,9 @@ func (f vscodeCopilotProviderFactory) Capabilities() Capabilities {
 func (f vscodeCopilotProviderFactory) NewProvider(cfg ProviderConfig) Provider {
 	cfg = cfg.Clone()
 	return &vscodeCopilotProvider{
-		ProviderBase: ProviderBase{
-			Def:    cloneAgentDef(f.def),
-			Caps:   vscodeCopilotProviderCapabilities(),
-			Config: cfg,
-		},
+		Def:     cloneAgentDef(f.def),
+		Caps:    vscodeCopilotProviderCapabilities(),
+		Config:  cfg,
 		sources: newVSCodeCopilotSourceSet(cfg.Roots),
 	}
 }
@@ -47,6 +47,10 @@ type vscodeCopilotProvider struct {
 
 func (p *vscodeCopilotProvider) Discover(ctx context.Context) ([]SourceRef, error) {
 	return p.sources.Discover(ctx)
+}
+
+func (p *vscodeCopilotProvider) DiscoverEach(ctx context.Context, yield func(SourceRef) error) error {
+	return p.sources.DiscoverEach(ctx, yield)
 }
 
 func (p *vscodeCopilotProvider) WatchPlan(ctx context.Context) (WatchPlan, error) {
@@ -84,7 +88,7 @@ func (p *vscodeCopilotProvider) Parse(
 	}
 	path, project, ok := p.sources.pathFromSource(req.Source)
 	if !ok {
-		return ParseOutcome{}, fmt.Errorf("vscode copilot source path unavailable")
+		return ParseOutcome{}, errors.New("vscode copilot source path unavailable")
 	}
 	if req.Source.ProjectHint != "" {
 		project = req.Source.ProjectHint
@@ -153,6 +157,77 @@ func (s vscodeCopilotSourceSet) Discover(ctx context.Context) ([]SourceRef, erro
 	}
 	sortJSONLSources(sources)
 	return sources, nil
+}
+
+func (s vscodeCopilotSourceSet) DiscoverEach(ctx context.Context, yield func(SourceRef) error) error {
+	for _, root := range s.roots {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		yieldDir := func(dir, project string) error {
+			return streamVSCodeSessionFiles(ctx, dir, project, AgentVSCodeCopilot, func(file DiscoveredFile) error {
+				source, ok := s.sourceRefWithProject(root, file.Path, file.Project)
+				if !ok {
+					return nil
+				}
+				source.ProjectHint = file.Project
+				return yield(source)
+			})
+		}
+		workspaceRoot := filepath.Join(root, "workspaceStorage")
+		if err := streamDirectoryEntries(ctx, workspaceRoot, func(entry os.DirEntry) error {
+			if !entry.IsDir() {
+				return nil
+			}
+			hashPath := filepath.Join(workspaceRoot, entry.Name())
+			project := readVSCodeWorkspaceManifest(hashPath)
+			if project == "" {
+				project = "unknown"
+			}
+			return yieldDir(filepath.Join(hashPath, "chatSessions"), project)
+		}); err != nil {
+			return err
+		}
+		for _, subdir := range []string{
+			"globalStorage/emptyWindowChatSessions",
+			"globalStorage/transferredChatSessions",
+		} {
+			if err := yieldDir(filepath.Join(root, subdir), "empty-window"); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func streamVSCodeSessionFiles(
+	ctx context.Context, dir, project string, agent AgentType,
+	yield func(DiscoveredFile) error,
+) error {
+	err := streamDirectoryEntries(ctx, dir, func(entry os.DirEntry) error {
+		if entry.IsDir() {
+			return nil
+		}
+		name := entry.Name()
+		ext := filepath.Ext(name)
+		if ext != ".json" && ext != ".jsonl" {
+			return nil
+		}
+		stem := strings.TrimSuffix(name, ext)
+		if !IsValidSessionID(stem) {
+			return nil
+		}
+		if ext == ".json" && IsRegularFile(filepath.Join(dir, stem+".jsonl")) {
+			return nil
+		}
+		return yield(DiscoveredFile{
+			Path: filepath.Join(dir, name), Project: project, Agent: agent,
+		})
+	})
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
 }
 
 // discoverSessionFiles traverses the VSCode workspaceStorage directory to find
@@ -358,7 +433,7 @@ func (s vscodeCopilotSourceSet) Fingerprint(
 	}
 	path, _, ok := s.pathFromSource(source)
 	if !ok {
-		return SourceFingerprint{}, fmt.Errorf("vscode copilot source path unavailable")
+		return SourceFingerprint{}, errors.New("vscode copilot source path unavailable")
 	}
 	info, err := os.Stat(path)
 	if err != nil {
@@ -640,13 +715,14 @@ func vscodeCopilotSourceHash(path, workspacePath string) (string, error) {
 	}
 	h := sha256.New()
 	_, _ = h.Write([]byte("chat\x00" + hash + "\x00workspace\x00" + workspaceHash))
-	return fmt.Sprintf("%x", h.Sum(nil)), nil
+	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
 func vscodeCopilotProviderCapabilities() Capabilities {
 	return Capabilities{
 		Source: SourceCapabilities{
 			DiscoverSources:      CapabilitySupported,
+			StreamingDiscovery:   CapabilitySupported,
 			WatchSources:         CapabilitySupported,
 			ClassifyChangedPath:  CapabilitySupported,
 			FindSource:           CapabilitySupported,

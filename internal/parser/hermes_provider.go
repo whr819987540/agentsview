@@ -4,24 +4,72 @@ import (
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"encoding"
+	"encoding/hex"
+	"encoding/json/v2"
+	"errors"
 	"fmt"
 	"hash"
 	"io"
 	"log"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 )
 
 var _ Provider = (*hermesProvider)(nil)
 
+// hermesProviderSpec parameterizes the one shared Hermes provider for Hermes
+// itself and its Augure Desktop fork. Both reuse the same discovery,
+// fingerprinting, and state-DB parsing code; they differ only in the agent
+// label and ID prefix applied via relabel after parsing. Hermes keeps its
+// stored output byte-identical because its spec carries a nil relabel.
+type hermesProviderSpec struct {
+	agent AgentType
+	// relabel rewrites a parsed Hermes-format result onto this agent's
+	// identity (session IDs, agent label, usage-event session IDs), and is
+	// nil for Hermes itself.
+	relabel func(*ParseResult)
+}
+
+func hermesProviderSpecForAgent(agent AgentType) hermesProviderSpec {
+	switch agent {
+	case AgentAugureDesktop:
+		return hermesProviderSpec{
+			agent:   AgentAugureDesktop,
+			relabel: relabelHermesResultAsAugureDesktop,
+		}
+	default:
+		return hermesProviderSpec{agent: AgentHermes}
+	}
+}
+
 type hermesProviderFactory struct {
-	def AgentDef
+	def  AgentDef
+	spec hermesProviderSpec
 }
 
 func newHermesProviderFactory(def AgentDef) ProviderFactory {
-	return hermesProviderFactory{def: cloneAgentDef(def)}
+	return hermesProviderFactory{
+		def:  cloneAgentDef(def),
+		spec: hermesProviderSpecForAgent(AgentHermes),
+	}
+}
+
+// newAugureDesktopProviderFactory serves Augure Desktop v3's Hermes-schema
+// state.db with the shared Hermes provider, relabeling every parsed session
+// onto the augure-desktop: ID prefix. Configured roots are accepted as
+// given, matching the TraeX fork: the defaults are fork-marker-named by
+// construction, so auto-discovery can never hand this provider a stock
+// Hermes-shaped store, and an explicitly configured root — a restored
+// backup or custom install dir — is the user's call.
+func newAugureDesktopProviderFactory(def AgentDef) ProviderFactory {
+	return hermesProviderFactory{
+		def:  cloneAgentDef(def),
+		spec: hermesProviderSpecForAgent(AgentAugureDesktop),
+	}
 }
 
 func (f hermesProviderFactory) Definition() AgentDef {
@@ -35,22 +83,26 @@ func (f hermesProviderFactory) Capabilities() Capabilities {
 func (f hermesProviderFactory) NewProvider(cfg ProviderConfig) Provider {
 	cfg = cfg.Clone()
 	return &hermesProvider{
-		ProviderBase: ProviderBase{
-			Def:    cloneAgentDef(f.def),
-			Caps:   hermesProviderCapabilities(),
-			Config: cfg,
-		},
-		sources: newHermesSourceSet(cfg.Roots),
+		Def:     cloneAgentDef(f.def),
+		Caps:    hermesProviderCapabilities(),
+		Config:  cfg,
+		spec:    f.spec,
+		sources: newHermesSourceSet(f.spec.agent, cfg.Roots),
 	}
 }
 
 type hermesProvider struct {
 	ProviderBase
+	spec    hermesProviderSpec
 	sources hermesSourceSet
 }
 
 func (p *hermesProvider) Discover(ctx context.Context) ([]SourceRef, error) {
 	return p.sources.Discover(ctx)
+}
+
+func (p *hermesProvider) DiscoverEach(ctx context.Context, yield func(SourceRef) error) error {
+	return p.sources.DiscoverEach(ctx, yield)
 }
 
 func (p *hermesProvider) WatchPlan(ctx context.Context) (WatchPlan, error) {
@@ -62,6 +114,52 @@ func (p *hermesProvider) SourcesForChangedPath(
 	req ChangedPathRequest,
 ) ([]SourceRef, error) {
 	return p.sources.SourcesForChangedPath(ctx, req)
+}
+
+// ResolveReconciliationScopes overrides the generic directory topology with
+// Hermes archive topology: state.db and sessions/ are two spellings of one
+// archive, a profiles container fans out to per-profile archives, and any
+// requested path inside an archive resolves to that whole archive's scope.
+func (p *hermesProvider) ResolveReconciliationScopes(
+	_ context.Context, req ReconciliationScopeRequest,
+) (ReconciliationScopePlan, error) {
+	if err := ValidateReconciliationScopeRoots(
+		p.sources.agent, p.sources.roots, req.Roots,
+	); err != nil {
+		return ReconciliationScopePlan{}, err
+	}
+	return p.sources.reconciliationScopePlan(req), nil
+}
+
+func (p *hermesProvider) SourceForReconciliation(
+	ctx context.Context, path, project string,
+) (SourceRef, bool, error) {
+	return p.sources.SourceForReconciliation(ctx, path, project)
+}
+
+// ReconciliationAggregateMemberPaths maps an aggregate-owned state.db row to
+// the sources streamed discovery emits for that member: the virtual
+// state.db#<id> path for state-backed sessions and both transcript file
+// shapes for transcript-backed ones. Container discovery stamps every
+// session with the container path itself (see Parse), which always exists,
+// so a removed member would otherwise never trip the missing-path check.
+func (p *hermesProvider) ReconciliationAggregateMemberPaths(
+	path, fullSessionID string,
+) []string {
+	path = filepath.Clean(path)
+	if filepath.Base(path) != "state.db" {
+		return nil
+	}
+	rawID := strings.TrimPrefix(fullSessionID, string(p.sources.agent)+":")
+	if rawID == fullSessionID || !IsValidSessionID(rawID) {
+		return nil
+	}
+	sessionsDir := filepath.Join(filepath.Dir(path), "sessions")
+	return []string{
+		VirtualSourcePath(path, rawID),
+		filepath.Join(sessionsDir, rawID+".jsonl"),
+		filepath.Join(sessionsDir, "session_"+rawID+".json"),
+	}
 }
 
 func (p *hermesProvider) FindSource(
@@ -79,6 +177,67 @@ func (p *hermesProvider) Fingerprint(
 	return p.sources.Fingerprint(ctx, source)
 }
 
+func WriteHermesSessionJSONL(ctx context.Context,
+	w io.Writer, storedPath string, roots []string, rawSessionID string,
+) error {
+	var storedStateErr error
+	if path := ResolveSourceFilePath(storedPath); filepath.Base(path) == "state.db" {
+		if _, err := os.Stat(path); err == nil {
+			err = writeHermesStateSessionJSONL(ctx, w, path, rawSessionID)
+			if err == nil {
+				return nil
+			}
+			_, hasLookupErr := errors.AsType[hermesStateLookupError](err)
+			if !errors.Is(err, os.ErrNotExist) &&
+				!hasLookupErr {
+				return err
+			}
+			storedStateErr = err
+		}
+		if transcript := findHermesSourceFile(
+			filepath.Join(filepath.Dir(path), "sessions"),
+			rawSessionID,
+		); transcript != "" {
+			return copyHermesTranscriptFile(w, transcript)
+		}
+	}
+	provider, ok := NewProvider(AgentHermes, ProviderConfig{Roots: roots})
+	if !ok {
+		return errors.New("hermes provider unavailable")
+	}
+	hp, ok := provider.(*hermesProvider)
+	if !ok {
+		return errors.New("hermes provider unavailable")
+	}
+	source, found, err := hp.FindSource(
+		ctx,
+		FindSourceRequest{RawSessionID: rawSessionID},
+	)
+	if err != nil {
+		return err
+	}
+	if !found {
+		if storedStateErr != nil && !errors.Is(storedStateErr, os.ErrNotExist) {
+			return storedStateErr
+		}
+		return fmt.Errorf(
+			"hermes session %s source not found: %w",
+			rawSessionID, os.ErrNotExist,
+		)
+	}
+	src, ok := hp.sources.sourceFromRef(source)
+	if !ok {
+		return errors.New("hermes source path unavailable")
+	}
+	if src.StateDB != "" && src.SessionID != "" {
+		return writeHermesStateSessionJSONL(ctx, w, src.StateDB, src.SessionID)
+	}
+	if filepath.Base(src.Path) == "state.db" {
+		return writeHermesStateSessionJSONL(ctx, w, src.Path, rawSessionID)
+	}
+	return copyHermesTranscriptFile(w, src.Path)
+}
+
 func (p *hermesProvider) Parse(
 	ctx context.Context,
 	req ParseRequest,
@@ -86,13 +245,17 @@ func (p *hermesProvider) Parse(
 	if err := ctx.Err(); err != nil {
 		return ParseOutcome{}, err
 	}
-	path, ok := p.sources.pathFromSource(req.Source)
+	src, ok := p.sources.sourceFromRef(req.Source)
 	if !ok {
-		return ParseOutcome{}, fmt.Errorf("hermes source path unavailable")
+		return ParseOutcome{}, errors.New("hermes source path unavailable")
 	}
+	path := src.Path
 	machine := firstNonEmptyJSONLString(req.Machine, p.Config.Machine)
+	if src.SessionID != "" {
+		return p.parseStateMember(ctx, src, req.Source.ProjectHint, machine, req.Fingerprint)
+	}
 	if filepath.Base(path) == "state.db" {
-		results, err := p.parseArchive(path, req.Source.ProjectHint, machine)
+		results, err := p.parseArchive(ctx, path, req.Source.ProjectHint, machine)
 		if err != nil {
 			return ParseOutcome{}, err
 		}
@@ -106,6 +269,9 @@ func (p *hermesProvider) Parse(
 			results[i].Session.File.Path = path
 			results[i].Session.File.Size = size
 			results[i].Session.File.Mtime = mtime
+			if p.spec.relabel != nil {
+				p.spec.relabel(&results[i])
+			}
 			out = append(out, ParseResultOutcome{
 				Result:      results[i],
 				DataVersion: DataVersionCurrent,
@@ -131,6 +297,17 @@ func (p *hermesProvider) Parse(
 	if req.Fingerprint.Hash != "" {
 		sess.File.Hash = req.Fingerprint.Hash
 	}
+	if p.spec.relabel != nil {
+		result := ParseResult{Session: *sess, Messages: msgs}
+		p.spec.relabel(&result)
+		return ParseOutcome{
+			Results: []ParseResultOutcome{{
+				Result:      result,
+				DataVersion: DataVersionCurrent,
+			}},
+			ResultSetComplete: true,
+		}, nil
+	}
 	return ParseOutcome{
 		Results: []ParseResultOutcome{{
 			Result: ParseResult{
@@ -143,23 +320,175 @@ func (p *hermesProvider) Parse(
 	}, nil
 }
 
+func (p *hermesProvider) parseStateMember(
+	ctx context.Context,
+	src hermesSource, project, machine string, fingerprint SourceFingerprint,
+) (ParseOutcome, error) {
+	conn, err := openSQLiteReadOnly(src.StateDB, sqliteReadOptions{})
+	if err != nil {
+		return ParseOutcome{}, fmt.Errorf("open hermes state db: %w", err)
+	}
+	defer conn.Close()
+	observeSharedContainerScan(ctx)
+	ss, found, err := readHermesStateSession(ctx, conn, src.SessionID)
+	if err != nil {
+		return ParseOutcome{}, err
+	}
+	if !found {
+		return ParseOutcome{ResultSetComplete: true, ForceReplace: true, SkipReason: SkipNoSession}, nil
+	}
+	messages, err := readHermesStateMessagesForSession(ctx, conn, src.SessionID)
+	if err != nil {
+		return ParseOutcome{}, err
+	}
+	result, ok := buildHermesStateResult(
+		ss, messages, filepath.Join(filepath.Dir(src.StateDB), "sessions"),
+		src.StateDB, project, machine,
+	)
+	if !ok {
+		return ParseOutcome{ResultSetComplete: true, ForceReplace: true, SkipReason: SkipNoSession}, nil
+	}
+	if p.spec.relabel != nil {
+		p.spec.relabel(&result)
+	}
+	result.Session.File.Path = src.Path
+	if fingerprint.Hash != "" {
+		result.Session.File.Hash = fingerprint.Hash
+	}
+	// Store the fingerprint's freshness identity (state.db plus selected
+	// transcript) so the engine's stored size+mtime skip recognizes an
+	// unchanged member while the container is untouched. The stat is shared
+	// by every member, so after any sibling change the engine falls back to
+	// the per-member content hash stored above to keep unchanged members
+	// from reparsing (providerSourceHashFreshDespiteStat); without either
+	// identity every pass reparses every member and reconciliation work
+	// scales with total member count.
+	if fingerprint.Size > 0 {
+		result.Session.File.Size = fingerprint.Size
+	}
+	if fingerprint.MTimeNS > 0 {
+		result.Session.File.Mtime = fingerprint.MTimeNS
+	}
+	return ParseOutcome{
+		Results:           []ParseResultOutcome{{Result: result, DataVersion: DataVersionCurrent}},
+		ResultSetComplete: true,
+		ForceReplace:      true,
+	}, nil
+}
+
 type hermesSource struct {
-	Root string
-	Path string
+	Root      string
+	Path      string
+	StateDB   string
+	SessionID string
 }
 
 type hermesSourceSet struct {
+	// agent labels the sources this set emits. Hermes-format forks share
+	// the store layout but must not share a discovery namespace: keying
+	// sources by agent keeps an Augure Desktop session ID from colliding
+	// with a Hermes one.
+	agent AgentType
 	roots []string
 }
 
-func newHermesSourceSet(roots []string) hermesSourceSet {
-	return hermesSourceSet{roots: cleanJSONLRoots(roots)}
+func newHermesSourceSet(agent AgentType, roots []string) hermesSourceSet {
+	if agent == "" {
+		agent = AgentHermes
+	}
+	return hermesSourceSet{agent: agent, roots: cleanJSONLRoots(roots)}
+}
+
+// The default Hermes roots include the stable profiles container rather than
+// its current children. Expanding direct children during discovery lets a
+// long-running provider see profiles created after initialization.
+func isHermesProfilesContainer(root string) bool {
+	root = filepath.Clean(root)
+	return filepath.Base(root) == "profiles" &&
+		filepath.Base(filepath.Dir(root)) == ".hermes"
+}
+
+// hermesProfileArchiveRoots expands a profiles container into its current
+// per-profile archive roots. A missing container simply means no profiles
+// exist yet; any other ReadDir failure (permissions, transient I/O) is
+// returned so callers report the expansion as incomplete discovery instead
+// of silently claiming zero profiles — the resolved reconciliation scope
+// still proves the whole container, so a swallowed failure would let the
+// engine tombstone every stored hermes session under it as source_missing.
+func hermesProfileArchiveRoots(profilesRoot string) ([]string, error) {
+	entries, err := os.ReadDir(profilesRoot)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf(
+			"expand hermes profiles container %s: %w", profilesRoot, err,
+		)
+	}
+	roots := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if !entry.IsDir() || entry.Type()&os.ModeSymlink != 0 {
+			continue
+		}
+		roots = append(roots, filepath.Join(profilesRoot, entry.Name()))
+	}
+	return roots, nil
+}
+
+// expandedRoots returns every discoverable archive root, expanding profiles
+// containers into their children. The returned roots always include every
+// root that did expand; a non-nil error joins the container expansion
+// failures so callers can act on the healthy subset while reporting the
+// failure as incomplete discovery rather than an authoritative empty scope.
+func (s hermesSourceSet) expandedRoots() ([]string, error) {
+	var roots []string
+	var expandErr error
+	for _, root := range s.roots {
+		if isHermesProfilesContainer(root) {
+			profileRoots, err := hermesProfileArchiveRoots(root)
+			if err != nil {
+				expandErr = errors.Join(expandErr, err)
+			}
+			roots = append(roots, profileRoots...)
+			continue
+		}
+		roots = append(roots, root)
+	}
+	return roots, expandErr
+}
+
+// incompleteProfileExpansionError wraps a profiles-container expansion
+// failure in the DiscoveryIncompleteError taxonomy so the sync engine
+// retains reconciliation markers and retries instead of tombstoning.
+func incompleteProfileExpansionError(expandErr error) error {
+	return incompleteDiscoveryError(
+		AgentHermes, "expand profiles container", expandErr,
+	)
+}
+
+func hermesProfileRootForPath(profilesRoot, changedPath string) (string, bool) {
+	profilesRoot = filepath.Clean(profilesRoot)
+	changedPath = filepath.Clean(changedPath)
+	rel, err := filepath.Rel(profilesRoot, changedPath)
+	if err != nil || rel == "." || rel == ".." ||
+		strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", false
+	}
+	name := rel
+	if before, _, ok := strings.Cut(rel, string(filepath.Separator)); ok {
+		name = before
+	}
+	if name == "" || name == "." || name == ".." {
+		return "", false
+	}
+	return filepath.Join(profilesRoot, name), true
 }
 
 func (s hermesSourceSet) Discover(ctx context.Context) ([]SourceRef, error) {
 	var sources []SourceRef
 	seen := make(map[string]struct{})
-	for _, root := range s.roots {
+	roots, expandErr := s.expandedRoots()
+	for _, root := range roots {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
@@ -172,15 +501,558 @@ func (s hermesSourceSet) Discover(ctx context.Context) ([]SourceRef, error) {
 		}
 	}
 	sortJSONLSources(sources)
+	if expandErr != nil {
+		return sources, incompleteProfileExpansionError(expandErr)
+	}
 	return sources, nil
+}
+
+func (s hermesSourceSet) DiscoverEach(ctx context.Context, yield func(SourceRef) error) error {
+	var discoveryErr error
+	appendDiscoveryErr := func(err error) {
+		err = incompleteDiscoveryError(
+			s.agent, "stream configured root", err,
+		)
+		if discoveryErr == nil {
+			discoveryErr = err
+			return
+		}
+		discoveryErr = errors.Join(discoveryErr, err)
+	}
+	discoverTranscripts := func(root, sessionsDir, stateDB string) error {
+		return s.discoverTranscriptEach(
+			ctx, root, sessionsDir, stateDB, func(source SourceRef) error {
+				if err := yield(source); err != nil {
+					return discoveryYieldError{cause: err}
+				}
+				return nil
+			},
+		)
+	}
+	roots, expandErr := s.expandedRoots()
+	if expandErr != nil {
+		appendDiscoveryErr(expandErr)
+	}
+	for _, root := range roots {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if stateDB, sessionsDir, ok := hermesStatePaths(root); ok {
+			yieldedAny, err := s.discoverStateEach(ctx, root, stateDB, yield)
+			if err != nil {
+				if cause, ok := discoveryYieldCause(err); ok {
+					return cause
+				}
+				if yieldedAny || ctx.Err() != nil {
+					if ctxErr := ctx.Err(); ctxErr != nil {
+						return ctxErr
+					}
+					appendDiscoveryErr(err)
+					continue
+				}
+				log.Printf(
+					"hermes: state db discovery failed for %s: %v; "+
+						"falling back to transcripts",
+					stateDB, err,
+				)
+				stateErr := err
+				fallbackErr := discoverTranscripts(root, sessionsDir, "")
+				if cause, ok := discoveryYieldCause(fallbackErr); ok {
+					return cause
+				}
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return ctxErr
+				}
+				appendDiscoveryErr(stateErr)
+				if fallbackErr != nil {
+					appendDiscoveryErr(fallbackErr)
+				}
+				continue
+			}
+			if err := discoverTranscripts(root, sessionsDir, stateDB); err != nil {
+				if cause, ok := discoveryYieldCause(err); ok {
+					return cause
+				}
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return ctxErr
+				}
+				appendDiscoveryErr(err)
+				continue
+			}
+			continue
+		}
+		transcriptRoot := hermesTranscriptRoot(root)
+		if err := discoverTranscripts(root, transcriptRoot, ""); err != nil {
+			if cause, ok := discoveryYieldCause(err); ok {
+				return cause
+			}
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
+			appendDiscoveryErr(err)
+			continue
+		}
+	}
+	return discoveryErr
+}
+
+func (s hermesSourceSet) discoverStateEach(
+	ctx context.Context, root, stateDB string, yield func(SourceRef) error,
+) (bool, error) {
+	conn, err := openSQLiteReadOnly(stateDB, sqliteReadOptions{})
+	if err != nil {
+		return false, fmt.Errorf("open hermes state db: %w", err)
+	}
+	defer conn.Close()
+	observeSharedContainerScan(ctx)
+	rows, err := conn.QueryContext(ctx, "SELECT id FROM sessions ORDER BY id")
+	if err != nil {
+		return false, fmt.Errorf("query hermes sessions: %w", err)
+	}
+	defer rows.Close()
+	yieldedAny := false
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return yieldedAny, fmt.Errorf("scan hermes session id: %w", err)
+		}
+		if !IsValidSessionID(id) {
+			continue
+		}
+		observeStreamingDiscoveryBuffer(ctx, 1)
+		yieldedAny = true
+		if err := yield(s.stateMemberSourceRef(root, stateDB, id)); err != nil {
+			return yieldedAny, discoveryYieldError{cause: err}
+		}
+	}
+	return yieldedAny, rows.Err()
+}
+
+func (s hermesSourceSet) discoverTranscriptEach(
+	ctx context.Context, root, sessionsDir, stateDB string,
+	yield func(SourceRef) error,
+) error {
+	// One read-only connection and prepared statement serve every membership
+	// check in the pass; opening state.db per transcript file would scale
+	// reconciliation work with archive size instead of the changed batch.
+	// Opened lazily so transcript-free directories cost nothing.
+	var membership *hermesStateMembership
+	defer func() {
+		if membership != nil {
+			membership.Close()
+		}
+	}()
+	return streamDirectoryEntries(ctx, sessionsDir, func(entry os.DirEntry) error {
+		if entry.IsDir() {
+			return nil
+		}
+		name := entry.Name()
+		id := HermesSessionID(name)
+		if !IsValidSessionID(id) {
+			return nil
+		}
+		switch {
+		case strings.HasSuffix(name, ".jsonl"):
+		case strings.HasPrefix(name, "session_") && strings.HasSuffix(name, ".json"):
+			if IsRegularFile(filepath.Join(sessionsDir, id+".jsonl")) {
+				return nil
+			}
+		default:
+			return nil
+		}
+		if stateDB != "" {
+			if membership == nil {
+				opened, err := openHermesStateMembership(ctx, stateDB)
+				if err != nil {
+					return err
+				}
+				membership = opened
+			}
+			found, err := membership.Has(ctx, id)
+			if err != nil {
+				return err
+			}
+			if found {
+				return nil
+			}
+		}
+		ref, ok := s.transcriptSourceRef(root, filepath.Join(sessionsDir, name))
+		if !ok {
+			return nil
+		}
+		return yield(ref)
+	})
+}
+
+// hermesStateMembership answers "does state.db hold this session id" through
+// one read-only connection and prepared statement for a whole discovery pass.
+type hermesStateMembership struct {
+	conn *sql.DB
+	stmt *sql.Stmt
+}
+
+func openHermesStateMembership(
+	ctx context.Context, stateDB string,
+) (*hermesStateMembership, error) {
+	conn, err := openSQLiteReadOnly(stateDB, sqliteReadOptions{})
+	if err != nil {
+		return nil, fmt.Errorf("open hermes state db: %w", err)
+	}
+	observeSharedContainerScan(ctx)
+	stmt, err := conn.PrepareContext(ctx, "SELECT 1 FROM sessions WHERE id = ? LIMIT 1")
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("prepare hermes session lookup: %w", err)
+	}
+	return &hermesStateMembership{conn: conn, stmt: stmt}, nil
+}
+
+func (m *hermesStateMembership) Has(ctx context.Context, rawID string) (bool, error) {
+	var found int
+	err := m.stmt.QueryRowContext(ctx, rawID).Scan(&found)
+	if err == nil {
+		return true, nil
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return false, fmt.Errorf("query hermes session %s: %w", rawID, err)
+}
+
+func (m *hermesStateMembership) Close() {
+	m.stmt.Close()
+	m.conn.Close()
 }
 
 func (s hermesSourceSet) WatchPlan(context.Context) (WatchPlan, error) {
 	roots := make([]WatchRoot, 0, len(s.roots))
 	for _, root := range s.roots {
-		roots = append(roots, hermesWatchRoots(root)...)
+		if isHermesProfilesContainer(root) {
+			roots = append(roots, WatchRoot{
+				Path:         root,
+				Recursive:    true,
+				IncludeGlobs: []string{"state.db", "state.db-wal", "*.jsonl", "session_*.json"},
+				DebounceKey:  string(s.agent) + ":profiles:" + root,
+			})
+			continue
+		}
+		roots = append(roots, hermesWatchRoots(s.agent, root)...)
 	}
 	return WatchPlan{Roots: roots}, nil
+}
+
+// hermesReconciliationUnit is one atomic Hermes archive: the smallest scope a
+// reconciliation request can resolve to. Every alias spelling of the archive
+// resolves to the same identity and the same proof scopes, so no spelling can
+// omit the state.db members or the sessions/ transcripts.
+type hermesReconciliationUnit struct {
+	identity string
+	proofs   []StoredSourceHintScope
+	stateDB  string
+}
+
+// hermesArchiveReconciliationUnit derives the archive identity and physical
+// proof scopes for one archive root, mirroring the ownership scopes the
+// provider historically declared: virtual members of a present state.db plus
+// the transcript directory. A root that is not archive-shaped falls back to a
+// plain directory unit.
+func hermesArchiveReconciliationUnit(archiveRoot string) hermesReconciliationUnit {
+	stateDB, sessionsDir, ok := hermesArchiveRootPaths(archiveRoot)
+	if !ok {
+		clean := filepath.Clean(archiveRoot)
+		return hermesReconciliationUnit{
+			identity: absoluteHermesPath(clean),
+			proofs:   []StoredSourceHintScope{{Path: clean}},
+		}
+	}
+	unit := hermesReconciliationUnit{stateDB: filepath.Clean(stateDB)}
+	unit.identity = absoluteHermesPath(filepath.Dir(unit.stateDB))
+	if IsRegularFile(unit.stateDB) {
+		unit.proofs = append(unit.proofs, StoredSourceHintScope{
+			Path: unit.stateDB, IncludeVirtualMembers: true,
+		})
+	}
+	unit.proofs = append(unit.proofs, StoredSourceHintScope{
+		Path: filepath.Clean(sessionsDir),
+	})
+	return unit
+}
+
+// hermesRequestDenotesArchive reports whether one requested root is inside or
+// an alias spelling of the archive anchored at stateDB: the archive directory,
+// the state.db file, the sessions/ directory, or any path beneath either.
+func hermesRequestDenotesArchive(requested, stateDB string) bool {
+	if stateDB == "" {
+		return false
+	}
+	absStateDB := absoluteHermesPath(stateDB)
+	if qStateDB, _, ok := hermesArchiveRootPaths(requested); ok &&
+		samePath(absoluteHermesPath(qStateDB), absStateDB) {
+		return true
+	}
+	if hermesPathWithinOrSame(requested, absStateDB) {
+		return true
+	}
+	sessionsDir := filepath.Join(filepath.Dir(absStateDB), "sessions")
+	return hermesPathWithinOrSame(requested, sessionsDir)
+}
+
+// hermesProfileScopeRoot resolves a request inside a profiles container to one
+// profile's archive root, spelled the way discovery stores it. Selection runs
+// against the absolute container so any request spelling picks the right
+// profile, but the returned root is always one the container enumerated, never
+// anything the caller spelled. That enumeration joins the configured container
+// with the on-disk directory name, which is the spelling discovery stores
+// under, so proof matches and no request can mint a second identity for one
+// profile by naming it differently.
+//
+// A request the container does not currently own returns false: a profile
+// already deleted, a symlinked or non-directory child, which the enumeration
+// deliberately skips, or a container that could not be read. The caller
+// widens those to the container itself rather than reconstructing a root from
+// the request.
+func hermesProfileScopeRoot(profiles []string, requested string) (string, bool) {
+	for _, candidate := range profiles {
+		if hermesPathWithinOrSame(requested, absoluteHermesPath(candidate)) {
+			return candidate, true
+		}
+	}
+	return "", false
+}
+
+func (s hermesSourceSet) reconciliationScopePlan(
+	req ReconciliationScopeRequest,
+) ReconciliationScopePlan {
+	type hermesConfiguredScope struct {
+		root      string // configured spelling handed back for traversal
+		match     string // absolute cleaned form for containment checks
+		container bool
+		// profiles is the container's owned children in configured spelling,
+		// empty for a directly configured archive or an unreadable container.
+		profiles []string
+		unit     hermesReconciliationUnit
+	}
+	var configured []hermesConfiguredScope
+	var required []string
+	for _, root := range s.roots {
+		if strings.TrimSpace(root) == "" {
+			continue
+		}
+		if strings.HasPrefix(strings.ToLower(root), "s3://") {
+			required = append(required, root)
+			continue
+		}
+		cfg := hermesConfiguredScope{
+			root:  root,
+			match: absoluteHermesPath(root),
+		}
+		if isHermesProfilesContainer(root) {
+			// The container is one coverage identity: profile membership is
+			// dynamic, so a pass covers it only by traversing the container
+			// itself, and discovery reports an unreadable container as
+			// incomplete, which withholds deletion authority.
+			cfg.container = true
+			cfg.unit = hermesReconciliationUnit{
+				identity: cfg.match,
+				proofs:   []StoredSourceHintScope{{Path: filepath.Clean(root)}},
+			}
+			// Enumerated once per resolution rather than per request: a batch
+			// of paths under one container would otherwise re-read the same
+			// directory for each of them.
+			cfg.profiles, _ = hermesProfileArchiveRoots(filepath.Clean(root))
+		} else {
+			cfg.unit = hermesArchiveReconciliationUnit(root)
+		}
+		configured = append(configured, cfg)
+	}
+	for _, cfg := range configured {
+		required = append(required, cfg.unit.identity)
+	}
+	plan := ReconciliationScopePlan{RequiredCoverageIdentities: required}
+	scopeIndex := make(map[string]int)
+	addScope := func(key, raw string, scope ReconciliationScope) {
+		index, ok := scopeIndex[key]
+		if !ok {
+			scope.RetryRoots = []string{raw}
+			scopeIndex[key] = len(plan.Scopes)
+			plan.Scopes = append(plan.Scopes, scope)
+			return
+		}
+		// One archive can resolve through several branches — its own
+		// configured root and a container's profile enumeration — in any
+		// order, depending on how overlapping roots are configured and
+		// requested. The colliding scopes describe the same unit, so merge
+		// every authority rather than keeping the first arrival's: dropping
+		// a later CoverageIdentities would leave a required identity
+		// permanently uncovered and withhold aggregate-member deletion from
+		// a pass that requested every configured root.
+		existing := &plan.Scopes[index]
+		if !slices.Contains(existing.RetryRoots, raw) {
+			existing.RetryRoots = append(existing.RetryRoots, raw)
+		}
+		for _, root := range scope.TraversalRoots {
+			if !slices.Contains(existing.TraversalRoots, root) {
+				existing.TraversalRoots = append(existing.TraversalRoots, root)
+			}
+		}
+		for _, proof := range scope.PhysicalProofScopes {
+			if !slices.Contains(existing.PhysicalProofScopes, proof) {
+				existing.PhysicalProofScopes = append(
+					existing.PhysicalProofScopes, proof,
+				)
+			}
+		}
+		for _, identity := range scope.CoverageIdentities {
+			if !slices.Contains(existing.CoverageIdentities, identity) {
+				existing.CoverageIdentities = append(
+					existing.CoverageIdentities, identity,
+				)
+			}
+		}
+	}
+	for _, raw := range req.Roots {
+		if strings.TrimSpace(raw) == "" ||
+			strings.HasPrefix(strings.ToLower(raw), "s3://") {
+			continue
+		}
+		requested := absoluteHermesPath(raw)
+		for _, cfg := range configured {
+			if hermesPathWithinOrSame(cfg.match, requested) {
+				// The request names the configured root or an ancestor
+				// covering it: the whole configured unit is one atomic scope.
+				addScope(cfg.unit.identity, raw, ReconciliationScope{
+					TraversalRoots:      []string{cfg.root},
+					PhysicalProofScopes: cfg.unit.proofs,
+					CoverageIdentities:  []string{cfg.unit.identity},
+				})
+				continue
+			}
+			if cfg.container {
+				if _, inside := hermesProfileRootForPath(
+					cfg.match, requested,
+				); !inside {
+					continue
+				}
+				if profileRoot, ok := hermesProfileScopeRoot(
+					cfg.profiles, requested,
+				); ok {
+					// A request inside one profile resolves to that profile's
+					// archive only. The container identity stays uncovered, so
+					// sibling profiles keep their sessions and their authority.
+					unit := hermesArchiveReconciliationUnit(profileRoot)
+					addScope(unit.identity, raw, ReconciliationScope{
+						TraversalRoots:      []string{profileRoot},
+						PhysicalProofScopes: unit.proofs,
+					})
+					continue
+				}
+				// The container does not own that child: it was deleted, or it
+				// is a symlink or a plain file the enumeration skips, or the
+				// container could not be read. Reconstructing a root from the
+				// request is what four earlier rounds each got wrong, and
+				// resolving nothing loses the removal: a deleted profile's
+				// sessions would then stay active until the daily archive
+				// audit happens to run. The container itself is the nearest
+				// scope spelled entirely from configuration, so the request
+				// widens to it, proving the container without covering it.
+				// Deletion still requires a stat per stored row, so live
+				// sibling profiles are retained, and the withheld coverage
+				// identity keeps aggregate-member removal out of reach.
+				addScope(cfg.unit.identity+"\x00unowned", raw,
+					ReconciliationScope{
+						TraversalRoots:      []string{cfg.root},
+						PhysicalProofScopes: cfg.unit.proofs,
+					})
+				continue
+			}
+			if hermesRequestDenotesArchive(requested, cfg.unit.stateDB) {
+				// Any alias spelling or interior path of an archive resolves
+				// to the identical archive scope, so no spelling can omit the
+				// state.db members or the sessions/ transcripts.
+				addScope(cfg.unit.identity, raw, ReconciliationScope{
+					TraversalRoots:      []string{cfg.root},
+					PhysicalProofScopes: cfg.unit.proofs,
+					CoverageIdentities:  []string{cfg.unit.identity},
+				})
+				continue
+			}
+			if cfg.unit.stateDB == "" &&
+				hermesPathWithinOrSame(requested, cfg.match) {
+				// A plain transcript-directory root has no archive topology
+				// to widen into, so a requested descendant resolves
+				// generically: traverse the configured root, prove only the
+				// descendant in the configured spelling, claim no coverage.
+				// Resolving nothing instead would leave a deleted
+				// transcript's session active until the daily archive audit.
+				proof := descendantProofSpelling(
+					cfg.match, filepath.Clean(cfg.root), requested,
+				)
+				addScope("descendant\x00"+proof, raw, ReconciliationScope{
+					TraversalRoots:      []string{cfg.root},
+					PhysicalProofScopes: []StoredSourceHintScope{{Path: proof}},
+				})
+			}
+		}
+	}
+	return plan
+}
+
+func (s hermesSourceSet) SourceForReconciliation(
+	ctx context.Context, path, project string,
+) (SourceRef, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return SourceRef{}, false, err
+	}
+	path = filepath.Clean(path)
+	roots, expandErr := s.expandedRoots()
+	for _, root := range roots {
+		var source SourceRef
+		var ok bool
+		if _, _, virtual := ParseVirtualSourcePathForBase(path, "state.db"); virtual {
+			source, ok = s.sourceForChangedPath(root, path, false)
+		} else if stateDB, sessionsDir, archive := hermesStatePaths(root); archive {
+			switch {
+			case samePath(path, stateDB):
+				source, ok = s.archiveSourceRef(root, stateDB)
+			case hermesPathInTranscriptDir(sessionsDir, path) && IsRegularFile(path):
+				source, ok = s.transcriptSourceRef(root, path)
+			}
+		} else {
+			source, ok = s.sourceRef(root, path)
+		}
+		if !ok {
+			continue
+		}
+		if project != "" {
+			source.ProjectHint = project
+		}
+		return source, true, nil
+	}
+	if expandErr != nil {
+		// Not-found under a failed container expansion is not authoritative:
+		// the engine tombstones sessions whose reconciliation source cannot
+		// be resolved, so surface the failure and let it retry instead.
+		return SourceRef{}, false, incompleteProfileExpansionError(expandErr)
+	}
+	return SourceRef{}, false, nil
+}
+
+func absoluteHermesPath(path string) string {
+	cleaned := filepath.Clean(path)
+	abs, err := filepath.Abs(cleaned)
+	if err != nil {
+		return cleaned
+	}
+	return abs
+}
+
+func hermesPathWithinOrSame(path, root string) bool {
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		return false
+	}
+	return rel == "." || rel != ".." &&
+		!strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 func (s hermesSourceSet) SourcesForChangedPath(
@@ -194,6 +1066,19 @@ func (s hermesSourceSet) SourcesForChangedPath(
 	if req.WatchRoot != "" {
 		watchRoot := filepath.Clean(req.WatchRoot)
 		for _, root := range s.roots {
+			if isHermesProfilesContainer(root) && samePath(root, watchRoot) {
+				profileRoot, ok := hermesProfileRootForPath(root, req.Path)
+				if !ok {
+					return nil, nil
+				}
+				source, ok := s.sourceForChangedPath(
+					profileRoot, req.Path, allowMissing,
+				)
+				if ok {
+					return []SourceRef{source}, nil
+				}
+				return nil, nil
+			}
 			if !hermesWatchRootMatches(root, watchRoot) {
 				continue
 			}
@@ -205,6 +1090,19 @@ func (s hermesSourceSet) SourcesForChangedPath(
 		return nil, nil
 	}
 	for _, root := range s.roots {
+		if isHermesProfilesContainer(root) {
+			profileRoot, ok := hermesProfileRootForPath(root, req.Path)
+			if !ok {
+				continue
+			}
+			source, ok := s.sourceForChangedPath(
+				profileRoot, req.Path, allowMissing,
+			)
+			if ok {
+				return []SourceRef{source}, nil
+			}
+			continue
+		}
 		source, ok := s.sourceForChangedPath(root, req.Path, allowMissing)
 		if ok {
 			return []SourceRef{source}, nil
@@ -220,23 +1118,33 @@ func (s hermesSourceSet) FindSource(
 	if err := ctx.Err(); err != nil {
 		return SourceRef{}, false, err
 	}
+	roots, expandErr := s.expandedRoots()
+	// Not-found is only authoritative when every profiles container
+	// expanded; otherwise return the expansion failure so callers retry
+	// instead of treating the source as gone.
+	notFound := func() (SourceRef, bool, error) {
+		if expandErr != nil {
+			return SourceRef{}, false, incompleteProfileExpansionError(expandErr)
+		}
+		return SourceRef{}, false, nil
+	}
 	for _, path := range []string{req.StoredFilePath, req.FingerprintKey} {
 		if path == "" {
 			continue
 		}
-		for _, root := range s.roots {
+		for _, root := range roots {
 			if source, ok := s.sourceForPath(root, path); ok {
 				return source, true, nil
 			}
 		}
 	}
 	if req.RawSessionID == "" {
-		return SourceRef{}, false, nil
+		return notFound()
 	}
-	for _, root := range s.roots {
+	for _, root := range roots {
 		if stateDB, _, ok := hermesStatePaths(root); ok &&
 			IsValidSessionID(req.RawSessionID) {
-			found, err := hermesStateDBHasSession(stateDB, req.RawSessionID)
+			found, err := hermesStateDBHasSession(ctx, stateDB, req.RawSessionID)
 			switch {
 			case err != nil:
 				// Mirror parseArchive: an unreadable or schema-incompatible
@@ -248,11 +1156,8 @@ func (s hermesSourceSet) FindSource(
 						"falling back to transcripts", stateDB, err,
 				)
 			case !found:
-				continue
 			default:
-				if source, ok := s.sourceRef(root, stateDB); ok {
-					return source, true, nil
-				}
+				return s.stateMemberSourceRef(root, stateDB, req.RawSessionID), true, nil
 			}
 		}
 		transcriptRoot := hermesTranscriptRoot(root)
@@ -264,25 +1169,37 @@ func (s hermesSourceSet) FindSource(
 			return source, true, nil
 		}
 	}
-	return SourceRef{}, false, nil
+	return notFound()
 }
 
-func hermesStateDBHasSession(stateDB string, rawID string) (bool, error) {
-	conn, err := sql.Open("sqlite3", "file:"+sqliteURIPath(stateDB)+"?mode=ro")
+type hermesStateLookupError struct {
+	err error
+}
+
+func (e hermesStateLookupError) Error() string {
+	return e.err.Error()
+}
+
+func (e hermesStateLookupError) Unwrap() error {
+	return e.err
+}
+
+func hermesStateDBHasSession(ctx context.Context, stateDB string, rawID string) (bool, error) {
+	conn, err := openSQLiteReadOnly(stateDB, sqliteReadOptions{})
 	if err != nil {
 		return false, fmt.Errorf("open hermes state db: %w", err)
 	}
 	defer conn.Close()
 
 	var found int
-	err = conn.QueryRow(
+	err = conn.QueryRowContext(ctx,
 		"SELECT 1 FROM sessions WHERE id = ? LIMIT 1",
 		rawID,
 	).Scan(&found)
 	if err == nil {
 		return true, nil
 	}
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
 	return false, fmt.Errorf("query hermes session %s: %w", rawID, err)
@@ -295,9 +1212,13 @@ func (s hermesSourceSet) Fingerprint(
 	if err := ctx.Err(); err != nil {
 		return SourceFingerprint{}, err
 	}
-	path, ok := s.pathFromSource(source)
+	src, ok := s.sourceFromRef(source)
 	if !ok {
-		return SourceFingerprint{}, fmt.Errorf("hermes source path unavailable")
+		return SourceFingerprint{}, errors.New("hermes source path unavailable")
+	}
+	path := src.Path
+	if src.SessionID != "" {
+		return hermesStateMemberFingerprint(ctx, source, src)
 	}
 	if filepath.Base(path) == "state.db" {
 		return hermesArchiveFingerprint(source, path)
@@ -321,28 +1242,32 @@ func (s hermesSourceSet) Fingerprint(
 	}, nil
 }
 
-func (s hermesSourceSet) pathFromSource(source SourceRef) (string, bool) {
+func (s hermesSourceSet) sourceFromRef(source SourceRef) (hermesSource, bool) {
 	switch src := source.Opaque.(type) {
 	case hermesSource:
-		return src.Path, src.Path != ""
+		return src, src.Path != ""
 	case *hermesSource:
 		if src != nil && src.Path != "" {
-			return src.Path, true
+			return *src, true
 		}
 	}
+	// Expansion failures are not reportable through this boolean seam;
+	// callers (Fingerprint, Parse) already turn "not found" into an error
+	// the sync engine retries, so search only the roots that expanded.
+	roots, _ := s.expandedRoots()
 	for _, candidate := range []string{
 		source.DisplayPath,
 		source.FingerprintKey,
 		source.Key,
 	} {
-		for _, root := range s.roots {
+		for _, root := range roots {
 			if ref, ok := s.sourceForPath(root, candidate); ok {
 				src := ref.Opaque.(hermesSource)
-				return src.Path, true
+				return src, true
 			}
 		}
 	}
-	return "", false
+	return hermesSource{}, false
 }
 
 func (s hermesSourceSet) sourceForPath(root, path string) (SourceRef, bool) {
@@ -356,43 +1281,59 @@ func (s hermesSourceSet) sourceForChangedPath(
 ) (SourceRef, bool) {
 	root = filepath.Clean(root)
 	path = filepath.Clean(path)
+	if stateDB, sessionID, ok := ParseVirtualSourcePathForBase(path, "state.db"); ok {
+		if expected, _, valid := hermesArchivePathsForEvent(root, stateDB); valid &&
+			samePath(expected, stateDB) && IsValidSessionID(sessionID) {
+			return s.stateMemberSourceRef(root, stateDB, sessionID), true
+		}
+		return SourceRef{}, false
+	}
 	if stateDB, sessionsDir, ok := hermesStatePaths(root); ok {
-		if samePath(path, stateDB) || hermesPathInTranscriptDir(sessionsDir, path) {
-			return hermesArchiveSourceRef(root, stateDB)
+		if hermesStatePathAffectsArchive(path, stateDB) ||
+			hermesPathInTranscriptDir(sessionsDir, path) {
+			return s.archiveSourceRef(root, stateDB)
 		}
 		return SourceRef{}, false
 	}
 	if allowMissing {
 		if stateDB, sessionsDir, ok := hermesArchivePathsForEvent(root, path); ok &&
-			(samePath(path, stateDB) || hermesPathInTranscriptDir(sessionsDir, path)) {
-			return hermesArchiveSourceRef(root, stateDB)
+			(hermesStatePathAffectsArchive(path, stateDB) ||
+				hermesPathInTranscriptDir(sessionsDir, path)) {
+			return s.archiveSourceRef(root, stateDB)
 		}
 		transcriptRoot := hermesTranscriptRoot(root)
 		if hermesPathInTranscriptDir(transcriptRoot, path) {
-			return hermesTranscriptSourceRef(root, path)
+			return s.transcriptSourceRef(root, path)
 		}
 	}
 	return s.sourceRef(root, path)
+}
+
+func hermesStatePathAffectsArchive(path, stateDB string) bool {
+	return samePath(path, stateDB) || samePath(path, stateDB+"-wal")
 }
 
 func (s hermesSourceSet) sourceRef(root, path string) (SourceRef, bool) {
 	root = filepath.Clean(root)
 	path = filepath.Clean(path)
 	if stateDB, _, ok := hermesStatePaths(root); ok && samePath(path, stateDB) {
-		return hermesArchiveSourceRef(root, stateDB)
+		return s.archiveSourceRef(root, stateDB)
 	}
 	transcriptRoot := hermesTranscriptRoot(root)
 	if !hermesPathInTranscriptDir(transcriptRoot, path) || !IsRegularFile(path) {
 		return SourceRef{}, false
 	}
-	return hermesTranscriptSourceRef(root, path)
+	return s.transcriptSourceRef(root, path)
 }
 
-func hermesArchiveSourceRef(root, stateDB string) (SourceRef, bool) {
+func (s hermesSourceSet) archiveSourceRef(
+	root, stateDB string,
+) (SourceRef, bool) {
 	root = filepath.Clean(root)
 	stateDB = filepath.Clean(stateDB)
 	return SourceRef{
-		Provider:       AgentHermes,
+		Provider:       s.agent,
+		ConfiguredRoot: root,
 		Key:            stateDB,
 		DisplayPath:    stateDB,
 		FingerprintKey: stateDB,
@@ -403,11 +1344,31 @@ func hermesArchiveSourceRef(root, stateDB string) (SourceRef, bool) {
 	}, true
 }
 
-func hermesTranscriptSourceRef(root, path string) (SourceRef, bool) {
+func (s hermesSourceSet) stateMemberSourceRef(
+	root, stateDB, sessionID string,
+) SourceRef {
+	path := VirtualSourcePath(stateDB, sessionID)
+	return SourceRef{
+		Provider:       s.agent,
+		ConfiguredRoot: filepath.Clean(root),
+		Key:            path,
+		DisplayPath:    path,
+		FingerprintKey: path,
+		Opaque: hermesSource{
+			Root: filepath.Clean(root), Path: path,
+			StateDB: filepath.Clean(stateDB), SessionID: sessionID,
+		},
+	}
+}
+
+func (s hermesSourceSet) transcriptSourceRef(
+	root, path string,
+) (SourceRef, bool) {
 	root = filepath.Clean(root)
 	path = filepath.Clean(path)
 	return SourceRef{
-		Provider:       AgentHermes,
+		Provider:       s.agent,
+		ConfiguredRoot: root,
 		Key:            path,
 		DisplayPath:    path,
 		FingerprintKey: path,
@@ -418,28 +1379,28 @@ func hermesTranscriptSourceRef(root, path string) (SourceRef, bool) {
 	}, true
 }
 
-func hermesWatchRoots(root string) []WatchRoot {
+func hermesWatchRoots(agent AgentType, root string) []WatchRoot {
 	root = filepath.Clean(root)
 	if stateDB, sessionsDir, ok := hermesArchiveRootPaths(root); ok {
 		watchRoots := []WatchRoot{{
 			Path:         filepath.Dir(stateDB),
 			Recursive:    false,
-			IncludeGlobs: []string{"state.db"},
-			DebounceKey:  string(AgentHermes) + ":archive:" + root,
+			IncludeGlobs: []string{"state.db", "state.db-wal"},
+			DebounceKey:  string(agent) + ":archive:" + root,
 		}}
 		watchRoots = append(watchRoots, WatchRoot{
 			Path:         sessionsDir,
 			Recursive:    true,
 			IncludeGlobs: []string{"*.jsonl", "session_*.json"},
-			DebounceKey:  string(AgentHermes) + ":sessions:" + root,
+			DebounceKey:  string(agent) + ":sessions:" + root,
 		})
 		return watchRoots
 	}
 	return []WatchRoot{{
 		Path:         root,
 		Recursive:    true,
-		IncludeGlobs: []string{"state.db", "*.jsonl", "session_*.json"},
-		DebounceKey:  string(AgentHermes) + ":sessions:" + root,
+		IncludeGlobs: []string{"state.db", "state.db-wal", "*.jsonl", "session_*.json"},
+		DebounceKey:  string(agent) + ":sessions:" + root,
 	}}
 }
 
@@ -569,6 +1530,29 @@ func hermesArchiveFingerprint(source SourceRef, stateDB string) (SourceFingerpri
 	if err := addHermesFingerprintPart(h, "state", stateDB, stateInfo); err != nil {
 		return SourceFingerprint{}, err
 	}
+	walPath := stateDB + "-wal"
+	if walInfo, err := os.Stat(walPath); err == nil {
+		if walInfo.IsDir() {
+			return SourceFingerprint{}, fmt.Errorf("stat %s: source is a directory", walPath)
+		}
+		// A zero-length WAL carries no committed frames and is created as a
+		// side effect of merely opening the database read-only (the parse
+		// itself creates one). Folding its mtime into the fingerprint would
+		// make the identity computed before a parse never match the one
+		// computed after it, so every subsequent sync re-parses an unchanged
+		// archive. Skip the empty WAL; any real commit gives it frames.
+		if walInfo.Size() > 0 {
+			fingerprint.Size += walInfo.Size()
+			if mtime := walInfo.ModTime().UnixNano(); mtime > fingerprint.MTimeNS {
+				fingerprint.MTimeNS = mtime
+			}
+			if err := addHermesFingerprintPart(h, "wal", walPath, walInfo); err != nil {
+				return SourceFingerprint{}, err
+			}
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return SourceFingerprint{}, fmt.Errorf("stat %s: %w", walPath, err)
+	}
 	_, sessionsDir, _ := hermesStatePaths(stateDB)
 	for _, file := range discoverHermesTranscriptFiles(sessionsDir) {
 		info, err := os.Stat(file.Path)
@@ -583,15 +1567,239 @@ func hermesArchiveFingerprint(source SourceRef, stateDB string) (SourceFingerpri
 			return SourceFingerprint{}, err
 		}
 	}
-	fingerprint.Hash = fmt.Sprintf("%x", h.Sum(nil))
+	fingerprint.Hash = hex.EncodeToString(h.Sum(nil))
 	return fingerprint, nil
 }
 
+func hermesStateMemberFingerprint(
+	ctx context.Context, source SourceRef, src hermesSource,
+) (SourceFingerprint, error) {
+	if !IsRegularFile(src.StateDB) {
+		return SourceFingerprint{Key: source.FingerprintKey}, nil
+	}
+	if reconciliationCacheAvailable(ctx) {
+		if h, selectedPath, ok := cachedHermesMemberCore(ctx, src); ok {
+			return hermesStateMemberFingerprintFinish(source, src, h, selectedPath)
+		}
+		// One bulk pass over state.db seeds every member's core, so the rest
+		// of the reconciliation fingerprints without reopening the database.
+		// Seeding failures fall through to the instrumented per-member open,
+		// which surfaces the underlying error with its usual handling.
+		if seedHermesMemberCores(ctx, src.StateDB) == nil {
+			if h, selectedPath, ok := cachedHermesMemberCore(ctx, src); ok {
+				return hermesStateMemberFingerprintFinish(source, src, h, selectedPath)
+			}
+		}
+	}
+	observeSharedContainerScan(ctx)
+	ss, messages, selectedPath, err := readHermesStateSessionSource(ctx,
+		src.StateDB, src.SessionID,
+	)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return SourceFingerprint{Key: source.FingerprintKey}, nil
+		}
+		return SourceFingerprint{}, err
+	}
+	h := sha256.New()
+	if err := addHermesStateSessionFingerprint(h, ss, messages); err != nil {
+		return SourceFingerprint{}, err
+	}
+	return hermesStateMemberFingerprintFinish(source, src, h, selectedPath)
+}
+
+func hermesStateMemberFingerprintFinish(
+	source SourceRef, src hermesSource, h hash.Hash, selectedPath string,
+) (SourceFingerprint, error) {
+	info, err := os.Stat(src.StateDB)
+	if err != nil {
+		return SourceFingerprint{}, err
+	}
+	fingerprint := SourceFingerprint{
+		Key:  firstNonEmptyJSONLString(source.FingerprintKey, source.Key, src.Path),
+		Size: info.Size(), MTimeNS: info.ModTime().UnixNano(),
+	}
+	if selectedPath != src.StateDB {
+		selectedInfo, err := os.Stat(selectedPath)
+		if err != nil {
+			return SourceFingerprint{}, fmt.Errorf("stat %s: %w", selectedPath, err)
+		}
+		fingerprint.Size += selectedInfo.Size()
+		fingerprint.MTimeNS = max(
+			fingerprint.MTimeNS, selectedInfo.ModTime().UnixNano(),
+		)
+		if err := addHermesFingerprintPart(
+			h, "selected-transcript", selectedPath, selectedInfo,
+		); err != nil {
+			return SourceFingerprint{}, err
+		}
+	}
+	fingerprint.Hash = hex.EncodeToString(h.Sum(nil))
+	return fingerprint, nil
+}
+
+// hermesMemberFingerprintCore is the cached per-member fingerprint seed: the
+// sha256 digest state over the member's session row and messages, plus the
+// selected source path. seedHermesMemberCores computes it once per pass on a
+// shared state.db connection; the fingerprint path resumes the digest instead
+// of reopening the database, producing byte-identical hashes either way.
+type hermesMemberFingerprintCore struct {
+	HashState    []byte `json:"hash_state"`
+	SelectedPath string `json:"selected_path"`
+}
+
+func hermesMemberCoreCacheKey(fingerprintKey string) string {
+	return "hermes:member-core:" + fingerprintKey
+}
+
+// seedHermesMemberCores reads every state.db member once and caches each
+// member's fingerprint core for the rest of the pass. The per-reconciliation
+// once keeps the bulk read to one per state.db per pass even when parallel
+// fingerprint workers miss concurrently or a member read error leaves
+// individual entries unseeded.
+func seedHermesMemberCores(ctx context.Context, stateDB string) error {
+	return reconciliationCacheOnce(
+		ctx, "hermes:member-cores-seeded:"+stateDB,
+		func() error { return seedHermesMemberCoresLocked(ctx, stateDB) },
+	)
+}
+
+func seedHermesMemberCoresLocked(ctx context.Context, stateDB string) error {
+	idsConn, err := openSQLiteReadOnly(stateDB, sqliteReadOptions{})
+	if err != nil {
+		return fmt.Errorf("open hermes state db: %w", err)
+	}
+	defer idsConn.Close()
+	memberConn, err := openSQLiteReadOnly(stateDB, sqliteReadOptions{})
+	if err != nil {
+		return fmt.Errorf("open hermes member state db: %w", err)
+	}
+	defer memberConn.Close()
+	observeSharedContainerScan(ctx)
+	rows, err := idsConn.QueryContext(ctx, "SELECT id FROM sessions ORDER BY id")
+	if err != nil {
+		return fmt.Errorf("query hermes sessions: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return fmt.Errorf("scan hermes session id: %w", err)
+		}
+		if !IsValidSessionID(id) {
+			continue
+		}
+		retainedIDBytes := int64(len(id))
+		observeStreamingRetainedBytes(ctx, retainedIDBytes)
+		if err := cacheHermesMemberCore(
+			ctx, memberConn, stateDB, id, VirtualSourcePath(stateDB, id),
+		); err != nil {
+			observeStreamingRetainedBytes(ctx, -retainedIDBytes)
+			return err
+		}
+		observeStreamingRetainedBytes(ctx, -retainedIDBytes)
+	}
+	return rows.Err()
+}
+
+// cacheHermesMemberCore seeds one member's fingerprint core into the
+// per-pass reconciliation cache. Member read and digest-marshal problems are
+// left for the fingerprint path to surface through its established error
+// handling; only cache-write failures propagate.
+func cacheHermesMemberCore(
+	ctx context.Context, conn *sql.DB, stateDB, id, fingerprintKey string,
+) error {
+	ss, messages, selectedPath, err := readHermesStateSessionSourceConn(ctx,
+		conn, stateDB, id,
+	)
+	if err != nil {
+		return nil //nolint:nilerr // Failure to build the optional checkpoint forces full parsing next time.
+	}
+	h := sha256.New()
+	if err := addHermesStateSessionFingerprint(h, ss, messages); err != nil {
+		return nil //nolint:nilerr // Failure to build the optional checkpoint forces full parsing next time.
+	}
+	marshaler, ok := h.(encoding.BinaryMarshaler)
+	if !ok {
+		return nil
+	}
+	state, err := marshaler.MarshalBinary()
+	if err != nil {
+		return nil //nolint:nilerr // Failure to build the optional checkpoint forces full parsing next time.
+	}
+	payload, err := json.Marshal(hermesMemberFingerprintCore{
+		HashState: state, SelectedPath: selectedPath,
+	})
+	if err != nil {
+		return nil //nolint:nilerr // Failure to build the optional checkpoint forces full parsing next time.
+	}
+	return reconciliationCachePut(
+		ctx, hermesMemberCoreCacheKey(fingerprintKey), string(payload),
+	)
+}
+
+// cachedHermesMemberCore resumes a member's seeded digest from the per-pass
+// reconciliation cache. Any miss, decode failure, or unresumable digest falls
+// back to the instrumented per-member open path.
+func cachedHermesMemberCore(
+	ctx context.Context, src hermesSource,
+) (hash.Hash, string, bool) {
+	value, found, err := reconciliationCacheGet(
+		ctx, hermesMemberCoreCacheKey(src.Path),
+	)
+	if err != nil || !found {
+		return nil, "", false
+	}
+	var core hermesMemberFingerprintCore
+	if err := json.Unmarshal([]byte(value), &core); err != nil {
+		return nil, "", false
+	}
+	h := sha256.New()
+	unmarshaler, ok := h.(encoding.BinaryUnmarshaler)
+	if !ok || unmarshaler.UnmarshalBinary(core.HashState) != nil {
+		return nil, "", false
+	}
+	return h, core.SelectedPath, true
+}
+
+func addHermesStateSessionFingerprint(
+	h hash.Hash, ss hermesStateSession, messages []hermesStateMessage,
+) error {
+	if _, err := fmt.Fprintf(
+		h,
+		"state-member\x00%q\x00%q\x00%q\x00%q\x00%d\x00%d\x00%d\x00%d\x00%d\x00%d\x00%d\x00%d\x00%d\x00%t\x00%g\x00%t\x00%g\x00%q\x00%q\x00%q\x00%d\x00",
+		ss.id,
+		ss.source,
+		ss.model,
+		ss.parentSessionID,
+		ss.startedAt.UnixNano(),
+		ss.endedAt.UnixNano(),
+		ss.messageCount,
+		ss.inputTokens,
+		ss.outputTokens,
+		ss.cacheReadTokens,
+		ss.cacheWriteTokens,
+		ss.reasoningTokens,
+		ss.apiCallCount,
+		ss.estimatedCost.Valid,
+		ss.estimatedCost.Float64,
+		ss.actualCost.Valid,
+		ss.actualCost.Float64,
+		ss.costStatus,
+		ss.costSource,
+		ss.title,
+		len(messages),
+	); err != nil {
+		return err
+	}
+	return encodeHermesStateSessionJSONL(h, ss, messages)
+}
+
 // hermesArchiveEffectiveFileInfo returns the aggregate size and mtime of a
-// Hermes archive: the state.db plus every transcript file in its sessions
-// directory. It reproduces the legacy engine's hermesArchiveEffectiveInfo so a
-// transcript-only change shifts the stored archive freshness even though the
-// state.db itself is unchanged. The transcript set matches the legacy
+// Hermes archive: the state.db, its WAL, and every transcript file in its
+// sessions directory. WAL-only commits and transcript-only changes both shift
+// the stored archive freshness even though state.db itself is unchanged. The
+// transcript set matches the legacy
 // hermesArchiveTranscriptFiles: every .jsonl and session_*.json file directly
 // under the sessions directory, without the .jsonl/.json dedup used elsewhere.
 func hermesArchiveEffectiveFileInfo(stateDB string) (int64, int64) {
@@ -601,6 +1809,16 @@ func hermesArchiveEffectiveFileInfo(stateDB string) (int64, int64) {
 	}
 	size := info.Size()
 	mtime := info.ModTime().UnixNano()
+	// A zero-length WAL is a read-side artifact of opening the database and
+	// carries no committed frames; hermesArchiveFingerprint ignores it for the
+	// same reason, and the two aggregations must agree.
+	if walInfo, err := os.Stat(stateDB + "-wal"); err == nil &&
+		!walInfo.IsDir() && walInfo.Size() > 0 {
+		size += walInfo.Size()
+		if walMtime := walInfo.ModTime().UnixNano(); walMtime > mtime {
+			mtime = walMtime
+		}
+	}
 	_, sessionsDir, ok := hermesStatePaths(stateDB)
 	if !ok {
 		return size, mtime
@@ -676,6 +1894,7 @@ func hermesProviderCapabilities() Capabilities {
 	return Capabilities{
 		Source: SourceCapabilities{
 			DiscoverSources:      CapabilitySupported,
+			StreamingDiscovery:   CapabilitySupported,
 			WatchSources:         CapabilitySupported,
 			ClassifyChangedPath:  CapabilitySupported,
 			FindSource:           CapabilitySupported,
@@ -694,6 +1913,9 @@ func hermesProviderCapabilities() Capabilities {
 			ToolResults:          CapabilitySupported,
 			AggregateUsageEvents: CapabilitySupported,
 			Model:                CapabilitySupported,
+		},
+		Sync: ProviderSyncSemantics{
+			FingerprintHashRequiredForFreshness: true,
 		},
 	}
 }

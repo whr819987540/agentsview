@@ -1,7 +1,7 @@
 package parser
 
 import (
-	"encoding/json"
+	"encoding/json/v2"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -38,12 +38,14 @@ func parseWorkBuddySession(path, project, machine string) (*ParsedSession, []Par
 		startedAt     time.Time
 		endedAt       time.Time
 		firstMsg      string
+		sessionName   string
 		cwd           string
 		realUserCount int
 		malformed     int
 	)
 
 	lr := newLineReader(f, maxLineSize)
+	defer releaseLineReader(lr)
 	for {
 		line, ok := lr.next()
 		if !ok {
@@ -75,6 +77,10 @@ func parseWorkBuddySession(path, project, machine string) (*ParsedSession, []Par
 		}
 
 		switch root.Get("type").Str {
+		case "ai-title":
+			if title := strings.TrimSpace(root.Get("aiTitle").Str); title != "" {
+				sessionName = title
+			}
 		case "message":
 			role, ok := workBuddyRole(root.Get("role").Str)
 			if !ok {
@@ -164,6 +170,7 @@ func parseWorkBuddySession(path, project, machine string) (*ParsedSession, []Par
 		Cwd:              cwd,
 		MalformedLines:   malformed,
 		FirstMessage:     firstMsg,
+		SessionName:      sessionName,
 		StartedAt:        startedAt,
 		EndedAt:          endedAt,
 		MessageCount:     len(messages),
@@ -298,7 +305,7 @@ func applyWorkBuddyUsage(msg *ParsedMessage, root gjson.Result) {
 	if reasoningField.Exists() {
 		normalized["reasoning_tokens"] = reasoning
 	}
-	j, err := json.Marshal(normalized)
+	j, err := json.Marshal(normalized, json.Deterministic(true))
 	if err != nil {
 		return
 	}

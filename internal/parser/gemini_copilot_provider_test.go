@@ -2,10 +2,13 @@ package parser
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -39,7 +42,7 @@ func TestGeminiProviderSourceMethods(t *testing.T) {
 	})
 	require.True(t, ok)
 
-	plan, err := provider.WatchPlan(context.Background())
+	plan, err := provider.WatchPlan(t.Context())
 	require.NoError(t, err)
 	require.Len(t, plan.Roots, 2)
 	assert.Equal(t, filepath.Join(root, "tmp"), plan.Roots[0].Path)
@@ -49,13 +52,13 @@ func TestGeminiProviderSourceMethods(t *testing.T) {
 	assert.False(t, plan.Roots[1].Recursive)
 	assert.Equal(t, []string{"projects.json", "trustedFolders.json"}, plan.Roots[1].IncludeGlobs)
 
-	discovered, err := provider.Discover(context.Background())
+	discovered, err := provider.Discover(t.Context())
 	require.NoError(t, err)
 	require.Len(t, discovered, 1)
 	assert.Equal(t, sourcePath, discovered[0].DisplayPath)
 	assert.Equal(t, "my_project", discovered[0].ProjectHint)
 
-	found, ok, err := provider.FindSource(context.Background(), FindSourceRequest{
+	found, ok, err := provider.FindSource(t.Context(), FindSourceRequest{
 		FullSessionID: "host~gemini:" + sessionID,
 	})
 	require.NoError(t, err)
@@ -63,7 +66,7 @@ func TestGeminiProviderSourceMethods(t *testing.T) {
 	assert.Equal(t, sourcePath, found.DisplayPath)
 
 	changed, err := provider.SourcesForChangedPath(
-		context.Background(),
+		t.Context(),
 		ChangedPathRequest{Path: sourcePath, EventKind: "write", WatchRoot: filepath.Join(root, "tmp")},
 	)
 	require.NoError(t, err)
@@ -72,7 +75,7 @@ func TestGeminiProviderSourceMethods(t *testing.T) {
 
 	require.NoError(t, os.Remove(sourcePath))
 	changed, err = provider.SourcesForChangedPath(
-		context.Background(),
+		t.Context(),
 		ChangedPathRequest{Path: sourcePath, EventKind: "remove", WatchRoot: filepath.Join(root, "tmp")},
 	)
 	require.NoError(t, err)
@@ -80,9 +83,149 @@ func TestGeminiProviderSourceMethods(t *testing.T) {
 	assert.Equal(t, sourcePath, changed[0].DisplayPath)
 	assert.Equal(t, "my_project", changed[0].ProjectHint)
 
-	fingerprint, err := provider.Fingerprint(context.Background(), found)
+	fingerprint, err := provider.Fingerprint(t.Context(), found)
 	require.Error(t, err)
 	require.Empty(t, fingerprint)
+}
+
+func TestGeminiProviderDiscoverEmptyRootSkipsProjectMap(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.MkdirAll(
+		filepath.Join(root, "tmp", "unused-project", geminiChatsDir),
+		0o755,
+	))
+	writeSourceFile(t, filepath.Join(root, "projects.json"),
+		`{"projects":{"/projects/unused":"unused-project"}}`)
+
+	projectMapBuilds := 0
+	orig := buildGeminiProjectMap
+	buildGeminiProjectMap = func(string) map[string]string {
+		projectMapBuilds++
+		return map[string]string{}
+	}
+	t.Cleanup(func() { buildGeminiProjectMap = orig })
+
+	provider, ok := NewProvider(AgentGemini, ProviderConfig{Roots: []string{root}})
+	require.True(t, ok)
+	discovered, err := provider.Discover(t.Context())
+	require.NoError(t, err)
+	assert.Empty(t, discovered)
+	assert.Zero(t, projectMapBuilds)
+}
+
+func TestGeminiProviderDiscoverEachEmptyRootSkipsProjectMap(t *testing.T) {
+	root := t.TempDir()
+	require.NoError(t, os.MkdirAll(
+		filepath.Join(root, "tmp", "unused-project", geminiChatsDir),
+		0o755,
+	))
+	writeSourceFile(t, filepath.Join(root, "trustedFolders.json"),
+		`{"trustedFolders":["/projects/unused"]}`)
+
+	diskMapBuilds := 0
+	orig := newGeminiDiscoveryMap
+	newGeminiDiscoveryMap = func(ctx context.Context) (*discoveryDiskMap, error) {
+		diskMapBuilds++
+		return newDiscoveryDiskMapForContext(ctx)
+	}
+	t.Cleanup(func() { newGeminiDiscoveryMap = orig })
+
+	provider, ok := NewProvider(AgentGemini, ProviderConfig{Roots: []string{root}})
+	require.True(t, ok)
+	discoverer, ok := provider.(StreamingDiscoverer)
+	require.True(t, ok)
+	var discovered []SourceRef
+	err := discoverer.DiscoverEach(t.Context(), func(source SourceRef) error {
+		discovered = append(discovered, source)
+		return nil
+	})
+	require.NoError(t, err)
+	assert.Empty(t, discovered)
+	assert.Zero(t, diskMapBuilds)
+}
+
+func TestGeminiProviderDiscoverEachBuildsOneProjectMapForSessions(t *testing.T) {
+	root := t.TempDir()
+	writeSourceFile(t, filepath.Join(root, "projects.json"),
+		`{"projects":{"/projects/used":"used-project"}}`)
+	for _, name := range []string{
+		"session-2026-06-19T12-00-first.json",
+		"session-2026-06-19T12-01-second.jsonl",
+	} {
+		writeSourceFile(t, filepath.Join(root, "tmp", "used-project", geminiChatsDir, name), "{}")
+	}
+
+	diskMapBuilds := 0
+	orig := newGeminiDiscoveryMap
+	newGeminiDiscoveryMap = func(ctx context.Context) (*discoveryDiskMap, error) {
+		diskMapBuilds++
+		return newDiscoveryDiskMapForContext(ctx)
+	}
+	t.Cleanup(func() { newGeminiDiscoveryMap = orig })
+
+	provider, ok := NewProvider(AgentGemini, ProviderConfig{Roots: []string{root}})
+	require.True(t, ok)
+	discoverer, ok := provider.(StreamingDiscoverer)
+	require.True(t, ok)
+	var discovered []SourceRef
+	err := discoverer.DiscoverEach(t.Context(), func(source SourceRef) error {
+		discovered = append(discovered, source)
+		return nil
+	})
+	require.NoError(t, err)
+	require.Len(t, discovered, 2)
+	assert.Equal(t, "used", discovered[0].ProjectHint)
+	assert.Equal(t, "used", discovered[1].ProjectHint)
+	assert.Equal(t, 1, diskMapBuilds)
+}
+
+func TestGeminiProviderReconciliationProjectMapWorkIsArchiveBounded(t *testing.T) {
+	var projectMapBuilds int
+	orig := buildGeminiProjectMap
+	buildGeminiProjectMap = func(string) map[string]string {
+		projectMapBuilds++
+		return map[string]string{}
+	}
+	t.Cleanup(func() { buildGeminiProjectMap = orig })
+
+	for _, sourceCount := range []int{1, 64} {
+		t.Run(fmt.Sprintf("sources_%d", sourceCount), func(t *testing.T) {
+			root := t.TempDir()
+			sourcePaths := make([]string, sourceCount)
+			for i := range sourcePaths {
+				sourcePaths[i] = filepath.Join(
+					root,
+					"tmp",
+					fmt.Sprintf("project-hash-%03d", i),
+					geminiChatsDir,
+					fmt.Sprintf("session-2026-06-19T12-%02d-source.json", i),
+				)
+				writeSourceFile(t, sourcePaths[i], "{}")
+			}
+
+			provider, ok := NewProvider(AgentGemini, ProviderConfig{
+				Roots: []string{root},
+			})
+			require.True(t, ok)
+			resolver, ok := provider.(ReconciliationSourceResolver)
+			require.True(t, ok)
+
+			projectMapBuilds = 0
+			for i, path := range sourcePaths {
+				project := fmt.Sprintf("spooled_project_%d", i)
+				source, found, err := resolver.SourceForReconciliation(
+					t.Context(), path, project,
+				)
+				require.NoError(t, err)
+				require.True(t, found)
+				assert.Equal(t, path, source.DisplayPath)
+				assert.Equal(t, path, source.FingerprintKey)
+				assert.Equal(t, project, source.ProjectHint)
+			}
+			assert.Zero(t, projectMapBuilds,
+				"exact reconciliation must not rebuild root-wide metadata per source")
+		})
+	}
 }
 
 func TestGeminiProviderProjectMetadataChangesClassifyAndFingerprint(t *testing.T) {
@@ -114,19 +257,19 @@ func TestGeminiProviderProjectMetadataChangesClassifyAndFingerprint(t *testing.T
 	})
 	require.True(t, ok)
 
-	found, ok, err := provider.FindSource(context.Background(), FindSourceRequest{
+	found, ok, err := provider.FindSource(t.Context(), FindSourceRequest{
 		FullSessionID: "host~gemini:" + sessionID,
 	})
 	require.NoError(t, err)
 	require.True(t, ok)
 	assert.Equal(t, "one", found.ProjectHint)
 
-	fingerprintOne, err := provider.Fingerprint(context.Background(), found)
+	fingerprintOne, err := provider.Fingerprint(t.Context(), found)
 	require.NoError(t, err)
 
 	writeSourceFile(t, projectsPath, `{"projects":{"/Users/alice/code/two":"alias"}}`)
 	changed, err := provider.SourcesForChangedPath(
-		context.Background(),
+		t.Context(),
 		ChangedPathRequest{Path: projectsPath, EventKind: "write", WatchRoot: root},
 	)
 	require.NoError(t, err)
@@ -134,9 +277,156 @@ func TestGeminiProviderProjectMetadataChangesClassifyAndFingerprint(t *testing.T
 	assert.Equal(t, sourcePath, changed[0].DisplayPath)
 	assert.Equal(t, "two", changed[0].ProjectHint)
 
-	fingerprintTwo, err := provider.Fingerprint(context.Background(), changed[0])
+	fingerprintTwo, err := provider.Fingerprint(t.Context(), changed[0])
 	require.NoError(t, err)
 	assert.NotEqual(t, fingerprintOne.Hash, fingerprintTwo.Hash)
+
+	source := changed[0]
+
+	// Adding an entry that does not change this session's resolution
+	// must NOT change its fingerprint. Cover both metadata files:
+	// an unrelated projects.json alias, and an unrelated
+	// trustedFolders.json path.
+	writeUnrelatedProjectsEntry(t, root)
+	fingerprintThree := fingerprintSource(t, provider, source)
+	assert.Equal(t, fingerprintTwo.Hash, fingerprintThree.Hash,
+		"unrelated projects.json entries must not invalidate the session")
+	writeUnrelatedTrustedFolder(t, root)
+	fingerprintFour := fingerprintSource(t, provider, source)
+	assert.Equal(t, fingerprintTwo.Hash, fingerprintFour.Hash,
+		"unrelated trustedFolders.json entries must not invalidate the session")
+
+	// A trustedFolders.json entry that DOES change this session's resolved
+	// project (an old-layout hash directory that only trustedFolders.json,
+	// not projects.json, ever resolves) must invalidate the fingerprint.
+	hashSessionID := "gemini-hash-project"
+	hashProjectPath := "/Users/erin/code/hash-project"
+	hashDirName := geminiPathHash(hashProjectPath)
+	hashSourcePath := filepath.Join(
+		root,
+		"tmp",
+		hashDirName,
+		geminiChatsDir,
+		"session-2026-06-19T12-00-gemini-hash-project.json",
+	)
+	writeSourceFile(t, hashSourcePath, testjsonl.GeminiSessionJSON(
+		hashSessionID,
+		"hash-project",
+		tsEarly,
+		tsEarlyS5,
+		[]map[string]any{
+			testjsonl.GeminiUserMsg("u1", tsEarly, "hello gemini"),
+			testjsonl.GeminiAssistantMsg("a1", tsEarlyS5, "hi", nil),
+		},
+	))
+
+	hashFoundBefore, ok, err := provider.FindSource(t.Context(), FindSourceRequest{
+		FullSessionID: "host~gemini:" + hashSessionID,
+	})
+	require.NoError(t, err)
+	require.True(t, ok)
+	assert.Equal(t, "unknown", hashFoundBefore.ProjectHint)
+	fingerprintHashBefore := fingerprintSource(t, provider, hashFoundBefore)
+
+	writeSourceFile(t, filepath.Join(root, "trustedFolders.json"),
+		fmt.Sprintf(`{"trustedFolders":["%s"]}`, hashProjectPath))
+
+	hashFoundAfter, ok, err := provider.FindSource(t.Context(), FindSourceRequest{
+		FullSessionID: "host~gemini:" + hashSessionID,
+	})
+	require.NoError(t, err)
+	require.True(t, ok)
+	assert.Equal(t, "hash_project", hashFoundAfter.ProjectHint)
+	fingerprintHashAfter := fingerprintSource(t, provider, hashFoundAfter)
+	assert.NotEqual(t, fingerprintHashBefore.Hash, fingerprintHashAfter.Hash,
+		"a trustedFolders.json entry that changes this session's resolution must invalidate it")
+}
+
+// writeUnrelatedProjectsEntry rewrites projects.json to keep the existing
+// "alias" -> two resolution while adding an entry under a different alias
+// name. It must not affect any session resolved via the "alias" directory.
+func writeUnrelatedProjectsEntry(t *testing.T, root string) {
+	t.Helper()
+
+	writeSourceFile(t, filepath.Join(root, "projects.json"),
+		`{"projects":{"/Users/alice/code/two":"alias","/Users/carol/code/three":"other-alias"}}`)
+}
+
+// writeUnrelatedTrustedFolder writes trustedFolders.json with a path whose
+// hash does not match any session directory used in this test, so it must
+// not affect existing resolutions.
+func writeUnrelatedTrustedFolder(t *testing.T, root string) {
+	t.Helper()
+
+	writeSourceFile(t, filepath.Join(root, "trustedFolders.json"),
+		`{"trustedFolders":["/Users/dave/code/unrelated"]}`)
+}
+
+// fingerprintSource fingerprints source via provider, failing the test on error.
+func fingerprintSource(t *testing.T, provider Provider, source SourceRef) SourceFingerprint {
+	t.Helper()
+
+	fingerprint, err := provider.Fingerprint(t.Context(), source)
+	require.NoError(t, err)
+	return fingerprint
+}
+
+// TestGeminiProviderFingerprintMatchesReconstructedSource verifies that
+// Fingerprint produces the same hash whether it is called with the
+// discovery-built SourceRef (ProjectHint already populated) or with a bare
+// SourceRef reconstructed from just a path (as happens when a caller looks
+// up a source by stored file path without going through discovery). Both
+// must resolve the same on-disk project so a metadata-scoped fingerprint
+// cannot drift between the two callers.
+func TestGeminiProviderFingerprintMatchesReconstructedSource(t *testing.T) {
+	root := t.TempDir()
+	sessionID := "gemini-reconstructed"
+	writeSourceFile(t, filepath.Join(root, "projects.json"),
+		`{"projects":{"/Users/alice/code/reconstructed":"alias"}}`)
+	sourcePath := filepath.Join(
+		root,
+		"tmp",
+		"alias",
+		geminiChatsDir,
+		"session-2026-06-19T12-00-gemini-reconstructed.json",
+	)
+	writeSourceFile(t, sourcePath, testjsonl.GeminiSessionJSON(
+		sessionID,
+		"alias",
+		tsEarly,
+		tsEarlyS5,
+		[]map[string]any{
+			testjsonl.GeminiUserMsg("u1", tsEarly, "hello gemini"),
+			testjsonl.GeminiAssistantMsg("a1", tsEarlyS5, "hi", nil),
+		},
+	))
+
+	provider, ok := NewProvider(AgentGemini, ProviderConfig{
+		Roots:   []string{root},
+		Machine: "devbox",
+	})
+	require.True(t, ok)
+
+	discovered, ok, err := provider.FindSource(t.Context(), FindSourceRequest{
+		FullSessionID: "host~gemini:" + sessionID,
+	})
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, "reconstructed", discovered.ProjectHint)
+	discoveredFingerprint := fingerprintSource(t, provider, discovered)
+
+	// A bare SourceRef with no Opaque and no ProjectHint, as a caller would
+	// build from only a stored file path.
+	reconstructed := SourceRef{
+		Provider:       AgentGemini,
+		Key:            sourcePath,
+		DisplayPath:    sourcePath,
+		FingerprintKey: sourcePath,
+	}
+	reconstructedFingerprint := fingerprintSource(t, provider, reconstructed)
+
+	assert.Equal(t, discoveredFingerprint.Hash, reconstructedFingerprint.Hash,
+		"discovery-built and reconstructed sources must resolve the same project")
 }
 
 func TestGeminiProviderParse(t *testing.T) {
@@ -166,20 +456,20 @@ func TestGeminiProviderParse(t *testing.T) {
 	})
 	require.True(t, ok)
 
-	found, ok, err := provider.FindSource(context.Background(), FindSourceRequest{
+	found, ok, err := provider.FindSource(t.Context(), FindSourceRequest{
 		FullSessionID: "host~gemini:" + sessionID,
 	})
 	require.NoError(t, err)
 	require.True(t, ok)
 
-	fingerprint, err := provider.Fingerprint(context.Background(), found)
+	fingerprint, err := provider.Fingerprint(t.Context(), found)
 	require.NoError(t, err)
 	assert.Equal(t, sourcePath, fingerprint.Key)
 	assert.Positive(t, fingerprint.Size)
 	assert.Positive(t, fingerprint.MTimeNS)
 	assert.NotEmpty(t, fingerprint.Hash)
 
-	outcome, err := provider.Parse(context.Background(), ParseRequest{
+	outcome, err := provider.Parse(t.Context(), ParseRequest{
 		Source:      found,
 		Fingerprint: fingerprint,
 	})
@@ -194,6 +484,96 @@ func TestGeminiProviderParse(t *testing.T) {
 	assert.Equal(t, "devbox", result.Result.Session.Machine)
 	assert.Equal(t, fingerprint.Hash, result.Result.Session.File.Hash)
 	assert.Len(t, result.Result.Messages, 2)
+}
+
+// A followed project-directory symlink whose target cannot be resolved must
+// surface incomplete streaming discovery rather than reading as absent:
+// reconciliation treats a clean DiscoverEach as authoritative and would
+// tombstone every session beneath the symlink.
+func TestGeminiProviderStreamingDiscoveryPropagatesProjectSymlinkErrors(t *testing.T) {
+	writeGeminiSession := func(t *testing.T, root, dir, id string) {
+		t.Helper()
+		path := filepath.Join(
+			root, "tmp", dir, geminiChatsDir,
+			"session-2026-06-19T12-00-"+id+".json",
+		)
+		writeSourceFile(t, path, testjsonl.GeminiSessionJSON(
+			id, dir, tsEarly, tsEarlyS5,
+			[]map[string]any{
+				testjsonl.GeminiUserMsg("u1", tsEarly, "hello gemini"),
+			},
+		))
+	}
+	discoverEach := func(t *testing.T, root string) ([]string, error) {
+		t.Helper()
+		provider, ok := NewProvider(AgentGemini, ProviderConfig{
+			Roots: []string{root},
+		})
+		require.True(t, ok)
+		discoverer, ok := provider.(StreamingDiscoverer)
+		require.True(t, ok)
+		var yielded []string
+		err := discoverer.DiscoverEach(t.Context(), func(source SourceRef) error {
+			yielded = append(yielded, source.DisplayPath)
+			return nil
+		})
+		return yielded, err
+	}
+
+	t.Run("dangling project symlink", func(t *testing.T) {
+		root := t.TempDir()
+		writeGeminiSession(t, root, "healthy-project", "healthy")
+		target := filepath.Join(t.TempDir(), "linked-project")
+		require.NoError(t, os.MkdirAll(target, 0o755))
+		link := filepath.Join(root, "tmp", "linked")
+		if err := os.Symlink(target, link); err != nil {
+			t.Skipf("symlink not supported: %v", err)
+		}
+		require.NoError(t, os.RemoveAll(target))
+
+		_, err := discoverEach(t, root)
+
+		require.Error(t, err)
+		require.ErrorIs(t, err, os.ErrNotExist)
+		var incomplete DiscoveryIncompleteError
+		require.ErrorAs(t, err, &incomplete)
+
+		require.NoError(t, os.Remove(link))
+		yielded, err := discoverEach(t, root)
+		require.NoError(t, err)
+		assert.Len(t, yielded, 1)
+	})
+
+	t.Run("unstatable project symlink target", func(t *testing.T) {
+		if runtime.GOOS == "windows" {
+			t.Skip("directory read permissions are not enforced on Windows")
+		}
+		if os.Geteuid() == 0 {
+			t.Skip("root bypasses directory permissions")
+		}
+		root := t.TempDir()
+		writeGeminiSession(t, root, "healthy-project", "healthy")
+		targetParent := t.TempDir()
+		target := filepath.Join(targetParent, "linked-project")
+		require.NoError(t, os.MkdirAll(target, 0o755))
+		if err := os.Symlink(target, filepath.Join(root, "tmp", "linked")); err != nil {
+			t.Skipf("symlink not supported: %v", err)
+		}
+		require.NoError(t, os.Chmod(targetParent, 0o000))
+		t.Cleanup(func() { _ = os.Chmod(targetParent, 0o755) })
+
+		_, err := discoverEach(t, root)
+
+		require.Error(t, err)
+		require.ErrorIs(t, err, os.ErrPermission)
+		var incomplete DiscoveryIncompleteError
+		require.ErrorAs(t, err, &incomplete)
+
+		require.NoError(t, os.Chmod(targetParent, 0o755))
+		yielded, err := discoverEach(t, root)
+		require.NoError(t, err)
+		assert.Len(t, yielded, 1)
+	})
 }
 
 func TestCopilotProviderSourceMethods(t *testing.T) {
@@ -217,19 +597,23 @@ func TestCopilotProviderSourceMethods(t *testing.T) {
 	})
 	require.True(t, ok)
 
-	plan, err := provider.WatchPlan(context.Background())
+	plan, err := provider.WatchPlan(t.Context())
 	require.NoError(t, err)
-	require.Len(t, plan.Roots, 1)
+	require.Len(t, plan.Roots, 2)
 	assert.Equal(t, filepath.Join(root, copilotStateDir), plan.Roots[0].Path)
 	assert.True(t, plan.Roots[0].Recursive)
 	assert.Equal(t, []string{"*.jsonl", "workspace.yaml"}, plan.Roots[0].IncludeGlobs)
+	assert.Equal(t, root, plan.Roots[1].Path)
+	assert.False(t, plan.Roots[1].Recursive)
+	assert.Equal(t, []string{"session-store.db", "session-store.db-wal"},
+		plan.Roots[1].IncludeGlobs)
 
-	discovered, err := provider.Discover(context.Background())
+	discovered, err := provider.Discover(t.Context())
 	require.NoError(t, err)
 	require.Len(t, discovered, 1)
 	assert.Equal(t, dirEvents, discovered[0].DisplayPath)
 
-	found, ok, err := provider.FindSource(context.Background(), FindSourceRequest{
+	found, ok, err := provider.FindSource(t.Context(), FindSourceRequest{
 		RawSessionID: "copilot-provider",
 	})
 	require.NoError(t, err)
@@ -238,7 +622,7 @@ func TestCopilotProviderSourceMethods(t *testing.T) {
 
 	for _, path := range []string{dirEvents, workspacePath} {
 		changed, err := provider.SourcesForChangedPath(
-			context.Background(),
+			t.Context(),
 			ChangedPathRequest{Path: path, EventKind: "write", WatchRoot: filepath.Join(root, copilotStateDir)},
 		)
 		require.NoError(t, err)
@@ -248,7 +632,7 @@ func TestCopilotProviderSourceMethods(t *testing.T) {
 
 	require.NoError(t, os.Remove(dirEvents))
 	changed, err := provider.SourcesForChangedPath(
-		context.Background(),
+		t.Context(),
 		ChangedPathRequest{Path: dirEvents, EventKind: "remove", WatchRoot: filepath.Join(root, copilotStateDir)},
 	)
 	require.NoError(t, err)
@@ -258,7 +642,7 @@ func TestCopilotProviderSourceMethods(t *testing.T) {
 
 	require.NoError(t, os.Remove(workspacePath))
 	changed, err = provider.SourcesForChangedPath(
-		context.Background(),
+		t.Context(),
 		ChangedPathRequest{Path: workspacePath, EventKind: "remove", WatchRoot: filepath.Join(root, copilotStateDir)},
 	)
 	require.NoError(t, err)
@@ -266,7 +650,7 @@ func TestCopilotProviderSourceMethods(t *testing.T) {
 	assert.Equal(t, dirEvents, changed[0].DisplayPath)
 	writeSourceFile(t, workspacePath, "name: Workspace title\n")
 
-	fingerprint, err := provider.Fingerprint(context.Background(), found)
+	fingerprint, err := provider.Fingerprint(t.Context(), found)
 	require.NoError(t, err)
 	assert.Equal(t, dirEvents, fingerprint.Key)
 	assert.Positive(t, fingerprint.Size)
@@ -274,14 +658,17 @@ func TestCopilotProviderSourceMethods(t *testing.T) {
 	assert.NotEmpty(t, fingerprint.Hash)
 
 	writeSourceFile(t, workspacePath, "name: Workspace other\n")
-	renamedFingerprint, err := provider.Fingerprint(context.Background(), found)
+	// Equal-size writes can share a filesystem timestamp tick on Windows.
+	workspaceTime := time.Unix(0, fingerprint.MTimeNS).Add(time.Second)
+	require.NoError(t, os.Chtimes(workspacePath, workspaceTime, workspaceTime))
+	renamedFingerprint, err := provider.Fingerprint(t.Context(), found)
 	require.NoError(t, err)
 	assert.NotEqual(t, fingerprint.Hash, renamedFingerprint.Hash)
 	writeSourceFile(t, workspacePath, "name: Workspace title\n")
-	fingerprint, err = provider.Fingerprint(context.Background(), found)
+	fingerprint, err = provider.Fingerprint(t.Context(), found)
 	require.NoError(t, err)
 
-	outcome, err := provider.Parse(context.Background(), ParseRequest{
+	outcome, err := provider.Parse(t.Context(), ParseRequest{
 		Source:      found,
 		Fingerprint: fingerprint,
 	})

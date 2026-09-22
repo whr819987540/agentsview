@@ -28,11 +28,11 @@ const (
 func ExtractTarStream(
 	ctx context.Context, r io.Reader, dst string,
 ) (int, error) {
-	return extractTarStream(ctx, r, dst)
+	return extractTarStream(ctx, r, dst, nil)
 }
 
 func extractTarStream(
-	ctx context.Context, r io.Reader, dst string,
+	ctx context.Context, r io.Reader, dst string, selected map[string]struct{},
 ) (int, error) {
 	endMarkerReader := &tarEndMarkerReader{r: r}
 	tr := tar.NewReader(endMarkerReader)
@@ -49,12 +49,21 @@ func extractTarStream(
 				return skipped, fmt.Errorf("read tar trailer: %w", drainErr)
 			}
 			if trailerBytes < tarEndMarkerSize || !endMarkerReader.hasEndMarker() {
-				return skipped, fmt.Errorf("missing tar end marker")
+				return skipped, errors.New("missing tar end marker")
 			}
 			return skipped, nil
 		}
 		if err != nil {
 			return skipped, fmt.Errorf("read tar entry: %w", err)
+		}
+		if _, err := safeJoin(dst, hdr.Name); err != nil {
+			return skipped, err
+		}
+		if selected != nil {
+			name := filepath.ToSlash(filepath.Clean(hdr.Name))
+			if _, ok := selected[name]; !ok {
+				continue
+			}
 		}
 		selfLink, err := extractEntry(tr, dst, hdr)
 		if err != nil {

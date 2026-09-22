@@ -2,25 +2,31 @@ package main
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"fmt"
 	"io"
 	"log"
-	"maps"
 	"net/http"
-	"net/url"
 	"os"
-	"strconv"
+	"os/signal"
 	"strings"
+	"sync/atomic"
 	"text/tabwriter"
 	"time"
 
+	"github.com/doordash-oss/oapi-codegen-dd/v3/pkg/runtime"
+	"go.kenn.io/agentsview/internal/apiclient"
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/export"
+	"go.kenn.io/agentsview/internal/money"
 	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/pricing"
+	"go.kenn.io/agentsview/internal/pricingrefresh"
 	"go.kenn.io/agentsview/internal/service"
 	"go.kenn.io/agentsview/internal/sync"
+	"go.kenn.io/agentsview/internal/timeutil"
 )
 
 // quickSyncMargin pads the mtime cutoff backward from the
@@ -66,6 +72,11 @@ type UsageDailyConfig struct {
 	Offline   bool
 	NoSync    bool
 	Timezone  string
+}
+
+type usageDailyDocument struct {
+	db.DailyUsageResult
+	MachineLabels service.MachineLabelCatalog `json:"machine_labels,omitzero"`
 }
 
 // resolveUsageWindow resolves the raw --since/--until flags into concrete
@@ -127,6 +138,13 @@ func resolveUsageWindowPoint(
 }
 
 func runUsageDaily(cfg UsageDailyConfig) {
+	if err := runUsageDailyResult(cfg); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func runUsageDailyResult(cfg UsageDailyConfig) error {
 	tz := cfg.Timezone
 	if tz == "" {
 		tz = localTimezone()
@@ -134,14 +152,12 @@ func runUsageDaily(cfg UsageDailyConfig) {
 
 	loc, err := time.LoadLocation(tz)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: invalid --timezone: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("invalid --timezone: %w", err)
 	}
 
 	since, until, err := resolveUsageWindow(cfg.Since, cfg.Until, time.Now(), loc)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		os.Exit(1)
+		return err
 	}
 
 	filter := db.UsageFilter{
@@ -152,45 +168,59 @@ func runUsageDaily(cfg UsageDailyConfig) {
 	}
 	noDefaultRange := cfg.All || cfg.Since != "" || cfg.Until != ""
 
-	ctx := context.Background()
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
 	backend, cleanup, err := resolveArchiveQueryBackend(ctx, archiveQueryPolicy{
 		Offline:              cfg.Offline,
 		NoSync:               cfg.NoSync,
 		AutoStart:            true,
+		SkipInitialSync:      true,
 		ReadOnlyDaemon:       archiveQuerySkipReadOnlyDaemon,
 		DirectReadOnlyAction: "refresh usage directly",
 	})
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		os.Exit(1)
+		return err
 	}
 	defer closeArchiveQueryBackend(cleanup)
 
+	progress, finishProgress := newUsageProgressPrinter(os.Stderr)
 	result, err := backend.DailyUsage(ctx, dailyUsageQuery{
+		Progress:       progress,
 		Filter:         filter,
 		NoDefaultRange: noDefaultRange,
 		Breakdowns:     cfg.Breakdown,
 		SessionCounts:  cfg.JSON,
 	})
+	finishProgress()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		os.Exit(1)
+		return err
 	}
 
 	if cfg.JSON {
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		if err := enc.Encode(result); err != nil {
-			fmt.Fprintf(os.Stderr, "error: %v\n", err)
-			os.Exit(1)
+		document := usageDailyDocument{DailyUsageResult: result}
+		if cfg.Breakdown {
+			keys := make(map[string]struct{})
+			for _, day := range result.Daily {
+				for _, breakdown := range day.MachineBreakdowns {
+					keys[breakdown.MachineName] = struct{}{}
+				}
+			}
+			document.MachineLabels = machineLabelsForKeys(machineLabelCatalog(
+				ctx, os.Stderr, backend.MachineLabels,
+			), keys)
 		}
-		return
+		enc := jsontext.NewEncoder(os.Stdout, jsontext.WithIndent("  "))
+		if err := json.MarshalEncode(enc, document); err != nil {
+			return err
+		}
+		return nil
 	}
 
 	printDailyTable(result, cfg.Breakdown)
 	if note := noTokenDataNote(cfg.Agent, result.Totals); note != "" {
 		fmt.Fprintln(os.Stderr, note)
 	}
+	return nil
 }
 
 // noTokenDataNote returns a one-line stderr note for a zero usage result when
@@ -217,21 +247,50 @@ func noTokenDataNote(agent string, totals db.UsageTotals) string {
 }
 
 type UsageStatuslineConfig struct {
+	JSON    bool
 	Agent   string
 	Offline bool
 	NoSync  bool
 }
 
+// usageStatuslineReport is the machine-readable form of the statusline. It
+// carries the same facts as the human line and nothing more: today's cost,
+// the day it covers, and the agent filter that produced it. Cost stays a
+// money.Money so callers read exact microdollars instead of scraping the
+// formatted string.
+type usageStatuslineReport struct {
+	Date  string      `json:"date"`
+	Cost  money.Money `json:"cost"`
+	Agent string      `json:"agent,omitempty"`
+}
+
+func usageDateForTimezone(now time.Time, timezone string) string {
+	loc, err := time.LoadLocation(timezone)
+	if err != nil {
+		loc = time.UTC
+	}
+	return now.In(loc).Format("2006-01-02")
+}
+
 func runUsageStatusline(cfg UsageStatuslineConfig) {
-	today := time.Now().Format("2006-01-02")
+	if err := runUsageStatuslineResult(cfg); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func runUsageStatuslineResult(cfg UsageStatuslineConfig) error {
+	timezone := localTimezone()
+	today := usageDateForTimezone(time.Now(), timezone)
 	filter := db.UsageFilter{
 		From:     today,
 		To:       today,
 		Agent:    cfg.Agent,
-		Timezone: localTimezone(),
+		Timezone: timezone,
 	}
 
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 	backend, cleanup, err := resolveArchiveQueryBackend(ctx, archiveQueryPolicy{
 		Offline:              cfg.Offline,
 		NoSync:               cfg.NoSync,
@@ -240,8 +299,7 @@ func runUsageStatusline(cfg UsageStatuslineConfig) {
 		DirectReadOnlyAction: "refresh usage directly",
 	})
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		os.Exit(1)
+		return err
 	}
 	defer closeArchiveQueryBackend(cleanup)
 
@@ -250,11 +308,30 @@ func runUsageStatusline(cfg UsageStatuslineConfig) {
 		NoDefaultRange: true,
 	})
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		os.Exit(1)
+		return err
+	}
+
+	if cfg.JSON {
+		return printUsageStatuslineJSON(result, cfg.Agent, today)
 	}
 
 	printUsageStatusline(result, cfg.Agent)
+	return nil
+}
+
+func printUsageStatuslineJSON(
+	result db.DailyUsageResult, agent, date string,
+) error {
+	enc := jsontext.NewEncoder(os.Stdout, jsontext.WithIndent("  "))
+	report := usageStatuslineReport{
+		Date:  date,
+		Cost:  result.Totals.TotalCost,
+		Agent: agent,
+	}
+	if err := json.MarshalEncode(enc, report); err != nil {
+		return err
+	}
+	return nil
 }
 
 func printUsageStatusline(result db.DailyUsageResult, agent string) {
@@ -308,9 +385,15 @@ func ensureFreshData(
 	defer log.SetOutput(origLog)
 
 	if database.NeedsResync() {
-		engine := sync.NewEngine(database, sync.EngineConfig{
-			AgentDirs: appCfg.AgentDirs,
-			Machine:   "local",
+		engine := sync.NewEngine(ctx, database, sync.EngineConfig{
+			AgentDirs:          appCfg.AgentDirs,
+			SourceMachines:     appCfg.SourceMachines,
+			ProviderMetadata:   appCfg.ProviderMetadata,
+			DisabledAgents:     appCfg.DisabledAgents,
+			IncludeCwdPrefixes: appCfg.SyncIncludeCwdPrefixes,
+			ScanProtectedPaths: appCfg.ScanProtectedPaths,
+			Machine:            appCfg.InstallationID,
+			ArchiveContent:     appCfg.ArchiveContent,
 		})
 		defer engine.Close()
 		fmt.Fprintln(os.Stderr,
@@ -331,13 +414,19 @@ func ensureFreshData(
 		return
 	}
 
-	engine := sync.NewEngine(database, sync.EngineConfig{
-		AgentDirs: appCfg.AgentDirs,
-		Machine:   "local",
+	engine := sync.NewEngine(ctx, database, sync.EngineConfig{
+		AgentDirs:          appCfg.AgentDirs,
+		SourceMachines:     appCfg.SourceMachines,
+		ProviderMetadata:   appCfg.ProviderMetadata,
+		DisabledAgents:     appCfg.DisabledAgents,
+		IncludeCwdPrefixes: appCfg.SyncIncludeCwdPrefixes,
+		ScanProtectedPaths: appCfg.ScanProtectedPaths,
+		Machine:            appCfg.InstallationID,
+		ArchiveContent:     appCfg.ArchiveContent,
 	})
 	defer engine.Close()
 
-	since := engine.LastSyncStartedAt()
+	since := engine.LastSyncStartedAt(ctx)
 	if !since.IsZero() {
 		since = since.Add(-quickSyncMargin)
 	}
@@ -349,9 +438,12 @@ func ensureFreshData(
 // stderr so it does not pollute stdout-bound JSON or statusline output.
 func printSyncSummaryStderr(stats sync.SyncStats, t time.Time) {
 	summary := fmt.Sprintf(
-		"\nSync complete: %d sessions synced",
+		"Sync complete: %d sessions synced",
 		stats.Synced,
 	)
+	if isTerminalWriter(os.Stderr) {
+		summary = "\n" + summary
+	}
 	if stats.OrphanedCopied > 0 {
 		summary += fmt.Sprintf(
 			", %d archived sessions preserved",
@@ -371,113 +463,31 @@ func printSyncSummaryStderr(stats sync.SyncStats, t time.Time) {
 	}
 }
 
-// seedPricing ensures fallback rates are present in
-// model_pricing, then kicks off a background LiteLLM refresh.
+// seedPricing ensures fallback rates are present in model_pricing.
 //
 // Fallback rates are only upserted when the stored seed
-// version differs from pricing.FallbackVersion (or is
+// version differs from pricing.SeedVersion (or is
 // absent). This avoids overwriting live LiteLLM rates on
 // every restart while still propagating corrected fallback
-// rates when the binary is upgraded.
-func seedPricing(database *db.DB) {
-	if err := seedFallbackPricing(database); err != nil {
+// rates when the binary is upgraded. SeedVersion folds in
+// the supplemental alias version, so curated alias additions
+// (see internal/pricing/supplemental.go) also reach existing
+// databases without a resync.
+func seedPricing(
+	database *db.DB,
+	runner remoteSyncExclusiveRunner,
+) {
+	err := runPricingExclusive(runner, func() error {
+		return pricingrefresh.SeedFallback(database)
+	})
+	if err != nil {
 		log.Printf("pricing seed: %v", err)
 	}
-	go refreshPricingFromLiteLLM(database)
-}
-
-func seedFallbackPricing(database *db.DB) error {
-	const metaKey = "_fallback_version"
-	stored, err := database.GetPricingMeta(metaKey)
-	if err != nil {
-		return err
-	}
-	if stored == pricing.FallbackVersion {
-		return nil
-	}
-	if err := upsertPricing(
-		database, pricing.FallbackPricing(),
-	); err != nil {
-		return err
-	}
-	return database.SetPricingMeta(metaKey, pricing.FallbackVersion)
-}
-
-// refreshPricingFromLiteLLM fetches the upstream LiteLLM
-// catalog and upserts it over whatever is in the table. Called
-// from a goroutine after the synchronous fallback seed so a
-// slow or failing fetch never blocks server startup.
-func refreshPricingFromLiteLLM(database *db.DB) {
-	prices, err := pricing.FetchLiteLLMPricing()
-	if err != nil {
-		log.Printf(
-			"pricing refresh: litellm fetch failed: %v", err,
-		)
-		return
-	}
-	if err := upsertPricing(database, prices); err != nil {
-		log.Printf("pricing refresh: upsert failed: %v", err)
-	}
-}
-
-// pricingRefreshMetaKey marks the last time the CLI tried to
-// refresh model_pricing from LiteLLM. Cooldown is enforced
-// against this value, win or fail, so a repeatedly-failing
-// fetch (offline, DNS broken) does not block every CLI call.
-const pricingRefreshMetaKey = "_litellm_last_attempt"
-
-// pricingRefreshCooldown is the minimum interval between
-// CLI-triggered LiteLLM fetches. Short enough that a newly
-// released model gets priced within hours of the user noticing,
-// long enough that statusline-style repeated CLI invocations
-// don't hammer LiteLLM when a session uses a truly unpriced
-// model (e.g. a local Ollama model).
-const pricingRefreshCooldown = time.Hour
-
-// refreshPricingIfStale fetches the LiteLLM pricing catalog
-// and upserts it when the last attempt is older than cooldown
-// (or has never run). The fetcher is injectable for tests so
-// the cooldown logic can be exercised without network. Returns
-// true when an upsert succeeded; callers can re-query pricing
-// after a true result. Errors from the fetch are returned so
-// the caller can emit a warning; cooldown is recorded before
-// the fetch so a persistent failure won't retry every call.
-func refreshPricingIfStale(
-	database *db.DB,
-	fetch func() ([]pricing.ModelPricing, error),
-	cooldown time.Duration,
-	now time.Time,
-) (bool, error) {
-	stored, err := database.GetPricingMeta(pricingRefreshMetaKey)
-	if err != nil {
-		return false, fmt.Errorf(
-			"reading pricing refresh meta: %w", err)
-	}
-	if stored != "" {
-		last, perr := time.Parse(time.RFC3339, stored)
-		if perr == nil && now.Sub(last) < cooldown {
-			return false, nil
-		}
-	}
-	if err := database.SetPricingMeta(
-		pricingRefreshMetaKey, now.UTC().Format(time.RFC3339),
-	); err != nil {
-		return false, fmt.Errorf(
-			"recording pricing refresh attempt: %w", err)
-	}
-	prices, err := fetch()
-	if err != nil {
-		return false, err
-	}
-	if err := upsertPricing(database, prices); err != nil {
-		return false, err
-	}
-	return true, nil
 }
 
 func ensurePricing(database *db.DB, offline bool) {
-	if _, err := ensurePricingWithFetcher(
-		database, offline, pricing.FetchLiteLLMPricing, time.Now(),
+	if _, err := pricingrefresh.Ensure(
+		database, offline, pricing.FetchCatalog, time.Now(),
 	); err != nil {
 		fmt.Fprintf(os.Stderr,
 			"warning: pricing refresh failed: %v\n", err)
@@ -498,39 +508,66 @@ func ensureUsagePricing(
 func applyFallbackPricing(
 	database *db.DB, custom map[string]config.CustomModelRate,
 ) {
-	rates := make(map[string]config.CustomModelRate)
+	database.SetEffectivePricing(fallbackPricingRates(custom))
+}
+
+func applyEmptyCatalogPricing(
+	database *db.DB, custom map[string]config.CustomModelRate,
+) {
+	database.SetEmptyCatalogPricing(fallbackPricingRates(custom))
+}
+
+func fallbackPricingRates(
+	custom map[string]config.CustomModelRate,
+) map[string]export.ModelRates {
+	rates := make(map[string]export.ModelRates)
 	for _, p := range pricing.FallbackPricing() {
 		// These keys are the same concrete model-pattern keys that the
 		// model_pricing table stores. SQLite usage lookups run the merged map
 		// through pricing.Resolve, so normalized/canonical aliases still match
 		// when this read-only path cannot seed model_pricing rows.
-		rates[p.ModelPattern] = config.CustomModelRate{
-			Input:         p.InputPerMTok,
-			Output:        p.OutputPerMTok,
-			CacheCreation: p.CacheCreationPerMTok,
-			CacheRead:     p.CacheReadPerMTok,
+		bands := make([]export.PricingBand, len(p.Bands))
+		for i, band := range p.Bands {
+			bands[i] = export.PricingBand{
+				AboveInputTokens:    band.AboveInputTokens,
+				InputPerMTok:        band.InputPerMTok,
+				OutputPerMTok:       band.OutputPerMTok,
+				CacheWritePerMTok:   band.CacheCreationPerMTok,
+				CacheWrite1hPerMTok: band.CacheCreation1hPerMTok,
+				CacheReadPerMTok:    band.CacheReadPerMTok,
+			}
+		}
+		rates[p.ModelPattern] = export.ModelRates{
+			InputPerMTok:        p.InputPerMTok,
+			OutputPerMTok:       p.OutputPerMTok,
+			CacheWritePerMTok:   p.CacheCreationPerMTok,
+			CacheWrite1hPerMTok: p.CacheCreation1hPerMTok,
+			CacheReadPerMTok:    p.CacheReadPerMTok,
+			Source:              export.PricingRowSourceEmbedded,
+			Bands:               bands,
 		}
 	}
-	maps.Copy(rates, custom)
-	database.SetCustomPricing(rates)
-}
-
-func ensurePricingWithFetcher(
-	database *db.DB, offline bool,
-	fetch func() ([]pricing.ModelPricing, error),
-	now time.Time,
-) (bool, error) {
-	if offline {
-		return false, upsertPricing(database, pricing.FallbackPricing())
+	for model, rate := range custom {
+		rates[model] = export.ModelRates{
+			InputPerMTok: money.Money{
+				Microdollars: rate.InputMicrodollarsPerMTok,
+			},
+			OutputPerMTok: money.Money{
+				Microdollars: rate.OutputMicrodollarsPerMTok,
+			},
+			CacheWritePerMTok: money.Money{
+				Microdollars: rate.CacheCreationMicrodollarsPerMTok,
+			},
+			CacheWrite1hPerMTok: money.Money{
+				Microdollars: rate.CacheCreation1hMicrodollarsPerMTok,
+			},
+			CacheReadPerMTok: money.Money{
+				Microdollars: rate.CacheReadMicrodollarsPerMTok,
+			},
+			Source: export.PricingRowSourceCustom,
+		}
 	}
-
-	if err := seedFallbackPricing(database); err != nil {
-		return false, err
-	}
-
-	return refreshPricingIfStale(
-		database, fetch, pricingRefreshCooldown, now,
-	)
+	return rates
 }
 
 func fetchHTTPDailyUsage(
@@ -540,87 +577,157 @@ func fetchHTTPDailyUsage(
 	query dailyUsageQuery,
 ) (db.DailyUsageResult, error) {
 	filter := query.Filter
-	q := url.Values{}
-	q.Set("no_default_range", strconv.FormatBool(query.NoDefaultRange))
-	q.Set("breakdowns", strconv.FormatBool(query.Breakdowns))
-	q.Set("session_counts", strconv.FormatBool(query.SessionCounts))
-	setIfNotEmpty := func(k, v string) {
-		if v != "" {
-			q.Set(k, v)
+	q := apiclient.GetAPIV1UsageSummaryStreamQuery{
+		NoDefaultRange: new(query.NoDefaultRange), Breakdowns: new(query.Breakdowns), SessionCounts: new(query.SessionCounts),
+		IncludeOneShot: new(!filter.ExcludeOneShot), IncludeAutomated: new(!filter.ExcludeAutomated),
+	}
+	if filter.Timezone != "" {
+		q.Timezone = new(filter.Timezone)
+	}
+	if filter.Agent != "" {
+		q.Agent = new(filter.Agent)
+	}
+	if filter.Project != "" {
+		q.Project = new(filter.Project)
+	}
+	if filter.Machine != "" {
+		q.Machine = new(filter.Machine)
+	}
+	if filter.ExcludeProject != "" {
+		q.ExcludeProject = new(filter.ExcludeProject)
+	}
+	if filter.ExcludeAgent != "" {
+		q.ExcludeAgent = new(filter.ExcludeAgent)
+	}
+	if filter.ExcludeModel != "" {
+		q.ExcludeModel = new(filter.ExcludeModel)
+	}
+	if filter.Model != "" {
+		q.Model = new(filter.Model)
+	}
+	if filter.Termination != "" {
+		q.Termination = new(filter.Termination)
+	}
+	if filter.From != "" {
+		parsed, err := time.Parse(time.DateOnly, filter.From)
+		if err != nil {
+			return db.DailyUsageResult{}, err
 		}
+		q.From = &runtime.Date{Time: parsed}
 	}
-	setIfNotEmpty("from", filter.From)
-	setIfNotEmpty("to", filter.To)
-	setIfNotEmpty("timezone", filter.Timezone)
-	setIfNotEmpty("agent", filter.Agent)
-	setIfNotEmpty("project", filter.Project)
-	setIfNotEmpty("machine", filter.Machine)
-	setIfNotEmpty("exclude_project", filter.ExcludeProject)
-	setIfNotEmpty("exclude_agent", filter.ExcludeAgent)
-	setIfNotEmpty("exclude_model", filter.ExcludeModel)
-	setIfNotEmpty("model", filter.Model)
-	setIfNotEmpty("active_since", filter.ActiveSince)
-	setIfNotEmpty("termination", filter.Termination)
+	if filter.To != "" {
+		parsed, err := time.Parse(time.DateOnly, filter.To)
+		if err != nil {
+			return db.DailyUsageResult{}, err
+		}
+		q.To = &runtime.Date{Time: parsed}
+	}
+	if filter.ActiveSince != "" {
+		parsed, err := time.Parse(time.RFC3339, filter.ActiveSince)
+		if err != nil {
+			return db.DailyUsageResult{}, err
+		}
+		q.ActiveSince = &parsed
+	}
 	if filter.MinUserMessages > 0 {
-		q.Set("min_user_messages", fmt.Sprint(filter.MinUserMessages))
+		q.MinUserMessages = new(int64(filter.MinUserMessages))
 	}
-	q.Set("include_one_shot", strconv.FormatBool(!filter.ExcludeOneShot))
-	q.Set("include_automated", strconv.FormatBool(!filter.ExcludeAutomated))
-
-	endpoint := strings.TrimSuffix(tr.URL, "/") +
-		"/api/v1/usage/summary?" + q.Encode()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	api, err := apiclient.NewHTTPClient(tr.URL, authToken, &http.Client{Timeout: 0})
 	if err != nil {
 		return db.DailyUsageResult{}, err
 	}
-	if authToken != "" {
-		req.Header.Set("Authorization", "Bearer "+authToken)
-	}
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return db.DailyUsageResult{}, err
+	var resp *http.Response
+	var payload []byte
+	var out apiclient.UsageSummaryResponse
+	var stream *runtime.Stream[[]byte]
+	if query.Progress != nil {
+		response, requestErr := api.GetAPIV1UsageSummaryStreamStreamWithResponse(ctx, &apiclient.GetAPIV1UsageSummaryStreamRequestOptions{Query: &q})
+		if response == nil {
+			return db.DailyUsageResult{}, requestErr
+		}
+		resp, payload, stream = response.HTTPResponse, response.Body, response.Stream200
+	} else {
+		bufferedQuery := apiclient.GetAPIV1UsageSummaryQuery(q)
+		response, requestErr := api.GetAPIV1UsageSummaryWithResponse(ctx, &apiclient.GetAPIV1UsageSummaryRequestOptions{Query: &bufferedQuery})
+		if response == nil {
+			return db.DailyUsageResult{}, requestErr
+		}
+		resp, payload = response.HTTPResponse, response.Body
+		if response.StatusCode == http.StatusOK {
+			if requestErr != nil {
+				return db.DailyUsageResult{}, requestErr
+			}
+			if len(response.Body) == 0 {
+				return db.DailyUsageResult{}, io.ErrUnexpectedEOF
+			}
+			out = *response.JSON200
+		}
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
+		body := payload
 		return db.DailyUsageResult{}, fmt.Errorf(
 			"usage summary: HTTP %d: %s",
 			resp.StatusCode, strings.TrimSpace(string(body)),
 		)
 	}
-	var out struct {
-		Totals        db.UsageTotals        `json:"totals"`
-		Daily         []db.DailyUsageEntry  `json:"daily"`
-		SessionCounts db.UsageSessionCounts `json:"sessionCounts"`
+	if query.Progress != nil {
+		if !strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream") {
+			return db.DailyUsageResult{}, fmt.Errorf("usage summary: expected a progress stream, received %q", resp.Header.Get("Content-Type"))
+		}
+		data, err := consumeDaemonPushEvents[apiclient.UsageSummaryResponse](stream, func(p struct {
+			Detail string `json:"detail"`
+		},
+		) {
+			query.Progress(p.Detail)
+		})
+		if err != nil {
+			return db.DailyUsageResult{}, fmt.Errorf("usage summary: %w", err)
+		}
+		out = data
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return db.DailyUsageResult{}, err
+	if out.Projects == nil {
+		out.Projects = map[string]export.ProjectMapEntry{}
+	}
+	schemaVersion := 0
+	if out.SchemaVersion != nil {
+		schemaVersion = int(*out.SchemaVersion)
 	}
 	return db.DailyUsageResult{
+		SchemaVersion: schemaVersion,
+		Pricing:       out.Pricing,
+		Projects:      out.Projects,
 		Daily:         out.Daily,
 		Totals:        out.Totals,
 		SessionCounts: out.SessionCounts,
 	}, nil
 }
 
-// upsertPricing copies pricing rows into the db.ModelPricing
-// shape and upserts them. Shared by ensurePricing (CLI),
-// seedPricing (startup fallback), and
-// refreshPricingFromLiteLLM (async refresh).
-func upsertPricing(
-	database *db.DB, prices []pricing.ModelPricing,
-) error {
-	dbPrices := make([]db.ModelPricing, len(prices))
-	for i, p := range prices {
-		dbPrices[i] = db.ModelPricing{
-			ModelPattern:         p.ModelPattern,
-			InputPerMTok:         p.InputPerMTok,
-			OutputPerMTok:        p.OutputPerMTok,
-			CacheCreationPerMTok: p.CacheCreationPerMTok,
-			CacheReadPerMTok:     p.CacheReadPerMTok,
+func newUsageProgressPrinter(w io.Writer) (func(string), func()) {
+	started := time.Now()
+	var phase atomic.Pointer[string]
+	phase.Store(new("Preparing usage report from the archive"))
+	stop, done := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		var lastPhase string
+		var lastPrinted time.Duration
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				current, elapsed := *phase.Load(), time.Since(started)
+				if current != lastPhase || elapsed-lastPrinted >= 5*time.Second {
+					fmt.Fprintf(w, "%s (%s)\n", current, elapsed.Round(time.Second))
+					lastPhase, lastPrinted = current, elapsed
+				}
+			}
 		}
-	}
-	return database.UpsertModelPricing(dbPrices)
+	}()
+	return func(current string) { phase.Store(&current) }, func() { close(stop); <-done }
 }
 
 func printDailyTable(
@@ -677,18 +784,15 @@ func printDailyTable(
 
 // localTimezone returns the IANA name of the system's local timezone.
 func localTimezone() string {
-	return time.Now().Location().String()
+	return timeutil.LocalTimezoneOrUTC()
 }
 
 // fmtCost formats a dollar amount with two decimal places,
 // matching conventional currency display. Non-zero values
 // under half a cent would otherwise round to "$0.00" and
 // read as "free", so they render as "<$0.01" instead.
-func fmtCost(v float64) string {
-	if v > 0 && v < 0.005 {
-		return "<$0.01"
-	}
-	return fmt.Sprintf("$%.2f", v)
+func fmtCost(v money.Money) string {
+	return money.FormatUSD(v, money.DisplayCents)
 }
 
 func joinModels(models []string) string {

@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"go.kenn.io/agentsview/internal/db"
@@ -29,6 +30,33 @@ func (s *Store) SearchContent(
 	if f.Pattern == "" {
 		return db.ContentSearchPage{}, nil
 	}
+
+	// Semantic and hybrid validate Sources themselves (messages only) ahead
+	// of the substring/regex/fts source-set default just below, which fills
+	// in tool_input/tool_result that neither mode supports -- mirroring
+	// internal/db's SearchContent so an empty Sources field is not defaulted
+	// out from under ValidateSemanticFilter's empty-or-messages-only check.
+	if f.Mode == "semantic" || f.Mode == "hybrid" {
+		// Validate input the same way SQLite's semantic/hybrid paths do
+		// before reporting the capability gate: an invalid request (bad
+		// cursor, non-messages source) must return the same 400
+		// SearchInputError on every backend rather than a 501 here and a
+		// 400 on SQLite (backend parity, see AGENTS.md).
+		if err := db.ValidateSemanticFilter(f); err != nil {
+			return db.ContentSearchPage{}, err
+		}
+		if s.getVectorSearcher() == nil {
+			return db.ContentSearchPage{}, s.semanticUnavailableError()
+		}
+		if f.Mode == "semantic" {
+			return s.searchContentSemanticPG(ctx, f)
+		}
+		return s.searchContentHybridPG(ctx, f)
+	}
+	if f.Mode == "terms" {
+		return s.searchContentTermsPG(ctx, f)
+	}
+
 	if len(f.Sources) == 0 {
 		f.Sources = []string{"messages", "tool_input", "tool_result"}
 	}
@@ -57,17 +85,50 @@ func pgHasSource(f db.ContentSearchFilter, src string) bool {
 	return slices.Contains(f.Sources, src)
 }
 
-// pgSessionFilter builds a db.SessionFilter from a ContentSearchFilter.
-func pgSessionFilter(f db.ContentSearchFilter) db.SessionFilter {
-	return db.SessionFilter{
-		Project: f.Project, ExcludeProject: f.ExcludeProject,
-		Machine: f.Machine, GitBranch: f.GitBranch, Agent: f.Agent,
-		Date: f.Date, DateFrom: f.DateFrom, DateTo: f.DateTo,
-		ActiveSince:      f.ActiveSince,
-		ExcludeOneShot:   !f.IncludeOneShot,
-		ExcludeAutomated: !f.IncludeAutomated,
-		IncludeChildren:  f.IncludeChildren,
+// searchContentTermsPG runs the shared terms-mode query
+// (db.BuildTermsSearchSQL) against PostgreSQL.
+func (s *Store) searchContentTermsPG(
+	ctx context.Context, f db.ContentSearchFilter,
+) (db.ContentSearchPage, error) {
+	if err := db.ValidateTermsFilter(f); err != nil {
+		return db.ContentSearchPage{}, err
 	}
+	terms := db.ParseContentSearchTerms(f.Pattern)
+	if len(terms) == 0 {
+		return db.ContentSearchPage{}, nil
+	}
+	query, args, err := db.BuildTermsSearchSQL(f, terms, db.PostgresQueryDialect())
+	if err != nil {
+		return db.ContentSearchPage{}, err
+	}
+	rows, err := s.pg.QueryContext(ctx, query, args...)
+	if err != nil {
+		return db.ContentSearchPage{}, fmt.Errorf("pg terms search: %w", err)
+	}
+	defer rows.Close()
+	var timestamp *time.Time
+	return db.ScanTermsMatches(rows, f, terms, &timestamp, func() string {
+		if timestamp == nil {
+			return ""
+		}
+		return FormatISO8601(*timestamp)
+	})
+}
+
+// appendExcludeSessionIDsPG adds `NOT (col = ANY($n))` using a Postgres text
+// array bind. Empty IDs are a no-op so callers can thread ContentSearchFilter
+// through without a nil check.
+func appendExcludeSessionIDsPG(
+	where string, args []any, col string, ids []string,
+) (string, []any) {
+	ids = db.NormalizeExcludeSessionIDs(ids)
+	if len(ids) == 0 {
+		return where, args
+	}
+	out := make([]any, 0, len(args)+1)
+	out = append(out, args...)
+	out = append(out, ids)
+	return where + fmt.Sprintf(" AND NOT (%s = ANY($%d))", col, len(out)), out
 }
 
 // searchContentSubstringPG runs ILIKE-based UNION ALL across the selected
@@ -75,7 +136,9 @@ func pgSessionFilter(f db.ContentSearchFilter) db.SessionFilter {
 func (s *Store) searchContentSubstringPG(
 	ctx context.Context, f db.ContentSearchFilter,
 ) (db.ContentSearchPage, error) {
-	scopeWhere, scopeArgs := buildPGSessionFilter(pgSessionFilter(f))
+	scopeWhere, scopeArgs := db.BuildContentScopeSQL(f, db.PostgresQueryDialect())
+	scopeWhere, scopeArgs = appendExcludeSessionIDsPG(
+		scopeWhere, scopeArgs, "id", f.ExcludeSessionIDs)
 	escapedPat := escapeLike(f.Pattern)
 
 	pb := &paramBuilder{
@@ -130,7 +193,7 @@ func pgMessagesBranch(
 	return fmt.Sprintf(`
 		SELECT m.session_id, s.project, s.agent, 'message' AS location,
 			m.role AS role, '' AS tool_name, m.ordinal,
-			COALESCE(m.timestamp::text, '') AS ts,
+			m.timestamp AS ts,
 			m.content AS snippet, 0 AS src, 0::bigint AS row_id,
 			COALESCE(s.ended_at, s.started_at, s.created_at) AS sort_ts
 		FROM messages m
@@ -182,7 +245,7 @@ func pgToolInputBranch(
 	return fmt.Sprintf(`
 		SELECT tc.session_id, s.project, s.agent, 'tool_input' AS location,
 			'assistant' AS role, tc.tool_name, tc.message_ordinal AS ordinal,
-			COALESCE(m.timestamp::text, '') AS ts,
+			m.timestamp AS ts,
 			tc.input_json AS snippet, 1 AS src, tc.id AS row_id,
 			COALESCE(s.ended_at, s.started_at, s.created_at) AS sort_ts
 		FROM tool_calls tc
@@ -207,7 +270,7 @@ func pgToolResultContentBranch(
 	return fmt.Sprintf(`
 		SELECT tc.session_id, s.project, s.agent, 'tool_result' AS location,
 			'assistant' AS role, tc.tool_name, tc.message_ordinal AS ordinal,
-			COALESCE(m.timestamp::text, '') AS ts,
+			m.timestamp AS ts,
 			tc.result_content AS snippet, 2 AS src, tc.id AS row_id,
 			COALESCE(s.ended_at, s.started_at, s.created_at) AS sort_ts
 		FROM tool_calls tc
@@ -236,7 +299,7 @@ func pgToolResultEventsBranch(
 		SELECT tre.session_id, s.project, s.agent, 'tool_result' AS location,
 			'assistant' AS role, '' AS tool_name,
 			tre.tool_call_message_ordinal AS ordinal,
-			COALESCE(tre.timestamp::text, '') AS ts,
+			tre.timestamp AS ts,
 			tre.content AS snippet, 3 AS src, tre.id AS row_id,
 			COALESCE(s.ended_at, s.started_at, s.created_at) AS sort_ts
 		FROM tool_result_events tre
@@ -248,7 +311,9 @@ func pgToolResultEventsBranch(
 
 // scanPGContentMatches runs query and assembles a ContentSearchPage. The
 // query's final column is the full source field; makeSnippet derives the
-// windowed, redacted snippet so redaction sees whole secrets.
+// windowed, redacted snippet so redaction sees whole secrets. The returned
+// page then gets its derived unit ranges and lineage assigned by the shared
+// deriveLexicalUnitsPG pass (post-truncation, O(page)).
 func (s *Store) scanPGContentMatches(
 	ctx context.Context, query string, args []any, limit, cursor int,
 	makeSnippet func(body string) string,
@@ -263,12 +328,16 @@ func (s *Store) scanPGContentMatches(
 	for rows.Next() {
 		var m db.ContentMatch
 		var body string
+		var ts *time.Time
 		if err := rows.Scan(
 			&m.SessionID, &m.Project, &m.Agent,
 			&m.Location, &m.Role, &m.ToolName, &m.Ordinal,
-			&m.Timestamp, &body,
+			&ts, &body,
 		); err != nil {
 			return db.ContentSearchPage{}, fmt.Errorf("scan pg match: %w", err)
+		}
+		if ts != nil {
+			m.Timestamp = FormatISO8601(*ts)
 		}
 		m.Snippet = makeSnippet(body)
 		out = append(out, m)
@@ -276,10 +345,20 @@ func (s *Store) scanPGContentMatches(
 	if err := rows.Err(); err != nil {
 		return db.ContentSearchPage{}, err
 	}
+	// Close the cursor before deriving units (exhausting Next already
+	// auto-closed it; this keeps the release explicit): deriveLexicalUnitsPG
+	// issues new queries, which must never wait on a connection this cursor
+	// would otherwise still pin.
+	if err := rows.Close(); err != nil {
+		return db.ContentSearchPage{}, fmt.Errorf("closing pg content matches: %w", err)
+	}
 	page := db.ContentSearchPage{Matches: out}
 	if len(out) > limit {
 		page.Matches = out[:limit]
 		page.NextCursor = cursor + limit
+	}
+	if err := s.deriveLexicalUnitsPG(ctx, page.Matches); err != nil {
+		return db.ContentSearchPage{}, err
 	}
 	return page, nil
 }
@@ -306,13 +385,17 @@ func (s *Store) searchContentRegexPG(
 	for rows.Next() {
 		var m db.ContentMatch
 		var body string
+		var ts *time.Time
 		if err := rows.Scan(
 			&m.SessionID, &m.Project, &m.Agent,
 			&m.Location, &m.Role, &m.ToolName, &m.Ordinal,
-			&m.Timestamp, &body,
+			&ts, &body,
 		); err != nil {
 			return db.ContentSearchPage{},
 				fmt.Errorf("scan pg regex candidate: %w", err)
+		}
+		if ts != nil {
+			m.Timestamp = FormatISO8601(*ts)
 		}
 		loc := re.FindStringIndex(body)
 		if loc == nil {
@@ -331,10 +414,16 @@ func (s *Store) searchContentRegexPG(
 	if err := rows.Err(); err != nil {
 		return db.ContentSearchPage{}, err
 	}
-	page := db.ContentSearchPage{Matches: out}
-	if len(out) > f.Limit {
-		page.Matches = out[:f.Limit]
-		page.NextCursor = f.Cursor + f.Limit
+	// Close the candidate cursor before deriving units: the loop breaks out
+	// with rows still open once Limit+1 matches are collected, and
+	// deriveLexicalUnitsPG issues new queries that could otherwise block on a
+	// constrained connection pool while this cursor pins a connection.
+	if err := rows.Close(); err != nil {
+		return db.ContentSearchPage{}, fmt.Errorf("closing pg regex candidates: %w", err)
+	}
+	page := f.Page(out)
+	if err := s.deriveLexicalUnitsPG(ctx, page.Matches); err != nil {
+		return db.ContentSearchPage{}, err
 	}
 	return page, nil
 }
@@ -343,7 +432,9 @@ func (s *Store) searchContentRegexPG(
 func (s *Store) pgRegexCandidateRows(
 	ctx context.Context, f db.ContentSearchFilter, lit string,
 ) (*sql.Rows, error) {
-	scopeWhere, scopeArgs := buildPGSessionFilter(pgSessionFilter(f))
+	scopeWhere, scopeArgs := db.BuildContentScopeSQL(f, db.PostgresQueryDialect())
+	scopeWhere, scopeArgs = appendExcludeSessionIDsPG(
+		scopeWhere, scopeArgs, "id", f.ExcludeSessionIDs)
 
 	pb := &paramBuilder{
 		n:    len(scopeArgs),
@@ -404,7 +495,7 @@ func pgMessagesCandidateBranch(
 	return fmt.Sprintf(`
 		SELECT m.session_id, s.project, s.agent, 'message' AS location,
 			m.role AS role, '' AS tool_name, m.ordinal,
-			COALESCE(m.timestamp::text, '') AS ts,
+			m.timestamp AS ts,
 			m.content AS body, 0 AS src, 0::bigint AS row_id,
 			COALESCE(s.ended_at, s.started_at, s.created_at) AS sort_ts
 		FROM messages m
@@ -420,19 +511,7 @@ func pgToolInputCandidateBranch(
 ) string {
 	prefilter := pgPrefilterClause("tc.input_json", lit, pb)
 
-	return fmt.Sprintf(`
-		SELECT tc.session_id, s.project, s.agent, 'tool_input' AS location,
-			'assistant' AS role, tc.tool_name, tc.message_ordinal AS ordinal,
-			COALESCE(m.timestamp::text, '') AS ts,
-			tc.input_json AS body, 1 AS src, tc.id AS row_id,
-			COALESCE(s.ended_at, s.started_at, s.created_at) AS sort_ts
-		FROM tool_calls tc
-		JOIN sessions s ON s.id = tc.session_id
-		JOIN scoped sc ON sc.id = tc.session_id
-		JOIN messages m ON m.session_id = tc.session_id
-			AND m.ordinal = tc.message_ordinal
-		WHERE %s`,
-		prefilter)
+	return "\n\t\tSELECT tc.session_id, s.project, s.agent, 'tool_input' AS location,\n\t\t\t'assistant' AS role, tc.tool_name, tc.message_ordinal AS ordinal,\n\t\t\tm.timestamp AS ts,\n\t\t\ttc.input_json AS body, 1 AS src, tc.id AS row_id,\n\t\t\tCOALESCE(s.ended_at, s.started_at, s.created_at) AS sort_ts\n\t\tFROM tool_calls tc\n\t\tJOIN sessions s ON s.id = tc.session_id\n\t\tJOIN scoped sc ON sc.id = tc.session_id\n\t\tJOIN messages m ON m.session_id = tc.session_id\n\t\t\tAND m.ordinal = tc.message_ordinal\n\t\tWHERE " + prefilter
 }
 
 // pgToolResultContentCandidateBranch: candidate result_content rows (no events).
@@ -444,7 +523,7 @@ func pgToolResultContentCandidateBranch(
 	return fmt.Sprintf(`
 		SELECT tc.session_id, s.project, s.agent, 'tool_result' AS location,
 			'assistant' AS role, tc.tool_name, tc.message_ordinal AS ordinal,
-			COALESCE(m.timestamp::text, '') AS ts,
+			m.timestamp AS ts,
 			tc.result_content AS body, 2 AS src, tc.id AS row_id,
 			COALESCE(s.ended_at, s.started_at, s.created_at) AS sort_ts
 		FROM tool_calls tc
@@ -468,18 +547,7 @@ func pgToolResultEventsCandidateBranch(
 ) string {
 	prefilter := pgPrefilterClause("tre.content", lit, pb)
 
-	return fmt.Sprintf(`
-		SELECT tre.session_id, s.project, s.agent, 'tool_result' AS location,
-			'assistant' AS role, '' AS tool_name,
-			tre.tool_call_message_ordinal AS ordinal,
-			COALESCE(tre.timestamp::text, '') AS ts,
-			tre.content AS body, 3 AS src, tre.id AS row_id,
-			COALESCE(s.ended_at, s.started_at, s.created_at) AS sort_ts
-		FROM tool_result_events tre
-		JOIN sessions s ON s.id = tre.session_id
-		JOIN scoped sc ON sc.id = tre.session_id
-		WHERE %s`,
-		prefilter)
+	return "\n\t\tSELECT tre.session_id, s.project, s.agent, 'tool_result' AS location,\n\t\t\t'assistant' AS role, '' AS tool_name,\n\t\t\ttre.tool_call_message_ordinal AS ordinal,\n\t\t\ttre.timestamp AS ts,\n\t\t\ttre.content AS body, 3 AS src, tre.id AS row_id,\n\t\t\tCOALESCE(s.ended_at, s.started_at, s.created_at) AS sort_ts\n\t\tFROM tool_result_events tre\n\t\tJOIN sessions s ON s.id = tre.session_id\n\t\tJOIN scoped sc ON sc.id = tre.session_id\n\t\tWHERE " + prefilter
 }
 
 // pgSnippetBounds returns the rune-snapped byte window around [start,end),
@@ -509,15 +577,15 @@ func pgBuildSnippet(f db.ContentSearchFilter, body string, start, end int) strin
 
 // pgSubstringSnippet builds a substring-match snippet: it locates the
 // case-insensitive pattern (the ILIKE already matched, so it is present; fall
-// back to the start) and windows it. It uses db.CaseInsensitiveIndex so the
-// offset indexes body directly even when lowercasing would change byte length.
+// back to the start) and windows it. It uses db.CaseInsensitiveSpan so both
+// offsets index body directly even when lowercasing would change byte length.
 func pgSubstringSnippet(f db.ContentSearchFilter, body string) string {
 	if f.Mode == "fts" {
 		start, end := db.FTSSnippetRange(f.Pattern, body)
 		return pgBuildSnippet(f, body, start, end)
 	}
-	off := max(db.CaseInsensitiveIndex(body, f.Pattern), 0)
-	return pgBuildSnippet(f, body, off, min(off+len(f.Pattern), len(body)))
+	start, end, _ := db.CaseInsensitiveSpan(body, f.Pattern)
+	return pgBuildSnippet(f, body, start, end)
 }
 
 // literalPrefixPG returns the required literal prefix from a regex pattern,

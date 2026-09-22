@@ -2,10 +2,13 @@ package ssh
 
 import (
 	"context"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"path"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -14,25 +17,309 @@ import (
 	"go.kenn.io/agentsview/internal/remotesync"
 )
 
-// buildTarCommand generates the remote tar command for the given
-// agent directories and extra files. Uses -C / so paths are relative
-// to root. Strips leading / from each path and shell-quotes it. The
-// extra files are resolved to exist on the remote (see
-// buildResolveScript), so tar does not fail on a missing path.
+// buildTarCommand generates the remote shell script for the given
+// agent directories, agent-scoped files, and extra files, while
+// preserving excluded-provider roots as path boundaries. Uses -C /
+// so paths are relative to root, and feeds paths to tar over stdin
+// instead of expanding them as tar argv. The script itself is sent to
+// the remote shell over stdin, so a large file-scoped Windsurf export
+// does not consume ssh/exec argument space. Agent ownership alone is
+// not sufficient: an allowed directory can contain a forbidden
+// provider's store, so every transfer input is screened independently
+// of its owner. Pass a nil forbiddenRoots when there are none.
 func buildTarCommand(
 	dirs map[parser.AgentType][]string,
+	files map[parser.AgentType][]string,
 	extraFiles []string,
+	forbiddenRoots []string,
 ) string {
-	var paths []string
-	for _, agentDirs := range dirs {
+	hermesStateDBs := hermesSSHStateDBs(dirs, extraFiles)
+	hermesStateDBs = filterForbiddenRoots(hermesStateDBs, forbiddenRoots)
+	hermesSQLite := make(map[string]struct{}, len(hermesStateDBs)*4)
+	for _, stateDB := range hermesStateDBs {
+		for _, suffix := range []string{"", "-wal", "-shm", "-journal"} {
+			hermesSQLite[path.Clean(stateDB+suffix)] = struct{}{}
+		}
+	}
+	paths := make([]string, 0)
+	addPath := func(remotePath string) {
+		if pathWithinForbiddenRoots(forbiddenRoots, remotePath) {
+			return
+		}
+		if _, isHermesSQLite := hermesSQLite[path.Clean(remotePath)]; isHermesSQLite {
+			return
+		}
+		if archivePath := tarListPath(remotePath); archivePath != "" {
+			paths = append(paths, archivePath)
+		}
+	}
+	for agent, agentDirs := range dirs {
+		if parser.RemoteSyncExcludedAgent(agent) {
+			continue
+		}
+		if _, fileScoped := files[agent]; fileScoped {
+			continue
+		}
 		for _, d := range agentDirs {
-			paths = append(paths, shellQuote(strings.TrimPrefix(d, "/")))
+			addPath(d)
+		}
+	}
+	for agent, agentFiles := range files {
+		if parser.RemoteSyncExcludedAgent(agent) {
+			continue
+		}
+		for _, f := range agentFiles {
+			addPath(f)
 		}
 	}
 	for _, f := range extraFiles {
-		paths = append(paths, shellQuote(strings.TrimPrefix(f, "/")))
+		addPath(f)
 	}
-	return "tar cf - -C / -- " + strings.Join(paths, " ")
+	forbiddenArchivePaths := make([]string, 0, len(forbiddenRoots))
+	for _, root := range forbiddenRoots {
+		if archivePath := tarListPath(root); archivePath != "" {
+			forbiddenArchivePaths = append(forbiddenArchivePaths, archivePath)
+		}
+	}
+	if len(hermesStateDBs) > 0 {
+		return buildPythonSnapshotTarCommand(
+			paths, hermesStateDBs, forbiddenArchivePaths,
+		)
+	}
+	return buildPlainTarCommand(paths, forbiddenArchivePaths)
+}
+
+func filterForbiddenRoots(paths, forbiddenRoots []string) []string {
+	filtered := make([]string, 0, len(paths))
+	for _, remotePath := range paths {
+		if !pathWithinForbiddenRoots(forbiddenRoots, remotePath) {
+			filtered = append(filtered, remotePath)
+		}
+	}
+	return filtered
+}
+
+// pathWithinForbiddenRoots reports whether remotePath is a forbidden root or
+// lies beneath one, treating remotePath and roots as remote POSIX paths. It
+// is a thin wrapper over remotesync.PathWithinForbiddenRoots, shared with
+// internal/remotesync's local-walk pruning so both call sites agree on
+// boundary matching (e.g. root "/a/b" must not match sibling path "/a/bc").
+func pathWithinForbiddenRoots(roots []string, remotePath string) bool {
+	return remotesync.PathWithinForbiddenRoots(roots, remotePath, '/')
+}
+
+func buildPlainTarCommand(paths, forbiddenArchivePaths []string) string {
+	var b strings.Builder
+	b.WriteString("set -e\n")
+	b.WriteString("av_emit_tar_path() { [ -e \"/$1\" ] || return 0; printf '%s\\n' \"$1\"; }\n")
+	b.WriteString("{\n")
+	b.WriteString(":\n")
+	for _, archivePath := range paths {
+		b.WriteString("av_emit_tar_path ")
+		b.WriteString(shellQuote(archivePath))
+		b.WriteByte('\n')
+	}
+	b.WriteString("} | tar cf - -C /")
+	for _, forbiddenPath := range forbiddenArchivePaths {
+		b.WriteString(" --exclude=")
+		b.WriteString(shellQuote(escapeTarExcludeGlob(forbiddenPath)))
+	}
+	b.WriteString(" -T -\n")
+	return b.String()
+}
+
+// escapeTarExcludeGlob backslash-escapes tar --exclude glob metacharacters
+// (*, ?, [, and \ itself) in a literal path so the resulting pattern matches
+// only that exact path. tar --exclude patterns are globs under both GNU
+// tar's fnmatch and bsdtar's libarchive, so an unescaped forbidden-root path
+// containing a metacharacter (e.g. reached via an env-override path
+// containing "[") can silently fail to match itself, defeating the
+// exclusion. Both implementations honor a leading backslash to force a
+// literal match, so escaping here is safe on both.
+func escapeTarExcludeGlob(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch r {
+		case '*', '?', '[', '\\':
+			b.WriteByte('\\')
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
+}
+
+func hermesSSHStateDBs(
+	dirs map[parser.AgentType][]string,
+	extraFiles []string,
+) []string {
+	extra := make(map[string]struct{}, len(extraFiles))
+	for _, remotePath := range extraFiles {
+		extra[path.Clean(remotePath)] = struct{}{}
+	}
+	seen := make(map[string]struct{})
+	for _, remotePath := range dirs[parser.AgentHermes] {
+		clean := path.Clean(remotePath)
+		switch path.Base(clean) {
+		case "state.db":
+			seen[clean] = struct{}{}
+		case "sessions":
+			stateDB := path.Join(path.Dir(clean), "state.db")
+			if _, ok := extra[stateDB]; ok {
+				seen[stateDB] = struct{}{}
+			}
+		}
+	}
+	stateDBs := make([]string, 0, len(seen))
+	for stateDB := range seen {
+		stateDBs = append(stateDBs, stateDB)
+	}
+	sort.Strings(stateDBs)
+	return stateDBs
+}
+
+func buildPythonSnapshotTarCommand(
+	paths, stateDBs, forbiddenArchivePaths []string,
+) string {
+	type sqliteArchivePath struct {
+		Source  string `json:"source"`
+		Archive string `json:"archive"`
+	}
+	databases := make([]sqliteArchivePath, 0, len(stateDBs))
+	for _, stateDB := range stateDBs {
+		archivePath := tarListPath(stateDB)
+		if archivePath == "" {
+			continue
+		}
+		databases = append(databases, sqliteArchivePath{
+			Source: stateDB, Archive: archivePath,
+		})
+	}
+	pathsJSON, _ := json.Marshal(paths)
+	databasesJSON, _ := json.Marshal(databases)
+	forbiddenJSON, _ := json.Marshal(forbiddenArchivePaths)
+	fallback := buildPlainTarCommand(paths, forbiddenArchivePaths)
+	var fallbackWarnings strings.Builder
+	for _, database := range databases {
+		fallbackWarnings.WriteString("  printf '%s\\n' ")
+		fallbackWarnings.WriteString(shellQuote(
+			"warning: skipped Hermes state.db snapshot: " + database.Source +
+				": Python 3 with SQLite backup support is unavailable",
+		))
+		fallbackWarnings.WriteString(" >&2\n")
+	}
+	return fmt.Sprintf(`set -e
+av_python=$(command -v python3 || true)
+if [ -n "$av_python" ] && "$av_python" -c 'import json, os, pathlib, sqlite3, stat, sys, tarfile, tempfile; raise SystemExit(0 if sys.version_info >= (3, 7) and hasattr(sqlite3.Connection, "backup") else 1)' >/dev/null 2>&1; then
+"$av_python" - <<'PY'
+import json
+import os
+import pathlib
+import sqlite3
+import stat
+import sys
+import tarfile
+import tempfile
+
+paths = json.loads(%q)
+databases = json.loads(%q)
+forbidden = json.loads(%q)
+
+# Member names and forbidden roots are compared in one rootless form so
+# the match cannot depend on whether tarfile preserves the "./" arcname
+# spelling (current CPython does; both spellings normalize identically).
+def archive_name(name):
+    if name.startswith("./"):
+        name = name[2:]
+    return name.lstrip("/")
+
+forbidden = [root for root in (archive_name(f) for f in forbidden) if root]
+
+def is_forbidden(archive_path):
+    archive_path = archive_name(archive_path)
+    for root in forbidden:
+        if archive_path == root or archive_path.startswith(root.rstrip("/") + "/"):
+            return True
+    return False
+
+def archive_filter(tarinfo):
+    if is_forbidden(tarinfo.name):
+        return None
+    return tarinfo
+
+def warn_skipped(source_path, reason):
+    print("warning: skipped Hermes state.db snapshot: {}: {}".format(source_path, reason), file=sys.stderr)
+
+with tarfile.open(fileobj=sys.stdout.buffer, mode="w|") as archive:
+    for archive_path in paths:
+        source_path = "/" + archive_path[2:] if archive_path.startswith("./") else archive_path
+        if not os.path.lexists(source_path):
+            continue
+        try:
+            archive.add(source_path, arcname=archive_path, recursive=True, filter=archive_filter)
+        except FileNotFoundError:
+            continue
+    for item in databases:
+        source_path = item["source"]
+        try:
+            source_info = os.lstat(source_path)
+        except OSError as exc:
+            warn_skipped(source_path, exc)
+            continue
+        if not stat.S_ISREG(source_info.st_mode):
+            warn_skipped(source_path, "not a regular file")
+            continue
+        sidecars = []
+        unsafe_sidecar = None
+        for suffix in ("-wal", "-shm", "-journal"):
+            try:
+                sidecar_info = os.lstat(source_path + suffix)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                unsafe_sidecar = "cannot inspect {}: {}".format(source_path + suffix, exc)
+                break
+            if not stat.S_ISREG(sidecar_info.st_mode):
+                unsafe_sidecar = "{} is not a regular file".format(source_path + suffix)
+                break
+            sidecars.append((suffix, sidecar_info))
+        if unsafe_sidecar:
+            warn_skipped(source_path, unsafe_sidecar)
+            continue
+        try:
+            with tempfile.TemporaryDirectory(prefix="agentsview-hermes-snapshot-") as tmp:
+                snapshot_path = os.path.join(tmp, "state.db")
+                source_uri = pathlib.Path(source_path).as_uri() + "?mode=ro"
+                with sqlite3.connect(source_uri, uri=True) as source_db:
+                    with sqlite3.connect(snapshot_path) as snapshot_db:
+                        source_db.backup(snapshot_db)
+                        snapshot_db.execute("PRAGMA journal_mode = DELETE")
+                mtime_ns = source_info.st_mtime_ns
+                for suffix, sidecar_info in sidecars:
+                    if suffix in ("-wal", "-journal"):
+                        mtime_ns = max(mtime_ns, sidecar_info.st_mtime_ns)
+                os.utime(snapshot_path, ns=(mtime_ns, mtime_ns))
+                archive.add(snapshot_path, arcname=item["archive"], recursive=False)
+        except (OSError, sqlite3.Error, tarfile.TarError, ValueError) as exc:
+            warn_skipped(source_path, exc)
+            continue
+PY
+else
+%s%sfi
+`, string(pathsJSON), string(databasesJSON), string(forbiddenJSON), fallbackWarnings.String(), fallback)
+}
+
+func tarListPath(path string) string {
+	if strings.ContainsAny(path, "\x00\n\r") {
+		return ""
+	}
+	rel := strings.TrimPrefix(path, "/")
+	if rel == "" || rel == "." {
+		return ""
+	}
+	if strings.HasPrefix(rel, "./") {
+		return rel
+	}
+	return "./" + rel
 }
 
 // shellQuote wraps s in single quotes, escaping any embedded
@@ -42,15 +329,20 @@ func shellQuote(s string) string {
 }
 
 // downloadAndExtract tars remote agent dirs and extracts to a local
-// temp dir. Returns the temp dir path; caller must clean up.
+// temp dir. Returns the temp dir path; caller must clean up. Pass a
+// nil forbiddenRoots when there are none.
 func downloadAndExtract(
 	ctx context.Context,
 	host, user string, port int, sshOpts []string,
 	dirs map[parser.AgentType][]string,
+	files map[parser.AgentType][]string,
 	extraFiles []string,
+	forbiddenRoots []string,
 ) (string, error) {
-	tarCmd := buildTarCommand(dirs, extraFiles)
-	stdout, cleanup, err := runSSHStream(
+	tarCmd := buildTarCommand(
+		dirs, files, extraFiles, forbiddenRoots,
+	)
+	stdout, cleanup, err := runSSHScriptStream(
 		ctx, host, user, port, sshOpts, tarCmd,
 	)
 	if err != nil {
@@ -202,8 +494,8 @@ var benignRemoteTarFallout = []string{
 // SSH-level failures are never benign, so they can never be persisted
 // to the skip cache as a successful sync.
 func remoteTarStderrBenign(err error) bool {
-	var ce *commandError
-	if !errors.As(err, &ce) {
+	ce, hasCe := errors.AsType[*commandError](err)
+	if !hasCe {
 		return false
 	}
 	sawPrimary := false

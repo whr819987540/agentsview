@@ -1,143 +1,279 @@
 <script lang="ts">
-  import { onMount, untrack } from "svelte";
+  import { RefreshControl as KitRefreshControl } from "@kenn-io/kit-ui";
+  import type { ComponentProps } from "svelte";
+  import { formatDateTime, getLocale } from "../../i18n/index.js";
   import {
-    createRefreshScheduler,
-    DEFAULT_REFRESH_INTERVAL_MS,
-    formatRefreshAge,
+    formatQueryDuration,
+    formatQueryPhaseLabel,
+    formatQueryStepLabel,
+    formatQueryTick,
+    formatRefreshStatus,
+    queryAxisTicks,
+    refreshStatusWidthSamples,
+    type QueryPhase,
+    type QueryStep,
   } from "../../utils/refresh.js";
-  import { RefreshCwIcon } from "../../icons.js";
 
-  // Re-evaluate the relative age label this often so it advances without a data
-  // fetch. Shared by every dashboard that shows an "Updated Xm ago" status.
-  const REFRESH_LABEL_INTERVAL_MS = 60 * 1000;
+  // Thin wrapper over kit-ui's RefreshControl: injects the app's localized
+  // label (age plus last-query duration via formatRefreshStatus), the current
+  // app locale, the localized width samples that keep the label box a
+  // constant width, and a hover breakdown of the last query's steps, so
+  // pages pass only data props — mirroring shared/RangePicker.svelte.
+
+  type Props = Omit<
+    ComponentProps<typeof KitRefreshControl>,
+    "formatAge" | "locale" | "ageWidthSamples" | "ageTooltip"
+  > & {
+    /** Replaces the relative age while a parent operation reports progress. */
+    status?: string;
+    /** Wall-clock time of the page's most recent data query, request start
+     * to data applied. Shown after the age label; null before the first
+     * query completes. */
+    queryDurationMs?: number | null;
+    /** Per-step timings behind `queryDurationMs`, in execution order. Shown
+     * as a list when the label is hovered or focused. */
+    querySteps?: readonly QueryStep[];
+  };
 
   let {
+    status = undefined,
+    queryDurationMs = null,
+    querySteps = [],
     lastUpdatedAt,
-    busy = false,
-    onRefresh,
-    label,
-    title,
-    intervalMs = DEFAULT_REFRESH_INTERVAL_MS,
-  }: {
-    /** Epoch ms of the last successful fetch, or null before the first load. */
-    lastUpdatedAt: number | null;
-    /** Spins the icon and disables the button while a refresh is in flight. */
-    busy?: boolean;
-    /** Refetches the dashboard data; invoked on the interval and on click. */
-    onRefresh: () => void;
-    /** Accessible name for the button (aria-label). */
-    label: string;
-    /** Tooltip text; defaults to `label` when omitted. */
-    title?: string;
-    /** Auto-refresh cadence in ms; defaults to the shared 5-minute interval. */
-    intervalMs?: number;
-  } = $props();
+    ...rest
+  }: Props = $props();
 
-  // The page owns the initial load -- it alone knows when its URL/filter state
-  // is hydrated -- so this control only keeps the data fresh afterward. Arm the
-  // interval without an immediate fetch (scheduleNext, not start) so the first
-  // auto-refresh lands one interval out instead of racing the page's mount; a
-  // manual click refreshes now and resets that timer. intervalMs is read once
-  // at setup (untrack); a live cadence change would need a fresh scheduler.
-  const scheduler = createRefreshScheduler(
-    () => onRefresh(),
-    untrack(() => intervalMs),
+  // Locale is fixed for the life of a page load (a language change reloads),
+  // so the samples are computed once per mount.
+  const ageWidthSamples = refreshStatusWidthSamples();
+  const showSteps = $derived(status === undefined && querySteps.length > 0);
+
+  // Time zero on the axis is the first request going out, not the refresh
+  // being asked for: the sub-millisecond setup before the first send would
+  // otherwise nudge every bar off the zero line. The axis runs to the last
+  // step's end, or to the recorded total if that is later.
+  const originMs = $derived(
+    querySteps.length === 0 ? 0 : Math.min(...querySteps.map((step) => step.startMs)),
   );
+  const axisMs = $derived(
+    Math.max(
+      (queryDurationMs ?? 0) - originMs,
+      ...querySteps.map((step) => step.startMs + step.durationMs - originMs),
+      1,
+    ),
+  );
+  // Requests fired in one dispatch burst leave a millisecond or two apart,
+  // which at this scale draws as a false stagger off the zero line. Anything
+  // starting within two pixels of the origin is drawn flush with it; later
+  // starts keep their real offset.
+  const TRACK_PX = 200;
+  const snapMs = $derived((2 * axisMs) / TRACK_PX);
+  function shiftMs(step: QueryStep): number {
+    const startMs = step.startMs - originMs;
+    return startMs < snapMs ? step.startMs : originMs;
+  }
+  const ticks = $derived(queryAxisTicks(axisMs));
+  const hasSegments = $derived(querySteps.some((step) => step.segments !== undefined));
+  const PHASES: QueryPhase[] = ["wait", "download", "apply"];
 
-  // Local clock that ticks once a minute so the age label re-derives without a
-  // data fetch. Seeded once at mount.
-  let tick = $state(Date.now());
-  const ageLabel = $derived(formatRefreshAge(lastUpdatedAt, tick));
+  function percent(ms: number): string {
+    return ((100 * ms) / axisMs).toFixed(2);
+  }
 
-  onMount(() => {
-    scheduler.scheduleNext();
-    let labelTimer: ReturnType<typeof setTimeout> | undefined;
-    function scheduleLabelTick() {
-      labelTimer = setTimeout(() => {
-        tick = Date.now();
-        scheduleLabelTick();
-      }, REFRESH_LABEL_INTERVAL_MS);
-    }
-    scheduleLabelTick();
-    return () => {
-      scheduler.stop();
-      if (labelTimer !== undefined) clearTimeout(labelTimer);
-    };
-  });
+  function barStyle(startMs: number, durationMs: number, shift: number): string {
+    return `left: ${percent(startMs - shift)}%; width: ${percent(durationMs)}%`;
+  }
+
+  // Tick labels centre on their line. A centred label may spill into the
+  // column gap, but one at the very end of the track would run into the
+  // duration column, so it hangs to the left of its line instead.
+  function tickStyle(tick: number): string {
+    const pct = (100 * tick) / axisMs;
+    const shift = pct > 98 ? "-100%" : "-50%";
+    return `left: ${pct.toFixed(2)}%; transform: translateX(${shift})`;
+  }
 </script>
 
-<div class="refresh-control">
-  <button
-    class="refresh-btn"
-    class:querying={busy}
-    onclick={() => scheduler.refreshNow()}
-    disabled={busy}
-    title={title ?? label}
-    aria-label={label}
-  >
-    <RefreshCwIcon size="14" strokeWidth="2" aria-hidden="true" />
-  </button>
-  <div class="refresh-status">
-    <span
-      title={lastUpdatedAt === null
-        ? undefined
-        : new Date(lastUpdatedAt).toLocaleString()}
-    >
-      {ageLabel}
-    </span>
+<KitRefreshControl
+  {...rest}
+  lastUpdatedAt={status === undefined ? lastUpdatedAt : null}
+  formatAge={status === undefined
+    ? (at, now) => formatRefreshStatus(at, queryDurationMs, now)
+    : () => status ?? ""}
+  locale={getLocale()}
+  {ageWidthSamples}
+  ageTooltip={showSteps ? querySteps_tooltip : undefined}
+/>
+
+{#snippet querySteps_tooltip()}
+  <div class="query-steps">
+    <div class="query-steps__head">
+      {#if lastUpdatedAt != null}
+        <span class="query-steps__at">
+          {formatDateTime(lastUpdatedAt, { dateStyle: "medium", timeStyle: "medium" })}
+        </span>
+      {/if}
+      <span class="query-steps__total">{formatQueryDuration(queryDurationMs)}</span>
+    </div>
+    <div class="query-steps__list">
+      <span></span>
+      <span class="query-steps__axis" aria-hidden="true">
+        {#each ticks as tick (tick)}
+          <span class="query-steps__tick" style={tickStyle(tick)}>
+            {formatQueryTick(tick)}
+          </span>
+        {/each}
+      </span>
+      <span></span>
+      {#each querySteps as step (step.name)}
+        {@const shift = shiftMs(step)}
+        <span class="query-steps__name">{formatQueryStepLabel(step.name)}</span>
+        <span class="query-steps__track" aria-hidden="true">
+          {#each ticks as tick (tick)}
+            <span class="query-steps__grid" style={`left: ${percent(tick)}%`}></span>
+          {/each}
+          {#if step.segments}
+            {#each step.segments as segment (segment.phase)}
+              <span
+                class={`query-steps__bar query-steps__bar--${segment.phase}`}
+                style={barStyle(segment.startMs, segment.durationMs, shift)}
+              ></span>
+            {/each}
+          {:else}
+            <span
+              class="query-steps__bar query-steps__bar--wait"
+              style={barStyle(step.startMs, step.durationMs, shift)}
+            ></span>
+          {/if}
+        </span>
+        <span class="query-steps__duration">{formatQueryDuration(step.durationMs)}</span>
+      {/each}
+    </div>
+    {#if hasSegments}
+      <div class="query-steps__legend">
+        {#each PHASES as phase (phase)}
+          <span class="query-steps__legend-item">
+            <span class={`query-steps__swatch query-steps__bar--${phase}`}></span>
+            {formatQueryPhaseLabel(phase)}
+          </span>
+        {/each}
+      </div>
+    {/if}
   </div>
-</div>
+{/snippet}
 
 <style>
-  .refresh-control {
-    min-height: 28px;
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
-  }
-
-  .refresh-btn {
-    width: 28px;
-    height: 28px;
+  .query-steps {
     display: flex;
-    align-items: center;
-    justify-content: center;
-    border-radius: var(--radius-sm);
-    color: var(--text-muted);
-    cursor: pointer;
-    transition: background 0.1s, color 0.1s, opacity 0.1s;
+    flex-direction: column;
+    gap: var(--space-3);
+    font-size: var(--font-size-xs);
   }
 
-  .refresh-btn:hover:not(:disabled) {
-    background: var(--bg-surface-hover);
-    color: var(--text-primary);
-  }
-
-  .refresh-btn:disabled {
-    cursor: default;
-    opacity: 0.75;
-  }
-
-  .refresh-btn.querying :global(svg) {
-    animation: spin 0.8s linear infinite;
-  }
-
-  .refresh-status {
-    min-height: 24px;
+  .query-steps__head {
     display: flex;
-    align-items: center;
-    gap: 8px;
+    justify-content: space-between;
+    gap: var(--space-5);
+  }
+
+  .query-steps__at {
     color: var(--text-muted);
-    font-size: 11px;
+  }
+
+  .query-steps__total {
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* Devtools-style timeline: name, a track on the shared time axis, duration. */
+  /* Rows touch (no row gap) and each track stretches to the full row height,
+   * so the per-row gridlines join into one continuous line per tick. Row
+   * rhythm comes from the text cells' padding instead. */
+  .query-steps__list {
+    display: grid;
+    grid-template-columns: max-content 200px max-content; /* track = TRACK_PX */
+    column-gap: var(--space-4);
+    align-items: center;
+  }
+
+  .query-steps__name,
+  .query-steps__duration {
+    padding: 2px 0;
+  }
+
+  .query-steps__name {
+    color: var(--text-secondary);
+  }
+
+  .query-steps__axis {
+    position: relative;
+    height: 1.4em;
+    color: var(--text-muted);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .query-steps__tick {
+    position: absolute;
+    bottom: 0;
     white-space: nowrap;
   }
 
-  @keyframes spin {
-    from {
-      transform: rotate(0deg);
-    }
-    to {
-      transform: rotate(360deg);
-    }
+  .query-steps__track {
+    position: relative;
+    align-self: stretch;
+  }
+
+  /* Centred on the tick position, so a bar starting at zero begins at the
+   * middle of the zero line instead of hiding it. */
+  .query-steps__grid {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 2px;
+    transform: translateX(-50%);
+    background: var(--border-muted);
+  }
+
+  .query-steps__bar {
+    position: absolute;
+    top: calc(50% - 4px);
+    height: 8px;
+    min-width: 1px;
+  }
+
+  /* Square ends: a rounded start would sit visibly right of the zero line. */
+  .query-steps__bar--wait {
+    background: var(--accent-blue);
+  }
+
+  .query-steps__bar--download {
+    background: color-mix(in srgb, var(--accent-blue) 45%, transparent);
+  }
+
+  .query-steps__bar--apply {
+    background: color-mix(in srgb, var(--text-muted) 60%, transparent);
+  }
+
+  .query-steps__duration {
+    text-align: end;
+    font-variant-numeric: tabular-nums;
+    color: var(--text-primary);
+  }
+
+  .query-steps__legend {
+    display: flex;
+    gap: var(--space-4);
+    color: var(--text-muted);
+  }
+
+  .query-steps__legend-item {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--space-2);
+  }
+
+  .query-steps__swatch {
+    width: 10px;
+    height: 8px;
+    border-radius: 2px;
   }
 </style>

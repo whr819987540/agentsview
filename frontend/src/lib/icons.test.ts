@@ -24,6 +24,7 @@ const approvedIconNames = [
   "CloudUploadIcon",
   "CopyIcon",
   "DatabaseBackupIcon",
+  "DatabaseIcon",
   "DownloadIcon",
   "EllipsisIcon",
   "EllipsisVerticalIcon",
@@ -50,6 +51,8 @@ const approvedIconNames = [
   "MoonIcon",
   "MoreHorizontalIcon",
   "MousePointer2Icon",
+  "PanelLeftCloseIcon",
+  "PanelLeftOpenIcon",
   "PencilIcon",
   "PinIcon",
   "PlusIcon",
@@ -64,6 +67,7 @@ const approvedIconNames = [
   "UploadIcon",
   "UserRoundIcon",
   "UsersRoundIcon",
+  "WholeWordIcon",
   "XIcon",
 ] as const;
 

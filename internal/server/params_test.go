@@ -70,6 +70,70 @@ func TestParseIntParam(t *testing.T) {
 	}
 }
 
+func TestParseBoolParam(t *testing.T) {
+	tests := []struct {
+		name       string
+		query      string
+		wantVal    bool
+		wantOK     bool
+		wantStatus int
+	}{
+		{
+			name:       "absent",
+			query:      "",
+			wantVal:    false,
+			wantOK:     true,
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:       "true",
+			query:      "dry_run=true",
+			wantVal:    true,
+			wantOK:     true,
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:       "false",
+			query:      "dry_run=false",
+			wantVal:    false,
+			wantOK:     true,
+			wantStatus: http.StatusOK,
+		},
+		{
+			name:       "one rejected",
+			query:      "dry_run=1",
+			wantVal:    false,
+			wantOK:     false,
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "yes rejected",
+			query:      "dry_run=yes",
+			wantVal:    false,
+			wantOK:     false,
+			wantStatus: http.StatusBadRequest,
+		},
+		{
+			name:       "uppercase rejected",
+			query:      "dry_run=TRUE",
+			wantVal:    false,
+			wantOK:     false,
+			wantStatus: http.StatusBadRequest,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			w, r := newTestRequest(t, tt.query)
+
+			val, ok := parseBoolParam(w, r, "dry_run")
+			assert.Equal(t, tt.wantOK, ok)
+			assert.Equal(t, tt.wantVal, val)
+			assert.Equal(t, tt.wantStatus, w.Code)
+		})
+	}
+}
+
 // TestParseNonNegativeIntParam pins the cursor-validation contract:
 // negative integers, which would flow through to SQL OFFSET and 500
 // on PostgreSQL, must be rejected with a 400 at the handler.
@@ -129,7 +193,7 @@ func TestParseNonNegativeIntParam(t *testing.T) {
 }
 
 func TestClampLimit(t *testing.T) {
-	const max = 1000
+	const maximum = 1000
 	const defaultLimit = 100
 	tests := []struct {
 		name  string
@@ -139,14 +203,14 @@ func TestClampLimit(t *testing.T) {
 		{"zero uses default", 0, defaultLimit},
 		{"negative uses default", -1, defaultLimit},
 		{"within range", defaultLimit / 2, defaultLimit / 2},
-		{"at max", max, max},
-		{"exceeds max", max + 1, max},
+		{"at max", maximum, maximum},
+		{"exceeds max", maximum + 1, maximum},
 		{"default itself", defaultLimit, defaultLimit},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			assert.Equal(t, tt.want, clampLimit(tt.limit, defaultLimit, max))
+			assert.Equal(t, tt.want, clampLimit(tt.limit, defaultLimit, maximum))
 		})
 	}
 }

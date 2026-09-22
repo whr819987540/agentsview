@@ -3,88 +3,114 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
+	"slices"
+	"strings"
 	"time"
 
+	"github.com/danielgtaylor/huma/v2"
+
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/money"
 	"go.kenn.io/agentsview/internal/service"
 )
 
 func (s *Server) registerUsageRoutes() {
-	group := newRouteGroup(s.api, "/api/v1/usage", "Usage")
+	group := huma.NewGroup(s.api, "/api/v1/usage")
+	configureRouteGroup(group, "Usage")
 
-	get(s, group, "/summary", "Get usage summary", s.humaUsageSummary)
-	get(s, group, "/comparison", "Get usage comparison", s.humaUsageComparison)
-	get(
-		s, group, "/pairwise-comparison",
+	// A cold report builds the requested usage data before returning exact
+	// totals. Its lifetime is the request context, not the normal write limit.
+	s.getLong(group, "/summary", "Get usage summary", s.humaUsageSummary)
+	s.stream(group, http.MethodGet, "/summary/stream", "Get usage summary with progress", s.humaUsageSummaryStream)
+	s.getLong(group, "/comparison", "Get usage comparison", s.humaUsageComparison)
+	s.getLong(group, "/pairwise-comparison",
 		"Get usage pairwise comparison", s.humaUsagePairwiseComparison,
 	)
-	get(s, group, "/top-sessions", "Get top usage sessions", s.humaUsageTopSessions)
+	deltaSchema := s.api.OpenAPI().Components.Schemas.Map()["ServiceUsagePairwiseComparisonDelta"]
+	if deltaSchema == nil {
+		panic("pairwise comparison delta OpenAPI schema is missing")
+	}
+	costPerSessionSchema := deltaSchema.Properties["costPerSessionDelta"]
+	if costPerSessionSchema == nil || costPerSessionSchema.Ref == "" {
+		panic("costPerSessionDelta OpenAPI reference is missing")
+	}
+	costPerSessionSchema.AnyOf = []*huma.Schema{
+		{Ref: costPerSessionSchema.Ref},
+		{Type: "null"},
+	}
+	costPerSessionSchema.Ref = ""
+	s.getLong(group, "/top-sessions", "Get top usage sessions", s.humaUsageTopSessions)
 }
 
 type UsageFilterInput struct {
-	From             string `query:"from" format:"date" doc:"Range start date"`
-	To               string `query:"to" format:"date" doc:"Range end date"`
-	Timezone         string `query:"timezone" doc:"IANA timezone name"`
-	Agent            string `query:"agent" doc:"Filter by agent"`
-	Project          string `query:"project" doc:"Filter by project"`
-	Machine          string `query:"machine" doc:"Filter by machine"`
-	GitBranch        string `query:"git_branch" doc:"Filter by git branch; opaque (project, branch) tokens from the /branches endpoint"`
-	ExcludeProject   string `query:"exclude_project" doc:"Exclude a project"`
-	ExcludeAgent     string `query:"exclude_agent" doc:"Exclude an agent"`
-	ExcludeModel     string `query:"exclude_model" doc:"Exclude a model"`
-	Model            string `query:"model" doc:"Filter by model"`
-	MinUserMessages  int    `query:"min_user_messages" minimum:"0" doc:"Minimum user message count"`
-	ActiveSince      string `query:"active_since" format:"date-time" doc:"Filter sessions active since this RFC3339 timestamp"`
-	Termination      string `query:"termination" doc:"Filter by termination status"`
-	IncludeOneShot   bool   `query:"include_one_shot" default:"true" doc:"Include one-shot sessions"`
-	IncludeAutomated bool   `query:"include_automated" doc:"Include automated sessions"`
-	NoDefaultRange   bool   `query:"no_default_range" doc:"Preserve omitted from/to without applying default range"`
-	Breakdowns       bool   `query:"breakdowns" default:"true" doc:"Include per-model, per-project, and per-agent breakdowns"`
-	SessionCounts    bool   `query:"session_counts" default:"true" doc:"Include distinct session counts"`
+	From              string `query:"from" format:"date" doc:"Range start date"`
+	To                string `query:"to" format:"date" doc:"Range end date"`
+	Timezone          string `query:"timezone" doc:"IANA timezone name"`
+	Agent             string `query:"agent" doc:"Filter by agent"`
+	Project           string `query:"project" doc:"Filter by project"`
+	Machine           string `query:"machine" doc:"Filter by machine"`
+	GitBranch         string `query:"git_branch" doc:"Filter by git branch; opaque (project, branch) tokens from the /branches endpoint"`
+	ExcludeProject    string `query:"exclude_project" doc:"Exclude a project"`
+	ExcludeProjectKey string `query:"exclude_project_key" doc:"Exclude an opaque project key"`
+	ExcludeAgent      string `query:"exclude_agent" doc:"Exclude an agent"`
+	ExcludeModel      string `query:"exclude_model" doc:"Exclude a model"`
+	Model             string `query:"model" doc:"Filter by model"`
+	MinUserMessages   int    `query:"min_user_messages" minimum:"0" doc:"Minimum user message count"`
+	ActiveSince       string `query:"active_since" format:"date-time" doc:"Filter sessions active since this RFC3339 timestamp"`
+	Termination       string `query:"termination" doc:"Filter by termination status"`
+	IncludeOneShot    bool   `query:"include_one_shot" default:"true" doc:"Include one-shot sessions"`
+	IncludeAutomated  bool   `query:"include_automated" doc:"Include automated sessions"`
+	NoDefaultRange    bool   `query:"no_default_range" doc:"Preserve omitted from/to without applying default range"`
+	Breakdowns        bool   `query:"breakdowns" default:"true" doc:"Include per-model, per-project, and per-agent breakdowns"`
+	SessionCounts     bool   `query:"session_counts" default:"true" doc:"Include distinct session counts"`
 }
 
 type usageTopSessionsInput struct {
 	UsageFilterInput
-	Limit int `query:"limit" minimum:"0" maximum:"100" default:"20" doc:"Maximum number of sessions"`
+	Limit      int    `query:"limit" minimum:"0" maximum:"100" default:"20" doc:"Maximum number of sessions"`
+	Sort       string `query:"sort" enum:"cost,tokens" default:"cost" doc:"Rank sessions by cost or selected token types"`
+	TokenTypes string `query:"token_types" doc:"Comma-separated token counters for token ranking: input, cache_write, cache_read, output"`
 }
 
 type usageComparisonInput struct {
 	UsageFilterInput
-	CurrentCost float64 `query:"current_cost" required:"true" doc:"Current period total cost"`
+	CurrentMicrodollars int64 `query:"current_microdollars" required:"true" minimum:"0" doc:"Current period total cost in microdollars"`
 }
 
 type usagePairwiseComparisonInput struct {
 	UsageFilterInput
 	LeftDimension  string `query:"left_dimension" required:"true" doc:"Left-side comparison dimension"`
-	LeftValue      string `query:"left_value" required:"true" doc:"Left-side comparison value"`
+	LeftValue      string `query:"left_value" required:"true" doc:"Left-side comparison value; opaque project key for the project dimension"`
 	RightDimension string `query:"right_dimension" required:"true" doc:"Right-side comparison dimension"`
-	RightValue     string `query:"right_value" required:"true" doc:"Right-side comparison value"`
+	RightValue     string `query:"right_value" required:"true" doc:"Right-side comparison value; opaque project key for the project dimension"`
 }
 
 // usageRequestFromInput maps the HTTP query-param struct to the
 // transport-neutral service.UsageRequest.
 func usageRequestFromInput(in UsageFilterInput) service.UsageRequest {
 	return service.UsageRequest{
-		From:             in.From,
-		To:               in.To,
-		Timezone:         in.Timezone,
-		Agent:            in.Agent,
-		Project:          in.Project,
-		Machine:          in.Machine,
-		GitBranch:        in.GitBranch,
-		ExcludeProject:   in.ExcludeProject,
-		ExcludeAgent:     in.ExcludeAgent,
-		ExcludeModel:     in.ExcludeModel,
-		Model:            in.Model,
-		MinUserMessages:  in.MinUserMessages,
-		ActiveSince:      in.ActiveSince,
-		Termination:      in.Termination,
-		IncludeOneShot:   in.IncludeOneShot,
-		IncludeAutomated: in.IncludeAutomated,
-		NoDefaultRange:   in.NoDefaultRange,
-		Breakdowns:       &in.Breakdowns,
-		SessionCounts:    &in.SessionCounts,
+		From:              in.From,
+		To:                in.To,
+		Timezone:          in.Timezone,
+		Agent:             in.Agent,
+		Project:           in.Project,
+		Machine:           in.Machine,
+		GitBranch:         in.GitBranch,
+		ExcludeProject:    in.ExcludeProject,
+		ExcludeProjectKey: in.ExcludeProjectKey,
+		ExcludeAgent:      in.ExcludeAgent,
+		ExcludeModel:      in.ExcludeModel,
+		Model:             in.Model,
+		MinUserMessages:   in.MinUserMessages,
+		ActiveSince:       in.ActiveSince,
+		Termination:       in.Termination,
+		IncludeOneShot:    in.IncludeOneShot,
+		IncludeAutomated:  in.IncludeAutomated,
+		NoDefaultRange:    in.NoDefaultRange,
+		Breakdowns:        &in.Breakdowns,
+		SessionCounts:     &in.SessionCounts,
 	}
 }
 
@@ -113,16 +139,28 @@ func usagePairwiseRequestFromInput(
 // usageFilterFromInput validates and builds a db.UsageFilter via the
 // shared service validator (the single source of truth, also used by the
 // usage-summary seam method), mapping a validation failure to HTTP 400.
-func usageFilterFromInput(in UsageFilterInput) (db.UsageFilter, error) {
-	f, err := service.BuildUsageFilter(usageRequestFromInput(in))
+func (s *Server) usageFilterFromInput(
+	ctx context.Context, in UsageFilterInput,
+) (db.UsageFilter, error) {
+	machine, err := db.ResolveMachineFilter(ctx, s.db, in.Machine)
 	if err != nil {
-		var ue *service.UsageInputError
-		if errors.As(err, &ue) {
-			return db.UsageFilter{}, apiError(http.StatusBadRequest, ue.Msg)
-		}
-		return db.UsageFilter{}, err
+		return db.UsageFilter{}, serverError(err)
 	}
-	return f, nil
+	in.Machine = machine
+	req, err := service.ResolveUsageProjectKeys(
+		ctx, s.db, usageRequestFromInput(in),
+	)
+	if err == nil {
+		var f db.UsageFilter
+		f, err = service.BuildUsageFilter(req)
+		if err == nil {
+			return f, nil
+		}
+	}
+	if ue, ok := errors.AsType[*service.UsageInputError](err); ok {
+		return db.UsageFilter{}, usageInputAPIError(ue)
+	}
+	return db.UsageFilter{}, err
 }
 
 func (s *Server) humaUsageSummary(
@@ -131,28 +169,65 @@ func (s *Server) humaUsageSummary(
 ) (*jsonOutput[UsageSummaryResponse], error) {
 	res, err := s.sessions.UsageSummary(ctx, usageRequestFromInput(*in))
 	if err != nil {
-		var ue *service.UsageInputError
-		if errors.As(err, &ue) {
-			return nil, apiError(http.StatusBadRequest, ue.Msg)
-		}
-		if handled := handleHumaContextError(err); handled != nil {
-			return nil, handled
-		}
-		if handled := handleHumaReadOnly(err); handled != nil {
-			return nil, handled
-		}
-		return nil, internalError("usage summary error", err)
+		return nil, usageSummaryAPIError(err)
 	}
 	return &jsonOutput[UsageSummaryResponse]{
 		Body: usageSummaryResponseFromService(res),
 	}, nil
 }
 
+func usageSummaryAPIError(err error) error {
+	if ue, ok := errors.AsType[*service.UsageInputError](err); ok {
+		return usageInputAPIError(ue)
+	}
+	if handled := handleHumaContextError(err); handled != nil {
+		return handled
+	}
+	if handled := handleHumaReadOnly(err); handled != nil {
+		return handled
+	}
+	return internalError("usage summary error", err)
+}
+
+func (s *Server) humaUsageSummaryStream(
+	ctx context.Context, in *UsageFilterInput,
+) (*huma.StreamResponse, error) {
+	req := usageRequestFromInput(*in)
+	if _, err := service.BuildUsageFilter(req); err != nil {
+		if input, ok := errors.AsType[*service.UsageInputError](err); ok {
+			return nil, usageInputAPIError(input)
+		}
+		return nil, serverError(err)
+	}
+	return &huma.StreamResponse{Body: func(hctx huma.Context) {
+		stream, ok := newHumaSSEStream(hctx)
+		if !ok {
+			return
+		}
+		ctx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		req.Progress = func(phase string) {
+			if !stream.SendJSON("progress", map[string]string{"detail": phase}) {
+				cancel()
+			}
+		}
+		req.Progress("Preparing usage report from the archive")
+		summary, err := s.sessions.UsageSummary(ctx, req)
+		if err != nil {
+			if err := usageSummaryAPIError(err); err != nil {
+				stream.SendJSON("error", map[string]string{"error": err.Error()})
+			}
+			return
+		}
+		stream.SendJSON("done", usageSummaryResponseFromService(summary))
+	}}, nil
+}
+
 func (s *Server) humaUsageComparison(
 	ctx context.Context,
 	in *usageComparisonInput,
 ) (*jsonOutput[Comparison], error) {
-	f, err := usageFilterFromInput(in.UsageFilterInput)
+	f, err := s.usageFilterFromInput(ctx, in.UsageFilterInput)
 	if err != nil {
 		return nil, err
 	}
@@ -162,7 +237,9 @@ func (s *Server) humaUsageComparison(
 			"usage comparison requires from and to when no_default_range is true",
 		)
 	}
-	comparison, err := s.computeUsageComparison(ctx, f, in.CurrentCost)
+	comparison, err := s.computeUsageComparison(ctx, f, money.Money{
+		Microdollars: in.CurrentMicrodollars,
+	})
 	if err != nil {
 		if handled := handleHumaContextError(err); handled != nil {
 			return nil, handled
@@ -181,17 +258,15 @@ func (s *Server) humaUsagePairwiseComparison(
 ) (*jsonOutput[service.UsagePairwiseComparisonResponse], error) {
 	req, err := usagePairwiseRequestFromInput(*in)
 	if err != nil {
-		var ue *service.UsageInputError
-		if errors.As(err, &ue) {
-			return nil, apiError(http.StatusBadRequest, ue.Msg)
+		if ue, ok := errors.AsType[*service.UsageInputError](err); ok {
+			return nil, usageInputAPIError(ue)
 		}
 		return nil, err
 	}
 	comparison, err := s.sessions.UsagePairwiseComparison(ctx, req)
 	if err != nil {
-		var ue *service.UsageInputError
-		if errors.As(err, &ue) {
-			return nil, apiError(http.StatusBadRequest, ue.Msg)
+		if ue, ok := errors.AsType[*service.UsageInputError](err); ok {
+			return nil, usageInputAPIError(ue)
 		}
 		if handled := handleHumaContextError(err); handled != nil {
 			return nil, handled
@@ -206,10 +281,17 @@ func (s *Server) humaUsagePairwiseComparison(
 	}, nil
 }
 
+func usageInputAPIError(err *service.UsageInputError) error {
+	if err.Code != "" {
+		return apiErrorWithCode(http.StatusBadRequest, err.Code, err.Msg)
+	}
+	return apiError(http.StatusBadRequest, err.Msg)
+}
+
 func (s *Server) computeUsageComparison(
 	ctx context.Context,
 	f db.UsageFilter,
-	currentCost float64,
+	currentCost money.Money,
 ) (*Comparison, error) {
 	fromT, err := time.Parse("2006-01-02", f.From)
 	if err != nil {
@@ -222,25 +304,12 @@ func (s *Server) computeUsageComparison(
 	days := int(toT.Sub(fromT).Hours()/24) + 1
 	priorTo := fromT.AddDate(0, 0, -1)
 	priorFrom := priorTo.AddDate(0, 0, -(days - 1))
-	priorFilter := db.UsageFilter{
-		From:             priorFrom.Format("2006-01-02"),
-		To:               priorTo.Format("2006-01-02"),
-		Agent:            f.Agent,
-		Project:          f.Project,
-		Machine:          f.Machine,
-		GitBranch:        f.GitBranch,
-		Model:            f.Model,
-		ExcludeProject:   f.ExcludeProject,
-		ExcludeAgent:     f.ExcludeAgent,
-		ExcludeModel:     f.ExcludeModel,
-		Timezone:         f.Timezone,
-		MinUserMessages:  f.MinUserMessages,
-		ExcludeOneShot:   f.ExcludeOneShot,
-		ExcludeAutomated: f.ExcludeAutomated,
-		ActiveSince:      f.ActiveSince,
-		Termination:      f.Termination,
-		Breakdowns:       false,
-	}
+	priorFilter := f
+	priorFilter.From = priorFrom.Format("2006-01-02")
+	priorFilter.To = priorTo.Format("2006-01-02")
+	priorFilter.ProjectLabels = slices.Clone(f.ProjectLabels)
+	priorFilter.ExcludeProjectLabels = slices.Clone(f.ExcludeProjectLabels)
+	priorFilter.Breakdowns = false
 	priorResult, err := s.db.GetDailyUsage(ctx, priorFilter)
 	if err != nil {
 		return nil, err
@@ -250,8 +319,13 @@ func (s *Server) computeUsageComparison(
 		PriorTo:        priorFilter.To,
 		PriorTotalCost: priorResult.Totals.TotalCost,
 	}
-	if c.PriorTotalCost > 0 {
-		c.DeltaPct = (currentCost - c.PriorTotalCost) / c.PriorTotalCost
+	if c.PriorTotalCost.Microdollars > 0 {
+		delta, err := money.Sub(currentCost, c.PriorTotalCost)
+		if err != nil {
+			return nil, fmt.Errorf("computing usage comparison delta: %w", err)
+		}
+		c.DeltaPct = float64(delta.Microdollars) /
+			float64(c.PriorTotalCost.Microdollars)
 	}
 	return c, nil
 }
@@ -260,11 +334,25 @@ func (s *Server) humaUsageTopSessions(
 	ctx context.Context,
 	in *usageTopSessionsInput,
 ) (*jsonOutput[[]db.TopSessionEntry], error) {
-	f, err := usageFilterFromInput(in.UsageFilterInput)
+	f, err := s.usageFilterFromInput(ctx, in.UsageFilterInput)
 	if err != nil {
 		return nil, err
 	}
 	f.Breakdowns = false
+	switch strings.ToLower(strings.TrimSpace(in.Sort)) {
+	case "", db.TopSessionsSortCost:
+		f.TopSessionsSort = db.TopSessionsSortCost
+	case db.TopSessionsSortTokens:
+		f.TopSessionsSort = db.TopSessionsSortTokens
+	default:
+		return nil, huma.Error400BadRequest("sort must be cost or tokens")
+	}
+	f.TopSessionsTokenTypes, err = db.ParseUsageTokenTypes(in.TokenTypes)
+	if err != nil {
+		return nil, huma.Error400BadRequest(
+			"invalid token_types: " + err.Error(),
+		)
+	}
 	limit := in.Limit
 	if limit <= 0 {
 		limit = 20

@@ -1,7 +1,6 @@
 package parser
 
 import (
-	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -52,6 +51,18 @@ func parseKimiSessionForTest(
 	return parseKimiSession(path, project, machine)
 }
 
+func kimiConfigUpdateCwdLine(t *testing.T) string {
+	t.Helper()
+	raw, err := os.ReadFile("testdata/kimi-config-update-cwd.jsonl")
+	require.NoError(t, err)
+	line := strings.TrimSpace(string(raw))
+	require.Equal(t,
+		`{"type":"config.update","cwd":"/Users/helix/Code/mcp-hub","modelAlias":"kimi-code/kimi-for-coding"}`,
+		line,
+	)
+	return line
+}
+
 func TestParseKimiSession_Basic(t *testing.T) {
 	path := writeKimiWireJSONL(t,
 		"abc123", "sess-uuid-1234",
@@ -82,7 +93,7 @@ func TestParseKimiSession_Basic(t *testing.T) {
 	wantEnd := time.Unix(1704067202, 0)
 	assertTimestamp(t, sess.EndedAt, wantEnd)
 
-	require.Equal(t, 2, len(msgs))
+	require.Len(t, msgs, 2)
 	assertMessage(t, msgs[0], RoleUser, "Hello Kimi")
 	assertMessage(t, msgs[1], RoleAssistant, "Hi there!")
 	assert.Equal(t, 0, msgs[0].Ordinal)
@@ -111,7 +122,7 @@ func TestParseKimiSession_ThinkingAndToolUse(t *testing.T) {
 	assert.Equal(t, "Read the file", sess.FirstMessage)
 
 	// user, assistant(thinking+tool), tool_result(user), assistant(text)
-	require.Equal(t, 4, len(msgs))
+	require.Len(t, msgs, 4)
 
 	// First message: user
 	assert.Equal(t, RoleUser, msgs[0].Role)
@@ -123,14 +134,14 @@ func TestParseKimiSession_ThinkingAndToolUse(t *testing.T) {
 	assert.Contains(t, msgs[1].Content, "[Thinking]")
 	assert.Contains(t, msgs[1].Content, "Let me plan.")
 	assert.Contains(t, msgs[1].Content, "[Glob:")
-	require.Equal(t, 1, len(msgs[1].ToolCalls))
+	require.Len(t, msgs[1].ToolCalls, 1)
 	assert.Equal(t, "Glob", msgs[1].ToolCalls[0].ToolName)
 	assert.Equal(t, "Glob", msgs[1].ToolCalls[0].Category)
 	assert.Equal(t, "tool_1", msgs[1].ToolCalls[0].ToolUseID)
 
 	// Third: tool result (user role)
 	assert.Equal(t, RoleUser, msgs[2].Role)
-	require.Equal(t, 1, len(msgs[2].ToolResults))
+	require.Len(t, msgs[2].ToolResults, 1)
 	assert.Equal(t, "tool_1", msgs[2].ToolResults[0].ToolUseID)
 	assert.Equal(t, "main.go\nutil.go",
 		DecodeContent(msgs[2].ToolResults[0].ContentRaw))
@@ -175,7 +186,7 @@ func TestParseKimiSession_ErrorToolResult(t *testing.T) {
 	require.NotNil(t, sess)
 
 	// user, assistant(tool call), tool_result(error)
-	require.Equal(t, 3, len(msgs))
+	require.Len(t, msgs, 3)
 	assert.Equal(t, "[error]",
 		DecodeContent(msgs[2].ToolResults[0].ContentRaw))
 }
@@ -200,8 +211,8 @@ func TestParseKimiSession_ArrayToolResult(t *testing.T) {
 	require.NotNil(t, sess)
 
 	// user, assistant(tool call), tool_result(array output), assistant(text)
-	require.Equal(t, 4, len(msgs))
-	require.Equal(t, 1, len(msgs[2].ToolResults))
+	require.Len(t, msgs, 4)
+	require.Len(t, msgs[2].ToolResults, 1)
 	assert.Equal(t, "line one\nline two",
 		DecodeContent(msgs[2].ToolResults[0].ContentRaw))
 	assert.Equal(t, len("line one\nline two"),
@@ -280,7 +291,7 @@ func TestParseKimiSession_SessionLevelTokensEmitUsageEvent(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, sess)
 
-	require.Equal(t, 1, len(sess.UsageEvents))
+	require.Len(t, sess.UsageEvents, 1)
 	ev := sess.UsageEvents[0]
 	assert.Equal(t, "kimi:proj-usage:sess-usage", ev.SessionID)
 	assert.Equal(t, "session", ev.Source)
@@ -385,7 +396,7 @@ func TestParseKimiSession_MessageTimestamps(t *testing.T) {
 		path, "testproj", "local",
 	)
 	require.NoError(t, err)
-	require.Equal(t, 4, len(msgs))
+	require.Len(t, msgs, 4)
 
 	// User message gets timestamp from TurnBegin record.
 	assertTimestamp(t, msgs[0].Timestamp,
@@ -426,7 +437,7 @@ func TestParseKimiSession_EmptyFragmentTimestamp(t *testing.T) {
 			path, "testproj", "local",
 		)
 		require.NoError(t, err)
-		require.Equal(t, 3, len(msgs))
+		require.Len(t, msgs, 3)
 		assertTimestamp(t, msgs[2].Timestamp,
 			time.Unix(1704067211, 0))
 	})
@@ -450,7 +461,7 @@ func TestParseKimiSession_EmptyFragmentTimestamp(t *testing.T) {
 			path, "testproj", "local",
 		)
 		require.NoError(t, err)
-		require.Equal(t, 2, len(msgs))
+		require.Len(t, msgs, 2)
 		assertTimestamp(t, msgs[1].Timestamp,
 			time.Unix(1704067205, 0))
 	})
@@ -480,7 +491,7 @@ func TestParseKimiSession_FirstMessageTruncation(t *testing.T) {
 	)
 	require.NoError(t, err)
 	require.NotNil(t, sess)
-	assert.Equal(t, 303, len(sess.FirstMessage))
+	assert.Len(t, sess.FirstMessage, 303)
 }
 
 func TestDiscoverKimiSessions(t *testing.T) {
@@ -503,7 +514,7 @@ func TestDiscoverKimiSessions(t *testing.T) {
 
 	provider, ok := NewProvider(AgentKimi, ProviderConfig{Roots: []string{dir}})
 	require.True(t, ok)
-	sources, err := provider.Discover(context.Background())
+	sources, err := provider.Discover(t.Context())
 	require.NoError(t, err)
 	require.Len(t, sources, 2)
 	assert.Equal(t, []string{
@@ -518,7 +529,7 @@ func TestDiscoverKimiSessions_Empty(t *testing.T) {
 		Roots: []string{"", "/nonexistent"},
 	})
 	require.True(t, ok)
-	sources, err := provider.Discover(context.Background())
+	sources, err := provider.Discover(t.Context())
 	require.NoError(t, err)
 	assert.Empty(t, sources)
 }
@@ -536,7 +547,7 @@ func TestFindKimiSourceFile(t *testing.T) {
 
 	provider, ok := NewProvider(AgentKimi, ProviderConfig{Roots: []string{dir}})
 	require.True(t, ok)
-	found, ok, err := provider.FindSource(context.Background(), FindSourceRequest{
+	found, ok, err := provider.FindSource(t.Context(), FindSourceRequest{
 		RawSessionID: "abc123:uuid-1",
 	})
 	require.NoError(t, err)
@@ -544,7 +555,7 @@ func TestFindKimiSourceFile(t *testing.T) {
 	assert.Equal(t, wirePath, found.DisplayPath)
 
 	for _, rawID := range []string{"abc123:nonexistent", "invalid"} {
-		_, ok, err := provider.FindSource(context.Background(), FindSourceRequest{
+		_, ok, err := provider.FindSource(t.Context(), FindSourceRequest{
 			RawSessionID: rawID,
 		})
 		require.NoError(t, err)
@@ -552,7 +563,7 @@ func TestFindKimiSourceFile(t *testing.T) {
 	}
 	emptyProvider, ok := NewProvider(AgentKimi, ProviderConfig{})
 	require.True(t, ok)
-	_, ok, err = emptyProvider.FindSource(context.Background(), FindSourceRequest{
+	_, ok, err = emptyProvider.FindSource(t.Context(), FindSourceRequest{
 		RawSessionID: "abc123:uuid-1",
 	})
 	require.NoError(t, err)
@@ -573,7 +584,7 @@ func TestDiscoverKimiSessions_NewLayout(t *testing.T) {
 
 	provider, ok := NewProvider(AgentKimi, ProviderConfig{Roots: []string{dir}})
 	require.True(t, ok)
-	sources, err := provider.Discover(context.Background())
+	sources, err := provider.Discover(t.Context())
 	require.NoError(t, err)
 	require.Len(t, sources, 1)
 	assert.Equal(t, wirePath, sources[0].DisplayPath)
@@ -595,7 +606,7 @@ func TestDiscoverKimiSessions_NewLayout_NonMainAgent(t *testing.T) {
 
 	provider, ok := NewProvider(AgentKimi, ProviderConfig{Roots: []string{dir}})
 	require.True(t, ok)
-	sources, err := provider.Discover(context.Background())
+	sources, err := provider.Discover(t.Context())
 	require.NoError(t, err)
 	require.Len(t, sources, 1)
 	assert.Equal(t, wirePath, sources[0].DisplayPath)
@@ -616,7 +627,7 @@ func TestFindKimiSourceFile_NewLayout(t *testing.T) {
 	provider, ok := NewProvider(AgentKimi, ProviderConfig{Roots: []string{dir}})
 	require.True(t, ok)
 	rawID := workdirDir + ":main:" + sessionDir
-	found, ok, err := provider.FindSource(context.Background(), FindSourceRequest{
+	found, ok, err := provider.FindSource(t.Context(), FindSourceRequest{
 		RawSessionID: rawID,
 	})
 	require.NoError(t, err)
@@ -627,7 +638,7 @@ func TestFindKimiSourceFile_NewLayout(t *testing.T) {
 		workdirDir + ":main:nonexistent",
 		workdirDir + ":" + sessionDir,
 	} {
-		_, ok, err := provider.FindSource(context.Background(), FindSourceRequest{
+		_, ok, err := provider.FindSource(t.Context(), FindSourceRequest{
 			RawSessionID: rawID,
 		})
 		require.NoError(t, err)
@@ -656,7 +667,7 @@ func TestParseKimiSession_NewLayoutSessionID(t *testing.T) {
 	)
 	assert.Equal(t, "Hello Kimi Code", sess.FirstMessage)
 	assertMessageCount(t, sess.MessageCount, 2)
-	require.Equal(t, 2, len(msgs))
+	require.Len(t, msgs, 2)
 	assertMessage(t, msgs[0], RoleUser, "Hello Kimi Code")
 	assertMessage(t, msgs[1], RoleAssistant, "Hi there!")
 }
@@ -705,17 +716,66 @@ func TestParseKimiSession_NativeKimiCodeEvents(t *testing.T) {
 	assert.Contains(t, msgs[1].Content,
 		"Hello! How can I help you today?")
 	assert.Equal(t, "kimi-code/kimi-for-coding", msgs[1].Model)
+	assert.Empty(t, sess.Cwd)
 	assert.Equal(t, "end_turn", msgs[1].StopReason)
 	assert.True(t, msgs[1].HasOutputTokens)
 	assert.True(t, msgs[1].HasContextTokens)
 	assert.Equal(t, 37, msgs[1].OutputTokens)
 	assert.Equal(t, 16190, msgs[1].ContextTokens)
-	assert.JSONEq(t,
-		`{"input_tokens":1598,"output_tokens":37,"cache_read_input_tokens":14592,"cache_creation_input_tokens":0}`,
+	assert.JSONEq(t, `{"input_tokens":1598,"output_tokens":37,"cache_read_input_tokens":14592,"cache_creation_input_tokens":0}`,
 		string(msgs[1].TokenUsage),
 	)
 	assertTimestamp(t, msgs[1].Timestamp,
 		time.UnixMilli(1782012668557))
+}
+
+func TestParseKimiSession_ConfigUpdateCwd(t *testing.T) {
+	cwdLine := kimiConfigUpdateCwdLine(t)
+	tests := []struct {
+		name  string
+		lines []string
+		want  string
+	}{
+		{
+			name:  "present",
+			lines: []string{cwdLine},
+			want:  "/Users/helix/Code/mcp-hub",
+		},
+		{
+			name:  "absent",
+			lines: []string{`{"type":"config.update","modelAlias":"kimi-code/kimi-for-coding"}`},
+		},
+		{
+			name:  "empty",
+			lines: []string{`{"type":"config.update","cwd":"","modelAlias":"kimi-code/kimi-for-coding"}`},
+		},
+		{
+			name: "last non-empty value wins",
+			lines: []string{
+				cwdLine,
+				`{"type":"config.update","cwd":"/Users/helix/Code/other"}`,
+				`{"type":"config.update","cwd":""}`,
+				`{"type":"config.update","modelAlias":"kimi-code/kimi-for-coding"}`,
+			},
+			want: "/Users/helix/Code/other",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := writeKimiCodeWireJSONL(t,
+				"wd_myproject_a1b2c3d4", "session-cwd", "main",
+				append(tt.lines,
+					`{"type":"turn.prompt","input":[{"type":"text","text":"hello"}]}`,
+				),
+			)
+			sess, msgs, err := parseKimiSessionForTest(t, path, "myproject", "local")
+			require.NoError(t, err)
+			require.NotNil(t, sess)
+			assert.Equal(t, tt.want, sess.Cwd)
+			require.NotEmpty(t, msgs)
+		})
+	}
 }
 
 func TestParseKimiSession_NativeKimiCodeToolCall(t *testing.T) {
@@ -766,6 +826,79 @@ func TestParseKimiSession_NativeKimiCodeToolCall(t *testing.T) {
 	assert.Equal(t, 75, msgs[3].ContextTokens)
 }
 
+func TestParseKimiSession_NativeKimiCodeToolResultsBeforeStepEnd(
+	t *testing.T,
+) {
+	path := writeKimiCodeWireJSONL(t,
+		"wd_myproject_a1b2c3d4", "session_uuid-late-usage", "main",
+		[]string{
+			`{"type":"metadata","protocol_version":"1.4","created_at":1785720000000}`,
+			`{"type":"config.update","modelAlias":"k3-agent","time":1785720000001}`,
+			`{"type":"turn.prompt","input":[{"type":"text","text":"Run tools"}],"time":1785720000002}`,
+			`{"type":"context.append_loop_event","event":{"type":"step.begin","uuid":"step-1"},"time":1785720000003}`,
+			`{"type":"context.append_loop_event","event":{"type":"tool.call","toolCallId":"tool-1","name":"Shell","args":{"command":"first"}},"time":1785720000004}`,
+			`{"type":"context.append_loop_event","event":{"type":"tool.call","toolCallId":"tool-2","name":"Shell","args":{"command":"second"}},"time":1785720000005}`,
+			`{"type":"context.append_loop_event","event":{"type":"tool.result","toolCallId":"tool-1","result":{"output":"one","isError":false}},"time":1785720000006}`,
+			`{"type":"context.append_loop_event","event":{"type":"tool.result","toolCallId":"tool-2","result":{"output":"two","isError":false}},"time":1785720000007}`,
+			`{"type":"context.append_loop_event","event":{"type":"step.end","uuid":"step-1","finishReason":"tool_use","usage":{"inputOther":100,"output":20,"inputCacheRead":300,"inputCacheCreation":4}},"time":1785720000008}`,
+			`{"type":"usage.record","model":"k3-agent","usage":{"inputOther":100,"output":20,"inputCacheRead":300,"inputCacheCreation":4},"usageScope":"turn","time":1785720000008}`,
+		},
+	)
+
+	sess, msgs, err := parseKimiSessionForTest(t, path, "myproject", "local")
+	require.NoError(t, err)
+	require.NotNil(t, sess)
+	require.Len(t, msgs, 4)
+
+	toolStep := msgs[1]
+	require.Equal(t, RoleAssistant, toolStep.Role)
+	require.Len(t, toolStep.ToolCalls, 2)
+	assert.Equal(t, "k3-agent", toolStep.Model)
+	assert.Equal(t, "tool_use", toolStep.StopReason)
+	assert.True(t, toolStep.HasOutputTokens)
+	assert.True(t, toolStep.HasContextTokens)
+	assert.Equal(t, 20, toolStep.OutputTokens)
+	assert.Equal(t, 404, toolStep.ContextTokens)
+	assert.JSONEq(t, `{"input_tokens":100,"output_tokens":20,"cache_read_input_tokens":300,"cache_creation_input_tokens":4}`,
+		string(toolStep.TokenUsage))
+	assert.Equal(t, 20, sess.TotalOutputTokens)
+	assert.Equal(t, 404, sess.PeakContextTokens)
+	assert.Empty(t, sess.UsageEvents,
+		"the following usage.record must not double-count step.end usage")
+}
+
+func TestParseKimiSession_NativeKimiCodeUsageRecordAfterToolResult(
+	t *testing.T,
+) {
+	path := writeKimiCodeWireJSONL(t,
+		"wd_myproject_a1b2c3d4", "session_uuid-usage-fallback", "main",
+		[]string{
+			`{"type":"metadata","protocol_version":"1.4","created_at":1785720000000}`,
+			`{"type":"turn.prompt","input":[{"type":"text","text":"Run a tool"}],"time":1785720000001}`,
+			`{"type":"context.append_loop_event","event":{"type":"step.begin","uuid":"step-1"},"time":1785720000002}`,
+			`{"type":"context.append_loop_event","event":{"type":"tool.call","toolCallId":"tool-1","name":"Shell","args":{}},"time":1785720000003}`,
+			`{"type":"context.append_loop_event","event":{"type":"tool.result","toolCallId":"tool-1","result":{"output":"ok","isError":false}},"time":1785720000004}`,
+			`{"type":"context.append_loop_event","event":{"type":"step.end","uuid":"step-1","finishReason":"tool_use"},"time":1785720000005}`,
+			`{"type":"usage.record","model":"k3-agent","usage":{"inputOther":10,"output":11,"inputCacheRead":12,"inputCacheCreation":13},"usageScope":"turn","time":1785720000005}`,
+		},
+	)
+
+	sess, msgs, err := parseKimiSessionForTest(t, path, "myproject", "local")
+	require.NoError(t, err)
+	require.NotNil(t, sess)
+	require.Len(t, msgs, 3)
+
+	toolStep := msgs[1]
+	assert.Equal(t, "k3-agent", toolStep.Model)
+	assert.Equal(t, "tool_use", toolStep.StopReason)
+	assert.Equal(t, 11, toolStep.OutputTokens)
+	assert.Equal(t, 35, toolStep.ContextTokens)
+	assert.JSONEq(t, `{"input_tokens":10,"output_tokens":11,"cache_read_input_tokens":12,"cache_creation_input_tokens":13}`,
+		string(toolStep.TokenUsage))
+	assert.Equal(t, 11, sess.TotalOutputTokens)
+	assert.Equal(t, 35, sess.PeakContextTokens)
+}
+
 func TestParseKimiSession_NewLayout_AgentZero(t *testing.T) {
 	path := writeKimiCodeWireJSONL(t,
 		"wd_myproject_a1b2c3d4", "session_uuid-5678", "agent-0",
@@ -810,7 +943,7 @@ func TestDiscoverKimiSessions_MixedLayouts(t *testing.T) {
 
 	provider, ok := NewProvider(AgentKimi, ProviderConfig{Roots: []string{dir}})
 	require.True(t, ok)
-	sources, err := provider.Discover(context.Background())
+	sources, err := provider.Discover(t.Context())
 	require.NoError(t, err)
 	require.Len(t, sources, 2)
 	paths := sourceDisplayPaths(sources)
@@ -890,7 +1023,7 @@ func TestDiscoverKimiSessions_NewLayout_RejectsInvalidComponent(t *testing.T) {
 
 	provider, ok := NewProvider(AgentKimi, ProviderConfig{Roots: []string{dir}})
 	require.True(t, ok)
-	sources, err := provider.Discover(context.Background())
+	sources, err := provider.Discover(t.Context())
 	require.NoError(t, err)
 	require.Len(t, sources, 1)
 	assert.Equal(t, goodPath, sources[0].DisplayPath)

@@ -16,9 +16,17 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use tauri::async_runtime::Receiver;
-use tauri::menu::{MenuBuilder, MenuItemBuilder, SubmenuBuilder};
+#[cfg(target_os = "macos")]
+use tauri::menu::{CheckMenuItem, CheckMenuItemBuilder};
+use tauri::menu::{
+    MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder, HELP_SUBMENU_ID,
+    WINDOW_SUBMENU_ID,
+};
 use tauri::plugin::Builder as PluginBuilder;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+use tauri::tray::TrayIconBuilder;
 use tauri::{App, AppHandle, Emitter, Manager, RunEvent, Url, WebviewWindow};
+use tauri_plugin_deep_link::DeepLinkExt;
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 use tauri_plugin_opener::OpenerExt;
 use tauri_plugin_shell::process::{CommandChild, CommandEvent};
@@ -35,12 +43,29 @@ const STATUS_PROBE_TIMEOUT: Duration = Duration::from_millis(1250);
 const STATUS_PROBE_FAILURE_NOTICE_AFTER: u32 = 10;
 const STATUS_PROBE_FAILURE_FAIL_AFTER: u32 = 30;
 const LOGIN_SHELL_ENV_TIMEOUT: Duration = Duration::from_secs(3);
-const UPDATE_SIDECAR_STOP_TIMEOUT: Duration = Duration::from_secs(10);
+// Stopping the detached daemon before an update install must outlast
+// both a daemon that is still mid-startup (serve stop refuses with
+// "retry once it is ready" while the startup sync runs, which takes
+// tens of seconds on large archives) and serve stop's own 10s graceful
+// shutdown window before it escalates to a forced kill.
+const UPDATE_SIDECAR_STOP_TIMEOUT: Duration = Duration::from_secs(120);
+const UPDATE_STOP_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+const SERVE_STOP_STARTING_RETRY_HINT: &str = "a server is starting; retry once it is ready";
 const DATA_VERSION_TOO_NEW_EXIT_CODE: i32 = 3;
 const DESKTOP_LOG_FILE_NAME: &str = "agentsview-desktop.log";
 const DESKTOP_LOG_QUEUE_CAPACITY: usize = 64;
 const STARTUP_OUTPUT_MAX_CHARS: usize = 12_000;
+const DEEP_LINK_SCHEME: &str = "agentsview";
+const DEEP_LINK_SESSIONS_HOST: &str = "sessions";
+const ABOUT_MENU_ID: &str = "about";
+const CHECK_UPDATES_MENU_ID: &str = "check_updates";
 const OPEN_LOGS_FOLDER_MENU_ID: &str = "open_logs_folder";
+const DOCUMENTATION_MENU_ID: &str = "documentation";
+const SHOW_MAIN_WINDOW_MENU_ID: &str = "show_main_window";
+const QUIT_FROM_STATUS_ITEM_MENU_ID: &str = "quit_from_status_item";
+#[cfg(target_os = "macos")]
+const DOCK_MODE_MENU_ID: &str = "dock_mode";
+const DOCK_MODE_SETTINGS_FILE_NAME: &str = "settings.json";
 // Delay after navigating to the backend before probing whether the
 // Linux WebKitGTK web content process is actually alive. Gives the
 // process time to spawn so we don't false-positive on slow startup.
@@ -67,6 +92,113 @@ struct SidecarState {
 struct SidecarProcess {
     child: CommandChild,
     generation: u64,
+}
+
+struct DeepLinkState {
+    dispatch: Mutex<DeepLinkDispatch>,
+}
+
+// Routes stay Deferred until the next backend redirect so a deep
+// link that arrives before the server answers rides
+// redirect_when_ready instead of racing it. Redirecting covers the
+// window between the redirect thread consuming the deferred route
+// and its navigation landing: a route dispatched there would lose
+// to the still-in-flight redirect, so it queues until
+// finish_redirect replays it.
+enum DeepLinkDispatch {
+    Deferred(Option<String>),
+    Redirecting(Option<String>),
+    Live,
+}
+
+impl DeepLinkDispatch {
+    // Some((port, route)) means the caller should navigate now.
+    fn route_for_navigation(&mut self, route: String, port: Option<u16>) -> Option<(u16, String)> {
+        match self {
+            DeepLinkDispatch::Deferred(pending) | DeepLinkDispatch::Redirecting(pending) => {
+                *pending = Some(route);
+                None
+            }
+            DeepLinkDispatch::Live => match port {
+                Some(port) => Some((port, route)),
+                // Sidecar is down; hold the route for the next redirect.
+                None => {
+                    *self = DeepLinkDispatch::Deferred(Some(route));
+                    None
+                }
+            },
+        }
+    }
+
+    fn take_pending(&mut self) -> Option<String> {
+        match self {
+            DeepLinkDispatch::Deferred(pending) | DeepLinkDispatch::Redirecting(pending) => {
+                let route = pending.take();
+                *self = DeepLinkDispatch::Redirecting(None);
+                route
+            }
+            DeepLinkDispatch::Live => None,
+        }
+    }
+
+    // Returns a route queued while the startup redirect was in
+    // flight; it is newer than the redirect target, so the caller
+    // must navigate to it. After a defer() (backend restarting) the
+    // state is Deferred again and a queued route rides the next
+    // redirect instead, so a late-finishing redirect thread changes
+    // nothing.
+    fn finish_redirect(&mut self) -> Option<String> {
+        match self {
+            DeepLinkDispatch::Redirecting(pending) => {
+                let route = pending.take();
+                *self = DeepLinkDispatch::Live;
+                route
+            }
+            DeepLinkDispatch::Deferred(_) | DeepLinkDispatch::Live => None,
+        }
+    }
+
+    // A freshly published port precedes HTTP readiness, so a route
+    // dispatched in that window would be clobbered by the pending
+    // redirect's fallback root navigation; hold routes until it runs.
+    fn defer(&mut self) {
+        match self {
+            DeepLinkDispatch::Live => *self = DeepLinkDispatch::Deferred(None),
+            DeepLinkDispatch::Redirecting(pending) => {
+                let route = pending.take();
+                *self = DeepLinkDispatch::Deferred(route);
+            }
+            DeepLinkDispatch::Deferred(_) => {}
+        }
+    }
+}
+
+impl Default for DeepLinkState {
+    fn default() -> Self {
+        Self {
+            dispatch: Mutex::new(DeepLinkDispatch::Deferred(None)),
+        }
+    }
+}
+
+/// Retained handle to the tray dock-mode checkbox. muda flips the
+/// checkmark before the menu event fires and Tauri 2.10 cannot look up
+/// tray items by id, so the toggle needs this handle to read the new
+/// checked state and to revert the mark when persisting fails.
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+struct DockModeCheckItem(Mutex<Option<CheckMenuItem<tauri::Wry>>>);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DesktopMenuAction {
+    About,
+    CheckUpdates,
+    OpenLogsFolder,
+    Documentation,
+    Quit,
+    ShowMainWindow,
+    #[cfg(target_os = "macos")]
+    ToggleDockMode,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -124,16 +256,33 @@ pub fn run() {
         }
     }
 
-    tauri::Builder::default()
+    let builder = tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            show_main_window(app);
+        }))
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(updater_builder.build())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_deep_link::init())
         .plugin(init_navigation_guard_plugin())
         .manage(SidecarState::default())
+        .manage(DeepLinkState::default());
+
+    #[cfg(target_os = "macos")]
+    let builder = builder.manage(DockModeCheckItem::default());
+
+    builder
         .setup(|app| {
+            setup_deep_link_handling(app);
             if let Err(err) = setup_menu(app) {
                 eprintln!("[agentsview] failed to set up desktop menu: {err}");
+            }
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            if let Err(err) =
+                setup_close_to_tray_with(app, setup_status_item, setup_window_lifecycle)
+            {
+                eprintln!("[agentsview] failed to set up close-to-tray behavior: {err}");
             }
             match tauri::async_runtime::block_on(run_data_version_preflight(app.handle())) {
                 Ok(()) => {
@@ -180,22 +329,461 @@ pub fn run() {
         .expect("failed to build tauri app")
         .run(|app_handle, event| {
             if let RunEvent::MenuEvent(event) = &event {
-                if event.id().0 == "about" {
-                    if let Some(window) = app_handle.get_webview_window("main") {
-                        let _ = window.eval("window.dispatchEvent(new CustomEvent('show-about'));");
-                    }
-                }
-                if event.id().0 == OPEN_LOGS_FOLDER_MENU_ID {
-                    open_logs_folder(app_handle);
-                }
-                if event.id().0 == "check_updates" {
-                    let handle = app_handle.clone();
-                    tauri::async_runtime::spawn(async move {
-                        check_for_updates(&handle, false).await;
-                    });
-                }
+                handle_desktop_menu_event(app_handle, event.id().0.as_str());
+            }
+            // macOS asks a running app to show itself again through
+            // applicationShouldHandleReopen (Dock icon click, Cmd-Tab
+            // activation with no visible windows, `open -a AgentsView`).
+            // Restore the close-to-tray window here; otherwise the app
+            // stays hidden with no way back in until it is relaunched.
+            #[cfg(target_os = "macos")]
+            if let RunEvent::Reopen { .. } = &event {
+                show_main_window(app_handle);
             }
         });
+}
+
+fn desktop_menu_action(id: &str) -> Option<DesktopMenuAction> {
+    match id {
+        ABOUT_MENU_ID => Some(DesktopMenuAction::About),
+        CHECK_UPDATES_MENU_ID => Some(DesktopMenuAction::CheckUpdates),
+        OPEN_LOGS_FOLDER_MENU_ID => Some(DesktopMenuAction::OpenLogsFolder),
+        DOCUMENTATION_MENU_ID => Some(DesktopMenuAction::Documentation),
+        QUIT_FROM_STATUS_ITEM_MENU_ID => Some(DesktopMenuAction::Quit),
+        SHOW_MAIN_WINDOW_MENU_ID => Some(DesktopMenuAction::ShowMainWindow),
+        #[cfg(target_os = "macos")]
+        DOCK_MODE_MENU_ID => Some(DesktopMenuAction::ToggleDockMode),
+        _ => None,
+    }
+}
+
+fn handle_desktop_menu_event(handle: &AppHandle, id: &str) {
+    match desktop_menu_action(id) {
+        Some(DesktopMenuAction::About) => {
+            if let Some(window) = handle.get_webview_window("main") {
+                let _ = window.eval("window.dispatchEvent(new CustomEvent('show-about'));");
+            }
+        }
+        Some(DesktopMenuAction::CheckUpdates) => {
+            let handle = handle.clone();
+            tauri::async_runtime::spawn(async move {
+                check_for_updates(&handle, false).await;
+            });
+        }
+        Some(DesktopMenuAction::OpenLogsFolder) => open_logs_folder(handle),
+        Some(DesktopMenuAction::Documentation) => {
+            if let Err(err) = handle
+                .opener()
+                .open_url("https://agentsview.io/docs/", Option::<&str>::None)
+            {
+                eprintln!("[agentsview] failed to open documentation: {err}");
+            }
+        }
+        Some(DesktopMenuAction::Quit) => handle.exit(0),
+        Some(DesktopMenuAction::ShowMainWindow) => show_main_window(handle),
+        #[cfg(target_os = "macos")]
+        Some(DesktopMenuAction::ToggleDockMode) => toggle_dock_mode(handle),
+        None => {}
+    }
+}
+
+/// Flips the persisted dock mode from the tray checkbox and applies the
+/// new Dock presence immediately, so a change while the window is hidden
+/// takes effect without showing and re-hiding the window.
+///
+/// muda flips the checkmark before the menu event fires, so the target
+/// mode is derived from the item's checked state (UI and intent cannot
+/// diverge); if persisting fails the mark is flipped back so the menu
+/// still reports the mode that is actually stored.
+#[cfg(target_os = "macos")]
+fn toggle_dock_mode(handle: &AppHandle) {
+    let Some(item) = dock_mode_check_item(handle) else {
+        return;
+    };
+    let Ok(checked) = item.is_checked() else {
+        return;
+    };
+    let Some(path) = dock_mode_settings_path(handle) else {
+        let _ = item.set_checked(!checked);
+        return;
+    };
+    let next = DockMode::from_checked(checked);
+    if let Err(err) = write_dock_mode(&path, next) {
+        eprintln!("[agentsview] failed to persist dock mode: {err}");
+        let _ = item.set_checked(!checked);
+        return;
+    }
+    let window_visible = handle
+        .get_webview_window("main")
+        .and_then(|window| window.is_visible().ok())
+        .unwrap_or(false);
+    apply_dock_presence(handle, next, window_visible);
+}
+
+#[cfg(target_os = "macos")]
+fn dock_mode_check_item(handle: &AppHandle) -> Option<CheckMenuItem<tauri::Wry>> {
+    handle
+        .state::<DockModeCheckItem>()
+        .0
+        .lock()
+        .expect("lock dock mode item")
+        .as_ref()
+        .cloned()
+}
+
+fn show_main_window(handle: &AppHandle) {
+    let Some(window) = handle.get_webview_window("main") else {
+        return;
+    };
+    #[cfg(target_os = "macos")]
+    sync_dock_presence(handle, true);
+    restore_main_window(&window);
+}
+
+fn setup_deep_link_handling(app: &App) {
+    let handle = app.handle().clone();
+    app.deep_link().on_open_url(move |event| {
+        for url in event.urls() {
+            handle_deep_link_url(&handle, &url);
+        }
+    });
+    // Launch URLs can precede the listener above: the plugin consumes
+    // Windows/Linux launch arguments during its own setup, and macOS
+    // can deliver an Opened event before app setup runs. Both paths
+    // record into get_current, so drain it here.
+    if let Ok(Some(urls)) = app.deep_link().get_current() {
+        for url in urls {
+            handle_deep_link_url(app.handle(), &url);
+        }
+    }
+    // Installers register the scheme; this covers dev builds and
+    // AppImages that were never registered with a launcher.
+    #[cfg(any(windows, target_os = "linux"))]
+    if let Err(err) = app.deep_link().register_all() {
+        log_deep_link_event(
+            app.handle(),
+            format!("failed to register deep link schemes: {err}").as_str(),
+        );
+    }
+}
+
+fn handle_deep_link_url(handle: &AppHandle, url: &Url) {
+    let Some(route) = deep_link_session_route(url) else {
+        log_deep_link_event(
+            handle,
+            format!("ignoring unsupported deep link URL: {url}").as_str(),
+        );
+        return;
+    };
+    log_deep_link_event(
+        handle,
+        format!("opening deep link {url} as route {route}").as_str(),
+    );
+    show_main_window(handle);
+    dispatch_deep_link_route(handle, route);
+}
+
+// Packaged builds discard stderr (no console on Windows, detached from
+// any terminal when Finder-launched), so mirror deep link diagnostics
+// into the desktop log file that Open Logs Folder surfaces.
+fn log_deep_link_event(handle: &AppHandle, message: &str) {
+    eprintln!("[agentsview] {message}");
+    let Ok(path) = desktop_log_file_path(handle) else {
+        return;
+    };
+    if let Err(err) = append_sidecar_log_record_at_path(&path, "deep-link", message) {
+        eprintln!("[agentsview] failed to append deep link log: {err}");
+    }
+}
+
+fn dispatch_deep_link_route(handle: &AppHandle, route: String) {
+    let deep_link_state = handle.state::<DeepLinkState>();
+    let Ok(mut dispatch) = deep_link_state.dispatch.lock() else {
+        log_deep_link_event(
+            handle,
+            format!("dropping deep link route {route}: dispatch lock poisoned").as_str(),
+        );
+        return;
+    };
+    if let Some((port, route)) = dispatch.route_for_navigation(route, current_backend_port(handle))
+    {
+        drop(dispatch);
+        navigate_main_window_to_route(handle, port, route.as_str());
+    }
+}
+
+fn take_pending_deep_link_route(handle: &AppHandle) -> Option<String> {
+    let deep_link_state = handle.try_state::<DeepLinkState>()?;
+    let Ok(mut dispatch) = deep_link_state.dispatch.lock() else {
+        log_deep_link_event(
+            handle,
+            "dropping any pending deep link route: dispatch lock poisoned",
+        );
+        return None;
+    };
+    dispatch.take_pending()
+}
+
+fn finish_deep_link_redirect(handle: &AppHandle) -> Option<String> {
+    let deep_link_state = handle.try_state::<DeepLinkState>()?;
+    let Ok(mut dispatch) = deep_link_state.dispatch.lock() else {
+        log_deep_link_event(
+            handle,
+            "dropping any deep link route queued during redirect: dispatch lock poisoned",
+        );
+        return None;
+    };
+    dispatch.finish_redirect()
+}
+
+fn defer_deep_link_dispatch(app: &AppHandle) {
+    let Some(deep_link_state) = app.try_state::<DeepLinkState>() else {
+        return;
+    };
+    let Ok(mut dispatch) = deep_link_state.dispatch.lock() else {
+        // Skipping the defer reopens the publish/redirect race, so
+        // leave a trace even though poisoning is near-unreachable.
+        log_deep_link_event(
+            app,
+            "cannot defer deep link dispatch: dispatch lock poisoned",
+        );
+        return;
+    };
+    dispatch.defer();
+}
+
+fn navigate_main_window_to_route(handle: &AppHandle, port: u16, route: &str) {
+    let Some(window) = handle.get_webview_window("main") else {
+        log_deep_link_event(
+            handle,
+            format!("dropping deep link route {route}: main window missing").as_str(),
+        );
+        return;
+    };
+    let target = desktop_route_url(port, route);
+    match Url::parse(target.as_str()) {
+        Ok(url) => {
+            if let Err(err) = window.navigate(url) {
+                log_deep_link_event(
+                    handle,
+                    format!("deep link navigation failed: {err}").as_str(),
+                );
+            }
+        }
+        Err(err) => {
+            log_deep_link_event(
+                handle,
+                format!("invalid deep link target URL {target}: {err}").as_str(),
+            );
+        }
+    }
+}
+
+// The id segment stays percent-encoded so splicing it into the
+// backend URL preserves the value the frontend router decodes.
+fn deep_link_session_route(url: &Url) -> Option<String> {
+    if url.scheme() != DEEP_LINK_SCHEME {
+        return None;
+    }
+    if !url
+        .host_str()
+        .is_some_and(|host| host.eq_ignore_ascii_case(DEEP_LINK_SESSIONS_HOST))
+    {
+        return None;
+    }
+    let mut segments = url.path_segments()?;
+    let id = segments.next()?;
+    if segments.next().is_some() {
+        return None;
+    }
+    // "." and ".." would collapse when the backend URL is parsed; a
+    // raw backslash would turn into a path separator there.
+    if id.is_empty() || id == "." || id == ".." || id.contains('\\') {
+        return None;
+    }
+    let route = format!("/sessions/{id}");
+    Some(match deep_link_msg_param(url) {
+        Some(msg) => format!("{route}?msg={msg}"),
+        None => route,
+    })
+}
+
+// Only ?msg=<ordinal|last> is forwarded; the frontend scrolls to that
+// message. Anything else in the query is dropped.
+fn deep_link_msg_param(url: &Url) -> Option<String> {
+    let value = url
+        .query_pairs()
+        .find(|(key, _)| key == "msg")
+        .map(|(_, value)| value.into_owned())?;
+    let valid = value == "last" || (!value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()));
+    valid.then_some(value)
+}
+
+trait MainWindowVisibility {
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn hide_main_window(&self);
+    fn show_main_window(&self);
+    fn unminimize_main_window(&self);
+    fn focus_main_window(&self);
+}
+
+impl MainWindowVisibility for WebviewWindow {
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn hide_main_window(&self) {
+        let _ = self.hide();
+    }
+
+    fn show_main_window(&self) {
+        let _ = self.show();
+    }
+
+    fn unminimize_main_window(&self) {
+        let _ = self.unminimize();
+    }
+
+    fn focus_main_window(&self) {
+        let _ = self.set_focus();
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn hide_main_window_on_close(window: &impl MainWindowVisibility, prevent_close: impl FnOnce()) {
+    prevent_close();
+    window.hide_main_window();
+}
+
+fn restore_main_window(window: &impl MainWindowVisibility) {
+    window.show_main_window();
+    window.unminimize_main_window();
+    window.focus_main_window();
+}
+
+/// Controls whether AgentsView keeps its Dock and Cmd-Tab presence while
+/// the main window is hidden. `Dock` keeps today's behavior (always
+/// present while running); `Hybrid` leaves the Dock and Cmd-Tab while
+/// the window is hidden, like a menu-bar-only app, and comes back when
+/// the window is restored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DockMode {
+    Dock,
+    Hybrid,
+}
+
+impl DockMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            DockMode::Dock => "dock",
+            DockMode::Hybrid => "hybrid",
+        }
+    }
+
+    fn from_str(value: &str) -> Option<DockMode> {
+        match value {
+            "dock" => Some(DockMode::Dock),
+            "hybrid" => Some(DockMode::Hybrid),
+            _ => None,
+        }
+    }
+
+    fn from_checked(checked: bool) -> DockMode {
+        if checked {
+            DockMode::Hybrid
+        } else {
+            DockMode::Dock
+        }
+    }
+}
+
+// Dock mode is persisted next to the other desktop app state as
+// {"dock_mode":"dock"|"hybrid"}. Any read failure falls back to Dock so
+// a missing or corrupt file never flips behavior behind the user's back.
+fn read_dock_mode(path: &Path) -> DockMode {
+    let Ok(content) = fs::read_to_string(path) else {
+        return DockMode::Dock;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return DockMode::Dock;
+    };
+    value
+        .get("dock_mode")
+        .and_then(|value| value.as_str())
+        .and_then(DockMode::from_str)
+        .unwrap_or(DockMode::Dock)
+}
+
+fn write_dock_mode(path: &Path, mode: DockMode) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    // Read-modify-write: keep any other keys in the settings file so a
+    // future setting added next to dock_mode is not wiped on toggle.
+    let mut settings = fs::read_to_string(path)
+        .ok()
+        .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
+        .and_then(|value| value.as_object().cloned())
+        .unwrap_or_default();
+    settings.insert(
+        "dock_mode".to_string(),
+        serde_json::Value::String(mode.as_str().to_string()),
+    );
+    let content =
+        serde_json::to_vec(&serde_json::Value::Object(settings)).map_err(io::Error::other)?;
+    fs::write(path, content)
+}
+
+fn dock_mode_settings_path(handle: &AppHandle) -> Option<PathBuf> {
+    handle
+        .path()
+        .app_config_dir()
+        .ok()
+        .map(|dir| dir.join(DOCK_MODE_SETTINGS_FILE_NAME))
+}
+
+/// Which Dock presence macOS should show for a dock mode and window
+/// visibility. Kept as an own type so the decision is testable without
+/// constructing Tauri's non-exhaustive ActivationPolicy.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DockPresence {
+    Regular,
+    Accessory,
+}
+
+#[cfg(target_os = "macos")]
+fn dock_presence_for(mode: DockMode, window_visible: bool) -> DockPresence {
+    match (mode, window_visible) {
+        (DockMode::Hybrid, false) => DockPresence::Accessory,
+        _ => DockPresence::Regular,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn apply_dock_presence(handle: &AppHandle, mode: DockMode, window_visible: bool) {
+    let policy = match dock_presence_for(mode, window_visible) {
+        DockPresence::Regular => tauri::ActivationPolicy::Regular,
+        DockPresence::Accessory => tauri::ActivationPolicy::Accessory,
+    };
+    if let Err(err) = handle.set_activation_policy(policy) {
+        eprintln!("[agentsview] failed to apply dock presence: {err}");
+    }
+}
+
+/// Reapplies the Dock presence for the current window state. Call after
+/// hiding or before showing the window.
+#[cfg(target_os = "macos")]
+fn sync_dock_presence(handle: &AppHandle, window_visible: bool) {
+    if let Some(path) = dock_mode_settings_path(handle) {
+        apply_dock_presence(handle, read_dock_mode(&path), window_visible);
+    }
+}
+
+/// Initial checked state for the tray dock-mode checkbox: checked only
+/// when hybrid mode is persisted.
+#[cfg(target_os = "macos")]
+fn dock_mode_checked(app: &App) -> bool {
+    dock_mode_settings_path(app.handle())
+        .map(|path| read_dock_mode(&path) == DockMode::Hybrid)
+        .unwrap_or(false)
 }
 
 fn launch_backend(app: &mut App) -> Result<(), DynError> {
@@ -256,6 +844,8 @@ fn sidecar_args() -> Vec<String> {
         "--background".to_string(),
         "--host".to_string(),
         HOST.to_string(),
+        "--port".to_string(),
+        "0".to_string(),
     ]
 }
 
@@ -399,7 +989,10 @@ fn is_allowed_navigation_url(url: &Url, backend_port: Option<u16>) -> bool {
 }
 
 fn is_allowed_external_open_url(url: &Url) -> bool {
-    matches!(url.scheme(), "http" | "https" | "mailto")
+    matches!(
+        url.scheme(),
+        "http" | "https" | "mailto" | "codex" | "claude"
+    )
 }
 
 // sidecar_env returns the environment passed to the backend
@@ -792,6 +1385,9 @@ fn save_sidecar(app: &AppHandle, child: CommandChild) -> Result<u64, DynError> {
 }
 
 fn save_sidecar_port(app: &AppHandle, port: u16) {
+    // Defer before publishing so a deep link cannot observe the new
+    // port and navigate ahead of the pending readiness redirect.
+    defer_deep_link_dispatch(app);
     let state = app.state::<SidecarState>();
     set_sidecar_port(&state, Some(port));
 }
@@ -1352,7 +1948,12 @@ fn trim_startup_output(output: &mut String) {
 }
 
 fn desktop_redirect_url(port: u16) -> String {
-    format!("http://{HOST}:{port}?desktop=1")
+    desktop_route_url(port, "")
+}
+
+fn desktop_route_url(port: u16, route: &str) -> String {
+    let sep = if route.contains('?') { '&' } else { '?' };
+    format!("http://{HOST}:{port}{route}{sep}desktop=1")
 }
 
 /// Recover a dead or stale WebView on window focus.
@@ -1397,14 +1998,33 @@ fn recover_webview(window: &WebviewWindow, port: u16) {
 }
 
 fn redirect_when_ready(window: WebviewWindow, port: u16) {
-    let target_url = desktop_redirect_url(port);
-
     thread::spawn(move || {
         if wait_for_server(port, READY_TIMEOUT) {
+            let deferred_route = take_pending_deep_link_route(window.app_handle());
+            let target_url = match deferred_route.as_deref() {
+                Some(route) => {
+                    log_deep_link_event(
+                        window.app_handle(),
+                        format!("redirecting to deferred deep link route {route}").as_str(),
+                    );
+                    desktop_route_url(port, route)
+                }
+                None => desktop_redirect_url(port),
+            };
+            // Failures after a deferred route was consumed go to the
+            // desktop log: packaged builds discard stderr, and the
+            // "redirecting" line above would otherwise read as success.
             match Url::parse(target_url.as_str()) {
                 Ok(url) => {
                     if let Err(err) = window.navigate(url) {
-                        eprintln!("[agentsview] navigate failed: {err}");
+                        if deferred_route.is_some() {
+                            log_deep_link_event(
+                                window.app_handle(),
+                                format!("deferred deep link navigation failed: {err}").as_str(),
+                            );
+                        } else {
+                            eprintln!("[agentsview] navigate failed: {err}");
+                        }
                     }
                     // On Linux a failed WebKitGTK GPU/EGL init aborts the
                     // web content process, leaving a blank window while the
@@ -1415,8 +2035,24 @@ fn redirect_when_ready(window: WebviewWindow, port: u16) {
                     spawn_webview_health_fallback(window.clone(), port);
                 }
                 Err(err) => {
-                    eprintln!("[agentsview] invalid redirect URL: {err}");
+                    if deferred_route.is_some() {
+                        log_deep_link_event(
+                            window.app_handle(),
+                            format!("invalid deferred deep link redirect URL {target_url}: {err}")
+                                .as_str(),
+                        );
+                    } else {
+                        eprintln!("[agentsview] invalid redirect URL: {err}");
+                    }
                 }
+            }
+            if let Some(route) = finish_deep_link_redirect(window.app_handle()) {
+                log_deep_link_event(
+                    window.app_handle(),
+                    format!("navigating to deep link route {route} queued during startup redirect")
+                        .as_str(),
+                );
+                navigate_main_window_to_route(window.app_handle(), port, route.as_str());
             }
             return;
         }
@@ -1425,7 +2061,7 @@ fn redirect_when_ready(window: WebviewWindow, port: u16) {
             window,
             "AgentsView interface did not respond",
             "The backend reported a port, but the desktop window could not connect to it.",
-            format!("Backend URL: {target_url}").as_str(),
+            format!("Backend URL: {}", desktop_redirect_url(port)).as_str(),
         );
     });
 }
@@ -1867,40 +2503,175 @@ fn parse_writable_listening_port_from_status(buffer: &str) -> Option<u16> {
 }
 
 fn setup_menu(app: &mut App) -> Result<(), DynError> {
-    let about = MenuItemBuilder::with_id("about", "About AgentsView").build(app)?;
+    let about = MenuItemBuilder::with_id(ABOUT_MENU_ID, "About AgentsView").build(app)?;
     let open_logs_folder =
         MenuItemBuilder::with_id(OPEN_LOGS_FOLDER_MENU_ID, "Open Logs Folder").build(app)?;
     let check_updates =
-        MenuItemBuilder::with_id("check_updates", "Check for Updates...").build(app)?;
+        MenuItemBuilder::with_id(CHECK_UPDATES_MENU_ID, "Check for Updates...").build(app)?;
 
-    let builder = SubmenuBuilder::new(app, "File")
+    #[cfg(target_os = "macos")]
+    let app_submenu = SubmenuBuilder::new(app, "AgentsView")
         .item(&about)
         .separator()
         .item(&open_logs_folder)
         .item(&check_updates)
-        .separator();
-
-    #[cfg(target_os = "macos")]
-    let builder = builder.hide().hide_others().separator();
-
-    let app_submenu = builder.quit().build()?;
-
-    let edit_submenu = SubmenuBuilder::new(app, "Edit")
-        .undo()
-        .redo()
         .separator()
-        .cut()
-        .copy()
-        .paste()
-        .select_all()
+        .item(&PredefinedMenuItem::services(app, None)?)
+        .separator()
+        .item(&PredefinedMenuItem::hide(app, None)?)
+        .item(&PredefinedMenuItem::hide_others(app, None)?)
+        .item(&PredefinedMenuItem::show_all(app, None)?)
+        .separator()
+        .item(&PredefinedMenuItem::quit(app, None)?)
         .build()?;
 
+    #[cfg(not(target_os = "macos"))]
+    let file_submenu = SubmenuBuilder::new(app, "File")
+        .item(&about)
+        .separator()
+        .item(&open_logs_folder)
+        .item(&check_updates)
+        .separator()
+        .item(&PredefinedMenuItem::close_window(app, None)?)
+        .separator()
+        .item(&PredefinedMenuItem::quit(app, None)?)
+        .build()?;
+
+    #[cfg(target_os = "macos")]
+    let file_submenu = SubmenuBuilder::new(app, "File")
+        .item(&PredefinedMenuItem::close_window(app, None)?)
+        .build()?;
+
+    let edit_submenu = SubmenuBuilder::new(app, "Edit")
+        .item(&PredefinedMenuItem::undo(app, None)?)
+        .item(&PredefinedMenuItem::redo(app, None)?)
+        .separator()
+        .item(&PredefinedMenuItem::cut(app, None)?)
+        .item(&PredefinedMenuItem::copy(app, None)?)
+        .item(&PredefinedMenuItem::paste(app, None)?)
+        .item(&PredefinedMenuItem::select_all(app, None)?)
+        .build()?;
+
+    #[cfg(target_os = "macos")]
+    let window_submenu = SubmenuBuilder::with_id(app, WINDOW_SUBMENU_ID, "Window")
+        .item(&PredefinedMenuItem::minimize(app, None)?)
+        .item(&PredefinedMenuItem::maximize(app, None)?)
+        .build()?;
+
+    let documentation =
+        MenuItemBuilder::with_id(DOCUMENTATION_MENU_ID, "Documentation").build(app)?;
+    let help_submenu = SubmenuBuilder::with_id(app, HELP_SUBMENU_ID, "Help")
+        .item(&documentation)
+        .build()?;
+
+    #[cfg(target_os = "macos")]
     let menu = MenuBuilder::new(app)
         .item(&app_submenu)
+        .item(&file_submenu)
         .item(&edit_submenu)
+        .item(&window_submenu)
+        .item(&help_submenu)
+        .build()?;
+
+    #[cfg(not(target_os = "macos"))]
+    let menu = MenuBuilder::new(app)
+        .item(&file_submenu)
+        .item(&edit_submenu)
+        .item(&help_submenu)
         .build()?;
     app.set_menu(menu)?;
     Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn setup_status_item(app: &mut App) -> Result<(), DynError> {
+    let show = MenuItemBuilder::with_id(SHOW_MAIN_WINDOW_MENU_ID, "Show AgentsView").build(app)?;
+    let open_logs =
+        MenuItemBuilder::with_id(OPEN_LOGS_FOLDER_MENU_ID, "Open Logs Folder").build(app)?;
+    let check_updates =
+        MenuItemBuilder::with_id(CHECK_UPDATES_MENU_ID, "Check for Updates...").build(app)?;
+    let quit =
+        MenuItemBuilder::with_id(QUIT_FROM_STATUS_ITEM_MENU_ID, "Quit AgentsView").build(app)?;
+    #[cfg(target_os = "macos")]
+    let hide_from_dock = CheckMenuItemBuilder::with_id(
+        DOCK_MODE_MENU_ID,
+        "Hide from Dock and Cmd-Tab when window closed",
+    )
+    .checked(dock_mode_checked(app))
+    .build(app)?;
+
+    #[cfg(target_os = "macos")]
+    {
+        let item = hide_from_dock.clone();
+        *app.state::<DockModeCheckItem>()
+            .0
+            .lock()
+            .expect("lock dock mode item") = Some(item);
+    }
+
+    let menu = MenuBuilder::new(app)
+        .item(&show)
+        .separator()
+        .item(&open_logs)
+        .item(&check_updates)
+        .separator();
+
+    #[cfg(target_os = "macos")]
+    let menu = menu.item(&hide_from_dock).separator();
+
+    let menu = menu.item(&quit).build()?;
+
+    let builder = TrayIconBuilder::with_id("agentsview")
+        .tooltip("AgentsView")
+        .menu(&menu);
+
+    #[cfg(target_os = "macos")]
+    let builder = builder
+        .icon(macos_status_item_icon()?)
+        .icon_as_template(true);
+
+    #[cfg(target_os = "windows")]
+    let builder = builder.icon(
+        app.default_window_icon()
+            .cloned()
+            .ok_or_else(|| io::Error::other("default window icon is unavailable"))?,
+    );
+
+    builder.build(app)?;
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn setup_close_to_tray_with<T>(
+    target: &mut T,
+    setup_status_item: impl FnOnce(&mut T) -> Result<(), DynError>,
+    setup_window_lifecycle: impl FnOnce(&T) -> Result<(), DynError>,
+) -> Result<(), DynError> {
+    setup_status_item(target)?;
+    setup_window_lifecycle(target)
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn setup_window_lifecycle(app: &App) -> Result<(), DynError> {
+    let window = main_window(app)?;
+    let close_window = window.clone();
+    #[cfg(target_os = "macos")]
+    let dock_presence_handle = app.handle().clone();
+    window.on_window_event(move |event| {
+        if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+            hide_main_window_on_close(&close_window, || api.prevent_close());
+            #[cfg(target_os = "macos")]
+            sync_dock_presence(&dock_presence_handle, false);
+        }
+    });
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_status_item_icon() -> Result<tauri::image::Image<'static>, DynError> {
+    Ok(tauri::image::Image::from_bytes(include_bytes!(
+        "../icons/trayTemplate.png"
+    ))?)
 }
 
 fn open_logs_folder(handle: &AppHandle) {
@@ -2401,13 +3172,21 @@ async fn check_for_updates(handle: &AppHandle, silent: bool) {
         |bytes| update.install(bytes),
     ) {
         eprintln!("[agentsview] update install failed: {err}");
+        let message = match err {
+            InstallDownloadedUpdateError::BackendStopTimedOut => {
+                "The update was downloaded, but the local backend \
+                 could not be stopped in time. Please try again in \
+                 a moment."
+            }
+            InstallDownloadedUpdateError::Install(_) => {
+                "Failed to install the update. \
+                 Please try downloading manually from the releases page."
+            }
+        };
         let h = handle.clone();
         handle
             .dialog()
-            .message(
-                "Failed to install the update. \
-                 Please try downloading manually from the releases page.",
-            )
+            .message(message)
             .title("Update Failed")
             .show(move |_| restore_webview_focus(&h));
         return;
@@ -2518,6 +3297,7 @@ async fn stop_backend_and_wait(app: AppHandle, timeout: Duration) -> bool {
 fn stop_backend_inner(app: &AppHandle, wait_timeout: Option<Duration>) -> bool {
     let state = app.state::<SidecarState>();
     if let Some(timeout) = wait_timeout {
+        let deadline = Instant::now() + timeout;
         begin_update_stop_wait(&state);
         let mut waited_generation = None;
         let detached_port = current_backend_port(app);
@@ -2541,22 +3321,22 @@ fn stop_backend_inner(app: &AppHandle, wait_timeout: Option<Duration>) -> bool {
                 app,
                 &state,
                 generation,
-                wait_for_sidecar_termination(&state, generation, timeout),
+                wait_for_sidecar_termination(&state, generation, remaining_timeout(deadline)),
             );
             launcher_stopped
-                && stop_detached_backend_for_update_with_port(app, timeout, detached_port)
+                && stop_detached_backend_for_update_with_port(app, deadline, detached_port)
         } else if let Some(generation) = current_stopping_generation(&state) {
             waited_generation = Some(generation);
             let launcher_stopped = finish_backend_stop_wait(
                 app,
                 &state,
                 generation,
-                wait_for_sidecar_termination(&state, generation, timeout),
+                wait_for_sidecar_termination(&state, generation, remaining_timeout(deadline)),
             );
             launcher_stopped
-                && stop_detached_backend_for_update_with_port(app, timeout, detached_port)
+                && stop_detached_backend_for_update_with_port(app, deadline, detached_port)
         } else {
-            stop_detached_backend_for_update(app, timeout)
+            stop_detached_backend_for_update_with_port(app, deadline, detached_port)
         };
         end_update_stop_wait(&state);
         if let Some(generation) = waited_generation {
@@ -2596,29 +3376,42 @@ fn current_backend_port(app: &AppHandle) -> Option<u16> {
         .and_then(|guard| *guard)
 }
 
-fn stop_detached_backend_for_update(app: &AppHandle, timeout: Duration) -> bool {
-    stop_detached_backend_for_update_with_port(app, timeout, current_backend_port(app))
-}
-
 fn stop_detached_backend_for_update_with_port(
     app: &AppHandle,
-    timeout: Duration,
+    deadline: Instant,
     port: Option<u16>,
 ) -> bool {
-    let deadline = Instant::now() + timeout;
-    let (mut rx, child) = match spawn_sidecar_with_args(app, sidecar_stop_args()) {
-        Ok(spawned) => spawned,
-        Err(err) => {
-            eprintln!("[agentsview] failed to run serve stop before update install: {err}");
-            return false;
-        }
-    };
-    if !wait_for_stop_launcher(&mut rx, remaining_timeout(deadline)) {
-        let _ = child.kill();
+    // serve stop exits non-zero while the daemon is still starting up
+    // ("a server is starting; retry once it is ready"), so a single
+    // failed attempt must not abort the update. Retry until the
+    // deadline passes.
+    let result = retry_stop_launcher(
+        deadline,
+        UPDATE_STOP_RETRY_INTERVAL,
+        |remaining| {
+            let (mut rx, child) = match spawn_sidecar_with_args(app, sidecar_stop_args()) {
+                Ok(spawned) => spawned,
+                Err(err) => {
+                    eprintln!("[agentsview] failed to run serve stop before update install: {err}");
+                    return StopLauncherResult::Fatal;
+                }
+            };
+            let result = wait_for_stop_launcher(&mut rx, remaining);
+            if result != StopLauncherResult::Success {
+                let _ = child.kill();
+            }
+            result
+        },
+        thread::sleep,
+    );
+    if result != StopLauncherResult::Success {
         if port.is_none() {
             eprintln!(
                 "[agentsview] serve stop did not report success, but no detached daemon port is known"
             );
+        }
+        if result == StopLauncherResult::RetryableStartup {
+            eprintln!("[agentsview] gave up stopping the backend before update install");
         }
         return false;
     }
@@ -2634,38 +3427,85 @@ fn stop_detached_backend_for_update_with_port(
     true
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StopLauncherResult {
+    Success,
+    RetryableStartup,
+    Fatal,
+}
+
+fn retry_stop_launcher<A, S>(
+    deadline: Instant,
+    retry_interval: Duration,
+    mut attempt: A,
+    mut sleep: S,
+) -> StopLauncherResult
+where
+    A: FnMut(Duration) -> StopLauncherResult,
+    S: FnMut(Duration),
+{
+    loop {
+        let result = attempt(remaining_timeout(deadline));
+        if result != StopLauncherResult::RetryableStartup {
+            return result;
+        }
+        if remaining_timeout(deadline) <= retry_interval {
+            return result;
+        }
+        sleep(retry_interval);
+    }
+}
+
 fn remaining_timeout(deadline: Instant) -> Duration {
     deadline
         .checked_duration_since(Instant::now())
         .unwrap_or_default()
 }
 
-fn wait_for_stop_launcher(rx: &mut CommandRx, timeout: Duration) -> bool {
+fn wait_for_stop_launcher(rx: &mut CommandRx, timeout: Duration) -> StopLauncherResult {
     let deadline = Instant::now() + timeout;
+    let mut output = String::new();
     loop {
         match rx.try_recv() {
-            Ok(CommandEvent::Terminated(payload)) => return payload.code.unwrap_or(1) == 0,
+            Ok(CommandEvent::Terminated(payload)) => {
+                return classify_stop_launcher_termination(payload.code, &output);
+            }
             Ok(CommandEvent::Stdout(bytes)) => {
                 let line = String::from_utf8_lossy(&bytes);
                 eprintln!("[agentsview] {}", line.trim_end());
+                output.push_str(&line);
             }
             Ok(CommandEvent::Stderr(bytes)) => {
                 let line = String::from_utf8_lossy(&bytes);
                 eprintln!("[agentsview:stderr] {}", line.trim_end());
+                output.push_str(&line);
             }
             Ok(CommandEvent::Error(err)) => {
                 eprintln!("[agentsview:error] {err}");
+                return StopLauncherResult::Fatal;
             }
             Ok(_) => {}
             Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
-            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => return false,
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                return StopLauncherResult::Fatal;
+            }
         }
         if Instant::now() >= deadline {
             eprintln!("[agentsview] timed out waiting for serve stop before update install");
-            return false;
+            return StopLauncherResult::Fatal;
         }
         thread::sleep(READY_POLL_INTERVAL);
     }
+}
+
+fn classify_stop_launcher_termination(code: Option<i32>, output: &str) -> StopLauncherResult {
+    if code == Some(0) {
+        return StopLauncherResult::Success;
+    }
+    if output.contains(SERVE_STOP_STARTING_RETRY_HINT) {
+        return StopLauncherResult::RetryableStartup;
+    }
+    StopLauncherResult::Fatal
 }
 
 fn finish_backend_stop_wait(
@@ -2817,7 +3657,7 @@ fn version_response_looks_valid(response: &[u8]) -> bool {
 mod tests {
     use super::*;
     use serde_json::Value;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, VecDeque};
     use std::fs;
     #[cfg(unix)]
     use std::os::unix::ffi::OsStrExt;
@@ -2836,6 +3676,8 @@ mod tests {
                 "--background".to_string(),
                 "--host".to_string(),
                 HOST.to_string(),
+                "--port".to_string(),
+                "0".to_string(),
             ]
         );
     }
@@ -3609,6 +4451,21 @@ agentsview running at http://127.0.0.1:18082
             extract_startup_status("\r  Swapping rebuilt database into place"),
             Some("Swapping rebuilt database into place".to_string())
         );
+        for detail in [
+            "Finalizing sync: committing session writes",
+            "Finalizing sync: saving session source state",
+            "Finalizing sync: linking file-backed subagent sessions",
+            "Finalizing sync: repairing subagent relationships",
+            "Finalizing sync: releasing parsed-session memory",
+            "Finalizing sync: checking database-backed sessions",
+            "Finalizing sync: linking all subagent sessions",
+            "Finalizing sync: saving the skip cache",
+        ] {
+            assert_eq!(
+                extract_startup_status(&format!("\r  {detail}")),
+                Some(detail.to_string())
+            );
+        }
 
         // Unrelated output is ignored
         assert_eq!(extract_startup_status("some random log line\n"), None);
@@ -3684,11 +4541,205 @@ agentsview running at http://127.0.0.1:18082
         let mailto = Url::parse("mailto:test@example.com").expect("valid mailto url");
         assert!(is_allowed_external_open_url(&mailto));
 
+        let codex = Url::parse("codex://threads/session-123").expect("valid codex url");
+        assert!(is_allowed_external_open_url(&codex));
+
+        let claude =
+            Url::parse("claude://code/new?folder=%2Ftmp%2Fproject").expect("valid Claude Code url");
+        assert!(is_allowed_external_open_url(&claude));
+
+        let obsolete_claude =
+            Url::parse("claude-cli://open?cwd=%2Ftmp%2Fproject").expect("valid obsolete URL");
+        assert!(!is_allowed_external_open_url(&obsolete_claude));
+
         let file = Url::parse("file:///tmp/foo").expect("valid file url");
         assert!(!is_allowed_external_open_url(&file));
 
         let custom = Url::parse("custom-scheme://foo").expect("valid custom url");
         assert!(!is_allowed_external_open_url(&custom));
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn status_item_actions_share_desktop_menu_routing() {
+        assert_eq!(
+            desktop_menu_action(ABOUT_MENU_ID),
+            Some(DesktopMenuAction::About)
+        );
+        assert_eq!(
+            desktop_menu_action(SHOW_MAIN_WINDOW_MENU_ID),
+            Some(DesktopMenuAction::ShowMainWindow)
+        );
+        assert_eq!(
+            desktop_menu_action(OPEN_LOGS_FOLDER_MENU_ID),
+            Some(DesktopMenuAction::OpenLogsFolder)
+        );
+        assert_eq!(
+            desktop_menu_action(CHECK_UPDATES_MENU_ID),
+            Some(DesktopMenuAction::CheckUpdates)
+        );
+        assert_eq!(
+            desktop_menu_action(QUIT_FROM_STATUS_ITEM_MENU_ID),
+            Some(DesktopMenuAction::Quit)
+        );
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            desktop_menu_action(DOCK_MODE_MENU_ID),
+            Some(DesktopMenuAction::ToggleDockMode)
+        );
+        assert_eq!(desktop_menu_action("unknown"), None);
+    }
+
+    #[test]
+    fn dock_mode_round_trips_through_json_settings() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(DOCK_MODE_SETTINGS_FILE_NAME);
+
+        write_dock_mode(&path, DockMode::Hybrid).expect("write hybrid");
+        assert_eq!(read_dock_mode(&path), DockMode::Hybrid);
+
+        write_dock_mode(&path, DockMode::Dock).expect("write dock");
+        assert_eq!(read_dock_mode(&path), DockMode::Dock);
+    }
+
+    #[test]
+    fn write_dock_mode_preserves_other_settings_keys() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(DOCK_MODE_SETTINGS_FILE_NAME);
+        fs::write(&path, r#"{"other":"value"}"#).expect("seed settings");
+
+        write_dock_mode(&path, DockMode::Hybrid).expect("write hybrid");
+
+        let content = fs::read_to_string(&path).expect("read settings");
+        let value: serde_json::Value = serde_json::from_str(&content).expect("valid json");
+        assert_eq!(value["dock_mode"], "hybrid");
+        assert_eq!(value["other"], "value");
+    }
+
+    #[test]
+    fn dock_mode_falls_back_to_dock_for_unreadable_settings() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("missing.json");
+        assert_eq!(read_dock_mode(&missing), DockMode::Dock);
+
+        let corrupt = dir.path().join("corrupt.json");
+        fs::write(&corrupt, "not json").expect("write corrupt settings");
+        assert_eq!(read_dock_mode(&corrupt), DockMode::Dock);
+
+        let other_key = dir.path().join("other.json");
+        fs::write(&other_key, r#"{"other":"hybrid"}"#).expect("write settings");
+        assert_eq!(read_dock_mode(&other_key), DockMode::Dock);
+    }
+
+    #[test]
+    fn dock_mode_from_checked_reflects_the_tray_mark() {
+        assert_eq!(DockMode::from_checked(true), DockMode::Hybrid);
+        assert_eq!(DockMode::from_checked(false), DockMode::Dock);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn hybrid_dock_presence_is_accessory_only_while_window_is_hidden() {
+        assert_eq!(
+            dock_presence_for(DockMode::Hybrid, false),
+            DockPresence::Accessory
+        );
+        assert_eq!(
+            dock_presence_for(DockMode::Hybrid, true),
+            DockPresence::Regular
+        );
+        assert_eq!(
+            dock_presence_for(DockMode::Dock, false),
+            DockPresence::Regular
+        );
+        assert_eq!(
+            dock_presence_for(DockMode::Dock, true),
+            DockPresence::Regular
+        );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[derive(Clone, Default)]
+    struct FakeMainWindow {
+        calls: std::sync::Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    impl MainWindowVisibility for FakeMainWindow {
+        fn hide_main_window(&self) {
+            self.calls.lock().expect("lock calls").push("hide");
+        }
+
+        fn show_main_window(&self) {
+            self.calls.lock().expect("lock calls").push("show");
+        }
+
+        fn unminimize_main_window(&self) {
+            self.calls.lock().expect("lock calls").push("unminimize");
+        }
+
+        fn focus_main_window(&self) {
+            self.calls.lock().expect("lock calls").push("focus");
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn close_hides_the_existing_window_and_show_restores_it() {
+        let window = FakeMainWindow::default();
+        let close_calls = window.calls.clone();
+
+        hide_main_window_on_close(&window, move || {
+            close_calls
+                .lock()
+                .expect("lock close calls")
+                .push("prevent_close");
+        });
+        restore_main_window(&window);
+
+        assert_eq!(
+            *window.calls.lock().expect("lock calls for assertion"),
+            vec!["prevent_close", "hide", "show", "unminimize", "focus"]
+        );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[test]
+    fn tray_setup_failure_does_not_register_window_lifecycle() {
+        let calls = std::cell::RefCell::new(Vec::new());
+
+        let result = setup_close_to_tray_with(
+            &mut (),
+            |_| {
+                calls.borrow_mut().push("tray");
+                Err(io::Error::other("tray setup failed").into())
+            },
+            |_| {
+                calls.borrow_mut().push("lifecycle");
+                Ok(())
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(*calls.borrow(), vec!["tray"]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_status_item_icon_is_a_key_only_template() {
+        let icon = macos_status_item_icon().expect("load macOS status item icon");
+
+        assert_eq!((icon.width(), icon.height()), (32, 32));
+        assert_eq!(image_alpha_at(&icon, 3, 3), 0, "tile stays transparent");
+        assert!(image_alpha_at(&icon, 8, 8) > 200, "key head is opaque");
+        assert_eq!(image_alpha_at(&icon, 20, 9), 0, "keyhole is transparent");
+        assert!(image_alpha_at(&icon, 16, 24) > 200, "key stem is opaque");
+    }
+
+    #[cfg(target_os = "macos")]
+    fn image_alpha_at(icon: &tauri::image::Image<'_>, x: u32, y: u32) -> u8 {
+        let offset = ((y * icon.width() + x) * 4 + 3) as usize;
+        icon.rgba()[offset]
     }
 
     #[test]
@@ -3889,6 +4940,114 @@ agentsview running at http://127.0.0.1:18082
         assert_eq!(
             events.lock().expect("lock events").as_slice(),
             ["install", "restart"]
+        );
+    }
+
+    #[test]
+    fn stop_launcher_retries_startup_refusal_then_succeeds() {
+        let attempts = Mutex::new(VecDeque::from([
+            StopLauncherResult::RetryableStartup,
+            StopLauncherResult::Success,
+        ]));
+        let sleeps = Mutex::new(Vec::new());
+
+        let result = retry_stop_launcher(
+            Instant::now() + Duration::from_secs(10),
+            Duration::from_secs(2),
+            |_| {
+                attempts
+                    .lock()
+                    .expect("lock attempts")
+                    .pop_front()
+                    .expect("configured attempt")
+            },
+            |duration| sleeps.lock().expect("lock sleeps").push(duration),
+        );
+
+        assert_eq!(result, StopLauncherResult::Success);
+        assert!(attempts.lock().expect("lock attempts").is_empty());
+        assert_eq!(
+            sleeps.lock().expect("lock sleeps").as_slice(),
+            [Duration::from_secs(2)]
+        );
+    }
+
+    #[test]
+    fn stop_launcher_does_not_retry_fatal_failure() {
+        let attempts = Mutex::new(0);
+        let sleeps = Mutex::new(Vec::new());
+
+        let result = retry_stop_launcher(
+            Instant::now() + Duration::from_secs(10),
+            Duration::from_secs(2),
+            |_| {
+                *attempts.lock().expect("lock attempts") += 1;
+                StopLauncherResult::Fatal
+            },
+            |duration| sleeps.lock().expect("lock sleeps").push(duration),
+        );
+
+        assert_eq!(result, StopLauncherResult::Fatal);
+        assert_eq!(*attempts.lock().expect("lock attempts"), 1);
+        assert!(sleeps.lock().expect("lock sleeps").is_empty());
+    }
+
+    #[test]
+    fn stop_launcher_stops_retrying_when_deadline_is_exhausted() {
+        let attempts = Mutex::new(0);
+
+        let result = retry_stop_launcher(
+            Instant::now(),
+            Duration::from_secs(2),
+            |_| {
+                *attempts.lock().expect("lock attempts") += 1;
+                StopLauncherResult::RetryableStartup
+            },
+            |_| panic!("deadline must prevent another retry"),
+        );
+
+        assert_eq!(result, StopLauncherResult::RetryableStartup);
+        assert_eq!(*attempts.lock().expect("lock attempts"), 1);
+    }
+
+    #[test]
+    fn stop_launcher_classifies_only_startup_refusal_as_retryable() {
+        assert_eq!(
+            classify_stop_launcher_termination(
+                Some(1),
+                "serve stop: a server is starting; retry once it is ready",
+            ),
+            StopLauncherResult::RetryableStartup
+        );
+        assert_eq!(
+            classify_stop_launcher_termination(
+                Some(1),
+                "serve stop: stopping pid 42: access denied",
+            ),
+            StopLauncherResult::Fatal
+        );
+        assert_eq!(
+            classify_stop_launcher_termination(Some(0), ""),
+            StopLauncherResult::Success
+        );
+    }
+
+    #[test]
+    fn stop_launcher_treats_command_error_as_fatal() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        tx.try_send(CommandEvent::Error("wait failed".to_string()))
+            .expect("send command error");
+        tx.try_send(CommandEvent::Terminated(
+            tauri_plugin_shell::process::TerminatedPayload {
+                code: Some(0),
+                signal: None,
+            },
+        ))
+        .expect("send misleading success");
+
+        assert_eq!(
+            wait_for_stop_launcher(&mut rx, Duration::from_secs(1)),
+            StopLauncherResult::Fatal
         );
     }
 
@@ -4283,6 +5442,168 @@ agentsview running at http://127.0.0.1:18082
         let url2 = desktop_redirect_url(8080);
         assert!(url2.contains("?desktop=1"));
         assert!(url2.starts_with("http://127.0.0.1:8080"));
+    }
+
+    #[test]
+    fn desktop_route_url_keeps_route_and_desktop_query_param() {
+        assert_eq!(
+            desktop_route_url(18080, "/sessions/abc-123"),
+            "http://127.0.0.1:18080/sessions/abc-123?desktop=1"
+        );
+        assert_eq!(
+            desktop_route_url(18080, "/sessions/abc-123?msg=last"),
+            "http://127.0.0.1:18080/sessions/abc-123?msg=last&desktop=1"
+        );
+    }
+
+    #[test]
+    fn deep_link_session_route_maps_session_urls() {
+        let cases = [
+            ("agentsview://sessions/abc-123", "/sessions/abc-123"),
+            ("agentsview://SESSIONS/abc-123", "/sessions/abc-123"),
+            ("agentsview://sessions/a%20b", "/sessions/a%20b"),
+            (
+                "agentsview://sessions/cursor:0198c6a1-b125-7c60-8d3f-2f9e4a7b1c2d",
+                "/sessions/cursor:0198c6a1-b125-7c60-8d3f-2f9e4a7b1c2d",
+            ),
+            ("agentsview://sessions/abc?msg=42", "/sessions/abc?msg=42"),
+            (
+                "agentsview://sessions/abc?msg=last",
+                "/sessions/abc?msg=last",
+            ),
+            ("agentsview://sessions/abc?msg=", "/sessions/abc"),
+            ("agentsview://sessions/abc?msg=evil&x=1", "/sessions/abc"),
+            ("agentsview://sessions/abc?other=1", "/sessions/abc"),
+        ];
+        for (input, want) in cases {
+            let url = Url::parse(input).expect(input);
+            assert_eq!(
+                deep_link_session_route(&url).as_deref(),
+                Some(want),
+                "{input}"
+            );
+        }
+    }
+
+    #[test]
+    fn deep_link_dispatch_defers_routes_until_first_redirect() {
+        let mut dispatch = DeepLinkDispatch::Deferred(None);
+        assert_eq!(
+            dispatch.route_for_navigation("/sessions/a".to_string(), Some(18080)),
+            None
+        );
+        assert_eq!(dispatch.take_pending().as_deref(), Some("/sessions/a"));
+        assert_eq!(dispatch.take_pending(), None);
+    }
+
+    #[test]
+    fn deep_link_dispatch_keeps_latest_route_while_deferred() {
+        let mut dispatch = DeepLinkDispatch::Deferred(None);
+        assert_eq!(
+            dispatch.route_for_navigation("/sessions/a".to_string(), None),
+            None
+        );
+        assert_eq!(
+            dispatch.route_for_navigation("/sessions/b".to_string(), Some(18080)),
+            None
+        );
+        assert_eq!(dispatch.take_pending().as_deref(), Some("/sessions/b"));
+    }
+
+    #[test]
+    fn deep_link_dispatch_navigates_directly_once_live() {
+        let mut dispatch = DeepLinkDispatch::Deferred(None);
+        dispatch.take_pending();
+        assert_eq!(dispatch.finish_redirect(), None);
+        assert_eq!(
+            dispatch.route_for_navigation("/sessions/a".to_string(), Some(18080)),
+            Some((18080, "/sessions/a".to_string()))
+        );
+    }
+
+    #[test]
+    fn deep_link_dispatch_queues_route_during_startup_redirect() {
+        // Between take_pending and the redirect's navigation landing,
+        // a newer route must queue and replay after the redirect
+        // instead of navigating first and losing to it.
+        let mut dispatch = DeepLinkDispatch::Deferred(Some("/sessions/a".to_string()));
+        assert_eq!(dispatch.take_pending().as_deref(), Some("/sessions/a"));
+        assert_eq!(
+            dispatch.route_for_navigation("/sessions/b".to_string(), Some(18080)),
+            None
+        );
+        assert_eq!(dispatch.finish_redirect().as_deref(), Some("/sessions/b"));
+        assert_eq!(
+            dispatch.route_for_navigation("/sessions/c".to_string(), Some(18080)),
+            Some((18080, "/sessions/c".to_string()))
+        );
+    }
+
+    #[test]
+    fn deep_link_dispatch_defer_during_redirect_holds_queued_route() {
+        let mut dispatch = DeepLinkDispatch::Deferred(None);
+        dispatch.take_pending();
+        assert_eq!(
+            dispatch.route_for_navigation("/sessions/a".to_string(), Some(18080)),
+            None
+        );
+        dispatch.defer();
+        // The redirect thread finishing after the defer must not flip
+        // the re-deferred dispatch to Live or steal the queued route.
+        assert_eq!(dispatch.finish_redirect(), None);
+        assert_eq!(dispatch.take_pending().as_deref(), Some("/sessions/a"));
+    }
+
+    #[test]
+    fn deep_link_dispatch_re_defers_live_route_when_port_unknown() {
+        let mut dispatch = DeepLinkDispatch::Deferred(None);
+        dispatch.take_pending();
+        dispatch.finish_redirect();
+        assert_eq!(
+            dispatch.route_for_navigation("/sessions/a".to_string(), None),
+            None
+        );
+        assert_eq!(dispatch.take_pending().as_deref(), Some("/sessions/a"));
+    }
+
+    #[test]
+    fn deep_link_dispatch_defer_holds_routes_for_the_next_redirect() {
+        // A republished port precedes readiness, so a route arriving
+        // after defer() must wait for the redirect, not navigate.
+        let mut dispatch = DeepLinkDispatch::Deferred(None);
+        dispatch.take_pending();
+        dispatch.finish_redirect();
+        dispatch.defer();
+        assert_eq!(
+            dispatch.route_for_navigation("/sessions/a".to_string(), Some(18080)),
+            None
+        );
+        assert_eq!(dispatch.take_pending().as_deref(), Some("/sessions/a"));
+    }
+
+    #[test]
+    fn deep_link_dispatch_defer_preserves_pending_route() {
+        let mut dispatch = DeepLinkDispatch::Deferred(Some("/sessions/a".to_string()));
+        dispatch.defer();
+        assert_eq!(dispatch.take_pending().as_deref(), Some("/sessions/a"));
+    }
+
+    #[test]
+    fn deep_link_session_route_rejects_unsupported_urls() {
+        let cases = [
+            "agentsview://sessions",
+            "agentsview://sessions/",
+            "agentsview://sessions/a/b",
+            "agentsview://sessions/.",
+            "agentsview://sessions/..",
+            "agentsview://settings/abc",
+            "agentsview:///sessions/abc",
+            "codex://sessions/abc",
+        ];
+        for input in cases {
+            let url = Url::parse(input).expect(input);
+            assert_eq!(deep_link_session_route(&url), None, "{input}");
+        }
     }
 
     #[test]

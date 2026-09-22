@@ -2,98 +2,84 @@ package duckdb
 
 import (
 	"context"
-	"crypto/sha256"
 	"database/sql"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
 	neturl "net/url"
+	"os"
 	"runtime"
 	"strings"
 	"sync"
+	"time"
 
 	"go.kenn.io/agentsview/internal/config"
-	"go.kenn.io/agentsview/internal/db"
 )
 
 const quackAttachmentName = "agentsview_remote"
 
-// Open opens a local DuckDB file for the agentsview mirror backend.
-func Open(path string) (*sql.DB, error) {
+// DefaultAttachTimeout bounds a remote Quack ATTACH (and its TCP preflight)
+// when the caller does not configure an explicit timeout. Native non-loopback
+// attach can silently upgrade to an SSL handshake and hang indefinitely
+// against a plain-HTTP listener, so agentsview enforces its own deadline.
+const DefaultAttachTimeout = 20 * time.Second
+
+// resolveAttachTimeout maps a configured attach timeout to an effective
+// duration. Zero selects DefaultAttachTimeout; a negative value disables the
+// guard (returns 0); a positive value is used as-is.
+func resolveAttachTimeout(configured time.Duration) time.Duration {
+	switch {
+	case configured == 0:
+		return DefaultAttachTimeout
+	case configured < 0:
+		return 0
+	default:
+		return configured
+	}
+}
+
+// Open opens a local DuckDB file read-write for the agentsview mirror
+// backend. Only push paths use it: DuckDB's write lock is exclusive across
+// processes, so a read-write handle blocks every other open on the file.
+// Serve and probe paths use OpenReadOnly instead.
+func Open(ctx context.Context, path string) (*sql.DB, error) {
 	if path == "" {
-		return nil, fmt.Errorf("duckdb path is required")
+		return nil, errors.New("duckdb path is required")
 	}
 	db, err := openDuckDB(path)
 	if err != nil {
 		return nil, fmt.Errorf("opening duckdb file: %w", err)
 	}
-	// DuckDB permits one writer per database file. Keeping a single
-	// pooled connection avoids surprising file-lock contention while
-	// the mirror sync path is still process-local.
+	return configureOpenedDuckDB(ctx, db)
+}
+
+// OpenReadOnly opens an existing local DuckDB file read-only. Read-only
+// handles coexist across processes (and, for the same literal DSN, share one
+// in-process instance), so serve processes and probes never take DuckDB's
+// exclusive write lock on the mirror and never create a missing file.
+func OpenReadOnly(ctx context.Context, path string) (*sql.DB, error) {
+	if path == "" {
+		return nil, errors.New("duckdb path is required")
+	}
+	db, err := openDuckDB(path + "?access_mode=read_only")
+	if err != nil {
+		return nil, fmt.Errorf("opening duckdb file %s read-only: %w", path, err)
+	}
+	return configureOpenedDuckDB(ctx, db)
+}
+
+// configureOpenedDuckDB applies the shared connection settings: a single
+// pooled connection (DuckDB permits one writer per database file, and a
+// single connection avoids surprising file-lock contention) and the thread
+// count.
+func configureOpenedDuckDB(ctx context.Context, db *sql.DB) (*sql.DB, error) {
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
-	if err := configureDuckDBThreads(db); err != nil {
+	if err := configureDuckDBThreads(ctx, db); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
 	return db, nil
-}
-
-// ReadLastPushAt reads the local DuckDB push watermark for the optional
-// PG-compatible target scope.
-func ReadLastPushAt(local *db.DB, syncStateTarget string) (string, error) {
-	if local == nil {
-		return "", fmt.Errorf("local sync state is required")
-	}
-	return local.GetSyncState(
-		scopedDuckDBSyncStateKey(lastPushStateKey, syncStateTarget),
-	)
-}
-
-// SyncStateTargetForConfig returns the local sync-state scope for a DuckDB
-// target. Local file mirrors keep the historical unscoped watermark; remote
-// Quack targets get a non-secret URL fingerprint so distinct remotes cannot
-// reuse each other's push watermark.
-func SyncStateTargetForConfig(cfg config.DuckDBConfig) string {
-	if strings.TrimSpace(cfg.URL) == "" {
-		return ""
-	}
-	sum := sha256.Sum256([]byte(canonicalDuckDBSyncTarget(cfg.URL)))
-	encoded := hex.EncodeToString(sum[:])
-	return "url-" + encoded[:16]
-}
-
-func canonicalDuckDBSyncTarget(rawURL string) string {
-	rawURL = strings.TrimSpace(rawURL)
-	if rawURL == "" {
-		return ""
-	}
-	if !strings.HasPrefix(rawURL, "quack:") {
-		return rawURL
-	}
-	transport := strings.TrimPrefix(rawURL, "quack:")
-	if strings.HasPrefix(transport, "http://") ||
-		strings.HasPrefix(transport, "https://") {
-		if u, err := neturl.Parse(transport); err == nil {
-			u.User = nil
-			q := u.Query()
-			for key := range q {
-				if isSecretURLQueryKey(key) {
-					q.Del(key)
-				}
-			}
-			u.RawQuery = q.Encode()
-			u.Fragment = ""
-			return "quack:" + u.String()
-		}
-	}
-	transport = strings.SplitN(transport, "#", 2)[0]
-	transport = strings.SplitN(transport, "?", 2)[0]
-	if at := strings.LastIndex(transport, "@"); at >= 0 {
-		transport = transport[at+1:]
-	}
-	return "quack:" + transport
 }
 
 func isSecretURLQueryKey(key string) bool {
@@ -117,39 +103,81 @@ func isCredentialQueryKey(key, credential string) bool {
 	return false
 }
 
-// ReadStatusFromConfig reads DuckDB/Quack row counts without requiring a local
-// Sync handle. Callers pass any local last-push watermark they want displayed.
+// ReadStatusFromConfig reads DuckDB/Quack push metadata and row counts
+// without requiring a local Sync handle. It reports the TARGET's own
+// sync_metadata (last push time/machine, schema/data version, scope) rather
+// than any locally tracked watermark, so it works identically for a local
+// mirror file and a remote Quack endpoint.
 func ReadStatusFromConfig(
 	ctx context.Context,
 	cfg config.DuckDBConfig,
-	lastPush string,
 ) (SyncStatus, error) {
 	if cfg.MachineName == "" {
-		return SyncStatus{}, fmt.Errorf("machine name must not be empty")
+		return SyncStatus{}, errors.New("machine name must not be empty")
 	}
-	store, err := NewStoreFromConfig(cfg)
+	if cfg.URL == "" {
+		return readLocalMirrorStatus(ctx, cfg)
+	}
+	store, err := NewStoreFromConfig(ctx, cfg)
 	if err != nil {
 		return SyncStatus{}, err
 	}
 	defer store.Close()
 	return readMachineStatus(
-		ctx, store.DB(), store.connectionKind, store.quack,
-		cfg.MachineName, lastPush,
+		ctx, store.DB(), store.connectionKind, store.quack, cfg.MachineName,
 	)
 }
 
+// readLocalMirrorStatus reads status from a local mirror file without ever
+// creating it. A missing file reports SyncStatus.MirrorMissing; an existing
+// file is opened with OpenReadOnly, which can never create or write.
+func readLocalMirrorStatus(
+	ctx context.Context, cfg config.DuckDBConfig,
+) (SyncStatus, error) {
+	if cfg.Path == "" {
+		return SyncStatus{}, errors.New("duckdb path is required")
+	}
+	if _, err := os.Stat(cfg.Path); os.IsNotExist(err) {
+		return SyncStatus{Machine: cfg.MachineName, MirrorMissing: true}, nil
+	} else if err != nil {
+		return SyncStatus{}, fmt.Errorf(
+			"statting duckdb mirror %s: %w", cfg.Path, err,
+		)
+	}
+	conn, err := OpenReadOnly(ctx, cfg.Path)
+	if err != nil {
+		return SyncStatus{}, err
+	}
+	defer func() { _ = conn.Close() }()
+	return readMachineStatus(
+		ctx, conn, duckDBBaseConnection, nil, cfg.MachineName,
+	)
+}
+
+// readMachineStatus reads the target's push metadata and total mirror row
+// counts. Sessions retain their per-source machine attribution, so status
+// cannot use LastPushMachine as a row filter. Missing metadata or tables
+// degrade to zero values so status remains usable for fresh and old mirrors.
 func readMachineStatus(
 	ctx context.Context,
 	duck *sql.DB,
 	connectionKind duckDBConnectionKind,
 	quack *quackClient,
 	machine string,
-	lastPush string,
 ) (SyncStatus, error) {
-	status := SyncStatus{Machine: machine, LastPushAt: lastPush}
+	status := SyncStatus{Machine: machine}
+	meta, err := readTargetMirrorStatusMetadata(ctx, duck, connectionKind, quack)
+	if err != nil {
+		return SyncStatus{}, err
+	}
+	status.LastPushAt = meta.LastPushAt
+	status.LastPushMachine = meta.LastPushMachine
+	status.SchemaVersion = meta.SchemaVersion
+	status.DataVersion = meta.DataVersion
+	status.Scope = meta.Scope
+
 	if err := queryDuckDBRowContext(ctx, duck, connectionKind, quack,
-		`SELECT COUNT(*) FROM sessions WHERE machine = ?`,
-		machine,
+		`SELECT COUNT(*) FROM sessions`,
 	).Scan(&status.DuckDBSessions); err != nil {
 		if isMissingDuckDBTable(err) {
 			return status, nil
@@ -160,9 +188,8 @@ func readMachineStatus(
 		`SELECT COUNT(*)
 		 FROM messages
 		 WHERE session_id IN (
-			SELECT id FROM sessions WHERE machine = ?
+			SELECT id FROM sessions
 		 )`,
-		machine,
 	).Scan(&status.DuckDBMessages); err != nil {
 		if isMissingDuckDBTable(err) {
 			return status, nil
@@ -170,6 +197,73 @@ func readMachineStatus(
 		return SyncStatus{}, fmt.Errorf("counting duckdb messages: %w", err)
 	}
 	return status, nil
+}
+
+// targetMirrorStatusMetadata is the subset of mirror push metadata that
+// duckdb status reports, read from whatever mirror the caller is connected
+// to (local file or remote Quack endpoint) via queryDuckDBContext so the
+// query literalizes correctly over Quack's query() table function.
+type targetMirrorStatusMetadata struct {
+	SchemaVersion   int
+	DataVersion     int
+	Scope           string
+	LastPushAt      string
+	LastPushMachine string
+}
+
+func readTargetMirrorStatusMetadata(
+	ctx context.Context,
+	duck *sql.DB,
+	connectionKind duckDBConnectionKind,
+	quack *quackClient,
+) (targetMirrorStatusMetadata, error) {
+	rows, err := queryDuckDBContext(ctx, duck, connectionKind, quack,
+		`SELECT key, value FROM sync_metadata WHERE key IN (?, ?, ?, ?, ?)`,
+		schemaVersionMetadataKey, dataVersionMetadataKey, pushScopeMetadataKey,
+		lastPushAtMetadataKey, lastPushMachineMetadataKey,
+	)
+	if err != nil {
+		if isMissingDuckDBTable(err) {
+			return targetMirrorStatusMetadata{}, nil
+		}
+		return targetMirrorStatusMetadata{}, fmt.Errorf(
+			"reading duckdb mirror push metadata: %w", err,
+		)
+	}
+	defer rows.Close()
+
+	raw := make(map[string]string, 5)
+	for rows.Next() {
+		var key, value string
+		if err := rows.Scan(&key, &value); err != nil {
+			return targetMirrorStatusMetadata{}, fmt.Errorf(
+				"scanning duckdb mirror push metadata: %w", err,
+			)
+		}
+		raw[key] = value
+	}
+	if err := rows.Err(); err != nil {
+		return targetMirrorStatusMetadata{}, fmt.Errorf(
+			"iterating duckdb mirror push metadata: %w", err,
+		)
+	}
+
+	meta := targetMirrorStatusMetadata{
+		Scope:           raw[pushScopeMetadataKey],
+		LastPushAt:      raw[lastPushAtMetadataKey],
+		LastPushMachine: raw[lastPushMachineMetadataKey],
+	}
+	if meta.SchemaVersion, err = parseMirrorMetadataInt(
+		schemaVersionMetadataKey, raw[schemaVersionMetadataKey],
+	); err != nil {
+		return targetMirrorStatusMetadata{}, err
+	}
+	if meta.DataVersion, err = parseMirrorMetadataInt(
+		dataVersionMetadataKey, raw[dataVersionMetadataKey],
+	); err != nil {
+		return targetMirrorStatusMetadata{}, err
+	}
+	return meta, nil
 }
 
 func isMissingDuckDBTable(err error) bool {
@@ -184,63 +278,34 @@ func isMissingDuckDBTable(err error) bool {
 // NewStoreFromConfig opens either a local DuckDB mirror file or a remote
 // Quack endpoint. Quack endpoints are attached as the default catalog so the
 // Store's unqualified read queries work for both local and remote modes.
-func NewStoreFromConfig(cfg config.DuckDBConfig) (*Store, error) {
+func NewStoreFromConfig(ctx context.Context, cfg config.DuckDBConfig) (*Store, error) {
 	if cfg.URL != "" {
-		return NewQuackStore(cfg.URL, cfg.Token, cfg.AllowInsecure)
+		return NewQuackStore(ctx,
+			cfg.URL, cfg.Token, cfg.AllowInsecure, cfg.AttachTimeout,
+		)
 	}
-	return NewStore(cfg.Path)
+	return NewStore(ctx, cfg.Path)
 }
 
-// ValidatePushTarget validates remote DuckDB push targets without opening a
-// DuckDB connection. Local file targets are validated when opened.
+// ValidatePushTarget rejects remote push targets. The mirror is written
+// locally; expose it read-only with `agentsview duckdb quack serve`.
 func ValidatePushTarget(cfg config.DuckDBConfig) error {
-	if cfg.URL == "" {
-		return nil
-	}
-	return ValidateQuackClientURL(cfg.URL, cfg.Token, cfg.AllowInsecure)
-}
-
-// NewFromConfig opens either a local DuckDB mirror file or a remote Quack
-// endpoint for push sync.
-func NewFromConfig(
-	cfg config.DuckDBConfig, local *db.DB, opts SyncOptions,
-) (*Sync, error) {
-	if err := validateSyncInputs(local, cfg.MachineName); err != nil {
-		return nil, err
-	}
-	var (
-		duck           *sql.DB
-		quack          *quackClient
-		err            error
-		connectionKind = duckDBBaseConnection
-	)
 	if cfg.URL != "" {
-		quack, err = openQuackClient(cfg.URL, cfg.Token, cfg.AllowInsecure)
-		if err == nil {
-			duck = quack.DB()
-		}
-		connectionKind = duckDBQuackClientConnection
-	} else {
-		duck, err = Open(cfg.Path)
+		return errors.New("duckdb push writes the local mirror file and cannot " +
+			"push to a remote Quack endpoint; unset [duckdb].url / " +
+			"AGENTSVIEW_DUCKDB_URL for pushes and serve the mirror with " +
+			"'agentsview duckdb quack serve'")
 	}
-	if err != nil {
-		return nil, err
-	}
-	return &Sync{
-		duck:            duck,
-		local:           local,
-		machine:         cfg.MachineName,
-		syncStateScope:  opts.SyncStateTarget,
-		projects:        opts.Projects,
-		excludeProjects: opts.ExcludeProjects,
-		connectionKind:  connectionKind,
-		quack:           quack,
-	}, nil
+	return nil
 }
 
-// NewQuackStore attaches a remote DuckDB exposed over Quack.
-func NewQuackStore(rawURL, token string, allowInsecure bool) (*Store, error) {
-	client, err := openQuackClient(rawURL, token, allowInsecure)
+// NewQuackStore attaches a remote DuckDB exposed over Quack. attachTimeout
+// bounds the ATTACH; zero selects DefaultAttachTimeout and a negative value
+// disables the guard.
+func NewQuackStore(ctx context.Context,
+	rawURL, token string, allowInsecure bool, attachTimeout time.Duration,
+) (*Store, error) {
+	client, err := openQuackClient(ctx, rawURL, token, allowInsecure, attachTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -251,16 +316,6 @@ func NewQuackStore(rawURL, token string, allowInsecure bool) (*Store, error) {
 	}, nil
 }
 
-// OpenQuack opens an in-memory DuckDB client and attaches a remote DuckDB
-// exposed over Quack as the default catalog.
-func OpenQuack(rawURL, token string, allowInsecure bool) (*sql.DB, error) {
-	client, err := openQuackClient(rawURL, token, allowInsecure)
-	if err != nil {
-		return nil, err
-	}
-	return client.DB(), nil
-}
-
 type quackClient struct {
 	duck       *sql.DB
 	rawURL     string
@@ -268,11 +323,22 @@ type quackClient struct {
 	reattachMu sync.Mutex
 }
 
-func openQuackClient(
-	rawURL, token string, allowInsecure bool,
+func openQuackClient(ctx context.Context,
+	rawURL, token string, allowInsecure bool, attachTimeout time.Duration,
 ) (*quackClient, error) {
 	if err := ValidateQuackClientURL(rawURL, token, allowInsecure); err != nil {
 		return nil, err
+	}
+	timeout := resolveAttachTimeout(attachTimeout)
+	// Cheap TCP preflight before ATTACH: catches unreachable or blackholed
+	// endpoints in a bounded time even when the extension would otherwise
+	// hang. A successful dial only proves the port accepts connections; the
+	// watchdog below still guards a server that accepts but never responds
+	// (e.g. a stalled SSL handshake).
+	if timeout > 0 {
+		if err := preflightQuackDial(ctx, rawURL, timeout); err != nil {
+			return nil, err
+		}
 	}
 	conn, err := openDuckDB("")
 	if err != nil {
@@ -280,16 +346,16 @@ func openQuackClient(
 	}
 	conn.SetMaxOpenConns(1)
 	conn.SetMaxIdleConns(1)
-	if err := configureDuckDBThreads(conn); err != nil {
+	if err := configureDuckDBThreads(ctx, conn); err != nil {
 		conn.Close()
 		return nil, err
 	}
 
-	if _, err := conn.Exec("INSTALL quack"); err != nil {
+	if _, err := conn.ExecContext(ctx, "INSTALL quack"); err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("installing quack extension: %w", err)
 	}
-	if _, err := conn.Exec("LOAD quack"); err != nil {
+	if _, err := conn.ExecContext(ctx, "LOAD quack"); err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("loading quack extension: %w", err)
 	}
@@ -298,11 +364,107 @@ func openQuackClient(
 		rawURL: rawURL,
 		token:  token,
 	}
-	if err := client.attach(context.Background()); err != nil {
+	if err := runWithAttachTimeout(rawURL, timeout, func() error {
+		return client.attach(context.Background())
+	}); err != nil {
 		conn.Close()
 		return nil, err
 	}
 	return client, nil
+}
+
+// preflightQuackDial performs a bounded TCP dial against the host:port encoded
+// in a quack URL before ATTACH. It returns nil (skips the check) when no
+// definite host:port can be derived, leaving the attach watchdog as the guard.
+func preflightQuackDial(ctx context.Context, rawURL string, timeout time.Duration) error {
+	addr, ok := quackDialAddress(rawURL)
+	if !ok {
+		return nil
+	}
+	conn, err := (&net.Dialer{Timeout: timeout}).DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return fmt.Errorf(
+			"connecting to quack endpoint %s: %w",
+			RedactQuackURL(rawURL), err,
+		)
+	}
+	return conn.Close()
+}
+
+// runWithAttachTimeout runs attach and enforces timeout. A non-positive
+// timeout runs attach inline with no guard. On timeout it returns an error
+// naming the endpoint and the timeout knob.
+//
+// The ATTACH executes inside the DuckDB C (CGO) extension, which cannot be
+// interrupted from Go: on timeout the attach goroutine and the client
+// connection it holds may leak. That is acceptable here because callers treat
+// a failed attach as fatal and the process is about to exit; the alternative
+// is hanging forever.
+func runWithAttachTimeout(
+	rawURL string, timeout time.Duration, attach func() error,
+) error {
+	if timeout <= 0 {
+		return attach()
+	}
+	// Buffered so the goroutine can always send and exit even after we have
+	// stopped waiting, avoiding a permanently blocked send.
+	done := make(chan error, 1)
+	go func() { done <- attach() }()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		return err
+	case <-timer.C:
+		return fmt.Errorf(
+			"attaching quack endpoint %s timed out after %s; the server did "+
+				"not respond (set [duckdb].attach_timeout or "+
+				"AGENTSVIEW_DUCKDB_ATTACH_TIMEOUT, or a negative value to "+
+				"disable)",
+			RedactQuackURL(rawURL), timeout,
+		)
+	}
+}
+
+// quackDialAddress extracts a host:port TCP dial target from a quack URL for a
+// preflight reachability check. It returns ok=false when no definite host:port
+// can be derived (for example a native URL without an explicit port).
+func quackDialAddress(rawURL string) (string, bool) {
+	transport := strings.TrimPrefix(rawURL, "quack:")
+	if strings.HasPrefix(transport, "http://") ||
+		strings.HasPrefix(transport, "https://") {
+		u, err := neturl.Parse(transport)
+		if err != nil || u.Hostname() == "" {
+			return "", false
+		}
+		port := u.Port()
+		if port == "" {
+			if u.Scheme == "https" {
+				port = "443"
+			} else {
+				port = "80"
+			}
+		}
+		return net.JoinHostPort(u.Hostname(), port), true
+	}
+	transport = strings.SplitN(transport, "#", 2)[0]
+	transport = strings.SplitN(transport, "?", 2)[0]
+	if _, rest, ok := strings.Cut(transport, "://"); ok {
+		transport = rest
+	}
+	transport = strings.TrimPrefix(transport, "//")
+	authority := transport
+	if i := strings.IndexByte(authority, '/'); i >= 0 {
+		authority = authority[:i]
+	}
+	if at := strings.LastIndex(authority, "@"); at >= 0 {
+		authority = authority[at+1:]
+	}
+	host, port, err := net.SplitHostPort(authority)
+	if err != nil || host == "" || port == "" {
+		return "", false
+	}
+	return net.JoinHostPort(host, port), true
 }
 
 func (q *quackClient) DB() *sql.DB { return q.duck }
@@ -516,40 +678,22 @@ func (q *quackClient) queryRemote(
 ) (*sql.Rows, error) {
 	query := "SELECT * FROM " + quackAttachmentName + ".query(?)"
 	rows, err := q.duck.QueryContext(ctx, query, sqlText)
-	if err == nil || !retryStale || !isStaleQuackConnectionError(err) ||
-		ctx.Err() != nil {
-		return rows, err
+	if err == nil {
+		return rows, nil
+	}
+	if !retryStale || !isStaleQuackConnectionError(err) || ctx.Err() != nil {
+		return nil, err
 	}
 	q.reattachMu.Lock()
 	defer q.reattachMu.Unlock()
 	if reattachErr := q.reattachLocked(ctx); reattachErr != nil {
 		return nil, fmt.Errorf(
-			"%w; reattaching quack endpoint %s: %v",
+			"%w; reattaching quack endpoint %s: %w",
 			err, RedactQuackURL(q.rawURL), reattachErr,
 		)
 	}
-	return q.duck.QueryContext(ctx, query, sqlText)
-}
-
-func (q *quackClient) execRemote(
-	ctx context.Context, sqlText string, retryStale bool,
-) error {
-	query := "FROM " + quackAttachmentName + ".query(?)"
-	_, err := q.duck.ExecContext(ctx, query, sqlText)
-	if err == nil || !retryStale || !isStaleQuackConnectionError(err) ||
-		ctx.Err() != nil {
-		return err
-	}
-	q.reattachMu.Lock()
-	defer q.reattachMu.Unlock()
-	if reattachErr := q.reattachLocked(ctx); reattachErr != nil {
-		return fmt.Errorf(
-			"%w; reattaching quack endpoint %s: %v",
-			err, RedactQuackURL(q.rawURL), reattachErr,
-		)
-	}
-	_, err = q.duck.ExecContext(ctx, query, sqlText)
-	return err
+	rows, err = q.duck.QueryContext(ctx, query, sqlText)
+	return rows, err
 }
 
 func isStaleQuackConnectionError(err error) bool {
@@ -576,9 +720,9 @@ func isMissingQuackAttachmentError(err error) bool {
 		strings.Contains(msg, "table function with name query")
 }
 
-func configureDuckDBThreads(db *sql.DB) error {
+func configureDuckDBThreads(ctx context.Context, db *sql.DB) error {
 	threads := duckDBThreadCount()
-	if _, err := db.Exec(fmt.Sprintf("SET threads TO %d", threads)); err != nil {
+	if _, err := db.ExecContext(ctx, fmt.Sprintf("SET threads TO %d", threads)); err != nil {
 		return fmt.Errorf("configuring duckdb threads: %w", err)
 	}
 	return nil
@@ -596,43 +740,32 @@ func duckDBThreadCount() int {
 // extension sees any token-bearing attach string.
 func ValidateQuackClientURL(rawURL, token string, allowInsecure bool) error {
 	if rawURL == "" {
-		return fmt.Errorf("duckdb url is required")
+		return errors.New("duckdb url is required")
 	}
 	if !strings.HasPrefix(rawURL, "quack:") {
-		return fmt.Errorf("duckdb url must start with quack")
+		return errors.New("duckdb url must start with quack")
 	}
 	if token == "" {
-		return fmt.Errorf(
-			"duckdb quack token is required; set AGENTSVIEW_DUCKDB_TOKEN or [duckdb].token",
-		)
+		return errors.New("duckdb quack token is required; set AGENTSVIEW_DUCKDB_TOKEN or [duckdb].token")
 	}
 	transport := strings.TrimPrefix(rawURL, "quack:")
-	if !strings.HasPrefix(transport, "http://") &&
-		!strings.HasPrefix(transport, "https://") {
-		host, err := quackURIHost(rawURL)
-		if err != nil {
-			return err
-		}
-		if !allowInsecure && !isLoopbackHost(host) {
-			return fmt.Errorf(
-				"duckdb native quack url host must be loopback unless allow_insecure is set",
-			)
-		}
-		return nil
-	}
-	u, err := neturl.Parse(transport)
-	if err != nil || u.Scheme == "" || u.Host == "" {
-		return fmt.Errorf(
-			"duckdb quack url must include an http:// or https:// endpoint",
+	if strings.HasPrefix(transport, "http://") ||
+		strings.HasPrefix(transport, "https://") {
+		// The Quack extension parses the string after "quack:" as a native
+		// HOST:PORT authority and rejects URL-scheme forms at ATTACH time
+		// with "Invalid Port". Reject them here with an actionable message
+		// instead of surfacing the cryptic extension error.
+		return errors.New("duckdb quack url must use the native form quack:HOST:PORT; " +
+			"the Quack extension does not accept http:// or https:// " +
+			"client urls",
 		)
 	}
-	if u.Scheme != "http" && u.Scheme != "https" {
-		return fmt.Errorf("duckdb quack url must use http or https")
+	host, err := quackURIHost(rawURL)
+	if err != nil {
+		return err
 	}
-	if u.Scheme == "http" && !allowInsecure && !isLoopbackHost(u.Hostname()) {
-		return fmt.Errorf(
-			"duckdb quack url uses plain HTTP for a non-loopback host; use https or set allow_insecure",
-		)
+	if !allowInsecure && !isLoopbackHost(host) {
+		return errors.New("duckdb native quack url host must be loopback unless allow_insecure is set")
 	}
 	return nil
 }
@@ -698,19 +831,17 @@ func redactNativeQuackTransport(transport string) string {
 // connection, so loopback binding is the safe default.
 func ValidateQuackServeURI(uri string, allowOtherHostname bool) error {
 	if uri == "" {
-		return fmt.Errorf("duckdb quack bind uri is required")
+		return errors.New("duckdb quack bind uri is required")
 	}
 	if !strings.HasPrefix(uri, "quack:") {
-		return fmt.Errorf("duckdb quack bind uri must start with quack")
+		return errors.New("duckdb quack bind uri must start with quack")
 	}
 	host, err := quackURIHost(uri)
 	if err != nil {
 		return err
 	}
 	if !allowOtherHostname && !isLoopbackHost(host) {
-		return fmt.Errorf(
-			"duckdb quack bind host must be loopback unless allow_insecure is set",
-		)
+		return errors.New("duckdb quack bind host must be loopback unless allow_insecure is set")
 	}
 	return nil
 }
@@ -726,14 +857,14 @@ func quackURIHost(uri string) (string, error) {
 			return "", fmt.Errorf("parsing duckdb quack bind uri: %w", err)
 		}
 		if u.Hostname() == "" {
-			return "", fmt.Errorf("duckdb quack bind uri host is required")
+			return "", errors.New("duckdb quack bind uri host is required")
 		}
 		return u.Hostname(), nil
 	}
 	if strings.HasPrefix(raw, "[") {
 		end := strings.Index(raw, "]")
 		if end < 0 {
-			return "", fmt.Errorf("duckdb quack bind uri has invalid IPv6 host")
+			return "", errors.New("duckdb quack bind uri has invalid IPv6 host")
 		}
 		return raw[1:end], nil
 	}
@@ -742,7 +873,7 @@ func quackURIHost(uri string) (string, error) {
 		host = raw[:i]
 	}
 	if host == "" {
-		return "", fmt.Errorf("duckdb quack bind uri host is required")
+		return "", errors.New("duckdb quack bind uri host is required")
 	}
 	return host, nil
 }

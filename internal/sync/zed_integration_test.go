@@ -10,13 +10,13 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	dbpkg "go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/dbtest"
 	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/sync"
 )
 
 func TestSyncSingleSessionZedUsesVirtualSourcePath(t *testing.T) {
-
 	zedDir := t.TempDir()
 	dbPath := filepath.Join(zedDir, "threads", "threads.db")
 	createZedThreadsDB(t, dbPath, []zedThreadFixture{
@@ -37,14 +37,14 @@ func TestSyncSingleSessionZedUsesVirtualSourcePath(t *testing.T) {
 	})
 
 	database := dbtest.OpenTestDB(t)
-	engine := sync.NewEngine(database, sync.EngineConfig{
+	engine := sync.NewEngine(t.Context(), database, sync.EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentZed: {zedDir},
 		},
 		Machine: "local",
 	})
 
-	source := engine.FindSourceFile("zed:exists")
+	source := engine.FindSourceFile(t.Context(), "zed:exists")
 	assert.Equal(t, dbPath+"#exists", source)
 	require.NoError(t, engine.SyncSingleSession("zed:exists"))
 
@@ -52,7 +52,7 @@ func TestSyncSingleSessionZedUsesVirtualSourcePath(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, exists)
 	assert.Equal(t, 1, exists.MessageCount)
-	filePath := database.GetSessionFilePath("zed:exists")
+	filePath := database.GetSessionFilePath(t.Context(), "zed:exists")
 	assert.Equal(t, dbPath+"#exists", filePath)
 
 	other, err := database.GetSession(t.Context(), "zed:other")
@@ -60,8 +60,55 @@ func TestSyncSingleSessionZedUsesVirtualSourcePath(t *testing.T) {
 	assert.Nil(t, other)
 }
 
-func TestSyncSingleSessionZedForceRewritesUnchangedSession(t *testing.T) {
+func TestSyncAllZedLegacySchemaPreservesOtherProviders(t *testing.T) {
+	root := t.TempDir()
+	zedDir := filepath.Join(root, "zed")
+	dbPath := filepath.Join(zedDir, "threads", "threads.db")
+	require.NoError(t, os.MkdirAll(filepath.Dir(dbPath), 0o755))
+	artifact, err := os.ReadFile(filepath.Join("..", "parser", "testdata", "zed-legacy-threads.sql"))
+	require.NoError(t, err)
+	db, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	_, err = db.ExecContext(t.Context(), string(artifact))
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+	provider, ok := parser.NewProvider(parser.AgentZed, parser.ProviderConfig{
+		Roots: []string{zedDir}, Machine: "local",
+	})
+	require.True(t, ok)
+	sources, err := provider.Discover(t.Context())
+	require.NoError(t, err)
+	require.Len(t, sources, 1)
+	parsed, err := provider.Parse(t.Context(), parser.ParseRequest{Source: sources[0]})
+	require.NoError(t, err)
+	assert.True(t, parsed.ResultSetComplete)
+	assert.Equal(t, parser.SkipNoSession, parsed.SkipReason)
+	assert.Empty(t, parsed.Results)
 
+	aiderDir := filepath.Join(root, "aider", "repo")
+	require.NoError(t, os.MkdirAll(aiderDir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(aiderDir, parser.AiderHistoryFileName()),
+		[]byte("# aider chat started at 2026-06-09 14:01:00\n#### prompt\nanswer\n"), 0o644))
+
+	database := dbtest.OpenTestDB(t)
+	engine := sync.NewEngine(t.Context(), database, sync.EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentZed: {zedDir}, parser.AgentAider: {filepath.Join(root, "aider")},
+		},
+		Machine: "local",
+	})
+	stats := engine.SyncAll(t.Context(), nil)
+	assert.Zero(t, stats.Failed)
+	assert.Equal(t, 1, stats.Synced)
+	zed, err := database.GetSession(t.Context(), "zed:legacy")
+	require.NoError(t, err)
+	assert.Nil(t, zed)
+	page, err := database.ListSessions(t.Context(), dbpkg.SessionFilter{Agent: string(parser.AgentAider), Limit: 10})
+	require.NoError(t, err)
+	assert.Len(t, page.Sessions, 1)
+}
+
+func TestSyncSingleSessionZedForceRewritesUnchangedSession(t *testing.T) {
 	zedDir := t.TempDir()
 	dbPath := filepath.Join(zedDir, "threads", "threads.db")
 	createZedThreadsDB(t, dbPath, []zedThreadFixture{{
@@ -73,7 +120,7 @@ func TestSyncSingleSessionZedForceRewritesUnchangedSession(t *testing.T) {
 	}})
 
 	database := dbtest.OpenTestDB(t)
-	engine := sync.NewEngine(database, sync.EngineConfig{
+	engine := sync.NewEngine(t.Context(), database, sync.EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentZed: {zedDir},
 		},
@@ -86,7 +133,7 @@ func TestSyncSingleSessionZedForceRewritesUnchangedSession(t *testing.T) {
 	require.Equal(t, 1, sess.MessageCount)
 
 	sess.MessageCount = 0
-	require.NoError(t, database.UpsertSession(*sess))
+	require.NoError(t, database.UpsertSession(t.Context(), *sess))
 
 	require.NoError(t, engine.SyncSingleSession("zed:exists"))
 
@@ -94,11 +141,10 @@ func TestSyncSingleSessionZedForceRewritesUnchangedSession(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, sess)
 	assert.Equal(t, 1, sess.MessageCount)
-	assert.Equal(t, dbPath+"#exists", database.GetSessionFilePath("zed:exists"))
+	assert.Equal(t, dbPath+"#exists", database.GetSessionFilePath(t.Context(), "zed:exists"))
 }
 
 func TestSyncPathsZedDeletedPhysicalDBPreservesSessions(t *testing.T) {
-
 	zedDir := t.TempDir()
 	dbPath := filepath.Join(zedDir, "threads", "threads.db")
 	createZedThreadsDB(t, dbPath, []zedThreadFixture{{
@@ -110,7 +156,7 @@ func TestSyncPathsZedDeletedPhysicalDBPreservesSessions(t *testing.T) {
 	}})
 
 	database := dbtest.OpenTestDB(t)
-	engine := sync.NewEngine(database, sync.EngineConfig{
+	engine := sync.NewEngine(t.Context(), database, sync.EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentZed: {zedDir},
 		},
@@ -130,8 +176,86 @@ func TestSyncPathsZedDeletedPhysicalDBPreservesSessions(t *testing.T) {
 	assert.Equal(t, "zed:exists", sess.ID)
 }
 
-func TestSyncSingleSessionZedMissingThreadReturnsNotFound(t *testing.T) {
+func TestReconcileWatchRootsZedDeletedPhysicalDBPreservesSessions(t *testing.T) {
+	zedDir := t.TempDir()
+	dbPath := filepath.Join(zedDir, "threads", "threads.db")
+	createZedThreadsDB(t, dbPath, []zedThreadFixture{{
+		id:        "archived-thread",
+		summary:   "Archived thread",
+		updatedAt: "2026-06-09T02:30:00Z",
+		dataType:  "json",
+		data:      []byte(`{"messages":[{"User":{"content":[{"Text":"hello"}]}}]}`),
+	}})
+	database := dbtest.OpenTestDB(t)
+	engine := sync.NewEngine(t.Context(), database, sync.EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentZed: {zedDir},
+		},
+		Machine: "local",
+	})
+	require.Equal(t, 1, engine.SyncAll(t.Context(), nil).Synced)
+	require.NoError(t, os.Remove(dbPath))
 
+	require.NoError(t, engine.ReconcileWatchRoots(
+		t.Context(), []string{zedDir}, false,
+	))
+
+	sess, err := database.GetSession(t.Context(), "zed:archived-thread")
+	require.NoError(t, err)
+	assert.NotNil(t, sess,
+		"reconciliation must preserve an archived Zed member when threads.db vanishes")
+}
+
+func TestReconcileWatchRootsZedDeletedMemberTombstonesSession(t *testing.T) {
+	zedDir := t.TempDir()
+	dbPath := filepath.Join(zedDir, "threads", "threads.db")
+	createZedThreadsDB(t, dbPath, []zedThreadFixture{
+		{
+			id: "deleted-thread", summary: "Deleted thread",
+			updatedAt: "2026-06-09T02:30:00Z", dataType: "json",
+			data: []byte(`{"messages":[{"User":{"content":[{"Text":"gone"}]}}]}`),
+		},
+		{
+			id: "surviving-thread", summary: "Surviving thread",
+			updatedAt: "2026-06-09T02:31:00Z", dataType: "json",
+			data: []byte(`{"messages":[{"User":{"content":[{"Text":"kept"}]}}]}`),
+		},
+	})
+	database := dbtest.OpenTestDB(t)
+	engine := sync.NewEngine(t.Context(), database, sync.EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{parser.AgentZed: {zedDir}},
+		Machine:   "local",
+	})
+	require.Equal(t, 2, engine.SyncAll(t.Context(), nil).Synced)
+	beforeDelete, err := database.GetSessionFull(t.Context(), "zed:deleted-thread")
+	require.NoError(t, err)
+	require.NotNil(t, beforeDelete)
+
+	zedDB, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	_, err = zedDB.ExecContext(t.Context(), "DELETE FROM threads WHERE id = ?", "deleted-thread")
+	require.NoError(t, err)
+	require.NoError(t, zedDB.Close())
+
+	require.NoError(t, engine.ReconcileWatchRoots(
+		t.Context(), []string{zedDir}, false,
+	))
+
+	deleted, err := database.GetSession(t.Context(), "zed:deleted-thread")
+	require.NoError(t, err)
+	assert.NotNil(t, deleted,
+		"a missing source must leave the archived session browsable")
+	archived, err := database.GetSessionFull(t.Context(), "zed:deleted-thread")
+	require.NoError(t, err)
+	assertSourceMissingState(t, archived)
+	assert.Equal(t, beforeDelete.MessageCount, archived.MessageCount,
+		"source loss must retain the archived transcript")
+	surviving, err := database.GetSession(t.Context(), "zed:surviving-thread")
+	require.NoError(t, err)
+	assert.NotNil(t, surviving)
+}
+
+func TestSyncSingleSessionZedMissingThreadReturnsNotFound(t *testing.T) {
 	zedDir := t.TempDir()
 	createZedThreadsDB(t, filepath.Join(zedDir, "threads", "threads.db"), []zedThreadFixture{{
 		id:        "exists",
@@ -142,14 +266,14 @@ func TestSyncSingleSessionZedMissingThreadReturnsNotFound(t *testing.T) {
 	}})
 
 	database := dbtest.OpenTestDB(t)
-	engine := sync.NewEngine(database, sync.EngineConfig{
+	engine := sync.NewEngine(t.Context(), database, sync.EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentZed: {zedDir},
 		},
 		Machine: "local",
 	})
 
-	assert.Empty(t, engine.FindSourceFile("zed:missing"))
+	assert.Empty(t, engine.FindSourceFile(t.Context(), "zed:missing"))
 	err := engine.SyncSingleSession("zed:missing")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "not found")
@@ -181,10 +305,11 @@ func createZedThreadsDB(
 	threads []zedThreadFixture,
 ) {
 	t.Helper()
+
 	require.NoError(t, os.MkdirAll(filepath.Dir(dbPath), 0o755))
 	copySQLiteSchemaTemplate(
 		t, dbPath, "zed threads", &zedSchemaOnce,
-		&zedSchemaBytes, &zedSchemaErr,
+		&zedSchemaBytes, &errZedSchema,
 		zedThreadsTestSchema,
 	)
 
@@ -193,7 +318,7 @@ func createZedThreadsDB(
 	defer db.Close()
 
 	for _, thread := range threads {
-		_, err = db.Exec(`INSERT INTO threads (
+		_, err = db.ExecContext(t.Context(), `INSERT INTO threads (
 			id, summary, updated_at, data_type, data,
 			parent_id, folder_paths, created_at
 		) VALUES (?, ?, ?, ?, ?, NULL, '', '')`,

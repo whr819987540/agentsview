@@ -1,7 +1,6 @@
 package parser
 
 import (
-	"context"
 	"crypto/sha256"
 	"fmt"
 	"os"
@@ -26,21 +25,21 @@ func TestCommandCodeProviderSourceMethods(t *testing.T) {
 	})
 	require.True(t, ok)
 
-	discovered, err := provider.Discover(context.Background())
+	discovered, err := provider.Discover(t.Context())
 	require.NoError(t, err)
 	require.Len(t, discovered, 1)
 	assert.Equal(t, AgentCommandCode, discovered[0].Provider)
 	assert.Equal(t, sourcePath, discovered[0].DisplayPath)
 	assert.Empty(t, discovered[0].ProjectHint)
 
-	found, ok, err := provider.FindSource(context.Background(), FindSourceRequest{
+	found, ok, err := provider.FindSource(t.Context(), FindSourceRequest{
 		FullSessionID: "host~commandcode:sess_123",
 	})
 	require.NoError(t, err)
 	require.True(t, ok)
 	assert.Equal(t, sourcePath, found.DisplayPath)
 
-	found, ok, err = provider.FindSource(context.Background(), FindSourceRequest{
+	found, ok, err = provider.FindSource(t.Context(), FindSourceRequest{
 		FingerprintKey: sourcePath,
 	})
 	require.NoError(t, err)
@@ -49,12 +48,50 @@ func TestCommandCodeProviderSourceMethods(t *testing.T) {
 
 	require.NoError(t, os.Remove(sourcePath))
 	changed, err := provider.SourcesForChangedPath(
-		context.Background(),
+		t.Context(),
 		ChangedPathRequest{Path: sourcePath, EventKind: "remove", WatchRoot: root},
 	)
 	require.NoError(t, err)
 	require.Len(t, changed, 1)
 	assert.Equal(t, sourcePath, changed[0].DisplayPath)
+}
+
+func TestCommandCodeProviderWatchRootsStayBounded(t *testing.T) {
+	root := t.TempDir()
+	transcript := filepath.Join(root, "project", "session.jsonl")
+	writeSourceFile(t, transcript, "{}\n")
+	companionCalls := 0
+	provider := &commandCodeProvider{
+		Def:  AgentDef{Type: AgentCommandCode},
+		Caps: commandCodeProviderCapabilities(),
+		sources: NewDirectoryJSONLSourceSet(
+			AgentCommandCode,
+			[]string{root},
+			WithCompanionFiles(func(path string) []string {
+				companionCalls++
+				return []string{commandCodeMetaCompanionPath(path)}
+			}),
+		),
+	}
+
+	assert.Equal(t, CapabilitySupported, provider.Capabilities().Source.WatchRoots)
+	assert.Implements(t, (*WatchRootPlanner)(nil), provider)
+	roots, err := ResolveWatchRoots(t.Context(), provider)
+	require.NoError(t, err)
+	assert.Equal(t, []WatchRoot{{
+		Path:        root,
+		Recursive:   true,
+		DebounceKey: string(AgentCommandCode) + ":jsonl:" + root,
+	}}, roots)
+	assert.Zero(t, companionCalls,
+		"bounded root scheduling must not discover transcript companions")
+
+	plan, err := provider.WatchPlan(t.Context())
+	require.NoError(t, err)
+	require.Len(t, plan.Roots, 1)
+	assert.Contains(t, plan.Roots[0].IncludeGlobs, "session.meta.json")
+	assert.Equal(t, 1, companionCalls,
+		"legacy WatchPlan must retain companion glob discovery")
 }
 
 func TestCommandCodeProviderDiscoversSymlinkedProjectDirectory(t *testing.T) {
@@ -76,12 +113,12 @@ func TestCommandCodeProviderDiscoversSymlinkedProjectDirectory(t *testing.T) {
 	})
 	require.True(t, ok)
 
-	discovered, err := provider.Discover(context.Background())
+	discovered, err := provider.Discover(t.Context())
 	require.NoError(t, err)
 	require.Len(t, discovered, 1)
 	assert.Equal(t, sourcePath, discovered[0].DisplayPath)
 
-	found, ok, err := provider.FindSource(context.Background(), FindSourceRequest{
+	found, ok, err := provider.FindSource(t.Context(), FindSourceRequest{
 		RawSessionID: "sess_123",
 	})
 	require.NoError(t, err)
@@ -100,13 +137,13 @@ func TestCommandCodeProviderParse(t *testing.T) {
 		Machine: "devbox",
 	})
 	require.True(t, ok)
-	sources, err := provider.Discover(context.Background())
+	sources, err := provider.Discover(t.Context())
 	require.NoError(t, err)
 	require.Len(t, sources, 1)
 
-	fingerprint, err := provider.Fingerprint(context.Background(), sources[0])
+	fingerprint, err := provider.Fingerprint(t.Context(), sources[0])
 	require.NoError(t, err)
-	outcome, err := provider.Parse(context.Background(), ParseRequest{
+	outcome, err := provider.Parse(t.Context(), ParseRequest{
 		Source:      sources[0],
 		Fingerprint: fingerprint,
 	})
@@ -136,18 +173,18 @@ func TestCommandCodeProviderParseUsesSharedFingerprintHash(t *testing.T) {
 		Machine: "devbox",
 	})
 	require.True(t, ok)
-	sources, err := provider.Discover(context.Background())
+	sources, err := provider.Discover(t.Context())
 	require.NoError(t, err)
 	require.Len(t, sources, 1)
 
-	fingerprint, err := provider.Fingerprint(context.Background(), sources[0])
+	fingerprint, err := provider.Fingerprint(t.Context(), sources[0])
 	require.NoError(t, err)
 	require.NotEmpty(t, fingerprint.Hash)
 	transcriptHash := fmt.Sprintf("%x", sha256.Sum256([]byte(transcript)))
 	require.NotEqual(t, transcriptHash, fingerprint.Hash,
 		"the .meta.json companion must participate in the fingerprint hash")
 
-	outcome, err := provider.Parse(context.Background(), ParseRequest{
+	outcome, err := provider.Parse(t.Context(), ParseRequest{
 		Source:      sources[0],
 		Fingerprint: fingerprint,
 	})
@@ -175,15 +212,15 @@ func TestCommandCodeProviderFingerprintIncludesContentHash(t *testing.T) {
 
 	provider, ok := NewProvider(AgentCommandCode, ProviderConfig{Roots: []string{root}})
 	require.True(t, ok)
-	sources, err := provider.Discover(context.Background())
+	sources, err := provider.Discover(t.Context())
 	require.NoError(t, err)
 	require.Len(t, sources, 1)
 
-	fp, err := provider.Fingerprint(context.Background(), sources[0])
+	fp, err := provider.Fingerprint(t.Context(), sources[0])
 	require.NoError(t, err)
 	require.NotEmpty(t, fp.Hash)
 
-	outcome, err := provider.Parse(context.Background(), ParseRequest{
+	outcome, err := provider.Parse(t.Context(), ParseRequest{
 		Source:      sources[0],
 		Fingerprint: fp,
 	})

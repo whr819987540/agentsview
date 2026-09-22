@@ -1,7 +1,6 @@
 package db
 
 import (
-	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -12,19 +11,54 @@ import (
 // the message ID. Fails the test if no messages exist.
 func pinFirstMessage(t *testing.T, d *DB, sessionID string) int64 {
 	t.Helper()
-	ctx := context.Background()
+
+	ctx := t.Context()
 	msgs, err := d.GetMessages(ctx, sessionID, 0, 1, true)
 	require.NoError(t, err, "GetMessages")
 	require.NotEmpty(t, msgs, "no messages in session %s", sessionID)
-	id, err := d.PinMessage(sessionID, msgs[0].ID, nil)
+	id, err := d.PinMessage(ctx, sessionID, msgs[0].ID, nil)
 	require.NoError(t, err, "PinMessage")
 	require.NotZero(t, id, "PinMessage returned 0 for session %s msg %d", sessionID, msgs[0].ID)
 	return msgs[0].ID
 }
 
+func TestListPinnedSessionIDsForScope(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+
+	insertSession(t, d, "s1", "alpha")
+	insertSession(t, d, "s2", "beta")
+	insertSession(t, d, "s3", "alpha")
+	insertMessages(t, d,
+		userMsg("s1", 0, "hello from alpha"),
+		userMsg("s1", 1, "second alpha message"))
+	insertMessages(t, d, userMsg("s2", 0, "hello from beta"))
+	insertMessages(t, d, userMsg("s3", 0, "unpinned alpha"))
+	// Two pins in s1 must still yield one distinct session id.
+	pinFirstMessage(t, d, "s1")
+	msgs, err := d.GetMessages(ctx, "s1", 0, 2, true)
+	require.NoError(t, err, "GetMessages")
+	require.Len(t, msgs, 2)
+	_, err = d.PinMessage(ctx, "s1", msgs[1].ID, nil)
+	require.NoError(t, err, "PinMessage second pin")
+	pinFirstMessage(t, d, "s2")
+
+	all, err := d.ListPinnedSessionIDsForScope(ctx, nil, nil)
+	require.NoError(t, err, "unfiltered scope")
+	assert.Equal(t, []string{"s1", "s2"}, all)
+
+	alphaOnly, err := d.ListPinnedSessionIDsForScope(ctx, []string{"alpha"}, nil)
+	require.NoError(t, err, "include alpha")
+	assert.Equal(t, []string{"s1"}, alphaOnly)
+
+	excludeAlpha, err := d.ListPinnedSessionIDsForScope(ctx, nil, []string{"alpha"})
+	require.NoError(t, err, "exclude alpha")
+	assert.Equal(t, []string{"s2"}, excludeAlpha)
+}
+
 func TestListPinnedMessages_NoFilter(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	insertSession(t, d, "s1", "alpha")
 	insertSession(t, d, "s2", "beta")
@@ -40,7 +74,7 @@ func TestListPinnedMessages_NoFilter(t *testing.T) {
 
 func TestListPinnedMessages_ProjectFilter(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	insertSession(t, d, "s1", "alpha")
 	insertSession(t, d, "s2", "alpha")
@@ -79,7 +113,7 @@ func TestListPinnedMessages_ProjectFilter(t *testing.T) {
 
 func TestListPinnedMessages_ProjectFilterExcludesTrashed(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	insertSession(t, d, "live", "alpha")
 	insertSession(t, d, "trashed", "alpha")
@@ -89,7 +123,7 @@ func TestListPinnedMessages_ProjectFilterExcludesTrashed(t *testing.T) {
 	pinFirstMessage(t, d, "trashed")
 
 	// Soft-delete the trashed session.
-	_, err := d.getWriter().Exec(
+	_, err := d.getWriter().Exec(ctx,
 		"UPDATE sessions SET deleted_at = ? WHERE id = ?",
 		tsZeroS1, "trashed",
 	)
@@ -104,7 +138,7 @@ func TestListPinnedMessages_ProjectFilterExcludesTrashed(t *testing.T) {
 
 func TestListPinnedMessages_SessionFilterIgnoresProject(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	insertSession(t, d, "s1", "alpha")
 	insertMessages(t, d, userMsg("s1", 0, "msg"))
@@ -121,7 +155,7 @@ func TestListPinnedMessages_SessionFilterIgnoresProject(t *testing.T) {
 // the session_name value in SessionDisplayName rather than NULL.
 func TestListPinnedMessages_SessionNameFallback(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	agentName := "My Agent Session"
 	insertSession(t, d, "s1", "alpha", func(s *Session) {

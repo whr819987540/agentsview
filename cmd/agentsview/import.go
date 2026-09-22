@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/importer"
+	"go.kenn.io/agentsview/internal/pathutil"
 )
 
 type ImportConfig struct {
@@ -19,14 +21,26 @@ type ImportConfig struct {
 }
 
 func runImport(cfg ImportConfig) {
+	if err := importSessions(cfg); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func importSessions(cfg ImportConfig) error {
+	expandedPath, err := pathutil.ExpandHome(cfg.Path)
+	if err != nil {
+		return fmt.Errorf("expanding import path: %w", err)
+	}
+	cfg.Path = expandedPath
+
 	appCfg, err := config.LoadMinimal()
 	if err != nil {
-		log.Fatalf("loading config: %v", err)
+		return fmt.Errorf("loading config: %w", err)
 	}
 
 	database, writeLock, err := openWriteDB(context.Background(), appCfg)
 	if err != nil {
-		log.Fatalf("Error opening database: %v", err)
+		return fmt.Errorf("opening database: %w", err)
 	}
 	defer closeWriteDB(database, writeLock)
 
@@ -35,43 +49,61 @@ func runImport(cfg ImportConfig) {
 	// Handle zip files.
 	dir, cleanup, err := resolveImportSource(cfg.Path)
 	if err != nil {
-		log.Fatalf("Error: %v", err)
+		return fmt.Errorf("import source: %w", err)
 	}
 	if cleanup != nil {
 		defer cleanup()
 	}
 
-	var stats importer.ImportStats
-
-	switch cfg.Type {
-	case "claude-ai":
-		stats, err = runClaudeAIImport(ctx, database, dir)
-	case "chatgpt":
-		assetsDir := filepath.Join(appCfg.DataDir, "assets")
-		stats, err = runChatGPTImport(
-			ctx, database, dir, assetsDir,
-		)
-	default:
-		log.Fatalf(
-			"Unknown import type: %s (use claude-ai or chatgpt)",
-			cfg.Type,
-		)
+	assetsDir := filepath.Join(appCfg.DataDir, "assets")
+	stats, err := runImportDispatch(
+		ctx, database, cfg.Type, dir, assetsDir, appCfg.InstallationID,
+	)
+	if errors.Is(err, errUnknownImportType) {
+		return fmt.Errorf("%w", err)
 	}
 
 	if err != nil {
-		fmt.Fprintln(os.Stderr)
-		log.Fatalf("Import failed: %v", err)
+		if summary := formatImportFailureSummary(stats); summary != "" {
+			fmt.Fprint(os.Stderr, summary)
+		} else {
+			fmt.Fprintln(os.Stderr)
+		}
+		return fmt.Errorf("import failed: %w", err)
 	}
 
 	printImportSummary(stats)
 
 	if stats.Errors > 0 {
-		os.Exit(1)
+		return fmt.Errorf("import completed with %d errors", stats.Errors)
+	}
+	return nil
+}
+
+var errUnknownImportType = errors.New("unknown import type")
+
+func runImportDispatch(
+	ctx context.Context,
+	database *db.DB,
+	importType, path, assetsDir, machine string,
+) (importer.ImportStats, error) {
+	switch importType {
+	case "claude-ai":
+		return runClaudeAIImport(ctx, database, path, machine)
+	case "chatgpt":
+		return runChatGPTImport(ctx, database, path, assetsDir, machine)
+	case "gemini-apps":
+		return runGeminiAppsImport(ctx, database, path, machine)
+	default:
+		return importer.ImportStats{}, fmt.Errorf(
+			"%w: %s (use claude-ai, chatgpt, or gemini-apps)",
+			errUnknownImportType, importType,
+		)
 	}
 }
 
 func runClaudeAIImport(
-	ctx context.Context, database *db.DB, path string,
+	ctx context.Context, database *db.DB, path, machine string,
 ) (importer.ImportStats, error) {
 	jsonPath := path
 	info, err := os.Stat(path)
@@ -104,13 +136,13 @@ func runClaudeAIImport(
 					"\rRebuilding search index...   ",
 				)
 			},
-		},
+		}, machine,
 	)
 }
 
 func runChatGPTImport(
 	ctx context.Context, database *db.DB,
-	dir, assetsDir string,
+	dir, assetsDir, machine string,
 ) (importer.ImportStats, error) {
 	return importer.ImportChatGPT(
 		ctx, database, dir, assetsDir,
@@ -128,13 +160,35 @@ func runChatGPTImport(
 					"\rRebuilding search index...   ",
 				)
 			},
-		},
+		}, machine,
+	)
+}
+
+func runGeminiAppsImport(
+	ctx context.Context, database *db.DB, path, machine string,
+) (importer.ImportStats, error) {
+	return importer.ImportGeminiApps(
+		ctx, database, path,
+		&importer.ImportCallbacks{
+			OnProgress: func(s importer.ImportStats) {
+				n := s.Imported + s.Updated + s.Skipped
+				fmt.Fprintf(os.Stderr, "\r%d records processed...", n)
+			},
+			OnIndexing: func() {
+				fmt.Fprintf(os.Stderr, "\rRebuilding search index...   ")
+			},
+		}, machine,
 	)
 }
 
 func printImportSummary(stats importer.ImportStats) {
+	fmt.Fprint(os.Stderr, formatImportSummary(stats))
+}
+
+func formatImportSummary(stats importer.ImportStats) string {
+	var summary strings.Builder
 	total := stats.Imported + stats.Updated + stats.Skipped
-	fmt.Fprintf(os.Stderr, "\rDone: %d processed", total)
+	fmt.Fprintf(&summary, "\rDone: %d processed", total)
 	var parts []string
 	if stats.Imported > 0 {
 		parts = append(
@@ -152,14 +206,20 @@ func printImportSummary(stats importer.ImportStats) {
 		)
 	}
 	if len(parts) > 0 {
-		fmt.Fprintf(
-			os.Stderr, " (%s)", strings.Join(parts, ", "),
-		)
+		fmt.Fprintf(&summary, " (%s)", strings.Join(parts, ", "))
 	}
-	fmt.Fprintln(os.Stderr)
+	fmt.Fprintln(&summary)
 	if stats.Errors > 0 {
-		fmt.Fprintf(os.Stderr, "  %d errors\n", stats.Errors)
+		fmt.Fprintf(&summary, "  %d errors\n", stats.Errors)
 	}
+	return summary.String()
+}
+
+func formatImportFailureSummary(stats importer.ImportStats) string {
+	if stats.Imported+stats.Updated+stats.Skipped+stats.Errors == 0 {
+		return ""
+	}
+	return formatImportSummary(stats)
 }
 
 // resolveImportSource handles zip extraction. If the path is

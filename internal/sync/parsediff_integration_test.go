@@ -1,11 +1,5 @@
 package sync_test
 
-// Integration tests for the report-only parse-diff mode. They are
-// written strictly against the exported contract in parsediff.go and
-// parsediff_report.go: assertions go through DiffClass buckets, the
-// Field* name constants, and ParseDiffTotals — never through rendered
-// strings, whose exact wording belongs to the renderer.
-
 import (
 	"context"
 	"database/sql"
@@ -17,7 +11,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-
+	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/dbtest"
 	"go.kenn.io/agentsview/internal/parser"
@@ -25,11 +19,17 @@ import (
 	"go.kenn.io/agentsview/internal/testjsonl"
 )
 
+// Integration tests for the report-only parse-diff mode. They are
+// written strictly against the exported contract in parsediff.go and
+// parsediff_report.go: assertions go through DiffClass buckets, the
+// Field* name constants, and ParseDiffTotals — never through rendered
+// strings, whose exact wording belongs to the renderer.
+
 // newParseDiffEngine builds a report-only diff engine over the same
 // database and agent directories the setupTestEnv harness used for
 // the initial SyncAll.
-func newParseDiffEngine(env *testEnv) *sync.Engine {
-	return sync.NewDiffEngine(env.db, sync.EngineConfig{
+func newParseDiffEngine(ctx context.Context, env *testEnv) *sync.Engine {
+	return sync.NewDiffEngine(ctx, env.db, sync.EngineConfig{
 		AgentDirs: parseDiffAgentDirs(env),
 		Machine:   "local",
 	})
@@ -57,6 +57,8 @@ func parseDiffAgentDirs(env *testEnv) map[parser.AgentType][]string {
 	add(parser.AgentKiro, env.kiroDir)
 	add(parser.AgentKilo, env.kiloDir)
 	add(parser.AgentShelley, env.shelleyDir)
+	add(parser.AgentTrae, env.traeDir)
+	add(parser.AgentWindsurf, env.windsurfDir)
 	add(parser.AgentAntigravityCLI, env.antigravityCLIDir)
 	return dirs
 }
@@ -67,8 +69,8 @@ func runParseDiff(
 	t *testing.T, env *testEnv, opts sync.ParseDiffOptions,
 ) *sync.ParseDiffReport {
 	t.Helper()
-	report, err := newParseDiffEngine(env).ParseDiff(
-		context.Background(), opts,
+	report, err := newParseDiffEngine(t.Context(), env).ParseDiff(
+		t.Context(), opts,
 	)
 	require.NoError(t, err, "ParseDiff")
 	require.NotNil(t, report, "ParseDiff report")
@@ -110,8 +112,8 @@ func mutateDB(
 	t *testing.T, env *testEnv, query string, args ...any,
 ) {
 	t.Helper()
-	err := env.db.Update(func(tx *sql.Tx) error {
-		_, err := tx.Exec(query, args...)
+	err := env.db.Update(t.Context(), func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(t.Context(), query, args...)
 		return err
 	})
 	require.NoError(t, err, "mutate db: %s", query)
@@ -214,6 +216,77 @@ func TestParseDiffCleanArchiveIsIdentical(t *testing.T) {
 	assert.False(t, report.HasFailures(), "HasFailures")
 }
 
+func TestParseDiffUsageOnlyArchiveIsIdentical(t *testing.T) {
+	env := setupSingleAgentTestEnv(t, parser.AgentClaude)
+	env.writeClaudeSession(t, "test-proj", "pd-usage-only.jsonl",
+		parseDiffClaudeContentRich())
+
+	cfg := sync.EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentClaude: {env.claudeDir},
+		},
+		Machine:        "local",
+		ArchiveContent: config.ArchiveContentUsage,
+	}
+	stats := sync.NewEngine(t.Context(), env.db, cfg).SyncAll(t.Context(), nil)
+	require.Equal(t, 1, stats.TotalSessions)
+	require.Equal(t, 1, stats.Synced)
+	require.Zero(t, stats.Failed)
+
+	report, err := sync.NewDiffEngine(t.Context(), env.db, cfg).ParseDiff(
+		t.Context(),
+		sync.ParseDiffOptions{Agents: []parser.AgentType{parser.AgentClaude}},
+	)
+	require.NoError(t, err)
+	assert.Equal(t, sync.ParseDiffTotals{Examined: 1, Identical: 1},
+		report.Totals)
+	assert.Empty(t, report.FieldCounts)
+	assert.Empty(t, report.Sessions)
+}
+
+func TestParseDiffOffloadDoesNotWriteAssets(t *testing.T) {
+	env := setupSingleAgentTestEnv(t, parser.AgentClaude)
+	const raw = `[{"type":"input_image","image_url":"data:image/png;base64,AAEC"}]`
+	content := testjsonl.NewSessionBuilder().
+		AddClaudeUser(tsEarly, "show the image").
+		AddRaw(testjsonl.ClaudeAssistantJSON([]map[string]any{
+			{"type": "tool_use", "id": "image-call", "name": "Bash", "input": map[string]any{}},
+		}, tsEarlyS1)).
+		AddRaw(testjsonl.ClaudeToolResultUserJSON("image-call", raw, tsEarlyS5)).
+		String()
+	env.writeClaudeSession(t, "test-proj", "pd-offload.jsonl", content)
+
+	assetsDir := t.TempDir()
+	cfg := sync.EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentClaude: {env.claudeDir},
+		},
+		Machine:          "local",
+		ToolResultImages: config.ToolResultImagesOffload,
+		AssetsDir:        assetsDir,
+	}
+	ingest := sync.NewEngine(t.Context(), env.db, cfg)
+	t.Cleanup(ingest.Close)
+	require.Equal(t, 1, ingest.SyncAll(t.Context(), nil).Synced)
+
+	entries, err := os.ReadDir(assetsDir)
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	require.NoError(t, os.Remove(filepath.Join(assetsDir, entries[0].Name())))
+
+	diff := sync.NewDiffEngine(t.Context(), env.db, cfg)
+	t.Cleanup(diff.Close)
+	report, err := diff.ParseDiff(t.Context(), sync.ParseDiffOptions{
+		Agents: []parser.AgentType{parser.AgentClaude},
+	})
+	require.NoError(t, err)
+	assert.Equal(t, sync.ParseDiffTotals{Examined: 1, Identical: 1}, report.Totals)
+
+	entries, err = os.ReadDir(assetsDir)
+	require.NoError(t, err)
+	assert.Empty(t, entries)
+}
+
 // TestParseDiffDetectsStoredDrift mutates stored rows directly after
 // a sync and verifies each drifted session is classified DiffChanged
 // with the expected field names while an untouched control session
@@ -266,8 +339,7 @@ func TestParseDiffDetectsStoredDrift(t *testing.T) {
 	// unchanged while every per-ordinal value differs.
 	swapMsgs := fetchMessages(t, env.db, "pd-swap")
 	require.Len(t, swapMsgs, 2, "pd-swap fixture")
-	require.NotEqual(t,
-		swapMsgs[0].ContentLength, swapMsgs[1].ContentLength,
+	require.NotEqual(t, swapMsgs[0].ContentLength, swapMsgs[1].ContentLength,
 		"swap needs distinct lengths or the collision test is vacuous")
 	mutateDB(t, env,
 		"UPDATE messages SET content = ?, content_length = ?"+
@@ -285,7 +357,7 @@ func TestParseDiffDetectsStoredDrift(t *testing.T) {
 		"truncated", "pd-term")
 	// The Claude parser emits no usage events for this fixture, so
 	// a synthetic stored event is pure drift.
-	require.NoError(t, env.db.ReplaceSessionUsageEvents(
+	require.NoError(t, env.db.ReplaceSessionUsageEvents(t.Context(),
 		"pd-usage", []db.UsageEvent{{
 			SessionID: "pd-usage",
 			Source:    "synthetic",
@@ -383,8 +455,7 @@ func TestParseDiffToleratesNullStoredTimestamp(t *testing.T) {
 	sd := findSessionDiff(report, "pd-nullts")
 	require.NotNil(t, sd, "session not listed")
 	assert.Equal(t, sync.DiffChanged, sd.Class, "class")
-	assert.ElementsMatch(t,
-		[]string{sync.FieldMessageMetadata},
+	assert.ElementsMatch(t, []string{sync.FieldMessageMetadata},
 		sessionDiffFieldNames(sd, false),
 		"non-informational fields")
 	assert.True(t, report.HasFailures(), "HasFailures")
@@ -524,7 +595,7 @@ func TestParseDiffWritesNothing(t *testing.T) {
 
 	// The drift must still be there: ParseDiff reports, never fixes.
 	sess, err := env.db.GetSessionFull(
-		context.Background(), "pd-keep",
+		t.Context(), "pd-keep",
 	)
 	require.NoError(t, err, "GetSessionFull")
 	require.NotNil(t, sess, "session pd-keep not found")
@@ -537,7 +608,7 @@ func TestParseDiffWritesNothing(t *testing.T) {
 
 	// Nothing was persisted: the parse error did not land in the
 	// skip cache table.
-	skipped, err := env.db.LoadSkippedFiles()
+	skipped, err := env.db.LoadSkippedFiles(t.Context())
 	require.NoError(t, err, "LoadSkippedFiles")
 	assert.Empty(t, skipped, "skipped_files must stay empty")
 }
@@ -587,8 +658,7 @@ func TestParseDiffBypassesSkipLayers(t *testing.T) {
 	) + "\n")
 	require.NoError(t, err, "append message line")
 	require.NoError(t, f.Close(), "close session file")
-	require.NoError(t,
-		os.Chtimes(path, origInfo.ModTime(), origInfo.ModTime()),
+	require.NoError(t, os.Chtimes(path, origInfo.ModTime(), origInfo.ModTime()),
 		"restore source mtime so the change is not classified raced")
 
 	report = runParseDiff(t, env, sync.ParseDiffOptions{})
@@ -609,7 +679,6 @@ func TestParseDiffBypassesSkipLayers(t *testing.T) {
 // buckets: skipped (source missing), new on disk, pending resync,
 // and parse error.
 func TestParseDiffBuckets(t *testing.T) {
-
 	t.Run("source missing", func(t *testing.T) {
 		env := setupSingleAgentTestEnv(t, parser.AgentClaude)
 		path := env.writeClaudeSession(
@@ -664,8 +733,7 @@ func TestParseDiffBuckets(t *testing.T) {
 		})
 
 		staleVersion := db.CurrentDataVersion() - 1
-		require.NoError(t,
-			env.db.SetSessionDataVersion("pd-stale", staleVersion),
+		require.NoError(t, env.db.SetSessionDataVersion(t.Context(), "pd-stale", staleVersion),
 			"downgrade data_version")
 		// A real field diff that must NOT count as parser drift.
 		mutateDB(t, env,
@@ -787,9 +855,9 @@ func TestParseDiffAgentScope(t *testing.T) {
 		TotalSessions: 2, Synced: 2,
 	})
 
-	engine := newParseDiffEngine(env)
+	engine := newParseDiffEngine(t.Context(), env)
 	report, err := engine.ParseDiff(
-		context.Background(), sync.ParseDiffOptions{
+		t.Context(), sync.ParseDiffOptions{
 			Agents: []parser.AgentType{parser.AgentCodex},
 		},
 	)
@@ -810,14 +878,15 @@ func TestParseDiffAgentScope(t *testing.T) {
 	assert.Equal(t, []string{"codex"}, report.Agents,
 		"report.Agents must reflect the scoped run")
 
-	// Database-backed agents have no on-disk source to re-parse.
+	// Import-only agents are outside parse-diff support.
 	_, err = engine.ParseDiff(
-		context.Background(), sync.ParseDiffOptions{
+		t.Context(), sync.ParseDiffOptions{
 			Agents: []parser.AgentType{parser.AgentClaudeAI},
 		},
 	)
 	require.Error(t, err,
-		"ParseDiff must reject database-backed agents")
+		"ParseDiff must reject import-only agents")
+	assert.ErrorContains(t, err, "is not supported by parse-diff")
 }
 
 func TestParseDiffCoversProviderAuthoritativePiFamily(t *testing.T) {
@@ -1054,7 +1123,7 @@ func TestParseDiffShelleyDBErrorAttributed(t *testing.T) {
 	// errors, forcing the whole-file job error path.
 	conn, err := sql.Open("sqlite3", dbPath)
 	require.NoError(t, err)
-	_, err = conn.Exec(`DROP TABLE messages`)
+	_, err = conn.ExecContext(t.Context(), `DROP TABLE messages`)
 	require.NoError(t, err)
 	require.NoError(t, conn.Close())
 
@@ -1076,7 +1145,6 @@ func TestParseDiffShelleyDBErrorAttributed(t *testing.T) {
 // being silently dropped (unstored) or misclassified as presence
 // drift (stored), so --fail-on-change stays trustworthy.
 func TestParseDiffKiroSQLitePerSessionError(t *testing.T) {
-
 	env := setupSingleAgentTestEnv(t, parser.AgentKiro)
 	ks := createKiroSQLiteDB(t, env.kiroDir)
 	standard := readKiroSQLiteFixture(t, "standard_payload.json")
@@ -1133,7 +1201,6 @@ func TestParseDiffKiroSQLitePerSessionError(t *testing.T) {
 // being silently dropped, so --fail-on-change stays trustworthy even
 // for a session that was never stored.
 func TestParseDiffKiloSQLitePerSessionError(t *testing.T) {
-
 	env := setupSingleAgentTestEnv(t, parser.AgentKilo)
 	ks := createKiloDB(t, env.kiloDir)
 	ks.addProject(t, "proj-1", "/home/user/code/kilo-app")
@@ -1323,6 +1390,7 @@ func appendClaudeLineAndSyncIncremental(
 	t *testing.T, env *testEnv, path, line string,
 ) {
 	t.Helper()
+
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
 	require.NoError(t, err, "open for append")
 	_, err = f.WriteString(line)
@@ -1354,7 +1422,7 @@ func TestParseDiffIncrementalAppendSkewNotCountedAsChange(t *testing.T) {
 
 	// Assert the marker was set by real production code, not simulated.
 	afterAppend, err := env.db.GetSessionFull(
-		context.Background(), "pd-skew",
+		t.Context(), "pd-skew",
 	)
 	require.NoError(t, err, "GetSessionFull after append")
 	require.NotNil(t, afterAppend, "session after append")
@@ -1454,7 +1522,7 @@ func TestParseDiffIncrementalMarkerDoesNotMaskNonArtifactDrift(t *testing.T) {
 	appendClaudeLineAndSyncIncremental(t, env, path,
 		claudeAppendedAssistantLine("appended reply", "2024-01-01T10:00:10Z"))
 
-	marked, err := env.db.GetSessionFull(context.Background(), "pd-nomask")
+	marked, err := env.db.GetSessionFull(t.Context(), "pd-nomask")
 	require.NoError(t, err, "GetSessionFull after append")
 	require.NotNil(t, marked, "session after append")
 	require.True(t, marked.LastWriteIncremental,
@@ -1510,9 +1578,9 @@ func TestParseDiffFullResyncClearsIncrementalSkew(t *testing.T) {
 	// marker. Re-seed the same drift afterward (the resync overwrote it),
 	// then confirm the session is now a genuine DiffChanged: the skew
 	// suppression self-heals once the comparison basis is rebuilt.
-	stats := env.engine.ResyncAll(context.Background(), nil)
+	stats := env.engine.ResyncAll(t.Context(), nil)
 	require.False(t, stats.Aborted, "resync aborted")
-	healed, err := env.db.GetSessionFull(context.Background(), "pd-heal")
+	healed, err := env.db.GetSessionFull(t.Context(), "pd-heal")
 	require.NoError(t, err, "GetSessionFull after resync")
 	require.NotNil(t, healed, "session after resync")
 	require.False(t, healed.LastWriteIncremental,
@@ -1547,7 +1615,7 @@ func TestParseDiffIncrementalSkewNeverSetForDBBackedProviders(t *testing.T) {
 	})
 
 	stored, err := env.db.GetSessionFull(
-		context.Background(), "kiro:kiro-db",
+		t.Context(), "kiro:kiro-db",
 	)
 	require.NoError(t, err, "GetSessionFull kiro")
 	require.NotNil(t, stored, "kiro session")
@@ -1815,7 +1883,7 @@ func TestParseDiffCodexTranscriptSkewUsesTranscriptStoredMtime(t *testing.T) {
 		TotalSessions: 1, Synced: 1,
 	})
 
-	stored, err := env.db.GetSessionFull(context.Background(), "codex:"+uuid)
+	stored, err := env.db.GetSessionFull(t.Context(), "codex:"+uuid)
 	require.NoError(t, err, "GetSessionFull")
 	require.NotNil(t, stored, "stored Codex session")
 	require.NotNil(t, stored.FileMtime, "stored file_mtime")
@@ -1924,7 +1992,7 @@ func TestParseDiffCodexLegacyStaleIncrementalHashDoesNotLookRaced(t *testing.T) 
 		TotalSessions: 1, Synced: 1,
 	})
 	beforeAppend, err := env.db.GetSessionFull(
-		context.Background(), "codex:"+uuid,
+		t.Context(), "codex:"+uuid,
 	)
 	require.NoError(t, err, "GetSessionFull before append")
 	require.NotNil(t, beforeAppend, "session before append")
@@ -1990,7 +2058,7 @@ func TestParseDiffCodexFullParsePartialTailDoesNotLookRaced(t *testing.T) {
 	assertSessionMessageCount(t, env.db, "codex:"+uuid, 1)
 
 	stored, err := env.db.GetSessionFull(
-		context.Background(), "codex:"+uuid,
+		t.Context(), "codex:"+uuid,
 	)
 	require.NoError(t, err, "GetSessionFull after full parse")
 	require.NotNil(t, stored, "stored session after full parse")
@@ -2081,7 +2149,7 @@ func writeHermesFanoutStateDB(t *testing.T, root string) {
 	conn, err := sql.Open("sqlite3", filepath.Join(root, "state.db"))
 	require.NoError(t, err, "open hermes state.db")
 	defer conn.Close()
-	_, err = conn.Exec(`
+	_, err = conn.ExecContext(t.Context(), `
 		CREATE TABLE sessions (
 			id TEXT PRIMARY KEY, source TEXT NOT NULL, user_id TEXT,
 			model TEXT, model_config TEXT, system_prompt TEXT,
@@ -2137,15 +2205,15 @@ func TestParseDiffHermesSharedStateDBNotMaskedAsRaced(t *testing.T) {
 		},
 		Machine: "local",
 	}
-	engine := sync.NewEngine(database, cfg)
-	stats := engine.SyncAll(context.Background(), nil)
+	engine := sync.NewEngine(t.Context(), database, cfg)
+	stats := engine.SyncAll(t.Context(), nil)
 	require.Equal(t, 2, stats.Synced, "expected both Hermes sessions synced")
 
 	// Seed real parser drift in the archive for BOTH sessions so a re-parse
 	// of the unchanged state.db reports a first_message change.
 	for _, id := range []string{"hermes:alpha", "hermes:beta"} {
-		require.NoError(t, database.Update(func(tx *sql.Tx) error {
-			_, err := tx.Exec(
+		require.NoError(t, database.Update(t.Context(), func(tx *sql.Tx) error {
+			_, err := tx.ExecContext(t.Context(),
 				"UPDATE sessions SET first_message = ? WHERE id = ?",
 				"drifted first message", id,
 			)
@@ -2160,8 +2228,8 @@ func TestParseDiffHermesSharedStateDBNotMaskedAsRaced(t *testing.T) {
 		filepath.Join(root, "state.db"), future, future,
 	), "advance state.db mtime")
 
-	report, err := sync.NewDiffEngine(database, cfg).ParseDiff(
-		context.Background(),
+	report, err := sync.NewDiffEngine(t.Context(), database, cfg).ParseDiff(
+		t.Context(),
 		sync.ParseDiffOptions{Agents: []parser.AgentType{parser.AgentHermes}},
 	)
 	require.NoError(t, err, "ParseDiff")
@@ -2189,12 +2257,12 @@ func TestParseDiffEngineRefusesWrites(t *testing.T) {
 
 	path := env.writeClaudeSession(t, "test-proj", "pd-guard.jsonl",
 		parseDiffClaudeContent(
-			"guard prompt with AKIA7QHWN2DKR4FYPLJM",
+			"guard prompt with private configuration text",
 			"guard reply",
 		))
 
-	diffEngine := newParseDiffEngine(env)
-	ctx := context.Background()
+	diffEngine := newParseDiffEngine(t.Context(), env)
+	ctx := t.Context()
 
 	assert.Equal(t, sync.SyncStats{}, diffEngine.SyncAll(ctx, nil),
 		"SyncAll on a report-only engine must be a no-op")
@@ -2208,7 +2276,7 @@ func TestParseDiffEngineRefusesWrites(t *testing.T) {
 		"SyncRootsSince on a report-only engine must be a no-op")
 	stats, err := diffEngine.SyncThenRun(
 		ctx, false, nil, func(forceFull bool) error {
-			return env.db.UpsertSession(db.Session{
+			return env.db.UpsertSession(ctx, db.Session{
 				ID: "sync-then-run-wrote",
 			})
 		},
@@ -2218,7 +2286,7 @@ func TestParseDiffEngineRefusesWrites(t *testing.T) {
 	assert.Equal(t, sync.SyncStats{}, stats,
 		"SyncThenRun on a report-only engine must be a no-op")
 	require.Error(t, diffEngine.RunExclusive(func() error {
-		return env.db.UpsertSession(db.Session{
+		return env.db.UpsertSession(ctx, db.Session{
 			ID: "run-exclusive-wrote",
 		})
 	}), "RunExclusive on a report-only engine must error")
@@ -2253,6 +2321,14 @@ func TestParseDiffEngineRefusesWrites(t *testing.T) {
 			" WHERE id = ?", sessionID)
 	mutateDB(t, env,
 		"DELETE FROM secret_findings WHERE session_id = ?", sessionID)
+	require.Error(t, diffEngine.BackfillSignalComputer()(ctx, sessionID),
+		"BackfillSignalComputer on a report-only engine must error")
+	mutateDB(t, env,
+		"UPDATE sessions SET secret_leak_count = 0, "+
+			"secrets_rules_version = '', quality_signal_version = 0"+
+			" WHERE id = ?", sessionID)
+	mutateDB(t, env,
+		"DELETE FROM secret_findings WHERE session_id = ?", sessionID)
 	_, err = diffEngine.ScanSecrets(
 		ctx, sync.SecretScanInput{Backfill: true}, nil,
 	)
@@ -2273,9 +2349,8 @@ func TestParseDiffEngineRefusesWrites(t *testing.T) {
 		"refused scans must not persist secret findings")
 }
 
-func TestParseDiffPresenceSweep(t *testing.T) {
-
-	t.Run("current-version row no longer emitted", func(t *testing.T) {
+func TestParseDiffClaudeMissingRowsRequireLegacyForkEvidence(t *testing.T) {
+	t.Run("current-version fork is presence drift", func(t *testing.T) {
 		env := setupSingleAgentTestEnv(t, parser.AgentClaude)
 		path := env.writeClaudeSession(t, "test-proj", "pd-real.jsonl",
 			parseDiffClaudeContent("real prompt", "real reply"))
@@ -2283,16 +2358,16 @@ func TestParseDiffPresenceSweep(t *testing.T) {
 			TotalSessions: 1, Synced: 1,
 		})
 
-		// A current-version row under the same source file with an ID
-		// today's parser never derives: the loudest drift signal.
-		require.NoError(t, env.db.UpsertSession(db.Session{
+		// A current-version fork row under the same transcript has already
+		// been accepted by this parser version. Its unexplained absence must
+		// stay visible as parser drift.
+		require.NoError(t, env.db.UpsertSession(t.Context(), db.Session{
 			ID: "pd-phantom", Project: "test-proj", Machine: "local",
-			Agent: "claude", FilePath: &path,
+			Agent: "claude", RelationshipType: "fork", FilePath: &path,
 		}), "insert phantom session")
-		require.NoError(t,
-			env.db.SetSessionDataVersion(
-				"pd-phantom", db.CurrentDataVersion(),
-			), "stamp current data version")
+		require.NoError(t, env.db.SetSessionDataVersion(t.Context(),
+			"pd-phantom", db.CurrentDataVersion(),
+		), "stamp current data version")
 
 		report := runParseDiff(t, env, sync.ParseDiffOptions{})
 		assert.Equal(t, sync.ParseDiffTotals{
@@ -2307,10 +2382,10 @@ func TestParseDiffPresenceSweep(t *testing.T) {
 		assert.Contains(t, sessionDiffFieldNames(sd, false),
 			sync.FieldPresence, "presence diff")
 		assert.True(t, report.HasFailures(),
-			"a current-version presence drop is parser drift")
+			"a current-version missing fork is parser drift")
 	})
 
-	t.Run("stale row no longer emitted is pending resync", func(t *testing.T) {
+	t.Run("stale non-fork is pending resync", func(t *testing.T) {
 		env := setupSingleAgentTestEnv(t, parser.AgentClaude)
 		path := env.writeClaudeSession(t, "test-proj", "pd-real.jsonl",
 			parseDiffClaudeContent("real prompt", "real reply"))
@@ -2318,11 +2393,11 @@ func TestParseDiffPresenceSweep(t *testing.T) {
 			TotalSessions: 1, Synced: 1,
 		})
 
-		// Data version 0: an incomplete write preserved by the
-		// archive (e.g. a transient fork row left by a live sync).
-		require.NoError(t, env.db.UpsertSession(db.Session{
+		// Data version 0: an incomplete non-fork write preserved by the
+		// archive. Staleness alone is not enough deletion evidence.
+		require.NoError(t, env.db.UpsertSession(t.Context(), db.Session{
 			ID: "pd-zombie", Project: "test-proj", Machine: "local",
-			Agent: "claude", FilePath: &path,
+			Agent: "claude", RelationshipType: "root", FilePath: &path,
 		}), "insert zombie session")
 
 		report := runParseDiff(t, env, sync.ParseDiffOptions{})
@@ -2336,9 +2411,84 @@ func TestParseDiffPresenceSweep(t *testing.T) {
 		require.NotNil(t, sd, "zombie session not listed")
 		assert.Equal(t, sync.DiffPendingResync, sd.Class, "class")
 		assert.Contains(t, sessionDiffFieldNames(sd, true),
-			sync.FieldPresence,
-			"presence field attached for drill-down")
+			sync.FieldPresence, "presence field attached for drill-down")
 		assert.False(t, report.HasFailures(),
 			"stale rows must not trip --fail-on-change")
+	})
+
+	t.Run("stale fork is marked source-missing", func(t *testing.T) {
+		env := setupSingleAgentTestEnv(t, parser.AgentClaude)
+		path := env.writeClaudeSession(t, "test-proj", "pd-real.jsonl",
+			parseDiffClaudeContent("real prompt", "real reply"))
+		runSyncAndAssert(t, env.engine, sync.SyncStats{
+			TotalSessions: 1, Synced: 1,
+		})
+
+		parentID := "pd-real"
+		require.NoError(t, env.db.UpsertSession(t.Context(), db.Session{
+			ID: "pd-legacy-fork", Project: "test-proj", Machine: "local",
+			Agent: "claude", ParentSessionID: &parentID,
+			RelationshipType: "fork", FilePath: &path,
+		}), "insert legacy fork")
+
+		report := runParseDiff(t, env, sync.ParseDiffOptions{})
+		assert.Equal(t, sync.ParseDiffTotals{
+			Examined: 1, Identical: 1, ExcludedByParser: 1,
+		}, report.Totals, "totals")
+		assert.Empty(t, report.FieldCounts,
+			"source-missing rows are not parser drift")
+
+		sd := findSessionDiff(report, "pd-legacy-fork")
+		require.NotNil(t, sd, "legacy fork not listed")
+		assert.Equal(t, sync.DiffExcluded, sd.Class, "class")
+		assert.Equal(t, "member source missing (would record source state)", sd.Reason)
+		assert.False(t, report.HasFailures(),
+			"an intentional source-state change must not trip --fail-on-change")
+	})
+
+	t.Run("stale fork outside CWD filter is policy-preserved", func(t *testing.T) {
+		env := setupSingleAgentTestEnv(t, parser.AgentClaude)
+		content := testjsonl.NewSessionBuilder().
+			AddClaudeUser(
+				tsEarly, "real prompt", "/workspace/work/project",
+			).
+			AddClaudeAssistant(tsEarlyS5, "real reply").
+			String()
+		path := env.writeClaudeSession(
+			t, "test-proj", "pd-real.jsonl", content,
+		)
+		runSyncAndAssert(t, env.engine, sync.SyncStats{
+			TotalSessions: 1, Synced: 1,
+		})
+
+		parentID := "pd-real"
+		require.NoError(t, env.db.UpsertSession(t.Context(), db.Session{
+			ID: "pd-filtered-fork", Project: "test-proj", Machine: "local",
+			Agent: "claude", Cwd: "/workspace/personal/project",
+			ParentSessionID: &parentID, RelationshipType: "fork", FilePath: &path,
+		}), "insert filtered legacy fork")
+
+		diffEngine := sync.NewDiffEngine(t.Context(), env.db, sync.EngineConfig{
+			AgentDirs:          parseDiffAgentDirs(env),
+			Machine:            "local",
+			IncludeCwdPrefixes: []string{"/workspace/work"},
+		})
+		t.Cleanup(diffEngine.Close)
+		report, err := diffEngine.ParseDiff(
+			t.Context(), sync.ParseDiffOptions{},
+		)
+		require.NoError(t, err)
+		require.NotNil(t, report)
+
+		assert.Equal(t, sync.ParseDiffTotals{
+			Examined: 1, Identical: 1, Skipped: 1,
+		}, report.Totals, "totals")
+		sd := findSessionDiff(report, "pd-filtered-fork")
+		require.NotNil(t, sd, "filtered legacy fork not listed")
+		assert.Equal(t, sync.DiffSkipped, sd.Class, "class")
+		assert.Equal(t, "member source missing (policy-preserved by CWD filter)",
+			sd.Reason)
+		assert.False(t, report.HasFailures(),
+			"a CWD-preserved fork must not trip --fail-on-change")
 	})
 }

@@ -1,54 +1,28 @@
 <script lang="ts">
+  import { searchBlock } from "../../search/session-block.svelte.js";
+  import { searchCollapsed } from "../../search/component-state.js";
+  import { inSessionSearch } from "../../stores/inSessionSearch.svelte.js";
+  import SearchMatchCount from "./SearchMatchCount.svelte";
   import { m } from "../../i18n/index.js";
-  import { renderMarkdown } from "../../utils/markdown.js";
+  import { loadAssetImages, renderMarkdown } from "../../utils/markdown.js";
   import { highlightCodeFences } from "../../utils/highlight-fences.js";
-  import {
-    applyHighlight,
-    escapeHTML,
-  } from "../../utils/highlight.js";
   import { ChevronRightIcon } from "../../icons.js";
+  import { ui } from "../../stores/ui.svelte.js";
 
   interface Props {
     content: string;
     name?: string;
-    highlightQuery?: string;
-    isCurrentHighlight?: boolean;
+    searchKey?: string;
   }
 
-  let {
-    content,
-    name,
-    highlightQuery = "",
-    isCurrentHighlight = false,
-  }: Props = $props();
-  let userCollapsed: boolean = $state(true);
-  let userOverride: boolean = $state(false);
-  let searchExpanded: boolean = $state(false);
-  let prevQuery: string = $state("");
+  let { content, name, searchKey }: Props = $props();
+  let userCollapsed = $state(true);
+  let overrideSeq = $state(-1);
+  let collapsed = $derived(searchCollapsed(
+    userCollapsed, inSessionSearch.isCurrentBlock(searchKey),
+    inSessionSearch.navigationRevision, overrideSeq,
+  ));
 
-  $effect(() => {
-    const q = highlightQuery;
-    const trimmed = q.trim();
-    searchExpanded =
-      trimmed !== "" &&
-      `${skillLabel}\n${content}`
-        .toLowerCase()
-        .includes(trimmed.toLowerCase());
-    if (q !== prevQuery) {
-      userOverride = false;
-      prevQuery = q;
-    }
-  });
-
-  let collapsed = $derived(
-    userOverride ? userCollapsed
-      : searchExpanded ? false
-      : userCollapsed,
-  );
-
-  let skillLabel = $derived(
-    m.skill_block_label({ name: name ?? m.shared_unknown() }),
-  );
   let previewLine = $derived(
     content.split("\n")[0]?.slice(0, 80) ?? "",
   );
@@ -57,24 +31,21 @@
 <div class="skill-block">
   <button
     class="skill-header"
+    aria-expanded={!collapsed}
     onclick={() => {
       const sel = window.getSelection();
       if (sel && sel.toString().length > 0) return;
       userCollapsed = !collapsed;
-      userOverride = true;
+      overrideSeq = inSessionSearch.navigationRevision;
     }}
   >
     <span class="skill-chevron" class:open={!collapsed}>
       <ChevronRightIcon size="10" strokeWidth="2.4" aria-hidden="true" />
     </span>
-    <span
-      class="skill-label"
-      use:applyHighlight={{
-        q: highlightQuery,
-        current: isCurrentHighlight,
-        content: skillLabel,
-      }}
-    >{@html escapeHTML(skillLabel)}</span>
+    <span class="skill-label">
+      {m.skill_block_label({ name: name ?? m.shared_unknown() })}
+    </span>
+    <SearchMatchCount {searchKey} />
     {#if collapsed && previewLine}
       <span class="skill-preview">{previewLine}</span>
     {/if}
@@ -82,18 +53,13 @@
   {#if !collapsed}
     <div
       class="skill-content markdown"
-      use:applyHighlight={{
-        q: highlightQuery,
-        current: isCurrentHighlight,
-        content,
-      }}
-      use:highlightCodeFences={{
-        q: highlightQuery,
-        content,
-        current: isCurrentHighlight,
-      }}
+      use:highlightCodeFences={{ content }}
+      {@attach searchBlock(searchKey)}
+      use:loadAssetImages={content}
     >
-      {@html renderMarkdown(content)}
+      {@html renderMarkdown(content, {
+        renderUnknownXmlBlocksAsPreformatted: ui.renderUnknownXmlBlocksAsPreformatted,
+      })}
     </div>
   {/if}
 </div>

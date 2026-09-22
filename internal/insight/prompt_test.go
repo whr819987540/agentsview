@@ -1,7 +1,6 @@
 package insight
 
 import (
-	"context"
 	"fmt"
 	"strings"
 	"testing"
@@ -10,6 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/dbtest"
+	"go.kenn.io/agentsview/internal/money"
 )
 
 func TestBuildPrompt(t *testing.T) {
@@ -29,6 +29,8 @@ func TestBuildPrompt(t *testing.T) {
 				DateTo:   "2025-01-15",
 			},
 			seed: func(t *testing.T, d *db.DB) {
+				t.Helper()
+
 				dbtest.SeedSession(t, d, "s1", "my-app", func(s *db.Session) {
 					s.MessageCount = 5
 					s.StartedAt = new("2025-01-15T10:00:00Z")
@@ -62,6 +64,8 @@ func TestBuildPrompt(t *testing.T) {
 				Project:  "my-app",
 			},
 			seed: func(t *testing.T, d *db.DB) {
+				t.Helper()
+
 				dbtest.SeedSession(t, d, "s1", "my-app", func(s *db.Session) {
 					s.MessageCount = 5
 					s.StartedAt = new("2025-01-15T10:00:00Z")
@@ -100,6 +104,47 @@ func TestBuildPrompt(t *testing.T) {
 			wantContains: []string{"analyzing AI agent"},
 		},
 		{
+			name: "single session analysis",
+			req: GenerateRequest{
+				Type:      "agent_analysis",
+				DateFrom:  "2025-01-15",
+				DateTo:    "2025-01-15",
+				SessionID: "s1",
+			},
+			seed: func(t *testing.T, d *db.DB) {
+				t.Helper()
+
+				dbtest.SeedSession(t, d, "s1", "my-app", func(s *db.Session) {
+					s.Agent = "claude"
+					s.MessageCount = 2
+					s.StartedAt = new("2025-01-15T10:00:00Z")
+					s.EndedAt = new("2025-01-15T10:10:00Z")
+				})
+				dbtest.SeedMessages(t, d,
+					db.Message{
+						SessionID: "s1",
+						Ordinal:   1,
+						Role:      "user",
+						Content:   "Review the flaky test setup",
+						Timestamp: "2025-01-15T10:00:01Z",
+					},
+					db.Message{
+						SessionID: "s1",
+						Ordinal:   2,
+						Role:      "assistant",
+						Content:   "I found two retry loops in the test harness",
+						Timestamp: "2025-01-15T10:00:10Z",
+					},
+				)
+			},
+			wantContains: []string{
+				"## Session: s1",
+				"Review the flaky test setup",
+				"retry loops",
+			},
+			wantNot: []string{"## Sessions"},
+		},
+		{
 			name: "truncation",
 			req: GenerateRequest{
 				Type:     "daily_activity",
@@ -107,6 +152,8 @@ func TestBuildPrompt(t *testing.T) {
 				DateTo:   "2025-01-15",
 			},
 			seed: func(t *testing.T, d *db.DB) {
+				t.Helper()
+
 				for i := range 55 {
 					dbtest.SeedSession(
 						t, d,
@@ -121,6 +168,8 @@ func TestBuildPrompt(t *testing.T) {
 			},
 			wantContains: []string{"omitted"},
 			checkPrompt: func(t *testing.T, prompt string) {
+				t.Helper()
+
 				count := strings.Count(prompt, "### Session")
 				assert.Equal(t, 50, count, "got %d sessions in prompt, want 50", count)
 			},
@@ -133,6 +182,8 @@ func TestBuildPrompt(t *testing.T) {
 				DateTo:   "2025-01-17",
 			},
 			seed: func(t *testing.T, d *db.DB) {
+				t.Helper()
+
 				dbtest.SeedSession(t, d, "s1", "my-app", func(s *db.Session) {
 					s.MessageCount = 3
 					s.StartedAt = new("2025-01-13T10:00:00Z")
@@ -159,6 +210,8 @@ func TestBuildPrompt(t *testing.T) {
 			},
 			wantContains: []string{"## Range Summary", "Peak concurrency: 2"},
 			checkPrompt: func(t *testing.T, prompt string) {
+				t.Helper()
+
 				header := strings.Index(prompt, "## Date Range")
 				summary := strings.Index(prompt, "## Range Summary")
 				sessions := strings.Index(prompt, "## Sessions")
@@ -202,6 +255,8 @@ func TestBuildPrompt(t *testing.T) {
 				DateTo:   "2025-01-15",
 			},
 			seed: func(t *testing.T, d *db.DB) {
+				t.Helper()
+
 				// A normal user session.
 				dbtest.SeedSession(t, d, "user-session", "my-app", func(s *db.Session) {
 					s.MessageCount = 5
@@ -231,7 +286,7 @@ func TestBuildPrompt(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			d := dbtest.OpenTestDB(t)
-			ctx := context.Background()
+			ctx := t.Context()
 
 			if tt.seed != nil {
 				tt.seed(t, d)
@@ -281,10 +336,10 @@ func TestCannedInsightValidation(t *testing.T) {
 
 	env, err := ParseCannedEnvelope(valid)
 	if err != nil {
-		t.Fatalf("ParseCannedEnvelope: %v", err)
+		require.NoError(t, err, "ParseCannedEnvelope")
 	}
 	if err := ValidateCannedEnvelope(env, payload); err != nil {
-		t.Fatalf("ValidateCannedEnvelope: %v", err)
+		require.NoError(t, err, "ValidateCannedEnvelope")
 	}
 
 	bad := strings.Replace(
@@ -295,10 +350,10 @@ func TestCannedInsightValidation(t *testing.T) {
 	)
 	env, err = ParseCannedEnvelope(bad)
 	if err != nil {
-		t.Fatalf("Parse bad envelope: %v", err)
+		require.NoError(t, err, "Parse bad envelope")
 	}
 	if err := ValidateCannedEnvelope(env, payload); err == nil {
-		t.Fatalf("expected validation error for unknown evidence ref")
+		require.Fail(t, "expected validation error for unknown evidence ref")
 	}
 }
 
@@ -314,11 +369,11 @@ func TestBuildCannedPromptIncludesBoundaries(t *testing.T) {
 	}
 	hash, err := CannedAggregateHash(payload)
 	if err != nil {
-		t.Fatalf("CannedAggregateHash: %v", err)
+		require.NoError(t, err, "CannedAggregateHash")
 	}
 	prompt, err := BuildCannedPrompt(payload, hash)
 	if err != nil {
-		t.Fatalf("BuildCannedPrompt: %v", err)
+		require.NoError(t, err, "BuildCannedPrompt")
 	}
 	for _, want := range []string{
 		"Output JSON only",
@@ -332,7 +387,7 @@ func TestBuildCannedPromptIncludesBoundaries(t *testing.T) {
 		"Aggregate payload JSON",
 	} {
 		if !strings.Contains(prompt, want) {
-			t.Fatalf("prompt missing %q: %s", want, prompt)
+			require.Failf(t, "prompt missing", "%q: %s", want, prompt)
 		}
 	}
 }
@@ -367,11 +422,11 @@ func TestBuildCannedPromptContextSetupPressureUnavailable(t *testing.T) {
 	}
 	hash, err := CannedAggregateHash(payload)
 	if err != nil {
-		t.Fatalf("CannedAggregateHash: %v", err)
+		require.NoError(t, err, "CannedAggregateHash")
 	}
 	prompt, err := BuildCannedPrompt(payload, hash)
 	if err != nil {
-		t.Fatalf("BuildCannedPrompt: %v", err)
+		require.NoError(t, err, "BuildCannedPrompt")
 	}
 	for _, want := range []string{
 		"Context setup template rules",
@@ -381,7 +436,7 @@ func TestBuildCannedPromptContextSetupPressureUnavailable(t *testing.T) {
 		"Prefer compactions, mid-task compactions, missing code context",
 	} {
 		if !strings.Contains(prompt, want) {
-			t.Fatalf("prompt missing %q: %s", want, prompt)
+			require.Failf(t, "prompt missing", "%q: %s", want, prompt)
 		}
 	}
 }
@@ -422,27 +477,27 @@ func TestBuildCannedCoachSummaryUsesCoachInsightFamilies(t *testing.T) {
 	summary := BuildCannedCoachSummary(sessions)
 
 	if summary.Source == "" || summary.SessionCount != len(sessions) {
-		t.Fatalf("unexpected summary header: %+v", summary)
+		require.Failf(t, "unexpected summary header", "%+v", summary)
 	}
 	if summary.IntentDistribution["Planning"] == 0 ||
 		summary.IntentDistribution["Implementation"] == 0 {
-		t.Fatalf("missing Coach intent buckets: %+v", summary.IntentDistribution)
+		require.Failf(t, "missing Coach intent buckets", "%+v", summary.IntentDistribution)
 	}
 	if summary.SpecDriven.Count == 0 || summary.SpecDriven.Rate <= 0 {
-		t.Fatalf("missing spec-driven summary: %+v", summary.SpecDriven)
+		require.Failf(t, "missing spec-driven summary", "%+v", summary.SpecDriven)
 	}
 	if summary.PromptMaturity.Score == 0 ||
 		summary.PromptMaturity.Dimensions["verification_steps"] == 0 {
-		t.Fatalf("missing prompt maturity summary: %+v", summary.PromptMaturity)
+		require.Failf(t, "missing prompt maturity summary", "%+v", summary.PromptMaturity)
 	}
 	if len(summary.WorkflowClusters) != 1 {
-		t.Fatalf("WorkflowClusters len = %d, want 1: %+v",
+		require.Failf(t, "WorkflowClusters length mismatch", "got %d, want 1: %+v",
 			len(summary.WorkflowClusters), summary.WorkflowClusters)
 	}
 	cluster := summary.WorkflowClusters[0]
 	if cluster.Occurrences != 3 || cluster.Sessions != 3 ||
 		!strings.Contains(cluster.Label, "Generate release notes") {
-		t.Fatalf("unexpected workflow cluster: %+v", cluster)
+		require.Failf(t, "unexpected workflow cluster", "%+v", cluster)
 	}
 }
 
@@ -466,12 +521,12 @@ func TestBuildCannedCoachSummaryStableWorkflowClusterIDs(t *testing.T) {
 	second := BuildCannedCoachSummary(reversed).WorkflowClusters
 
 	if len(first) != len(second) || len(first) != 2 {
-		t.Fatalf("cluster counts differ: first=%+v second=%+v", first, second)
+		require.Failf(t, "cluster counts differ", "first=%+v second=%+v", first, second)
 	}
 	for i := range first {
 		if first[i].ID == "" || first[i].ID != second[i].ID ||
 			first[i].Label != second[i].Label {
-			t.Fatalf("cluster %d not stable: first=%+v second=%+v",
+			require.Failf(t, "cluster not stable", "%d: first=%+v second=%+v",
 				i, first[i], second[i])
 		}
 	}
@@ -498,7 +553,7 @@ func TestCannedEvidenceRefsIncludesCoachSummary(t *testing.T) {
 		"coach:workflow_clusters",
 	} {
 		if !strings.Contains(joined, want) {
-			t.Fatalf("refs missing %s: %v", want, ids)
+			require.Failf(t, "refs missing", "%s: %v", want, ids)
 		}
 	}
 }
@@ -507,11 +562,11 @@ func TestCannedEvidenceRefsIncludesUsageModelBreakdown(t *testing.T) {
 	usage := &CannedUsageSummary{
 		InputTokens:  150,
 		OutputTokens: 30,
-		TotalCost:    0.04,
+		TotalCost:    money.MustParseDollars("0.04"),
 		ModelBreakdowns: []CannedModelBreakdown{{
 			ModelName:   "claude-opus-4-7",
 			InputTokens: 100,
-			Cost:        0.03,
+			Cost:        money.MustParseDollars("0.03"),
 		}},
 	}
 
@@ -528,7 +583,7 @@ func TestCannedEvidenceRefsIncludesUsageModelBreakdown(t *testing.T) {
 		"usage:model_breakdown",
 	} {
 		if !strings.Contains(joined, want) {
-			t.Fatalf("refs missing %s: %v", want, ids)
+			require.Failf(t, "refs missing", "%s: %v", want, ids)
 		}
 	}
 }

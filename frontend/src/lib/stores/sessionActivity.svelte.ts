@@ -1,9 +1,8 @@
+import { m } from "../i18n/index.js";
 import { SessionsService } from "../api/generated/index";
-import { configureGeneratedClient } from "../api/runtime.js";
-import type {
-  SessionActivityBucket,
-  SessionActivityResponse,
-} from "../api/types/session-activity.js";
+import { isAbortError } from "../api/runtime.js";
+import type { DbSessionActivityBucket as SessionActivityBucket } from "../api/generated/index.js";
+import { LatestRead } from "../utils/latest-read.js";
 
 export function findActiveBucketIndex(
   buckets: SessionActivityBucket[],
@@ -30,6 +29,7 @@ class SessionActivityStore {
 
   private cachedSessionId: string | null = null;
   private loadVersion = 0;
+  private activityRead = new LatestRead();
 
   /** True when buckets are loaded for the given session. */
   isForSession(sessionId: string): boolean {
@@ -37,17 +37,11 @@ class SessionActivityStore {
   }
 
   get activeBucketIndex(): number | null {
-    return findActiveBucketIndex(
-      this.buckets,
-      this.firstVisibleTimestamp,
-    );
+    return findActiveBucketIndex(this.buckets, this.firstVisibleTimestamp);
   }
 
   async load(sessionId: string) {
-    if (
-      this.cachedSessionId === sessionId &&
-      (this.buckets.length > 0 || this.loaded)
-    ) {
+    if (this.cachedSessionId === sessionId && this.loaded) {
       return;
     }
     // Clear stale data from a different session before
@@ -57,52 +51,52 @@ class SessionActivityStore {
       this.loaded = false;
     }
     const version = ++this.loadVersion;
+    const signal = this.activityRead.begin();
     this.loading = true;
     this.error = null;
     this.firstVisibleTimestamp = null;
     try {
-      configureGeneratedClient();
-      const resp =
-        await SessionsService.getApiV1SessionsIdActivity({
-          id: sessionId,
-        }) as unknown as SessionActivityResponse;
+      const resp = await SessionsService.getApiV1SessionsByIdActivity(
+        { id: sessionId },
+        { signal },
+      );
       // Ignore stale responses from previous sessions.
-      if (version !== this.loadVersion) return;
+      if (version !== this.loadVersion || !this.activityRead.isCurrent(signal)) return;
       this.buckets = resp.buckets;
       this.intervalSeconds = resp.interval_seconds;
       this.totalMessages = resp.total_messages;
       this.cachedSessionId = sessionId;
       this.loaded = true;
     } catch (e) {
-      if (version !== this.loadVersion) return;
-      this.error =
-        e instanceof Error
-          ? e.message
-          : "Failed to load activity";
+      if (isAbortError(e) || version !== this.loadVersion || !this.activityRead.isCurrent(signal))
+        return;
+      this.error = e instanceof Error ? e.message : m.session_activity_load_failed();
       this.buckets = [];
       this.cachedSessionId = sessionId;
       this.loaded = true;
     } finally {
-      if (version === this.loadVersion) {
+      if (this.activityRead.finish(signal)) {
         this.loading = false;
       }
     }
   }
 
   reload(sessionId: string) {
-    this.cachedSessionId = null;
+    this.loaded = false;
     return this.load(sessionId);
   }
 
   /** Mark cached data as stale so the next load() refetches.
    *  Also discards any in-flight response. */
   invalidate() {
+    this.activityRead.cancel();
     this.loadVersion++;
     this.cachedSessionId = null;
     this.loaded = false;
   }
 
   clear() {
+    this.activityRead.cancel();
     this.loadVersion++;
     this.buckets = [];
     this.intervalSeconds = 0;
@@ -112,6 +106,12 @@ class SessionActivityStore {
     this.error = null;
     this.cachedSessionId = null;
     this.firstVisibleTimestamp = null;
+  }
+
+  cancelInFlight(): void {
+    this.loadVersion++;
+    this.activityRead.cancel();
+    this.loading = false;
   }
 }
 

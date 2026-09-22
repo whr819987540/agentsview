@@ -2,7 +2,8 @@ package parser
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -37,6 +38,7 @@ func openClaudeProviderCapabilities() Capabilities {
 	return Capabilities{
 		Source: SourceCapabilities{
 			DiscoverSources:      CapabilitySupported,
+			StreamingDiscovery:   CapabilitySupported,
 			WatchSources:         CapabilitySupported,
 			ClassifyChangedPath:  CapabilitySupported,
 			FindSource:           CapabilitySupported,
@@ -86,6 +88,72 @@ func (s openClaudeSourceSet) Discover(ctx context.Context) ([]SourceRef, error) 
 	}
 	sortJSONLSources(sources)
 	return sources, nil
+}
+
+func (s openClaudeSourceSet) DiscoverEach(
+	ctx context.Context, yield func(SourceRef) error,
+) error {
+	for _, root := range s.roots {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := s.streamLocalRoot(ctx, root, yield); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// streamLocalRoot enumerates one local projects root. Project directories
+// resolve through streamingDirCandidateOrIncomplete so followed symlinked
+// projects are descended exactly as Discover's isDirOrSymlink walk does, and
+// a symlink whose target cannot be resolved surfaces DiscoveryIncompleteError
+// instead of reading as absent: reconciliation treats a clean DiscoverEach as
+// authoritative and would tombstone every session beneath the symlink.
+func (s openClaudeSourceSet) streamLocalRoot(
+	ctx context.Context, root string, yield func(SourceRef) error,
+) error {
+	var incomplete error
+	err := streamDirectoryEntries(ctx, root, func(project os.DirEntry) error {
+		isProjectDir, dirErr := streamingDirCandidateOrIncomplete(
+			AgentOpenClaude, "OpenClaude project directory", project, root,
+		)
+		if dirErr != nil {
+			incomplete = errors.Join(incomplete, dirErr)
+			return nil
+		}
+		if !isProjectDir {
+			return nil
+		}
+		projectRoot := filepath.Join(root, project.Name())
+		err := streamDirectoryTreeRecursive(ctx, projectRoot, func(
+			path string, entry os.DirEntry,
+		) error {
+			if !strings.HasSuffix(entry.Name(), ".jsonl") {
+				return nil
+			}
+			source, ok := s.sourceRef(root, path)
+			if !ok {
+				return nil
+			}
+			return yield(source)
+		})
+		if err == nil {
+			return nil
+		}
+		if _, ok := discoveryYieldCause(err); ok {
+			return err
+		}
+		if ctx.Err() != nil {
+			return err
+		}
+		incomplete = errors.Join(incomplete, err)
+		return nil
+	})
+	if cause, ok := discoveryYieldCause(err); ok {
+		return cause
+	}
+	return errors.Join(incomplete, err)
 }
 
 func (s openClaudeSourceSet) discoveredSourceRef(
@@ -177,7 +245,7 @@ func (s openClaudeSourceSet) Fingerprint(
 	}
 	path, ok := s.pathFromSource(source)
 	if !ok {
-		return SourceFingerprint{}, fmt.Errorf("openclaude source path unavailable")
+		return SourceFingerprint{}, errors.New("openclaude source path unavailable")
 	}
 	info, err := os.Stat(path)
 	if err != nil {
@@ -210,7 +278,7 @@ func (s openClaudeSourceSet) Parse(
 	}
 	path, ok := s.pathFromSource(req.Source)
 	if !ok {
-		return ParseOutcome{}, fmt.Errorf("openclaude source path unavailable")
+		return ParseOutcome{}, errors.New("openclaude source path unavailable")
 	}
 	machine := firstNonEmptyJSONLString(req.Machine)
 	project := GetProjectName(firstNonEmptyJSONLString(
@@ -339,6 +407,7 @@ func parseOpenClaudeSession(
 	defer f.Close()
 
 	lr := newLineReader(f, maxLineSize)
+	defer releaseLineReader(lr)
 	lastLine := ""
 	malformedLines := 0
 	ordinal := 0
@@ -412,7 +481,7 @@ func parseOpenClaudeSession(
 		}
 
 		if isOpenClaudeCompactBoundary(line) {
-			content, _, _, _, _, _ := ExtractTextContent(
+			content, _, _, _, _, _ := ExtractTextContent(context.Background(),
 				gjson.Get(line, "message.content"),
 			)
 			messages = append(messages, ParsedMessage{
@@ -447,8 +516,7 @@ func parseOpenClaudeSession(
 		}
 
 		content := gjson.Get(line, "message.content")
-		text, thinkingText, hasThinking, hasToolUse, toolCalls, toolResults :=
-			ExtractTextContent(content)
+		text, thinkingText, hasThinking, hasToolUse, toolCalls, toolResults := ExtractTextContent(context.Background(), content)
 		if strings.TrimSpace(text) == "" && len(toolResults) == 0 &&
 			len(toolCalls) == 0 && role != "system" {
 			continue
@@ -527,7 +595,9 @@ func parseOpenClaudeSession(
 	}
 
 	if len(queuedCommands) > 0 {
-		messages = mergeQueuedCommands(messages, queuedCommands, 0)
+		messages = mergeQueuedCommands(
+			messages, queuedCommands, 0, openClaudeQueuedCommandMessage,
+		)
 		firstUser, userCount = firstMessageAndUserCount(messages)
 		for _, qc := range queuedCommands {
 			if qc.timestamp.After(endedAt) {
@@ -577,7 +647,7 @@ func parseOpenClaudeSession(
 	}
 	accumulateMessageTokenUsage(sess, messages)
 	sess.TerminationStatus = Classify(
-		openClaudeSemanticMessages(messages),
+		messages,
 		lastAssistantStopReason(openClaudeSemanticMessages(messages)),
 		isTruncated,
 	)
@@ -617,7 +687,7 @@ func extractOpenClaudeQueuedCommand(line string) (claudeQueuedCommand, bool) {
 		return claudeQueuedCommand{}, false
 	}
 
-	prompt, _, _, _, _, _ := ExtractTextContent(attachment.Get("prompt"))
+	prompt, _, _, _, _, _ := ExtractTextContent(context.Background(), attachment.Get("prompt"))
 	if strings.TrimSpace(prompt) == "" {
 		return claudeQueuedCommand{}, false
 	}
@@ -626,6 +696,17 @@ func extractOpenClaudeQueuedCommand(line string) (claudeQueuedCommand, bool) {
 		prompt:    prompt,
 		timestamp: extractTimestamp(line),
 	}, true
+}
+
+func openClaudeQueuedCommandMessage(q claudeQueuedCommand) ParsedMessage {
+	return ParsedMessage{
+		Role:          RoleUser,
+		Content:       q.prompt,
+		Timestamp:     q.timestamp,
+		ContentLength: len(q.prompt),
+		SourceType:    "user",
+		SourceSubtype: "queued_command",
+	}
 }
 
 func openClaudeSessionID(id string) string {
@@ -655,7 +736,7 @@ func extractOpenClaudeTokenFields(msg *ParsedMessage, line string) {
 
 	usageResult := gjson.Get(line, "message.usage")
 	if usageResult.Exists() {
-		msg.TokenUsage = json.RawMessage(usageResult.Raw)
+		msg.TokenUsage = jsontext.Value(usageResult.Raw)
 		msg.HasOutputTokens = usageResult.Get("output_tokens").Exists()
 		msg.HasContextTokens = usageResult.Get("input_tokens").Exists() ||
 			usageResult.Get("cache_creation_input_tokens").Exists() ||

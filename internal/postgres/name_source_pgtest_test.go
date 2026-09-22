@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/storage"
 )
 
 // TestPushSessionNameRoundTrip verifies that session_name is pushed from
@@ -30,7 +31,7 @@ func TestPushSessionNameRoundTrip(t *testing.T) {
 	require.NoError(t, err, "drop schema")
 	require.NoError(t, EnsureSchema(ctx, pg, schema), "EnsureSchema")
 
-	localDB, err := db.Open(filepath.Join(t.TempDir(), "local.db"))
+	localDB, err := db.Open(t.Context(), filepath.Join(t.TempDir(), "local.db"))
 	require.NoError(t, err, "db.Open")
 	defer localDB.Close()
 
@@ -56,7 +57,7 @@ func TestPushSessionNameRoundTrip(t *testing.T) {
 		SessionName:      &sessionName,
 	}
 
-	markerID, err := sync.pushMarkerID()
+	markerID, err := sync.pushMarkerID(t.Context())
 	require.NoError(t, err, "pushMarkerID")
 
 	// Push via pushSession directly.
@@ -119,8 +120,8 @@ func TestPushSessionNameRoundTrip(t *testing.T) {
 }
 
 // TestPushSessionNameViaPushPath verifies session_name survives the REAL push
-// path (Push -> ListSessionsModifiedBetween read), not just a direct
-// pushSession call. ListSessionsModifiedBetween reads sessionFullCols, so a
+// path (Push -> ListSessionsForMirrorWindow read), not just a direct
+// pushSession call. ListSessionsForMirrorWindow reads sessionFullCols, so a
 // missing session_name there would silently drop the value on every real push.
 func TestPushSessionNameViaPushPath(t *testing.T) {
 	pgURL := testPGURL(t)
@@ -130,7 +131,7 @@ func TestPushSessionNameViaPushPath(t *testing.T) {
 	local := testDB(t)
 	ps, err := New(
 		pgURL, "agentsview", local, "machine-sessionname-push", true,
-		SyncOptions{},
+		storage.PusherOptions{},
 	)
 	require.NoError(t, err, "creating sync")
 	defer ps.Close()
@@ -141,7 +142,7 @@ func TestPushSessionNameViaPushPath(t *testing.T) {
 	started := time.Now().UTC().Format(time.RFC3339)
 	firstMsg := "real push path"
 	sessionName := "plan-2b-review"
-	require.NoError(t, local.UpsertSession(db.Session{
+	require.NoError(t, local.UpsertSession(t.Context(), db.Session{
 		ID:           "sn-push-001",
 		Project:      "p",
 		Machine:      "local",

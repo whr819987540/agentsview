@@ -4,6 +4,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -14,6 +15,7 @@ import (
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/sync"
+	"golang.org/x/term"
 )
 
 // parseDiffChangedCap caps the non-verbose changed-sessions
@@ -72,7 +74,7 @@ func newParseDiffCommand() *cobra.Command {
 		Args:         cobra.NoArgs,
 		PreRunE: func(cmd *cobra.Command, _ []string) error {
 			if cfg.Limit < 0 {
-				return fmt.Errorf("--limit must be >= 0")
+				return errors.New("--limit must be >= 0")
 			}
 			_, err := parseDiffAgentTypes(cfg.Agents)
 			return err
@@ -81,7 +83,7 @@ func newParseDiffCommand() *cobra.Command {
 			cfg.JSON = outputFormat(cmd) == "json"
 			cfg.Stdout = cmd.OutOrStdout()
 			cfg.Stderr = cmd.ErrOrStderr()
-			runParseDiff(cfg)
+			runParseDiff(cmd.Context(), cfg)
 		},
 	}
 	cmd.Flags().StringArrayVar(&cfg.Agents, "agent", nil,
@@ -96,8 +98,8 @@ func newParseDiffCommand() *cobra.Command {
 	return cmd
 }
 
-func runParseDiff(cfg ParseDiffConfig) {
-	if doParseDiff(cfg) {
+func runParseDiff(ctx context.Context, cfg ParseDiffConfig) {
+	if doParseDiff(ctx, cfg) {
 		os.Exit(1)
 	}
 }
@@ -108,7 +110,7 @@ func runParseDiff(cfg ParseDiffConfig) {
 // an exit code without skipping cleanup. It deliberately skips
 // setupLogFile: stdout owns the report and engine warnings belong on
 // stderr, matching the health command's diagnostic style.
-func doParseDiff(cfg ParseDiffConfig) (failed bool) {
+func doParseDiff(ctx context.Context, cfg ParseDiffConfig) (failed bool) {
 	agents, err := parseDiffAgentTypes(cfg.Agents)
 	if err != nil {
 		fatal("%v", err)
@@ -122,13 +124,19 @@ func doParseDiff(cfg ParseDiffConfig) (failed bool) {
 		fatal("creating data dir: %v", err)
 	}
 
-	database, writeLock := mustOpenWriteDB(context.Background(), appCfg)
+	database, writeLock := mustOpenWriteDB(ctx, appCfg)
 	defer closeWriteDB(database, writeLock)
 
-	engine := sync.NewDiffEngine(database, sync.EngineConfig{
+	engine := sync.NewDiffEngine(ctx, database, sync.EngineConfig{
 		AgentDirs:               appCfg.AgentDirs,
-		Machine:                 "local",
+		SourceMachines:          appCfg.SourceMachines,
+		ProviderMetadata:        appCfg.ProviderMetadata,
+		DisabledAgents:          appCfg.DisabledAgents,
+		IncludeCwdPrefixes:      appCfg.SyncIncludeCwdPrefixes,
+		ScanProtectedPaths:      appCfg.ScanProtectedPaths,
+		Machine:                 appCfg.InstallationID,
 		BlockedResultCategories: appCfg.ResultContentBlockedCategories,
+		ArchiveContent:          appCfg.ArchiveContent,
 	})
 
 	opts := sync.ParseDiffOptions{Agents: agents, Limit: cfg.Limit}
@@ -136,7 +144,7 @@ func doParseDiff(cfg ParseDiffConfig) (failed bool) {
 		opts.Progress = parseDiffProgress(cfg.stderr())
 	}
 
-	report, err := engine.ParseDiff(context.Background(), opts)
+	report, err := engine.ParseDiff(ctx, opts)
 	if err != nil {
 		fatal("parse-diff: %v", err)
 	}
@@ -213,11 +221,7 @@ func isTerminalWriter(w io.Writer) bool {
 	if !ok {
 		return false
 	}
-	info, err := f.Stat()
-	if err != nil {
-		return false
-	}
-	return info.Mode()&os.ModeCharDevice != 0
+	return term.IsTerminal(int(f.Fd()))
 }
 
 // parseDiffAgentTypes validates --agent values against the parser
@@ -242,8 +246,7 @@ func parseDiffAgentTypes(names []string) ([]parser.AgentType, error) {
 		}
 		if !parseDiffAgentSupported(def) {
 			return nil, fmt.Errorf(
-				"agent %q is not supported by parse-diff "+
-					"(no on-disk source to re-parse)",
+				"agent %q is not supported by parse-diff",
 				raw,
 			)
 		}
@@ -270,9 +273,9 @@ func parseDiffAgentSupported(def parser.AgentDef) bool {
 	// A provider-authoritative agent with a registered factory has a
 	// Discover()/Parse() parse-diff can re-parse, whether it reads literal
 	// per-session files or a shared SQLite store it fans out per session
-	// (Kiro, OpenCode, Forge, Piebald, Warp). FileBased is not consulted:
-	// import-only agents are already excluded because they are not
-	// provider-authoritative.
+	// (Kiro, OpenCode, Forge, Devin, Piebald, Warp). FileBased is not
+	// consulted: import-only agents are already excluded because they are
+	// not provider-authoritative.
 	switch parser.ProviderMigrationModes()[def.Type] {
 	case parser.ProviderMigrationProviderAuthoritative:
 		_, ok := parser.ProviderFactoryByType(def.Type)

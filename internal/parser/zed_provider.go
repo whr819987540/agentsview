@@ -1,12 +1,12 @@
 package parser
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 )
 
 // Zed stores every thread in one shared SQLite database
@@ -23,16 +23,41 @@ func newZedProviderFactory(def AgentDef) ProviderFactory {
 				AgentZed,
 				cfg.Roots,
 				WithContainerDiscovery(zedDiscoverContainers),
+				WithStreamingSourceDiscovery(zedDiscoverEach),
 				WithWatchRoots(zedWatchRoots),
 				WithChangedPathClassifier(zedClassifyPath),
 				WithMemberLookup(zedFindMember),
-				WithFingerprint(zedFingerprintSource),
-				WithContainerParse(zedParseContainer),
-				WithMemberParse(zedParseMember),
+				WithContextFingerprint(zedFingerprintSource),
+				WithContextContainerParse(zedParseContainer),
+				WithContextMemberParse(zedParseMember),
 				WithMemberPresence(zedMemberPresent),
 			)
 		},
 	)
+}
+
+func zedDiscoverEach(
+	ctx context.Context, root string, yield func(multiSessionMatch) error,
+) error {
+	containers := zedDiscoverContainers(root)
+	if len(containers) == 0 {
+		return nil
+	}
+	dbPath := containers[0]
+	conn, err := OpenZedDB(dbPath)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	shape, err := inspectZedSchema(ctx, conn)
+	if err != nil {
+		return wrapZedListingError(err)
+	}
+	return forEachZedThreadMeta(ctx, conn, dbPath, shape, func(meta ZedThreadMeta) error {
+		return yield(multiSessionMatch{
+			Path: meta.VirtualPath, Container: dbPath, MemberID: meta.RawID,
+		})
+	})
 }
 
 func zedDiscoverContainers(root string) []string {
@@ -63,38 +88,21 @@ func zedWatchRoots(roots []string) []WatchRoot {
 // zedClassifyPath maps a stored or changed path to its database container and
 // thread, reproducing the legacy strict sourceRef / lenient
 // sourceRefForChangedPath split: allowMissing relaxes the regular-file check so
-// a database delete (or its WAL/SHM sibling) still classifies for tombstones.
+// a database delete (or its WAL sibling) still classifies for tombstones. A
+// bare "-shm" sibling event is rejected: the provider's own read connections
+// rewrite that file, so honoring it would make every scan schedule the next.
 func zedClassifyPath(root, path string, allowMissing bool) (multiSessionMatch, bool) {
-	root = filepath.Clean(root)
-	path = filepath.Clean(path)
-	requireRegular := !allowMissing
-	if dbPath, sessionID, ok := parseZedVirtualPath(path); ok {
-		if !zedDBUnderRoot(root, dbPath, requireRegular) {
-			return multiSessionMatch{}, false
-		}
-		return multiSessionMatch{
-			Path:      path,
-			Container: dbPath,
-			MemberID:  sessionID,
-		}, true
-	}
-	if zedDBUnderRoot(root, path, requireRegular) {
-		return multiSessionMatch{Path: path, Container: path}, true
-	}
-	if allowMissing {
-		if dbPath, ok := zedDBPathForEvent(root, path); ok {
-			return multiSessionMatch{Path: dbPath, Container: dbPath}, true
-		}
-	}
-	return multiSessionMatch{}, false
+	return classifySQLiteContainerPath(
+		root, path, zedThreadsDBRelPath, allowMissing, true, parseZedVirtualPath,
+	)
 }
 
-func zedFindMember(root, rawID string) (multiSessionMatch, bool) {
+func zedFindMember(ctx context.Context, root, rawID string) (multiSessionMatch, bool) {
 	if root == "" || !IsValidSessionID(rawID) {
 		return multiSessionMatch{}, false
 	}
 	path := filepath.Join(root, zedThreadsDBRelPath)
-	if !ZedSQLiteSessionExists(path, rawID) {
+	if !ZedSQLiteSessionExists(ctx, path, rawID) {
 		return multiSessionMatch{}, false
 	}
 	return multiSessionMatch{
@@ -104,7 +112,7 @@ func zedFindMember(root, rawID string) (multiSessionMatch, bool) {
 	}, true
 }
 
-func zedFingerprintSource(src multiSessionSource) (SourceFingerprint, error) {
+func zedFingerprintSource(ctx context.Context, src multiSessionSource) (SourceFingerprint, error) {
 	info, err := os.Stat(src.Container)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -114,8 +122,10 @@ func zedFingerprintSource(src multiSessionSource) (SourceFingerprint, error) {
 	}
 	mtime := info.ModTime().UnixNano()
 	if src.MemberID != "" {
-		sessionMtime, err := ZedSQLiteSourceMtime(src.Path)
+		sessionMtime, err := ZedSQLiteSourceMtimeContext(ctx, src.Path)
 		switch {
+		case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+			return SourceFingerprint{}, err
 		case errors.Is(err, sql.ErrNoRows):
 			// The thread row is gone but threads.db is still present. Return a
 			// keyed-empty fingerprint without error (matching the Shelley and
@@ -127,11 +137,12 @@ func zedFingerprintSource(src multiSessionSource) (SourceFingerprint, error) {
 			return SourceFingerprint{}, nil
 		case err == nil:
 			mtime = sessionMtime
+		default:
+			return SourceFingerprint{}, err
 		}
-		// A non-ErrNoRows error (unreadable DB, non-virtual path) keeps the
-		// physical DB mtime fallback, preserving the prior behavior for
-		// transient failures.
-	} else if compositeMtime, err := sqliteDBCompositeMtime(src.Container); err == nil {
+	} else if compositeMtime, err := sqliteDBCompositeMtime(
+		src.Container, sqliteDBJournalSuffixes,
+	); err == nil {
 		mtime = compositeMtime
 	}
 	// Zed has no cheap per-thread content digest; legacy sync stored the
@@ -148,15 +159,15 @@ func zedFingerprintSource(src multiSessionSource) (SourceFingerprint, error) {
 	}, nil
 }
 
-func zedMemberPresent(src multiSessionSource) bool {
+func zedMemberPresent(ctx context.Context, src multiSessionSource) bool {
 	if src.MemberID == "" {
 		return IsRegularFile(src.Container)
 	}
-	return ZedSQLiteSessionExists(src.Container, src.MemberID)
+	return ZedSQLiteSessionExists(ctx, src.Container, src.MemberID)
 }
 
 func zedParseMember(
-	src multiSessionSource, req ParseRequest,
+	ctx context.Context, src multiSessionSource, req ParseRequest,
 ) (*ParseResult, error) {
 	dbInfo, err := os.Stat(src.Container)
 	if err != nil {
@@ -173,13 +184,17 @@ func zedParseMember(
 		return nil, err
 	}
 	defer conn.Close()
-	return parseZedThreadFromDB(
-		conn, src.Container, src.MemberID, req.Machine, dbInfo,
+	shape, err := inspectZedSchema(ctx, conn)
+	if err != nil {
+		return nil, wrapZedLoadingError(src.MemberID, err)
+	}
+	return parseZedThreadFromDBWithSchema(
+		ctx, conn, src.Container, src.MemberID, req.Machine, dbInfo, shape,
 	)
 }
 
 func zedParseContainer(
-	src multiSessionSource, req ParseRequest,
+	ctx context.Context, src multiSessionSource, req ParseRequest,
 ) ([]ParseResult, error) {
 	dbInfo, err := os.Stat(src.Container)
 	if err != nil {
@@ -193,7 +208,15 @@ func zedParseContainer(
 		return nil, err
 	}
 	defer conn.Close()
-	metas, err := ListZedThreadMetas(conn, src.Container)
+	shape, err := inspectZedSchema(ctx, conn)
+	if err != nil {
+		return nil, wrapZedListingError(err)
+	}
+	var metas []ZedThreadMeta
+	err = forEachZedThreadMeta(ctx, conn, src.Container, shape, func(meta ZedThreadMeta) error {
+		metas = append(metas, meta)
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -204,8 +227,8 @@ func zedParseContainer(
 	dbHash, _ := hashJSONLSourceFile(src.Container)
 	results := make([]ParseResult, 0, len(metas))
 	for _, meta := range metas {
-		result, err := parseZedThreadFromDB(
-			conn, src.Container, meta.RawID, req.Machine, dbInfo,
+		result, err := parseZedThreadFromDBWithSchema(
+			ctx, conn, src.Container, meta.RawID, req.Machine, dbInfo, shape,
 		)
 		if err != nil {
 			return nil, err
@@ -221,49 +244,6 @@ func zedParseContainer(
 	return results, nil
 }
 
-func zedDBUnderRoot(root, dbPath string, requireRegular bool) bool {
-	root = filepath.Clean(root)
-	dbPath = filepath.Clean(dbPath)
-	rel, ok := relUnder(root, dbPath)
-	if !ok || filepath.ToSlash(rel) != "threads/threads.db" {
-		return false
-	}
-	return !requireRegular || IsRegularFile(dbPath)
-}
-
-func zedDBPathForEvent(root, path string) (string, bool) {
-	root = filepath.Clean(root)
-	path = filepath.Clean(path)
-	rel, ok := relUnder(root, path)
-	if !ok {
-		return "", false
-	}
-	relSlash := filepath.ToSlash(rel)
-	if relSlash == "threads/threads.db" ||
-		(filepath.ToSlash(filepath.Dir(rel)) == "threads" &&
-			strings.HasPrefix(filepath.Base(rel), "threads.db-")) {
-		return filepath.Join(root, zedThreadsDBRelPath), true
-	}
-	return "", false
-}
-
-func sqliteDBCompositeMtime(dbPath string) (int64, error) {
-	var maxMtime int64
-	for _, suffix := range []string{"", "-wal", "-shm"} {
-		info, err := os.Stat(dbPath + suffix)
-		if err != nil {
-			continue
-		}
-		if mtime := info.ModTime().UnixNano(); mtime > maxMtime {
-			maxMtime = mtime
-		}
-	}
-	if maxMtime == 0 {
-		return 0, &os.PathError{Op: "stat", Path: dbPath, Err: os.ErrNotExist}
-	}
-	return maxMtime, nil
-}
-
 // parseZedVirtualPath splits a Zed virtual source path into its physical
 // threads.db path and raw thread ID. The container basename must be threads.db
 // and the thread ID must pass IsValidSessionID so path-like input is rejected.
@@ -276,19 +256,13 @@ func parseZedVirtualPath(path string) (string, string, bool) {
 }
 
 func zedProviderCapabilities() Capabilities {
+	source := multiSessionContainerSourceCapabilities(
+		CapabilitySupported,
+		CapabilitySupported,
+	)
+	source.PersistentArchive = CapabilitySupported
 	return Capabilities{
-		Source: SourceCapabilities{
-			DiscoverSources:      CapabilitySupported,
-			WatchSources:         CapabilitySupported,
-			ClassifyChangedPath:  CapabilitySupported,
-			FindSource:           CapabilitySupported,
-			CompositeFingerprint: CapabilitySupported,
-			IncrementalAppend:    CapabilityNotApplicable,
-			MultiSessionSource:   CapabilitySupported,
-			PerSessionErrors:     CapabilityNotApplicable,
-			ExcludedSessions:     CapabilityNotApplicable,
-			ForceReplaceOnParse:  CapabilitySupported,
-		},
+		Source: source,
 		Content: ContentCapabilities{
 			FirstMessage:         CapabilitySupported,
 			SessionName:          CapabilitySupported,
@@ -298,6 +272,9 @@ func zedProviderCapabilities() Capabilities {
 			ToolResults:          CapabilitySupported,
 			AggregateUsageEvents: CapabilitySupported,
 			Model:                CapabilitySupported,
+		},
+		Sync: ProviderSyncSemantics{
+			UnchangedResults: UnchangedResultMTime,
 		},
 	}
 }

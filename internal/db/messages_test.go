@@ -15,13 +15,15 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-const largeSessionPerfCeiling = 10 * time.Second
-const crossSessionNeighborCount = 40
-const crossSessionToolCallsPerNeighbor = 250
-const crossSessionToolCallTotal = crossSessionNeighborCount * crossSessionToolCallsPerNeighbor
-const largeSessionFixtureID = "large-session-fixture"
-const largeSessionFixtureToken = "ftslargefixture"
-const largeSessionNeighborPrefix = "large-session-neighbor"
+const (
+	largeSessionPerfCeiling          = 10 * time.Second
+	crossSessionNeighborCount        = 40
+	crossSessionToolCallsPerNeighbor = 250
+	crossSessionToolCallTotal        = crossSessionNeighborCount * crossSessionToolCallsPerNeighbor
+	largeSessionFixtureID            = "large-session-fixture"
+	largeSessionFixtureToken         = "ftslargefixture"
+	largeSessionNeighborPrefix       = "large-session-neighbor"
+)
 
 var (
 	largeSessionTemplateBuildMu sync.Mutex
@@ -59,14 +61,12 @@ func openLargeSessionFixtureDB(t *testing.T, withFKPoison bool) *DB {
 	var src string
 	if withFKPoison {
 		largeSessionPoisonOnce.Do(func() {
-			largeSessionPoisonDir, largeSessionPoisonPath =
-				buildLargeSessionFixtureTemplate(t, true)
+			largeSessionPoisonDir, largeSessionPoisonPath = buildLargeSessionFixtureTemplate(t, true)
 		})
 		src = largeSessionPoisonPath
 	} else {
 		largeSessionOnlyOnce.Do(func() {
-			largeSessionOnlyDir, largeSessionOnlyPath =
-				buildLargeSessionFixtureTemplate(t, false)
+			largeSessionOnlyDir, largeSessionOnlyPath = buildLargeSessionFixtureTemplate(t, false)
 		})
 		src = largeSessionOnlyPath
 	}
@@ -99,7 +99,7 @@ func TestGetInputOutlineFiltersUserInputs(t *testing.T) {
 		userMsg(sessionID, 5, "<bash-input>go test ./...</bash-input>"),
 	}
 	msgs[3].IsSystem = true
-	require.NoError(t, d.ReplaceSessionMessages(sessionID, msgs))
+	require.NoError(t, d.ReplaceSessionMessages(ctx, sessionID, msgs))
 
 	outline, err := d.GetInputOutline(ctx, sessionID)
 	require.NoError(t, err)
@@ -125,13 +125,19 @@ func buildLargeSessionFixtureTemplate(
 	t *testing.T, withFKPoison bool,
 ) (string, string) {
 	t.Helper()
+
 	largeSessionTemplateBuildMu.Lock()
 	defer largeSessionTemplateBuildMu.Unlock()
 
-	dir, err := os.MkdirTemp("", "agentsview-large-session-*")
-	require.NoError(t, err, "create large-session fixture dir")
+	dirName := "large-session-only"
+	if withFKPoison {
+		dirName = "large-session-poison"
+	}
+	dir := filepath.Join(testDBFixtureTempDir, dirName)
+	require.NoError(t, os.MkdirAll(dir, 0o700), "create large-session fixture dir")
+	var err error
 	path := filepath.Join(dir, "test.db")
-	require.NoError(t, copyTestDBTemplate(path),
+	require.NoError(t, copyTestDBTemplate(t, path),
 		"copy base db template for large-session fixture")
 
 	d, err := OpenPreparedTestDB(path)
@@ -143,7 +149,7 @@ func buildLargeSessionFixtureTemplate(
 		seedCrossSessionFKGrowth(t, d, largeSessionNeighborPrefix)
 		poisonMessagesDeleteTrigger(t, d)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), largeSessionPerfCeiling)
+	ctx, cancel := context.WithTimeout(t.Context(), largeSessionPerfCeiling)
 	defer cancel()
 	require.NoError(t, d.CheckpointWALTruncate(ctx),
 		"checkpoint large-session template")
@@ -164,10 +170,10 @@ func seedCrossSessionFKGrowth(t *testing.T, d *DB, sessionID string) {
 		neighborID := sessionID + "-" + strconv.Itoa(i)
 		insertSession(t, d, neighborID, "proj")
 		insertMessages(t, d, userMsg(neighborID, 0, "neighbor"))
-		msgs, err := d.GetAllMessages(context.Background(), neighborID)
+		msgs, err := d.GetAllMessages(t.Context(), neighborID)
 		require.NoError(t, err, "GetAllMessages neighbor %s", neighborID)
 		require.Len(t, msgs, 1)
-		_, err = d.PinMessage(neighborID, msgs[0].ID, nil)
+		_, err = d.PinMessage(t.Context(), neighborID, msgs[0].ID, nil)
 		require.NoError(t, err, "PinMessage neighbor %s", neighborID)
 		seeds = append(seeds, neighborSeed{
 			sessionID: neighborID,
@@ -175,10 +181,10 @@ func seedCrossSessionFKGrowth(t *testing.T, d *DB, sessionID string) {
 		})
 	}
 
-	require.NoError(t, d.Update(func(tx *sql.Tx) error {
+	require.NoError(t, d.Update(t.Context(), func(tx *sql.Tx) error {
 		for _, seed := range seeds {
 			for i := range crossSessionToolCallsPerNeighbor {
-				if _, err := tx.Exec(
+				if _, err := tx.ExecContext(t.Context(),
 					`INSERT INTO tool_calls
 					 (message_id, session_id, tool_name, category, tool_use_id)
 					 VALUES (?, ?, ?, ?, ?)`,
@@ -196,7 +202,7 @@ func seedCrossSessionFKGrowth(t *testing.T, d *DB, sessionID string) {
 func assertNoFTSLeak(t *testing.T, d *DB, token string) {
 	t.Helper()
 	var leaked int
-	err := d.getReader().QueryRow(
+	err := d.getReader().QueryRow(t.Context(),
 		`SELECT count(*) FROM messages_fts
 		 WHERE messages_fts MATCH ?`,
 		token,
@@ -208,11 +214,11 @@ func assertNoFTSLeak(t *testing.T, d *DB, token string) {
 func poisonMessagesDeleteTrigger(t *testing.T, d *DB) {
 	t.Helper()
 
-	require.NoError(t, d.Update(func(tx *sql.Tx) error {
-		if _, err := tx.Exec("DROP TRIGGER IF EXISTS messages_ad"); err != nil {
+	require.NoError(t, d.Update(t.Context(), func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(t.Context(), "DROP TRIGGER IF EXISTS messages_ad"); err != nil {
 			return err
 		}
-		_, err := tx.Exec(`
+		_, err := tx.ExecContext(t.Context(), `
 			CREATE TRIGGER messages_ad AFTER DELETE ON messages BEGIN
 				SELECT RAISE(FAIL, 'poison messages_ad fired');
 			END`)
@@ -224,7 +230,7 @@ func requireMessagesDeleteTriggerRestored(t *testing.T, d *DB) {
 	t.Helper()
 
 	var triggerSQL string
-	err := d.getReader().QueryRow(
+	err := d.getReader().QueryRow(t.Context(),
 		`SELECT sql FROM sqlite_master
 		 WHERE type = 'trigger' AND name = 'messages_ad'`,
 	).Scan(&triggerSQL)
@@ -239,7 +245,7 @@ func requireMessagesDeleteTriggerPoisoned(t *testing.T, d *DB) {
 	t.Helper()
 
 	var triggerSQL string
-	err := d.getReader().QueryRow(
+	err := d.getReader().QueryRow(t.Context(),
 		`SELECT sql FROM sqlite_master
 		 WHERE type = 'trigger' AND name = 'messages_ad'`,
 	).Scan(&triggerSQL)
@@ -262,7 +268,7 @@ func TestInsertAndGetMessage_ThinkingText(t *testing.T) {
 		ThinkingText: "I am pondering",
 	})
 
-	got, err := d.GetAllMessages(context.Background(), sessionID)
+	got, err := d.GetAllMessages(t.Context(), sessionID)
 	require.NoError(t, err, "GetAllMessages")
 	require.Len(t, got, 1)
 	assert.Equal(t, "I am pondering", got[0].ThinkingText, "ThinkingText")
@@ -271,24 +277,24 @@ func TestInsertAndGetMessage_ThinkingText(t *testing.T) {
 func TestWriteSessionBatchCommitsGoodRowsAndSkipsBadRows(t *testing.T) {
 	d := testDB(t)
 
-	require.NoError(t, d.Update(func(tx *sql.Tx) error {
-		_, err := tx.Exec(
+	require.NoError(t, d.Update(t.Context(), func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(t.Context(),
 			"INSERT INTO excluded_sessions (id) VALUES (?)",
 			"excluded",
 		)
 		return err
 	}), "seed excluded session")
-	require.NoError(t, d.UpsertSession(Session{
+	require.NoError(t, d.UpsertSession(t.Context(), Session{
 		ID:      "trashed",
 		Project: "proj",
 		Machine: defaultMachine,
 		Agent:   defaultAgent,
 	}), "seed trashed session")
-	require.NoError(t, d.SoftDeleteSession("trashed"), "soft delete session")
+	require.NoError(t, d.SoftDeleteSession(t.Context(), "trashed"), "soft delete session")
 
 	health := 95
 	grade := "A"
-	result, err := d.WriteSessionBatch([]SessionBatchWrite{
+	writes := []SessionBatchWrite{
 		{
 			Session: Session{
 				ID:               "good",
@@ -366,36 +372,68 @@ func TestWriteSessionBatchCommitsGoodRowsAndSkipsBadRows(t *testing.T) {
 			},
 			DataVersion: CurrentDataVersion(),
 		},
-	})
+	}
+	writes[0], writes[1] = writes[1], writes[0]
+	result, err := d.WriteSessionBatch(writes)
 	require.NoError(t, err, "WriteSessionBatch")
 	require.Equal(t, 1, result.WrittenSessions, "WrittenSessions")
 	require.Equal(t, 2, result.WrittenMessages, "WrittenMessages")
 	require.Equal(t, 1, result.FailedSessions, "FailedSessions")
 	require.Equal(t, 2, result.ExcludedSessions, "ExcludedSessions")
+	assert.Equal(t, []int{1}, result.WrittenIndexes)
 
-	sess, err := d.GetSessionFull(context.Background(), "good")
+	sess, err := d.GetSessionFull(t.Context(), "good")
 	require.NoError(t, err, "GetSessionFull good")
 	require.NotNil(t, sess, "good session not found")
 	assert.Equal(t, CurrentDataVersion(), sess.DataVersion, "DataVersion")
 	assert.Equal(t, "success", sess.Outcome, "Outcome")
 	assert.Equal(t, "high", sess.OutcomeConfidence, "OutcomeConfidence")
 	assert.True(t, sess.HasToolCalls, "HasToolCalls")
-	trashed, err := d.GetSessionFull(context.Background(), "trashed")
+	trashed, err := d.GetSessionFull(t.Context(), "trashed")
 	require.NoError(t, err, "GetSessionFull trashed")
 	require.NotNil(t, trashed, "trashed session was not preserved in trash")
 	assert.NotNil(t, trashed.DeletedAt, "trashed session was not preserved in trash")
 
-	msgs, err := d.GetAllMessages(context.Background(), "good")
+	msgs, err := d.GetAllMessages(t.Context(), "good")
 	require.NoError(t, err, "GetAllMessages good")
 	require.Len(t, msgs, 2)
 	require.Len(t, msgs[1].ToolCalls, 1, "assistant tool calls")
 
-	bad, err := d.GetSessionFull(context.Background(), "bad")
+	bad, err := d.GetSessionFull(t.Context(), "bad")
 	require.NoError(t, err, "GetSessionFull bad")
 	assert.Nil(t, bad, "bad session should have rolled back")
-	excluded, err := d.GetSessionFull(context.Background(), "excluded")
+	excluded, err := d.GetSessionFull(t.Context(), "excluded")
 	require.NoError(t, err, "GetSessionFull excluded")
 	assert.Nil(t, excluded, "excluded session should not be written")
+}
+
+func TestWriteSessionBatchContextDoesNotWriteAfterCancellation(t *testing.T) {
+	d := testDB(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	result, err := d.WriteSessionBatchContext(ctx, []SessionBatchWrite{{
+		Session: Session{
+			ID:      "cancelled-batch",
+			Project: "proj",
+			Machine: defaultMachine,
+			Agent:   defaultAgent,
+		},
+		Messages: []Message{userMsg("cancelled-batch", 0, "prompt")},
+		UsageEvents: []UsageEvent{{
+			SessionID:   "cancelled-batch",
+			Source:      "message",
+			Model:       "model-a",
+			InputTokens: 10,
+		}},
+		DataVersion: CurrentDataVersion(),
+	}})
+
+	require.ErrorIs(t, err, context.Canceled)
+	assert.Zero(t, result.WrittenSessions)
+	session, readErr := d.GetSessionFull(t.Context(), "cancelled-batch")
+	require.NoError(t, readErr)
+	assert.Nil(t, session)
 }
 
 func TestMigration_ThinkingTextColumn(t *testing.T) {
@@ -404,7 +442,7 @@ func TestMigration_ThinkingTextColumn(t *testing.T) {
 
 	// Create a DB with the current schema then drop the
 	// thinking_text column to simulate a pre-migration DB.
-	d, err := Open(path)
+	d, err := Open(t.Context(), path)
 	require.NoError(t, err, "initial open")
 	insertSession(t, d, "s1", "proj")
 	insertMessages(t, d,
@@ -423,15 +461,15 @@ func TestMigration_ThinkingTextColumn(t *testing.T) {
 	// (SQLite 3.35+) to simulate a legacy schema.
 	conn, err := sql.Open("sqlite3", path)
 	require.NoError(t, err, "raw open")
-	_, err = conn.Exec(
+	_, err = conn.ExecContext(t.Context(),
 		`ALTER TABLE messages DROP COLUMN thinking_text`,
 	)
 	require.NoError(t, err, "drop thinking_text column")
 
 	// Verify column is gone.
 	var count int
-	err = conn.QueryRow(
-		`SELECT count(*) FROM pragma_table_info('messages')` +
+	err = conn.QueryRowContext(t.Context(),
+		`SELECT count(*) FROM pragma_table_info('messages')`+
 			` WHERE name = 'thinking_text'`,
 	).Scan(&count)
 	require.NoError(t, err, "verify column removed")
@@ -439,7 +477,7 @@ func TestMigration_ThinkingTextColumn(t *testing.T) {
 
 	// Insert a legacy row with an explicit column list that
 	// cannot reference thinking_text (column doesn't exist yet).
-	_, err = conn.Exec(`
+	_, err = conn.ExecContext(t.Context(), `
 		INSERT INTO messages (
 			session_id, ordinal, role, content, timestamp,
 			has_thinking, has_tool_use, content_length,
@@ -465,20 +503,20 @@ func TestMigration_ThinkingTextColumn(t *testing.T) {
 	conn.Close()
 
 	// Reopen with Open() — migration should add the column.
-	d2, err := Open(path)
+	d2, err := Open(t.Context(), path)
 	require.NoError(t, err, "reopen after migration")
 	defer d2.Close()
 
 	// Verify column exists.
-	err = d2.getReader().QueryRow(
-		`SELECT count(*) FROM pragma_table_info('messages')` +
+	err = d2.getReader().QueryRow(t.Context(),
+		`SELECT count(*) FROM pragma_table_info('messages')`+
 			` WHERE name = 'thinking_text'`,
 	).Scan(&count)
 	require.NoError(t, err, "verify column added")
 	require.Equal(t, 1, count, "expected thinking_text column after migration")
 
 	// Verify all rows survive and the legacy row defaults to "".
-	msgs, err := d2.GetAllMessages(context.Background(), "s1")
+	msgs, err := d2.GetAllMessages(t.Context(), "s1")
 	require.NoError(t, err, "get messages")
 	require.Len(t, msgs, 3)
 	for _, m := range msgs {
@@ -493,7 +531,7 @@ func TestMigration_ThinkingTextColumn(t *testing.T) {
 		Content:      "post-migration answer",
 		ThinkingText: "x",
 	})
-	msgs, err = d2.GetAllMessages(context.Background(), "s1")
+	msgs, err = d2.GetAllMessages(t.Context(), "s1")
 	require.NoError(t, err, "get messages after insert")
 	require.Len(t, msgs, 4)
 	assert.Equal(t, "x", msgs[3].ThinkingText, "ThinkingText")
@@ -525,14 +563,14 @@ func TestReplaceSessionMessages_LargeSession(t *testing.T) {
 		repl = append(repl, userMsg(largeSessionFixtureID, i, "after"))
 	}
 	start := time.Now()
-	require.NoError(t, d.ReplaceSessionMessages(largeSessionFixtureID, repl),
+	require.NoError(t, d.ReplaceSessionMessages(t.Context(), largeSessionFixtureID, repl),
 		"ReplaceSessionMessages")
 	elapsed := time.Since(start)
 	require.LessOrEqual(t, elapsed, largeSessionPerfCeiling,
 		"ReplaceSessionMessages took %s, want < 10s (per-row FTS trigger regression?)",
 		elapsed.Round(time.Millisecond))
 
-	got, err := d.GetAllMessages(context.Background(), largeSessionFixtureID)
+	got, err := d.GetAllMessages(t.Context(), largeSessionFixtureID)
 	require.NoError(t, err, "GetAllMessages after replace")
 	require.Len(t, got, len(repl), "after replace")
 
@@ -578,14 +616,14 @@ func TestWriteSessionBatch_ReplaceMessagesLargeSession(t *testing.T) {
 		"WriteSessionBatch replace took %s, want < 10s (per-row FTS trigger regression?)",
 		elapsed.Round(time.Millisecond))
 
-	got, err := d.GetAllMessages(context.Background(), largeSessionFixtureID)
+	got, err := d.GetAllMessages(t.Context(), largeSessionFixtureID)
 	require.NoError(t, err, "GetAllMessages after batch replace")
 	require.Len(t, got, len(repl), "after batch replace")
 	assertNoFTSLeak(t, d, largeSessionFixtureToken)
 	requireMessagesDeleteTriggerRestored(t, d)
 
 	var neighborToolCalls int
-	err = d.getReader().QueryRow(
+	err = d.getReader().QueryRow(t.Context(),
 		"SELECT count(*) FROM tool_calls WHERE session_id LIKE ?",
 		largeSessionNeighborPrefix+"-%",
 	).Scan(&neighborToolCalls)
@@ -622,6 +660,170 @@ func TestWriteSessionBatchFreshReplaceMessagesSkipsDeletePath(t *testing.T) {
 	requireMessagesDeleteTriggerPoisoned(t, d)
 }
 
+func TestWriteSessionBatchReplaceMessagesOnlyBumpsChangedTranscript(t *testing.T) {
+	t.Parallel()
+	d := testDB(t)
+	const sessionID = "batch-revision"
+	insertSession(t, d, sessionID, "proj")
+	original := Message{
+		SessionID:     sessionID,
+		Ordinal:       0,
+		Role:          "assistant",
+		Content:       "same answer",
+		ContentLength: len("same answer"),
+		ToolCalls: []ToolCall{{
+			ToolName:      "Read",
+			Category:      "file",
+			ToolUseID:     "toolu_1",
+			InputJSON:     `{"path":"same"}`,
+			ResultContent: "same result",
+			ResultEvents: []ToolResultEvent{{
+				Status:  "completed",
+				Content: "same result",
+			}},
+		}},
+	}
+	insertMessages(t, d, original)
+	_, err := d.getWriter().Exec(t.Context(),
+		`UPDATE sessions SET transcript_revision = '7' WHERE id = ?`,
+		sessionID,
+	)
+	require.NoError(t, err)
+
+	write := SessionBatchWrite{
+		Session: Session{
+			ID:           sessionID,
+			Project:      "proj",
+			Machine:      defaultMachine,
+			Agent:        defaultAgent,
+			MessageCount: 1,
+		},
+		Messages:        []Message{original},
+		ReplaceMessages: true,
+	}
+	_, err = d.WriteSessionBatch([]SessionBatchWrite{write})
+	require.NoError(t, err)
+	unchanged, err := d.GetSession(t.Context(), sessionID)
+	require.NoError(t, err)
+	require.NotNil(t, unchanged)
+	require.NotNil(t, unchanged.TranscriptRevision)
+	assert.Equal(t, "7", *unchanged.TranscriptRevision)
+
+	write.Messages[0].ContentLength = 999
+	write.Messages[0].ToolCalls[0].ResultContentLength = 999
+	write.Messages[0].ToolCalls[0].ResultEvents[0].ContentLength = 999
+	_, err = d.WriteSessionBatch([]SessionBatchWrite{write})
+	require.NoError(t, err)
+	recalculated, err := d.GetSession(t.Context(), sessionID)
+	require.NoError(t, err)
+	require.NotNil(t, recalculated)
+	require.NotNil(t, recalculated.TranscriptRevision)
+	assert.Equal(t, "7", *recalculated.TranscriptRevision)
+
+	write.Messages[0].ToolCalls[0].ResultContent = "changed result"
+	_, err = d.WriteSessionBatch([]SessionBatchWrite{write})
+	require.NoError(t, err)
+	changed, err := d.GetSession(t.Context(), sessionID)
+	require.NoError(t, err)
+	require.NotNil(t, changed)
+	require.NotNil(t, changed.TranscriptRevision)
+	assert.Equal(t, "8", *changed.TranscriptRevision)
+
+	write.ReplaceMessages = false
+	_, err = d.WriteSessionBatch([]SessionBatchWrite{write})
+	require.NoError(t, err)
+	replayed, err := d.GetSession(t.Context(), sessionID)
+	require.NoError(t, err)
+	require.NotNil(t, replayed)
+	require.NotNil(t, replayed.TranscriptRevision)
+	assert.Equal(t, "8", *replayed.TranscriptRevision)
+}
+
+func TestReplacementAPIsOnlyBumpVisibleTranscriptChanges(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name    string
+		replace func(*DB, string, []Message) error
+	}{
+		{
+			name: "messages",
+			replace: func(d *DB, id string, msgs []Message) error {
+				return d.ReplaceSessionMessages(t.Context(), id, msgs)
+			},
+		},
+		{
+			name: "content",
+			replace: func(d *DB, id string, msgs []Message) error {
+				return d.ReplaceSessionContent(t.Context(),
+					id, msgs, SessionSignalUpdate{}, nil,
+				)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			d := testDB(t)
+			messageSessionID := "replacement-" + tc.name
+			insertSession(t, d, messageSessionID, "proj")
+			original := Message{
+				SessionID:     messageSessionID,
+				Ordinal:       0,
+				Role:          "assistant",
+				Content:       "same answer",
+				ContentLength: len("same answer"),
+			}
+			insertMessages(t, d, original)
+			_, err := d.getWriter().Exec(t.Context(),
+				`UPDATE sessions SET transcript_revision = '7' WHERE id = ?`,
+				messageSessionID,
+			)
+			require.NoError(t, err)
+
+			derivedOnly := original
+			derivedOnly.ContentLength = 999
+			require.NoError(t, tc.replace(
+				d, messageSessionID, []Message{derivedOnly},
+			))
+			unchanged, err := d.GetSession(
+				t.Context(), messageSessionID,
+			)
+			require.NoError(t, err)
+			require.NotNil(t, unchanged)
+			require.NotNil(t, unchanged.TranscriptRevision)
+			assert.Equal(t, "7", *unchanged.TranscriptRevision)
+
+			visibleChange := derivedOnly
+			visibleChange.Content = "changed answer"
+			require.NoError(t, tc.replace(
+				d, messageSessionID, []Message{visibleChange},
+			))
+			changed, err := d.GetSession(
+				t.Context(), messageSessionID,
+			)
+			require.NoError(t, err)
+			require.NotNil(t, changed)
+			require.NotNil(t, changed.TranscriptRevision)
+			assert.Equal(t, "8", *changed.TranscriptRevision)
+
+			emptySessionID := "empty-replacement-" + tc.name
+			insertSession(t, d, emptySessionID, "proj")
+			_, err = d.getWriter().Exec(t.Context(),
+				`UPDATE sessions SET transcript_revision = '3' WHERE id = ?`,
+				emptySessionID,
+			)
+			require.NoError(t, err)
+			require.NoError(t, tc.replace(d, emptySessionID, nil))
+			empty, err := d.GetSession(
+				t.Context(), emptySessionID,
+			)
+			require.NoError(t, err)
+			require.NotNil(t, empty)
+			require.NotNil(t, empty.TranscriptRevision)
+			assert.Equal(t, "3", *empty.TranscriptRevision)
+		})
+	}
+}
+
 // TestMessageReadsTolerateNullTimestamp pins NULL-timestamp robustness
 // across the three message read paths. timestamp is the only nullable
 // text column in the messages table; fresh inserts always bind a Go
@@ -640,8 +842,8 @@ func TestMessageReadsTolerateNullTimestamp(t *testing.T) {
 	)
 
 	nullOrdinal1 := func() {
-		require.NoError(t, d.Update(func(tx *sql.Tx) error {
-			_, err := tx.Exec(
+		require.NoError(t, d.Update(t.Context(), func(tx *sql.Tx) error {
+			_, err := tx.ExecContext(t.Context(),
 				"UPDATE messages SET timestamp = NULL"+
 					" WHERE session_id = ? AND ordinal = ?", "null-ts", 1)
 			return err
@@ -653,40 +855,40 @@ func TestMessageReadsTolerateNullTimestamp(t *testing.T) {
 	// the two. InsertMessages binds a Go string, so reach past it with
 	// raw SQL to plant the NULL.
 	nullOrdinal1()
-	fpNull, err := d.MessageRoleTimeFingerprint("null-ts")
+	fpNull, err := d.MessageRoleTimeFingerprint(t.Context(), "null-ts")
 	require.NoError(t, err, "fingerprint over NULL timestamp")
-	require.NoError(t, d.Update(func(tx *sql.Tx) error {
-		_, err := tx.Exec(
+	require.NoError(t, d.Update(t.Context(), func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(t.Context(),
 			"UPDATE messages SET timestamp = ''"+
 				" WHERE session_id = ? AND ordinal = ?", "null-ts", 1)
 		return err
 	}), "set the stored timestamp to empty string")
-	fpEmpty, err := d.MessageRoleTimeFingerprint("null-ts")
+	fpEmpty, err := d.MessageRoleTimeFingerprint(t.Context(), "null-ts")
 	require.NoError(t, err, "fingerprint over empty timestamp")
 	assert.Equal(t, fpEmpty, fpNull,
 		"NULL timestamp must fingerprint identically to empty string")
 
 	// Tier-2 batch read path (scanMessages via selectMessageCols).
 	nullOrdinal1()
-	msgs, err := d.GetAllMessages(context.Background(), "null-ts")
+	msgs, err := d.GetAllMessages(t.Context(), "null-ts")
 	require.NoError(t, err, "GetAllMessages over NULL timestamp")
 	require.Len(t, msgs, 2)
 	assert.Equal(t, "2024-01-01T10:00:00Z", msgs[0].Timestamp)
-	assert.Equal(t, "", msgs[1].Timestamp,
+	assert.Empty(t, msgs[1].Timestamp,
 		"NULL timestamp reads as empty string")
 
 	// Single-row read path (GetMessageByOrdinal via selectMessageCols).
-	m, err := d.GetMessageByOrdinal("null-ts", 1)
+	m, err := d.GetMessageByOrdinal(t.Context(), "null-ts", 1)
 	require.NoError(t, err, "GetMessageByOrdinal over NULL timestamp")
 	require.NotNil(t, m)
-	assert.Equal(t, "", m.Timestamp,
+	assert.Empty(t, m.Timestamp,
 		"NULL timestamp reads as empty string")
 }
 
 func TestToolCallFilePathCallIndexRoundTrip(t *testing.T) {
 	t.Parallel()
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	insertSession(t, d, "sess-1", "proj")
 	insertMessages(t, d, userMsg("sess-1", 0, "hello"))
@@ -697,7 +899,7 @@ func TestToolCallFilePathCallIndexRoundTrip(t *testing.T) {
 		`SELECT id FROM messages WHERE session_id = 'sess-1' AND ordinal = 0`,
 	).Scan(&msgID))
 
-	tx, err := d.getWriter().Begin()
+	tx, err := d.getWriter().Begin(ctx)
 	require.NoError(t, err, "begin tx")
 	err = insertToolCallsChunkTx(tx, []ToolCall{
 		{

@@ -53,7 +53,34 @@ func TestHumanizeSessionAge(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			assert.Equal(t, tc.want, humanizeSessionAge(tc.sess, renderNow))
+		})
+	}
+}
+
+func TestHumanizeAgeRelative(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name    string
+		t       time.Time
+		wantStr string
+		wantOK  bool
+	}{
+		{"future skew reads as now", renderNow.Add(5 * time.Second), "now", true},
+		{"seconds", renderNow.Add(-30 * time.Second), "30s", true},
+		{"minutes", renderNow.Add(-5 * time.Minute), "5m", true},
+		{"hours", renderNow.Add(-3 * time.Hour), "3h", true},
+		{"days", renderNow.Add(-2 * 24 * time.Hour), "2d", true},
+		{"a week or more returns not-ok", renderNow.Add(-7 * 24 * time.Hour), "", false},
+		{"long past returns not-ok", renderNow.Add(-90 * 24 * time.Hour), "", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got, ok := humanizeAgeRelative(tc.t, renderNow)
+			assert.Equal(t, tc.wantOK, ok)
+			assert.Equal(t, tc.wantStr, got)
 		})
 	}
 }
@@ -84,6 +111,7 @@ func TestIsSessionRecentlyActive(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			assert.Equal(t, tc.want, isSessionRecentlyActive(tc.sess, renderNow))
 		})
 	}
@@ -125,6 +153,7 @@ func TestCollapseHome(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			assert.Equal(t, tc.want, collapseHome(tc.cwd, tc.home))
 		})
 	}
@@ -144,6 +173,7 @@ func TestTruncName(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 			assert.Equal(t, tc.want, truncName(tc.in, tc.max))
 		})
 	}
@@ -157,7 +187,7 @@ func TestSessionDisplayName(t *testing.T) {
 	assert.Equal(t, "first", sessionDisplayName(db.Session{
 		FirstMessage: new("first"),
 	}))
-	assert.Equal(t, "", sessionDisplayName(db.Session{}))
+	assert.Empty(t, sessionDisplayName(db.Session{}))
 	// An empty display name falls through to the first message.
 	assert.Equal(t, "first", sessionDisplayName(db.Session{
 		DisplayName: new(""), FirstMessage: new("first"),

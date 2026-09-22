@@ -1,12 +1,17 @@
 <script lang="ts">
   import { m } from "../../i18n/index.js";
   import {
+    getSessionStatus,
     sessions,
     type SessionGroupInput,
   } from "../../stores/sessions.svelte.js";
+  import {
+    buildReadProgressToken,
+    readProgress,
+  } from "../../stores/read-progress.svelte.js";
   import { starred } from "../../stores/starred.svelte.js";
   import { formatRelativeTime, truncate } from "../../utils/format.js";
-  import { agentColor as getAgentColor, agentLabel } from "../../utils/agents.js";
+  import { agentColor as getAgentColor, agentLabel, entrypointBadge } from "../../utils/agents.js";
   import {
     normalizeMessagePreview,
     previewMessage,
@@ -17,9 +22,13 @@
     StarIcon,
     UserRoundIcon,
     UsersRoundIcon,
+    XIcon,
   } from "../../icons.js";
-  import StatusDot from "../common/StatusDot.svelte";
+  import { Button, IconButton, showFlash, StatusDot } from "@kenn-io/kit-ui";
+  import { sessionStatusLabel } from "../../utils/sessionStatus.js";
   import { router } from "../../stores/router.svelte.js";
+  import { sync } from "../../stores/sync.svelte.js";
+  import ProjectTypeahead from "../layout/ProjectTypeahead.svelte";
 
   interface Props {
     session: SessionGroupInput;
@@ -73,6 +82,8 @@
     selected = false,
   }: Props = $props();
 
+  let sessionStatus = $derived(getSessionStatus(session, groupSessions));
+
   let isActive = $derived.by(() => {
     const aid = sessions.activeSessionId;
     if (!aid) return false;
@@ -95,6 +106,17 @@
     !!session.machine &&
     session.machine !== "local",
   );
+
+  let hasUnread = $derived.by(() => {
+    const candidates = groupSessions && !expanded
+      ? groupSessions
+      : [session];
+    return candidates.some((candidate) => {
+      const token = buildReadProgressToken(candidate);
+      return token !== null &&
+        readProgress.hasUnread(candidate.id, token);
+    });
+  });
 
   /** Whether this session is a team member (received a <teammate-message>). */
   let isTeamSession = $derived(
@@ -169,13 +191,17 @@
 
   // Context menu state
   let contextMenu: { x: number; y: number } | null = $state(null);
+  let projectEditor: { x: number; y: number } | null = $state(null);
+  let targetProject = $state("");
+  let projectSaving = $state(false);
+  let projectError = $state("");
 
   // Rename state
   let renaming = $state(false);
   let renameValue = $state("");
   let renameInput: HTMLInputElement | undefined = $state(undefined);
 
-  function portal(node: HTMLElement) {
+  function mountOverlay(node: HTMLElement) {
     document.body.appendChild(node);
     return {
       destroy() {
@@ -191,6 +217,55 @@
 
   function closeContextMenu() {
     contextMenu = null;
+  }
+
+  function startProjectEditor(e: MouseEvent) {
+    e.stopPropagation();
+    const origin = contextMenu;
+    if (!origin) return;
+    projectEditor = {
+      x: Math.max(8, Math.min(origin.x, window.innerWidth - 316)),
+      y: Math.max(8, Math.min(origin.y, window.innerHeight - 220)),
+    };
+    targetProject = "";
+    projectError = "";
+    closeContextMenu();
+    void sessions.loadProjects();
+  }
+
+  async function assignProject() {
+    const target = targetProject.trim();
+    if (!target || projectSaving) return;
+    projectSaving = true;
+    projectError = "";
+    try {
+      const project = await sessions.assignSessionProject(session.id, target);
+      projectEditor = null;
+      showFlash(m.data_session_assignment_saved({ project }), { tone: "success" });
+    } catch (error) {
+      projectError = error instanceof Error
+        ? error.message
+        : m.data_session_assignment_failed();
+    } finally {
+      projectSaving = false;
+    }
+  }
+
+  async function clearProjectAssignment() {
+    if (projectSaving) return;
+    projectSaving = true;
+    projectError = "";
+    try {
+      const project = await sessions.clearSessionProjectAssignment(session.id);
+      projectEditor = null;
+      showFlash(m.data_session_assignment_cleared({ project }), { tone: "success" });
+    } catch (error) {
+      projectError = error instanceof Error
+        ? error.message
+        : m.data_session_assignment_clear_failed();
+    } finally {
+      projectSaving = false;
+    }
   }
 
   function startRename() {
@@ -295,9 +370,12 @@
   });
 
   $effect(() => {
-    if (!contextMenu) return;
+    if (!contextMenu && !projectEditor) return;
     function handler(e: KeyboardEvent) {
-      if (e.key === "Escape") contextMenu = null;
+      if (e.key === "Escape") {
+        contextMenu = null;
+        projectEditor = null;
+      }
     }
     document.addEventListener("keydown", handler);
     return () => document.removeEventListener("keydown", handler);
@@ -375,7 +453,7 @@
     </button>
   {/if}
 
-  <StatusDot {session} {groupSessions} size={6} />
+  <StatusDot status={sessionStatus} label={sessionStatusLabel(sessionStatus)} size={6} />
 
 
   <div class="session-info">
@@ -408,6 +486,7 @@
         <div
           class="session-name"
           class:shell={displayLabel.isShell}
+          title={displayLabel.text}
           ondblclick={handleDblClick}
         >
           {#if displayLabel.isShell}
@@ -418,9 +497,17 @@
         </div>
         <div class="session-meta">
           {#if !hideProject}
-            <span class="session-project">{session.project}</span>
+            <span class="session-project" title={session.project}>{session.project}</span>
           {/if}
           <span class="session-time">{timeStr}</span>
+          {#if hasUnread}
+            <span
+              class="session-unread-indicator"
+              role="status"
+              aria-label={m.read_progress_unread_messages()}
+              title={m.read_progress_unread_messages()}
+            ></span>
+          {/if}
           <span class="session-count">{session.user_message_count}</span>
           {#if hasSubagents}
             <UserRoundIcon class="group-hint-icon" size="9" strokeWidth="2" aria-hidden="true" />
@@ -454,11 +541,21 @@
   {#if !compact && (!hideAgent || showMachine)}
     <div class="side-meta">
       {#if !hideAgent}
-        <span class="agent-tag" style:color={agentColor}>{agentLabel(session.agent)}</span>
+        <span
+          class="agent-tag"
+          style:color={agentColor}
+          title={agentLabel(session.agent, session.agent_label)}
+        >{agentLabel(session.agent, session.agent_label)}</span>
+        {#if entrypointBadge(session.entrypoint)}
+          <span
+            class="entrypoint-tag"
+            title={entrypointBadge(session.entrypoint)}
+          >{entrypointBadge(session.entrypoint)}</span>
+        {/if}
       {/if}
       {#if showMachine}
         <span class="machine-tag" title={session.machine}>
-          {truncate(session.machine, 18)}
+          {truncate(sessions.machineLabel(session.machine), 18)}
         </span>
       {/if}
     </div>
@@ -468,12 +565,17 @@
 {#if contextMenu}
   <div
     class="context-menu"
-    use:portal
+    use:mountOverlay
     style="left: {contextMenu.x}px; top: {contextMenu.y}px;"
   >
     <button class="context-menu-item" onclick={startRename}>
       {m.sidebar_row_rename()}
     </button>
+    {#if !sync.readOnly}
+      <button class="context-menu-item" onclick={startProjectEditor}>
+        {m.sidebar_row_change_project()}
+      </button>
+    {/if}
     <button
       class="context-menu-item"
       onclick={() => {
@@ -489,11 +591,72 @@
   </div>
 {/if}
 
+{#if projectEditor}
+  <div
+    class="project-editor kit-popover-card"
+    use:mountOverlay
+    style="left: {projectEditor.x}px; top: {projectEditor.y}px;"
+  >
+    <div class="project-editor-header">
+      <div>
+        <strong>{m.data_session_assignment_heading()}</strong>
+        <span class:manual={session.project_assigned} class="project-assignment-status">
+          {session.project_assigned
+            ? m.data_session_assignment_manual()
+            : m.data_session_assignment_automatic()}
+        </span>
+      </div>
+      <IconButton
+        size="sm"
+        ariaLabel={m.data_workspace_close()}
+        onclick={() => (projectEditor = null)}
+      >
+        <XIcon size="13" aria-hidden="true" />
+      </IconButton>
+    </div>
+    <div class="project-editor-current">{session.project}</div>
+    <ProjectTypeahead
+      projects={sessions.projects}
+      value={targetProject}
+      onselect={(value) => (targetProject = value)}
+      onquery={() => (projectError = "")}
+      includeAll={false}
+      allowCustom={true}
+      customLabel={m.data_reclassify_use_custom_project({ query: "{query}" })}
+      placeholder={m.data_session_assignment_target()}
+      title={m.data_session_assignment_target()}
+    />
+    <div class="project-editor-actions">
+      <Button
+        size="sm"
+        label={projectSaving
+          ? m.data_session_assignment_saving()
+          : m.data_session_assignment_save()}
+        disabled={!targetProject.trim() || projectSaving}
+        onclick={() => void assignProject()}
+      />
+      {#if session.project_assigned}
+        <Button
+          size="sm"
+          label={projectSaving
+            ? m.data_session_assignment_clearing()
+            : m.data_session_assignment_use_automatic()}
+          disabled={projectSaving}
+          onclick={() => void clearProjectAssignment()}
+        />
+      {/if}
+    </div>
+    <p class:error-text={projectError} class="project-editor-feedback" role="status">
+      {projectError}
+    </p>
+  </div>
+{/if}
+
 <style>
   .session-item {
     display: flex;
     align-items: center;
-    gap: 5px;
+    gap: var(--space-2);
     width: 100%;
     height: 42px;
     padding: 0 10px;
@@ -588,9 +751,10 @@
     display: flex;
     flex-direction: column;
     align-items: flex-end;
-    gap: 3px;
+    gap: var(--space-1);
     min-width: 0;
     flex-shrink: 0;
+    max-width: 40%;
     margin-left: 4px;
   }
 
@@ -603,7 +767,16 @@
     line-height: 1;
     opacity: 0.7;
     white-space: nowrap;
-    max-width: 52px;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .entrypoint-tag {
+    opacity: 0.75;
+    font-size: 0.9em;
+    white-space: nowrap;
+    max-width: 100%;
     overflow: hidden;
     text-overflow: ellipsis;
   }
@@ -707,6 +880,17 @@
     flex-shrink: 0;
   }
 
+  .session-unread-indicator {
+    width: 7px;
+    height: 7px;
+    border-radius: 999px;
+    background: var(--accent-blue);
+    box-shadow: 0 0 0 1px color-mix(
+      in srgb, var(--accent-blue) 24%, transparent
+    );
+    flex-shrink: 0;
+  }
+
   .session-count::before {
     content: "\2022 ";
   }
@@ -755,11 +939,11 @@
 
   :global(.context-menu) {
     position: fixed;
-    z-index: 9999;
+    z-index: var(--z-popover);
     background: var(--bg-surface);
     border: 1px solid var(--border-default);
     border-radius: 6px;
-    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
+    box-shadow: var(--shadow-lg);
     padding: 4px 0;
     min-width: 120px;
   }
@@ -787,6 +971,68 @@
 
   :global(.context-menu .context-menu-item.danger:hover) {
     background: color-mix(in srgb, var(--accent-red, #e55) 10%, transparent);
+  }
+
+  :global(.project-editor) {
+    position: fixed;
+    z-index: var(--z-popover);
+    display: flex;
+    width: 300px;
+    flex-direction: column;
+    gap: 8px;
+    padding: 10px;
+  }
+
+  :global(.project-editor-header),
+  :global(.project-editor-header > div),
+  :global(.project-editor-actions) {
+    display: flex;
+    align-items: center;
+  }
+
+  :global(.project-editor-header) {
+    justify-content: space-between;
+  }
+
+  :global(.project-editor-header > div) {
+    gap: var(--space-4);
+  }
+
+  :global(.project-editor-header strong) {
+    color: var(--text-primary);
+    font-size: 12px;
+  }
+
+  :global(.project-assignment-status) {
+    color: var(--text-muted);
+    font-size: 10px;
+    font-weight: 550;
+  }
+
+  :global(.project-assignment-status.manual) {
+    color: var(--accent-blue);
+  }
+
+  :global(.project-editor-current) {
+    color: var(--text-secondary);
+    font-size: 11px;
+    overflow-wrap: anywhere;
+  }
+
+  :global(.project-editor-actions) {
+    justify-content: flex-end;
+    gap: 6px;
+  }
+
+  :global(.project-editor-feedback) {
+    min-height: 16px;
+    margin: 0;
+    color: var(--text-muted);
+    font-size: 10px;
+  }
+
+  :global(.project-editor-feedback.error-text) {
+    color: var(--accent-red);
   }
 
   .select-checkbox {

@@ -2,11 +2,12 @@ package main
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/v2"
 	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -17,6 +18,7 @@ import (
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/dbtest"
+	"go.kenn.io/agentsview/internal/money"
 	"go.kenn.io/agentsview/internal/service"
 )
 
@@ -139,12 +141,65 @@ func TestResolveMCPServicePGFlagUsesPGReadStore(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(cleanup)
 
-	res, err := svc.List(context.Background(), service.ListFilter{Limit: 10})
+	res, err := svc.List(t.Context(), service.ListFilter{Limit: 10})
 	require.NoError(t, err)
 	require.Len(t, res.Sessions, 1)
 	assert.Equal(t, "pg-session", res.Sessions[0].ID)
 	assert.Equal(t, "postgres://example.test/agentsview", stub.PG.URL)
 	assert.Equal(t, "custom_schema", stub.PG.Schema)
+}
+
+func TestResolveMCPServiceExplicitServerUsesReportedCapabilities(
+	t *testing.T,
+) {
+	tokenFile := filepath.Join(t.TempDir(), "token")
+	require.NoError(t, os.WriteFile(tokenFile, []byte("probe-token\n"), 0o600))
+
+	tests := []struct {
+		name                 string
+		readOnly             bool
+		apiVersion           int
+		wantRecallCapability bool
+	}{
+		{
+			name: "writable API v4 server", apiVersion: 4,
+			wantRecallCapability: true,
+		},
+		{name: "writable API v3 server", apiVersion: 3},
+		{name: "read-only API v4 server", readOnly: true, apiVersion: 4},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var probeCount int
+			srv := httptest.NewServer(http.HandlerFunc(func(
+				w http.ResponseWriter, r *http.Request,
+			) {
+				probeCount++
+				assert.Equal(t, "/api/v1/version", r.URL.Path)
+				assert.Equal(t, "Bearer probe-token", r.Header.Get("Authorization"))
+				_ = json.MarshalWrite(w, map[string]any{
+					"read_only":   tt.readOnly,
+					"api_version": tt.apiVersion,
+				})
+			}))
+			t.Cleanup(srv.Close)
+
+			cmd := newMCPCommand()
+			cmd.SetContext(t.Context())
+			require.NoError(t, cmd.ParseFlags([]string{
+				"--server", srv.URL,
+				"--server-token-file", tokenFile,
+			}))
+
+			svc, cleanup, err := resolveMCPService(cmd)
+			require.NoError(t, err)
+			t.Cleanup(cleanup)
+
+			assert.Equal(t, tt.wantRecallCapability,
+				service.SupportsRecallQueries(svc))
+			assert.Equal(t, 1, probeCount)
+		})
+	}
 }
 
 func TestMCPDaemonServiceStartsDaemonForEachOperation(t *testing.T) {
@@ -157,7 +212,7 @@ func TestMCPDaemonServiceStartsDaemonForEachOperation(t *testing.T) {
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, "/api/v1/sessions", r.URL.Path)
 		assert.Equal(t, "7", r.URL.Query().Get("limit"))
-		_ = json.NewEncoder(w).Encode(service.SessionList{
+		_ = json.MarshalWrite(w, service.SessionList{
 			Sessions: []db.Session{{ID: "from-daemon", Agent: "codex"}},
 			Total:    1,
 		})
@@ -173,13 +228,63 @@ func TestMCPDaemonServiceStartsDaemonForEachOperation(t *testing.T) {
 
 	svc := newMCPDaemonService(cfg)
 	for range 2 {
-		res, err := svc.List(context.Background(), service.ListFilter{Limit: 7})
+		res, err := svc.List(t.Context(), service.ListFilter{Limit: 7})
 		require.NoError(t, err)
 		require.Len(t, res.Sessions, 1)
 		assert.Equal(t, "from-daemon", res.Sessions[0].ID)
 	}
 	assert.Equal(t, 2, starts)
 	assert.NoFileExists(t, cfg.DBPath)
+}
+
+func TestMCPDaemonServiceRawSuffixResolvesDaemonPerCall(t *testing.T) {
+	dataDir := t.TempDir()
+	cfg := config.Config{DataDir: dataDir, DBPath: filepath.Join(dataDir, "sessions.db")}
+	var starts, requests int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/api/v1/session-ids/resolve", r.URL.Path)
+		assert.Equal(t, fmt.Sprintf("uuid-%d", requests), r.URL.Query().Get("partial"))
+		assert.Equal(t, "2", r.URL.Query().Get("limit"))
+		assert.Equal(t, "true", r.URL.Query().Get("raw_suffix"))
+		requests++
+		_ = json.MarshalWrite(w, map[string]any{"ids": []string{"codex:from-daemon"}, "raw_suffix": true})
+	}))
+	t.Cleanup(srv.Close)
+	host, port := splitTestServerURL(t, srv.URL)
+	stubStartBackgroundServeForTransport(t, func(context.Context, *config.Config, time.Duration) (*DaemonRuntime, error) {
+		starts++
+		return &DaemonRuntime{Host: host, Port: port}, nil
+	})
+	svc := newMCPDaemonService(cfg)
+	for i := range 2 {
+		ids, err := svc.FindSessionIDsByRawSuffix(t.Context(), fmt.Sprintf("uuid-%d", i), 2)
+		require.NoError(t, err)
+		assert.Equal(t, []string{"codex:from-daemon"}, ids)
+	}
+	assert.Equal(t, 2, starts)
+	assert.Equal(t, 2, requests)
+	assert.NoFileExists(t, cfg.DBPath)
+	t.Logf("daemon_starts=%d requests=%d ids=[codex:from-daemon] archive_opened=false", starts, requests)
+}
+
+func TestMCPDaemonServiceRecallCapabilityFollowsResolvedRuntime(t *testing.T) {
+	tests := []struct {
+		name     string
+		readOnly bool
+		want     bool
+	}{
+		{name: "writable daemon", want: true},
+		{name: "read-only daemon", readOnly: true, want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dataDir := runtimeTestDir(t)
+			writeLiveRuntime(t, dataDir, tt.readOnly)
+			svc := newMCPDaemonService(config.Config{DataDir: dataDir})
+
+			assert.Equal(t, tt.want, service.SupportsRecallQueries(svc))
+		})
+	}
 }
 
 func TestMCPDaemonService_UsagePairwiseComparisonForwardsToDaemon(t *testing.T) {
@@ -191,17 +296,17 @@ func TestMCPDaemonService_UsagePairwiseComparisonForwardsToDaemon(t *testing.T) 
 
 	expected := service.UsagePairwiseComparisonResponse{
 		Left: service.UsagePairwiseComparisonSide{
-			TotalCost:    1.25,
+			TotalCost:    money.MustParseDollars("1.25"),
 			TotalTokens:  150,
 			SessionCount: 2,
 		},
 		Right: service.UsagePairwiseComparisonSide{
-			TotalCost:    3.5,
+			TotalCost:    money.MustParseDollars("3.5"),
 			TotalTokens:  420,
 			SessionCount: 5,
 		},
 		Deltas: service.UsagePairwiseComparisonDelta{
-			TotalCostDelta:    2.25,
+			TotalCostDelta:    money.MustParseDollars("2.25"),
 			TotalTokensDelta:  270,
 			SessionCountDelta: 3,
 		},
@@ -221,7 +326,7 @@ func TestMCPDaemonService_UsagePairwiseComparisonForwardsToDaemon(t *testing.T) 
 		assert.Equal(t, "3", r.URL.Query().Get("min_user_messages"))
 		assert.Equal(t, "true", r.URL.Query().Get("include_one_shot"))
 		assert.Equal(t, "false", r.URL.Query().Get("include_automated"))
-		_ = json.NewEncoder(w).Encode(expected)
+		_ = json.MarshalWrite(w, expected)
 	}))
 	t.Cleanup(ts.Close)
 
@@ -235,20 +340,18 @@ func TestMCPDaemonService_UsagePairwiseComparisonForwardsToDaemon(t *testing.T) 
 
 	svc := newMCPDaemonService(cfg)
 	res, err := svc.UsagePairwiseComparison(
-		context.Background(),
+		t.Context(),
 		service.UsagePairwiseComparisonRequest{
-			UsageRequest: service.UsageRequest{
-				From:            "2024-06-01",
-				To:              "2024-06-07",
-				Timezone:        "UTC",
-				MinUserMessages: 3,
-				IncludeOneShot:  true,
-				Model:           "gpt-4o",
-			},
-			LeftDimension:  "model",
-			LeftValue:      "claude-sonnet-4-20250514",
-			RightDimension: "project",
-			RightValue:     "proj-b",
+			From:            "2024-06-01",
+			To:              "2024-06-07",
+			Timezone:        "UTC",
+			MinUserMessages: 3,
+			IncludeOneShot:  true,
+			Model:           "gpt-4o",
+			LeftDimension:   "model",
+			LeftValue:       "claude-sonnet-4-20250514",
+			RightDimension:  "project",
+			RightValue:      "proj-b",
 		},
 	)
 	require.NoError(t, err)
@@ -260,7 +363,8 @@ func TestMCPDaemonService_UsagePairwiseComparisonForwardsToDaemon(t *testing.T) 
 
 func splitTestServerURL(t *testing.T, raw string) (string, int) {
 	t.Helper()
-	req, err := http.NewRequest(http.MethodGet, raw, nil)
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, raw, nil)
 	require.NoError(t, err)
 	host, portText, err := net.SplitHostPort(req.URL.Host)
 	require.NoError(t, err)

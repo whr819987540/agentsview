@@ -1,11 +1,12 @@
 package parser
 
 import (
+	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 
@@ -40,8 +41,15 @@ type KiroSQLiteStore struct {
 
 // OpenKiroSQLiteStore opens a read-only current-store Kiro SQLite DB.
 func OpenKiroSQLiteStore(dbPath string) (*KiroSQLiteStore, error) {
-	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+	info, err := os.Lstat(dbPath)
+	if os.IsNotExist(err) {
 		return nil, fmt.Errorf("kiro sqlite db not found: %s", dbPath)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("stat kiro sqlite db %s: %w", dbPath, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return nil, fmt.Errorf("refusing symlinked kiro sqlite db: %s", dbPath)
 	}
 	db, err := openKiroSQLiteDB(dbPath)
 	if err != nil {
@@ -61,15 +69,37 @@ func (s *KiroSQLiteStore) Close() error {
 // kiroSQLiteDBPath returns the current-store Kiro SQLite DB when the
 // configured root contains one.
 func kiroSQLiteDBPath(dir string) string {
+	path, _ := kiroSQLiteDBPathChecked(dir)
+	return path
+}
+
+func kiroSQLiteDBPathChecked(dir string) (string, error) {
 	if dir == "" {
-		return ""
+		return "", nil
 	}
 	path := filepath.Join(dir, kiroSQLiteDBName)
 	info, err := os.Stat(path)
-	if err != nil || info.IsDir() {
-		return ""
+	if os.IsNotExist(err) {
+		return "", nil
 	}
-	return path
+	if err != nil {
+		return "", fmt.Errorf("stat Kiro SQLite DB %s: %w", path, err)
+	}
+	if info.IsDir() {
+		return "", nil
+	}
+	resolvedDir, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return "", nil //nolint:nilerr // Unresolvable optional companion paths provide no metadata hint.
+	}
+	resolvedPath, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", nil //nolint:nilerr // Unresolvable optional companion paths provide no metadata hint.
+	}
+	if _, ok := relUnder(resolvedDir, resolvedPath); !ok {
+		return "", nil
+	}
+	return path, nil
 }
 
 // KiroSQLiteVirtualPath gives each conversation inside the shared
@@ -86,33 +116,91 @@ func kiroSQLiteVirtualPathParts(path string) (string, string, bool) {
 
 // KiroSQLiteSessionExists reports whether the current Kiro DB has
 // at least one row for sessionID.
-func KiroSQLiteSessionExists(dbPath, sessionID string) bool {
+func KiroSQLiteSessionExists(ctx context.Context, dbPath, sessionID string) bool {
+	exists, _ := KiroSQLiteSessionExistsWithError(ctx, dbPath, sessionID)
+	return exists
+}
+
+func KiroSQLiteSessionExistsWithError(ctx context.Context, dbPath, sessionID string) (bool, error) {
 	if dbPath == "" || sessionID == "" {
-		return false
+		return false, nil
 	}
 	store, err := OpenKiroSQLiteStore(dbPath)
 	if err != nil {
-		return false
+		return false, err
 	}
 	defer store.Close()
-	return store.SessionExists(sessionID)
+	return store.sessionExists(ctx, sessionID)
+}
+
+// KiroSQLiteSessionMetaForID returns metadata for one logical conversation
+// without enumerating the rest of the database.
+func KiroSQLiteSessionMetaForID(ctx context.Context,
+	dbPath, sessionID string,
+) (KiroSQLiteSessionMeta, bool, error) {
+	if dbPath == "" || sessionID == "" {
+		return KiroSQLiteSessionMeta{}, false, nil
+	}
+	store, err := OpenKiroSQLiteStore(dbPath)
+	if err != nil {
+		return KiroSQLiteSessionMeta{}, false, err
+	}
+	defer store.Close()
+	return store.sessionMetaForID(ctx, sessionID)
 }
 
 // SessionExists reports whether the current Kiro DB has at least one
 // row for sessionID.
-func (s *KiroSQLiteStore) SessionExists(sessionID string) bool {
+func (s *KiroSQLiteStore) SessionExists(ctx context.Context, sessionID string) bool {
+	exists, _ := s.sessionExists(ctx, sessionID)
+	return exists
+}
+
+func (s *KiroSQLiteStore) sessionMetaForID(ctx context.Context,
+	sessionID string,
+) (KiroSQLiteSessionMeta, bool, error) {
+	if s == nil || s.db == nil {
+		return KiroSQLiteSessionMeta{}, false, errors.New("kiro sqlite store is closed")
+	}
+	var id string
+	var updatedAt int64
+	err := s.db.QueryRowContext(ctx, `
+		SELECT conversation_id, MAX(updated_at)
+		  FROM conversations_v2
+		 WHERE conversation_id = ?
+		 GROUP BY conversation_id
+	`, sessionID).Scan(&id, &updatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return KiroSQLiteSessionMeta{}, false, nil
+	}
+	if err != nil {
+		return KiroSQLiteSessionMeta{}, false, fmt.Errorf(
+			"finding kiro sqlite session meta: %w", err,
+		)
+	}
+	return KiroSQLiteSessionMeta{
+		SessionID:   id,
+		VirtualPath: KiroSQLiteVirtualPath(s.dbPath, id),
+		FileMtime:   updatedAt * 1_000_000,
+	}, true, nil
+}
+
+func (s *KiroSQLiteStore) sessionExists(ctx context.Context, sessionID string) (bool, error) {
 	if s == nil || s.db == nil || sessionID == "" {
-		return false
+		return false, nil
 	}
 	var found int
-	err := s.db.QueryRow(
+	err := s.db.QueryRowContext(ctx,
 		`SELECT 1
 		   FROM conversations_v2
 		  WHERE conversation_id = ?
 		  LIMIT 1`,
 		sessionID,
 	).Scan(&found)
-	return err == nil
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return err == nil, err
 }
 
 // ListKiroSQLiteSessionMeta returns one metadata row per logical
@@ -135,46 +223,60 @@ func ListKiroSQLiteSessionMeta(
 // ListSessionMeta returns one metadata row per logical conversation
 // using the store's existing SQLite handle.
 func (s *KiroSQLiteStore) ListSessionMeta() ([]KiroSQLiteSessionMeta, error) {
+	var metas []KiroSQLiteSessionMeta
+	err := s.ForEachSessionMeta(context.Background(), func(meta KiroSQLiteSessionMeta) error {
+		metas = append(metas, meta)
+		return nil
+	})
+	return metas, err
+}
+
+// ForEachSessionMeta streams one metadata row per logical conversation using
+// the store's existing SQLite handle. The query orders rows so callers never
+// need an archive-sized Go slice or membership map.
+func (s *KiroSQLiteStore) ForEachSessionMeta(
+	ctx context.Context, yield func(KiroSQLiteSessionMeta) error,
+) error {
 	if s == nil || s.db == nil {
-		return nil, fmt.Errorf("kiro sqlite store is closed")
+		return errors.New("kiro sqlite store is closed")
 	}
-	rows, err := s.db.Query(`
+	rows, err := s.db.QueryContext(ctx, `
 		SELECT conversation_id, MAX(updated_at)
 		  FROM conversations_v2
 		 GROUP BY conversation_id
+		 ORDER BY conversation_id
 	`)
 	if err != nil {
-		return nil, fmt.Errorf(
+		return fmt.Errorf(
 			"listing kiro sqlite sessions: %w", err,
 		)
 	}
 	defer rows.Close()
 
-	var metas []KiroSQLiteSessionMeta
 	for rows.Next() {
 		var id string
 		var updatedAt int64
 		if err := rows.Scan(&id, &updatedAt); err != nil {
-			return nil, fmt.Errorf(
+			return fmt.Errorf(
 				"scanning kiro sqlite session meta: %w", err,
 			)
 		}
 		if id == "" {
 			continue
 		}
-		metas = append(metas, KiroSQLiteSessionMeta{
+		observeStreamingDiscoveryBuffer(ctx, 1)
+		if err := yield(KiroSQLiteSessionMeta{
 			SessionID:   id,
 			VirtualPath: KiroSQLiteVirtualPath(s.dbPath, id),
 			FileMtime:   updatedAt * 1_000_000,
-		})
+		}); err != nil {
+			return err
+		}
 	}
 	if err := rows.Err(); err != nil {
-		return nil, err
+		return err
 	}
-	sort.Slice(metas, func(i, j int) bool {
-		return metas[i].SessionID < metas[j].SessionID
-	})
-	return metas, nil
+	return nil
 }
 
 // KiroSQLiteSessionIDs returns the set of current-store logical
@@ -197,12 +299,12 @@ func KiroSQLiteSessionIDs(dir string) map[string]struct{} {
 
 // KiroSQLiteSourceMtime resolves the canonical per-session
 // updated_at timestamp for a virtual SQLite source path.
-func KiroSQLiteSourceMtime(path string) (int64, error) {
+func KiroSQLiteSourceMtime(ctx context.Context, path string) (int64, error) {
 	dbPath, sessionID, ok := kiroSQLiteVirtualPathParts(path)
 	if !ok {
 		return 0, fmt.Errorf("not a kiro sqlite virtual path: %s", path)
 	}
-	row, err := loadKiroSQLiteRow(dbPath, sessionID)
+	row, err := loadKiroSQLiteRow(ctx, dbPath, sessionID)
 	if err != nil {
 		return 0, err
 	}
@@ -212,22 +314,22 @@ func KiroSQLiteSourceMtime(path string) (int64, error) {
 // parseKiroSQLiteSession parses one current-store Kiro CLI conversation
 // into normal AgentsView session/message records.
 func parseKiroSQLiteSession(
-	dbPath, sessionID, machine string,
+	ctx context.Context, dbPath, sessionID, machine string,
 ) (*ParsedSession, []ParsedMessage, error) {
 	store, err := OpenKiroSQLiteStore(dbPath)
 	if err != nil {
 		return nil, nil, err
 	}
 	defer store.Close()
-	return store.ParseSession(sessionID, machine)
+	return store.ParseSession(ctx, sessionID, machine)
 }
 
 // ParseSession parses one current-store Kiro CLI conversation using
 // the store's existing SQLite handle.
 func (s *KiroSQLiteStore) ParseSession(
-	sessionID, machine string,
+	ctx context.Context, sessionID, machine string,
 ) (*ParsedSession, []ParsedMessage, error) {
-	row, err := s.loadRow(sessionID)
+	row, err := s.loadRow(ctx, sessionID)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -298,7 +400,7 @@ func (s *KiroSQLiteStore) ParseSession(
 	if row.key != "" {
 		cwd = row.key
 	}
-	project := ExtractProjectFromCwd(cwd)
+	project := ExtractProjectFromCwdWithBranchContext(ctx, cwd, "")
 	if project == "" {
 		project = "unknown"
 	}
@@ -331,9 +433,7 @@ func (s *KiroSQLiteStore) ParseSession(
 }
 
 func openKiroSQLiteDB(dbPath string) (*sql.DB, error) {
-	dsn := dbPath +
-		"?mode=ro&_journal_mode=WAL&_busy_timeout=3000"
-	db, err := sql.Open("sqlite3", dsn)
+	db, err := openSQLiteReadOnly(dbPath, sqliteReadOptions{busyTimeoutMS: 3000})
 	if err != nil {
 		return nil, fmt.Errorf(
 			"opening kiro sqlite db %s: %w", dbPath, err,
@@ -342,7 +442,7 @@ func openKiroSQLiteDB(dbPath string) (*sql.DB, error) {
 	return db, nil
 }
 
-func loadKiroSQLiteRow(
+func loadKiroSQLiteRow(ctx context.Context,
 	dbPath, sessionID string,
 ) (kiroSQLiteRow, error) {
 	store, err := OpenKiroSQLiteStore(dbPath)
@@ -350,17 +450,17 @@ func loadKiroSQLiteRow(
 		return kiroSQLiteRow{}, err
 	}
 	defer store.Close()
-	return store.loadRow(sessionID)
+	return store.loadRow(ctx, sessionID)
 }
 
-func (s *KiroSQLiteStore) loadRow(
+func (s *KiroSQLiteStore) loadRow(ctx context.Context,
 	sessionID string,
 ) (kiroSQLiteRow, error) {
 	if s == nil || s.db == nil {
-		return kiroSQLiteRow{}, fmt.Errorf("kiro sqlite store is closed")
+		return kiroSQLiteRow{}, errors.New("kiro sqlite store is closed")
 	}
 	var row kiroSQLiteRow
-	err := s.db.QueryRow(`
+	err := s.db.QueryRowContext(ctx, `
 		SELECT key, conversation_id, value,
 		       created_at, updated_at
 		  FROM conversations_v2

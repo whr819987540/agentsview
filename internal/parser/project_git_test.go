@@ -1,7 +1,6 @@
 package parser
 
 import (
-	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -22,6 +21,8 @@ func TestExtractProjectFromCwd_Git(t *testing.T) {
 		{
 			name: "GitRepoRoot",
 			setup: func(t *testing.T, root string) string {
+				t.Helper()
+
 				repo := filepath.Join(root, "my-app")
 				subdir := filepath.Join(repo, "internal", "sync")
 
@@ -32,8 +33,26 @@ func TestExtractProjectFromCwd_Git(t *testing.T) {
 			want: "my_app",
 		},
 		{
+			name: "SupersetStandaloneBranchRepoUsesAnchoredProject",
+			setup: func(t *testing.T, root string) string {
+				t.Helper()
+
+				branchRepo := filepath.Join(
+					root, ".superset", "worktrees",
+					"sample-service", "feature-branch",
+				)
+				subdir := filepath.Join(branchRepo, "internal", "parser")
+				mustMkdirAll(t, filepath.Join(branchRepo, ".git"))
+				mustMkdirAll(t, subdir)
+				return subdir
+			},
+			want: "sample_service",
+		},
+		{
 			name: "GitWorktree",
 			setup: func(t *testing.T, root string) string {
+				t.Helper()
+
 				mainRepo := filepath.Join(root, "agentsview")
 				worktree := filepath.Join(root, "agentsview-worktree-tool-calls")
 				worktreeGitDir := filepath.Join(mainRepo, ".git", "worktrees", "feature")
@@ -54,6 +73,8 @@ func TestExtractProjectFromCwd_Git(t *testing.T) {
 		{
 			name: "GitWorktreeFallbackWithoutCommondir",
 			setup: func(t *testing.T, root string) string {
+				t.Helper()
+
 				mainRepo := filepath.Join(root, "my-repo")
 				worktree := filepath.Join(root, "my-repo-experiment")
 				worktreeGitDir := filepath.Join(mainRepo, ".git", "worktrees", "exp")
@@ -69,6 +90,31 @@ func TestExtractProjectFromCwd_Git(t *testing.T) {
 			},
 			want: "my_repo",
 		},
+		{
+			name: "CodexCustomNamedWorktreeUsesLinkedGitIdentity",
+			setup: func(t *testing.T, root string) string {
+				t.Helper()
+
+				mainRepo := filepath.Join(root, "sample-service")
+				worktree := filepath.Join(
+					root, ".codex", "worktrees",
+					"sample-service-graph-retry-20260820",
+				)
+				worktreeGitDir := filepath.Join(
+					mainRepo, ".git", "worktrees", "graph-retry",
+				)
+
+				mustMkdirAll(t, filepath.Join(mainRepo, ".git"))
+				mustMkdirAll(t, worktreeGitDir)
+				mustMkdirAll(t, filepath.Join(worktree, "docs", "reviews", "run"))
+				mustWriteFile(t, filepath.Join(worktree, ".git"),
+					"gitdir: "+worktreeGitDir+"\n")
+				mustWriteFile(t, filepath.Join(worktreeGitDir, "commondir"), "../..\n")
+
+				return filepath.Join(worktree, "docs", "reviews", "run")
+			},
+			want: "sample_service",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -76,6 +122,68 @@ func TestExtractProjectFromCwd_Git(t *testing.T) {
 			cwd := tt.setup(t, root)
 			assert.Equal(t, tt.want, ExtractProjectFromCwd(cwd),
 				"ExtractProjectFromCwd(%q)", cwd)
+		})
+	}
+}
+
+func TestExtractProjectFromCwd_MissingAnchoredPathRequiresAssociatedWorktree(
+	t *testing.T,
+) {
+	tests := []struct {
+		name               string
+		containerParts     []string
+		missingParts       []string
+		associatedWorktree string
+		want               string
+	}{
+		{
+			name:           "Superset",
+			containerParts: []string{".superset", "worktrees", "sample-service"},
+			missingParts:   []string{"missing-branch", "internal"},
+			want:           "sample_service",
+		},
+		{
+			name:           "Codex",
+			containerParts: []string{".codex", "worktrees", "worktree-id"},
+			missingParts:   []string{"sample-service", "internal"},
+			want:           "sample_service",
+		},
+		{
+			name:               "SupersetAssociated",
+			containerParts:     []string{".superset", "worktrees", "sample-service"},
+			missingParts:       []string{"missing-branch", "internal"},
+			associatedWorktree: "missing-branch",
+			want:               "canonical_repo",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			canonicalRepo := filepath.Join(root, "canonical-repo")
+			worktreeGitDir := filepath.Join(
+				canonicalRepo, ".git", "worktrees", "existing",
+			)
+			container := filepath.Join(
+				append([]string{root}, tt.containerParts...)...,
+			)
+			sibling := filepath.Join(container, "existing")
+			mustMkdirAll(t, sibling)
+			mustMkdirAll(t, worktreeGitDir)
+			mustWriteFile(t, filepath.Join(sibling, ".git"),
+				"gitdir: "+worktreeGitDir+"\n")
+			mustWriteFile(t, filepath.Join(worktreeGitDir, "commondir"), "../..\n")
+			if tt.associatedWorktree != "" {
+				mustMkdirAll(t, filepath.Join(
+					canonicalRepo, ".git", "worktrees", tt.associatedWorktree,
+				))
+			}
+
+			cwd := filepath.Join(
+				append([]string{container}, tt.missingParts...)...,
+			)
+			assert.Equal(t, tt.want, ExtractProjectFromCwd(cwd),
+				"a sibling may override the anchor only when Git records the missing worktree")
 		})
 	}
 }
@@ -100,10 +208,58 @@ func TestExtractProjectFromCwdWithBranchContext_GitWorktreeMainRoot(t *testing.T
 	mustMkdirAll(t, subdir)
 
 	got := ExtractProjectFromCwdWithBranchContext(
-		context.Background(), subdir, "feature",
+		t.Context(), subdir, "feature",
 	)
 	assert.Equal(t, "agentsview", got,
 		"kit-backed worktree resolution should use the main repo name")
+}
+
+func TestExtractProjectFromCwd_BareBackedGitWorktree(t *testing.T) {
+	skipIfNoGit(t)
+
+	root := t.TempDir()
+	source := filepath.Join(root, "source")
+	bareRepo := filepath.Join(root, "shared", "sample-repo.git")
+	worktree := filepath.Join(root, "checkouts", "generated-leaf")
+	subdir := filepath.Join(worktree, "internal", "parser")
+
+	mustMkdirAll(t, source)
+	mustMkdirAll(t, filepath.Dir(bareRepo))
+	mustMkdirAll(t, filepath.Dir(worktree))
+	gitRun(t, source, "init", "-q", "-b", "main")
+	gitRun(t, source,
+		"-c", "user.email=test@example.com",
+		"-c", "user.name=Test User",
+		"-c", "commit.gpgsign=false",
+		"commit", "--allow-empty", "-q", "-m", "seed",
+	)
+	gitRun(t, root, "clone", "--bare", "-q", source, bareRepo)
+	gitRun(t, root,
+		"--git-dir", bareRepo,
+		"worktree", "add", "-q", "-b", "feature", worktree, "main",
+	)
+	mustMkdirAll(t, subdir)
+
+	assert.Equal(t, "sample_repo", ExtractProjectFromCwd(subdir))
+}
+
+func TestRepoRootFromGitFileDoesNotTreatNonBareCommonDirAsBare(
+	t *testing.T,
+) {
+	root := t.TempDir()
+	checkout := filepath.Join(root, "checkouts", "generated-leaf")
+	commonDir := filepath.Join(root, "shared", "sample-repo.git")
+	gitDir := filepath.Join(commonDir, "worktrees", "generated-leaf")
+	gitFile := filepath.Join(checkout, ".git")
+
+	mustMkdirAll(t, checkout)
+	mustMkdirAll(t, gitDir)
+	mustWriteFile(t, gitFile, "gitdir: "+gitDir+"\n")
+	mustWriteFile(t, filepath.Join(gitDir, "commondir"), "../..\n")
+	mustWriteFile(t, filepath.Join(commonDir, "config"),
+		"[core]\n\tbare = false\n")
+
+	assert.Equal(t, checkout, repoRootFromGitFile(checkout, gitFile))
 }
 
 func TestExtractProjectFromCwdPlainRepoDoesNotInvokeGit(t *testing.T) {
@@ -129,7 +285,13 @@ func TestExtractProjectFromCwdPlainRepoDoesNotInvokeGit(t *testing.T) {
 	assert.NoFileExists(t, marker, "plain .git directory should resolve without invoking git")
 }
 
-func TestExtractProjectFromCwdFallsBackToGitWhenLocalWalkMisses(t *testing.T) {
+// TestExtractProjectFromCwdNoGitInvocationWhenLocalWalkMisses pins that a
+// cwd with no discoverable .git falls back to its basename without spawning
+// git: passive discovery must not let git follow config-derived paths such
+// as [include] path into locations the probe policy never vetted. The shim
+// would happily resolve the repo, so a reintroduced fallback is caught by
+// both the name and the invocation log.
+func TestExtractProjectFromCwdNoGitInvocationWhenLocalWalkMisses(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("test uses a POSIX shell git shim")
 	}
@@ -154,12 +316,18 @@ func TestExtractProjectFromCwdFallsBackToGitWhenLocalWalkMisses(t *testing.T) {
 	require.NoError(t, os.Chmod(fakeGit, 0o755), "chmod fake git")
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	assert.Equal(t, "virtual_repo",
-		ExtractProjectFromCwdWithBranchContext(context.Background(), cwd, ""))
-	assert.FileExists(t, gitLog, "git fallback should be used when local walk misses")
+	assert.Equal(t, "parser",
+		ExtractProjectFromCwdWithBranchContext(t.Context(), cwd, ""))
+	assert.NoFileExists(t, gitLog,
+		"passive discovery must not invoke git when the local walk misses")
 }
 
-func TestExtractProjectFromCwdTriesGitBeforeConservativeGitFileFallback(
+// TestExtractProjectFromCwdConservativeGitFileRootWithoutGit pins that a
+// gitfile whose external gitdir has no commondir resolves to the worktree
+// itself without spawning git. The shim would resolve the main repository,
+// so a reintroduced git fallback is caught by both the name and the
+// invocation log.
+func TestExtractProjectFromCwdConservativeGitFileRootWithoutGit(
 	t *testing.T,
 ) {
 	if runtime.GOOS == "windows" {
@@ -192,10 +360,10 @@ func TestExtractProjectFromCwdTriesGitBeforeConservativeGitFileFallback(
 	require.NoError(t, os.Chmod(fakeGit, 0o755), "chmod fake git")
 	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
 
-	assert.Equal(t, "main_repo",
-		ExtractProjectFromCwdWithBranchContext(context.Background(), cwd, ""))
-	assert.FileExists(t, gitLog,
-		"git fallback should run before accepting conservative gitfile root")
+	assert.Equal(t, "feature_worktree",
+		ExtractProjectFromCwdWithBranchContext(t.Context(), cwd, ""))
+	assert.NoFileExists(t, gitLog,
+		"passive discovery must not invoke git for a conservative gitfile root")
 }
 
 func TestExtractProjectFromCwd_DeletedNestedWorktree(t *testing.T) {
@@ -546,6 +714,88 @@ func TestExtractProjectFromCwdWithBranch_NestedWorktree(
 		"ExtractProjectFromCwdWithBranch(%q, %q)", deleted, "tauri-packaging")
 }
 
+func TestExtractProjectFromCwd_HostingWorktreeLayouts(t *testing.T) {
+	root := t.TempDir()
+	tests := []struct {
+		name  string
+		parts []string
+		want  string
+	}{
+		{
+			name: "HostingWorktree",
+			parts: []string{
+				"worktrees", "github.com", "example-org",
+				"sample-repo", "feature-branch",
+			},
+			want: "sample_repo",
+		},
+		{
+			name: "HostingWorktreeSubdirectory",
+			parts: []string{
+				"worktrees", "github.com", "example-org",
+				"sample-repo", "feature-branch", "internal", "parser",
+			},
+			want: "sample_repo",
+		},
+		{
+			name: "NamespacedHostingWorktree",
+			parts: []string{
+				"worktrees", "github", "github.com", "example-org",
+				"data-pipeline", "pr-17",
+			},
+			want: "data_pipeline",
+		},
+		{
+			name: "NamespacedHostingWorktreeSubdirectory",
+			parts: []string{
+				"worktrees", "github", "github.com", "example-org",
+				"data-pipeline", "pr-17", "cmd", "worker",
+			},
+			want: "data_pipeline",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cwd := filepath.Join(append([]string{root}, tt.parts...)...)
+			assert.Equal(t, tt.want, ExtractProjectFromCwd(cwd))
+		})
+	}
+}
+
+func TestExtractProjectFromCwd_HostingLayoutInsideGitRepoPrefersRepo(
+	t *testing.T,
+) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "outer-repo")
+	cwd := filepath.Join(
+		repo, "worktrees", "github.com", "example-org",
+		"sample-repo", "fixture",
+	)
+
+	mustMkdirAll(t, filepath.Join(repo, ".git"))
+	mustMkdirAll(t, cwd)
+
+	assert.Equal(t, "outer_repo", ExtractProjectFromCwd(cwd))
+}
+
+func TestProjectFromWorktreeLayoutRequiresWorktreeLeaf(t *testing.T) {
+	root := t.TempDir()
+	tests := []string{
+		filepath.Join(
+			root, "worktrees", "github.com", "example-org", "sample-repo",
+		),
+		filepath.Join(
+			root, "worktrees", "github", "github.com",
+			"example-org", "sample-repo",
+		),
+	}
+
+	for _, path := range tests {
+		assert.Empty(t, projectFromWorktreeLayout(path), path)
+	}
+}
+
 func TestExtractProjectFromCwdWithBranch(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -555,81 +805,111 @@ func TestExtractProjectFromCwdWithBranch(t *testing.T) {
 	}{
 		{
 			name:   "OfflineWorktreePath",
-			cwd:    filepath.FromSlash("/Users/wesm/code/agentsview-worktree-tool-call-arguments"),
+			cwd:    filepath.FromSlash("/Users/user-a/code/agentsview-worktree-tool-call-arguments"),
 			branch: "worktree-tool-call-arguments",
 			want:   "agentsview",
 		},
 		{
 			name:   "BranchWithSlash",
-			cwd:    filepath.FromSlash("/Users/wesm/code/agentsview-feature-worktree-support"),
+			cwd:    filepath.FromSlash("/Users/user-a/code/agentsview-feature-worktree-support"),
 			branch: "feature/worktree-support",
 			want:   "agentsview",
 		},
 		{
 			name:   "MismatchNoTrim",
-			cwd:    filepath.FromSlash("/Users/wesm/code/agentsview-hotfix"),
+			cwd:    filepath.FromSlash("/Users/user-a/code/agentsview-hotfix"),
 			branch: "feature/other",
 			want:   "agentsview_hotfix",
 		},
 		{
 			name:   "DefaultBranchNoTrim",
-			cwd:    filepath.FromSlash("/Users/wesm/code/project-main"),
+			cwd:    filepath.FromSlash("/Users/user-a/code/project-main"),
 			branch: "main",
 			want:   "project_main",
 		},
 		{
 			name:   "SupersetWorktreeFlat",
-			cwd:    filepath.FromSlash("/Users/wesm/.superset/worktrees/agentsview/tauri-packaging"),
+			cwd:    filepath.FromSlash("/Users/user-a/.superset/worktrees/agentsview/tauri-packaging"),
 			branch: "tauri-packaging",
 			want:   "agentsview",
 		},
 		{
 			name:   "SupersetWorktreeNested",
-			cwd:    filepath.FromSlash("/Users/wesm/.superset/worktrees/agentsview/fix/worktrees"),
+			cwd:    filepath.FromSlash("/Users/user-a/.superset/worktrees/agentsview/fix/worktrees"),
 			branch: "fix/worktrees",
 			want:   "agentsview",
 		},
 		{
 			name:   "SupersetWorktreeContainerOnly",
-			cwd:    filepath.FromSlash("/Users/wesm/.superset/worktrees/agentsview"),
+			cwd:    filepath.FromSlash("/Users/user-a/.superset/worktrees/agentsview"),
 			branch: "",
 			want:   "agentsview",
 		},
 		{
 			name:   "ConductorWorktreeFlat",
-			cwd:    filepath.FromSlash("/Users/wesm/conductor/workspaces/my-app/feature-branch"),
+			cwd:    filepath.FromSlash("/Users/user-a/conductor/workspaces/my-app/feature-branch"),
 			branch: "feature-branch",
 			want:   "my_app",
 		},
 		{
 			name:   "ConductorWorktreeNested",
-			cwd:    filepath.FromSlash("/Users/wesm/conductor/workspaces/my-app/fix/auth-bug"),
+			cwd:    filepath.FromSlash("/Users/user-a/conductor/workspaces/my-app/fix/auth-bug"),
 			branch: "fix/auth-bug",
 			want:   "my_app",
 		},
 		{
-			name: "MiddlemanGitHubWorktree",
+			name: "GenericClientGitHubWorktree",
 			cwd: filepath.FromSlash(
-				"/Users/wesm/.config/middleman/worktrees/github.com/wesm/middleman/pr-205",
+				"/Users/user-a/.config/worktree-client/worktrees/github.com/example-org/sampleapp/pr-205",
 			),
 			branch: "fix-exited-agent-session-cleanup",
-			want:   "middleman",
+			want:   "sampleapp",
 		},
 		{
-			name: "MiddlemanGitHubWorktreeSubdir",
+			name: "GenericClientGitHubWorktreeSubdir",
 			cwd: filepath.FromSlash(
-				"/Users/wesm/.config/middleman/worktrees/github.com/wesm/middleman/pr-205/internal/parser",
+				"/Users/user-a/.config/worktree-client/worktrees/github.com/example-org/sampleapp/pr-205/internal/parser",
 			),
 			branch: "fix-exited-agent-session-cleanup",
-			want:   "middleman",
+			want:   "sampleapp",
+		},
+		{
+			name: "GenericGitHubWorktreeNested",
+			cwd: filepath.FromSlash(
+				"/srv/worktrees/github.com/example-org/sample-service/fix-123/cmd/server",
+			),
+			branch: "fix-123",
+			want:   "sample_service",
+		},
+		{
+			name: "GenericGitHubRepositoryRootUsesFallback",
+			cwd: filepath.FromSlash(
+				"/srv/worktrees/github.com/example-org/sample-service",
+			),
+			want: "sample_service",
+		},
+		{
+			name: "AdjacentGitHubWorktreesNameDoesNotMatch",
+			cwd: filepath.FromSlash(
+				"/srv/not-worktrees/github.com/example-org/sample-service/fix-123",
+			),
+			want: "fix_123",
 		},
 		{
 			name: "CodexAppWorktree",
 			cwd: filepath.FromSlash(
-				"/Users/wesm/.codex/worktrees/44be/middleman/internal/parser",
+				"/Users/user-a/.codex/worktrees/44be/sampleapp/internal/parser",
 			),
 			branch: "fix-exited-agent-session-cleanup",
-			want:   "middleman",
+			want:   "sampleapp",
+		},
+		{
+			name: "ClaudeRepoLocalWorktree",
+			cwd: filepath.FromSlash(
+				"/workspace/agentsview/.claude/worktrees/awesome-almeida-fddd4e",
+			),
+			branch: "awesome-almeida-fddd4e",
+			want:   "agentsview",
 		},
 		{
 			name: "RoborevCIWorktree",
@@ -739,7 +1019,7 @@ func skipIfNoGit(t *testing.T) {
 
 func gitRun(t *testing.T, dir string, args ...string) {
 	t.Helper()
-	cmd := exec.Command("git", args...)
+	cmd := exec.CommandContext(t.Context(), "git", args...)
 	cmd.Dir = dir
 	out, err := cmd.CombinedOutput()
 	require.NoError(t, err, "git %s: %s", strings.Join(args, " "), out)

@@ -64,6 +64,8 @@ func TestContentTypeWrapper(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
 			w := httptest.NewRecorder()
 			wrapper := &contentTypeWrapper{
 				ResponseWriter: w,
@@ -71,7 +73,7 @@ func TestContentTypeWrapper(t *testing.T) {
 				triggerStatus:  tt.triggerStatus,
 			}
 
-			req := httptest.NewRequest(http.MethodGet, "/", nil)
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/", nil)
 			tt.handler(wrapper, req)
 
 			assertRecorderStatus(t, w, tt.wantStatus)
@@ -107,7 +109,7 @@ func TestMiddlewareTimeout(t *testing.T) {
 	// Use a real listener to discover the bound port, then
 	// rebuild Handler() with the correct port in the Host
 	// allowlist.
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	port := ln.Addr().(*net.TCPAddr).Port
 	srv.SetPort(port)
@@ -120,23 +122,28 @@ func TestMiddlewareTimeout(t *testing.T) {
 		name        string
 		path        string
 		wantTimeout bool
+		wantDetail  []string
 		wantStatus  int // Only checked if wantTimeout is false
 	}{
-		{"Wrapped_ListSessions", "/api/v1/sessions", true, 0},
-		{"Wrapped_GetStats", "/api/v1/stats", true, 0},
-		{"Unwrapped_ExportSession", "/api/v1/sessions/invalid-id/export", false, http.StatusNotFound},
-		{"Unwrapped_SPA", "/", false, http.StatusOK},
+		{"Wrapped_ListSessions", "/api/v1/sessions", true, []string{"GET /api/v1/sessions", "10ms", "--write-timeout"}, 0},
+		{"Wrapped_GetStats", "/api/v1/stats", true, []string{"GET /api/v1/stats", "10ms", "--write-timeout"}, 0},
+		{"Unwrapped_SearchContent", "/api/v1/search/content?pattern=needle", false, nil, http.StatusOK},
+		{"Unwrapped_ActivitySessions", "/api/v1/activity/report/invalid/sessions", false, nil, http.StatusBadRequest},
+		{"Unwrapped_ExportSession", "/api/v1/sessions/invalid-id/export", false, nil, http.StatusNotFound},
+		{"Unwrapped_SPA", "/", false, nil, http.StatusOK},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			resp, err := ts.Client().Get(ts.URL + tt.path)
+			req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, ts.URL+tt.path, nil)
+			require.NoError(t, err)
+			resp, err := ts.Client().Do(req)
 			require.NoError(t, err)
 			defer resp.Body.Close()
 
 			if tt.wantTimeout {
-				assertTimeoutResponse(t, resp)
+				assertTimeoutResponse(t, resp, tt.wantDetail...)
 			} else {
 				assert.False(t, isTimeoutResponse(t, resp),
 					"%s: unexpected timeout for unwrapped route", tt.path)
@@ -186,7 +193,7 @@ func TestCSPMiddlewareSetsHeaderOnNonAPIRoutes(t *testing.T) {
 				"default-src":     "'self' http://127.0.0.1:8081",
 				"script-src":      "'self' http://127.0.0.1:8081",
 				"connect-src":     "'self' http: https: ws: wss:",
-				"img-src":         "'self' http://127.0.0.1:8081 data:",
+				"img-src":         "'self' http://127.0.0.1:8081 data: blob:",
 				"style-src":       "'self' http://127.0.0.1:8081 'unsafe-inline' https://fonts.googleapis.com",
 				"font-src":        "'self' http://127.0.0.1:8081 data: https://fonts.gstatic.com",
 				"object-src":      "'none'",
@@ -241,7 +248,7 @@ func TestCSPMiddlewareSetsHeaderOnNonAPIRoutes(t *testing.T) {
 			})
 			handler := cspMiddleware(tt.host, tt.port, tt.basePath, "", nil, inner)
 
-			req := httptest.NewRequest(http.MethodGet, tt.path, nil)
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, tt.path, nil)
 			w := httptest.NewRecorder()
 			handler.ServeHTTP(w, req)
 
@@ -299,16 +306,13 @@ func TestBuildCSPPolicyPinsPublicURLOrigin(t *testing.T) {
 		nil,
 	))
 
-	assert.Equal(t,
-		"'self' https://agentsview.example.com",
+	assert.Equal(t, "'self' https://agentsview.example.com",
 		directives["default-src"],
 	)
-	assert.Equal(t,
-		"'self' https://agentsview.example.com",
+	assert.Equal(t, "'self' https://agentsview.example.com",
 		directives["script-src"],
 	)
-	assert.Equal(t,
-		"'self' https://agentsview.example.com data:",
+	assert.Equal(t, "'self' https://agentsview.example.com data: blob:",
 		directives["img-src"],
 	)
 	assert.NotContains(t, directives["default-src"], "0.0.0.0")
@@ -366,7 +370,7 @@ func TestCORSMiddlewareMergesVaryHeader(t *testing.T) {
 		cors.ServeHTTP(w, r)
 	})
 
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/stats", nil)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1/stats", nil)
 	req.Header.Set("Origin", "http://127.0.0.1:8080")
 	w := httptest.NewRecorder()
 	handler.ServeHTTP(w, req)

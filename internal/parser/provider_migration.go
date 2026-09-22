@@ -19,47 +19,75 @@ var providerMigrationModes = map[AgentType]ProviderMigrationMode{
 	AgentOpenClaude:     ProviderMigrationProviderAuthoritative,
 	AgentCowork:         ProviderMigrationProviderAuthoritative,
 	AgentCodex:          ProviderMigrationProviderAuthoritative,
+	AgentTraeX:          ProviderMigrationProviderAuthoritative,
+	AgentAugureCode:     ProviderMigrationProviderAuthoritative,
 	AgentCopilot:        ProviderMigrationProviderAuthoritative,
 	AgentGemini:         ProviderMigrationProviderAuthoritative,
+	AgentGeminiApps:     ProviderMigrationImportOnly,
 	AgentOpenHands:      ProviderMigrationProviderAuthoritative,
 	AgentCursor:         ProviderMigrationProviderAuthoritative,
+	AgentCursorIDE:      ProviderMigrationProviderAuthoritative,
 	AgentMiMoCode:       ProviderMigrationProviderAuthoritative,
 	AgentOpenCode:       ProviderMigrationProviderAuthoritative,
+	AgentOpenCodeReview: ProviderMigrationProviderAuthoritative,
 	AgentKilo:           ProviderMigrationProviderAuthoritative,
+	AgentKiloLegacy:     ProviderMigrationProviderAuthoritative,
 	AgentIcodemate:      ProviderMigrationProviderAuthoritative,
 	AgentIflow:          ProviderMigrationProviderAuthoritative,
 	AgentAmp:            ProviderMigrationProviderAuthoritative,
 	AgentZencoder:       ProviderMigrationProviderAuthoritative,
 	AgentVSCodeCopilot:  ProviderMigrationProviderAuthoritative,
+	AgentWindsurf:       ProviderMigrationProviderAuthoritative,
+	AgentTrae:           ProviderMigrationProviderAuthoritative,
 	AgentVSCopilot:      ProviderMigrationProviderAuthoritative,
 	AgentPi:             ProviderMigrationProviderAuthoritative,
+	AgentTau:            ProviderMigrationProviderAuthoritative,
+	AgentPrimeAgent:     ProviderMigrationProviderAuthoritative,
 	AgentQwen:           ProviderMigrationProviderAuthoritative,
 	AgentCommandCode:    ProviderMigrationProviderAuthoritative,
 	AgentDeepSeekTUI:    ProviderMigrationProviderAuthoritative,
 	AgentOpenClaw:       ProviderMigrationProviderAuthoritative,
 	AgentQClaw:          ProviderMigrationProviderAuthoritative,
 	AgentKimi:           ProviderMigrationProviderAuthoritative,
+	AgentKimiWork:       ProviderMigrationProviderAuthoritative,
 	AgentClaudeAI:       ProviderMigrationImportOnly,
 	AgentChatGPT:        ProviderMigrationImportOnly,
 	AgentKiro:           ProviderMigrationProviderAuthoritative,
 	AgentKiroIDE:        ProviderMigrationProviderAuthoritative,
 	AgentCortex:         ProviderMigrationProviderAuthoritative,
 	AgentHermes:         ProviderMigrationProviderAuthoritative,
+	AgentAugureDesktop:  ProviderMigrationProviderAuthoritative,
+	AgentGrok:           ProviderMigrationProviderAuthoritative,
+	AgentGoose:          ProviderMigrationProviderAuthoritative,
 	AgentWorkBuddy:      ProviderMigrationProviderAuthoritative,
+	AgentCodeBuddy:      ProviderMigrationProviderAuthoritative,
 	AgentForge:          ProviderMigrationProviderAuthoritative,
+	AgentDevin:          ProviderMigrationProviderAuthoritative,
 	AgentPiebald:        ProviderMigrationProviderAuthoritative,
 	AgentWarp:           ProviderMigrationProviderAuthoritative,
 	AgentPositron:       ProviderMigrationProviderAuthoritative,
+	AgentPositAssistant: ProviderMigrationProviderAuthoritative,
+	AgentZCode:          ProviderMigrationProviderAuthoritative,
 	AgentAntigravity:    ProviderMigrationProviderAuthoritative,
 	AgentAntigravityCLI: ProviderMigrationProviderAuthoritative,
 	AgentVibe:           ProviderMigrationProviderAuthoritative,
 	AgentZed:            ProviderMigrationProviderAuthoritative,
 	AgentQwenPaw:        ProviderMigrationProviderAuthoritative,
 	AgentGptme:          ProviderMigrationProviderAuthoritative,
+	AgentQoder:          ProviderMigrationProviderAuthoritative,
 	AgentShelley:        ProviderMigrationProviderAuthoritative,
 	AgentAider:          ProviderMigrationProviderAuthoritative,
 	AgentOMP:            ProviderMigrationProviderAuthoritative,
+	AgentEvener:         ProviderMigrationProviderAuthoritative,
 	AgentReasonix:       ProviderMigrationProviderAuthoritative,
+	AgentRooCode:        ProviderMigrationProviderAuthoritative,
+	AgentCline:          ProviderMigrationProviderAuthoritative,
+	AgentPoolside:       ProviderMigrationProviderAuthoritative,
+	AgentOmnigent:       ProviderMigrationProviderAuthoritative,
+	AgentCodebuff:       ProviderMigrationProviderAuthoritative,
+	AgentCrush:          ProviderMigrationProviderAuthoritative,
+
+	AgentDeepSeekHarness: ProviderMigrationProviderAuthoritative,
 }
 
 // ProviderMigrationModes returns the current provider migration manifest.
@@ -117,6 +145,48 @@ func validateProviderMigrationMode(
 				def.Type, mode,
 			)
 		}
+		if caps.StreamingDiscovery == CapabilitySupported {
+			provider := factory.NewProvider(ProviderConfig{})
+			if sourceSetProvider, ok := provider.(*SourceSetProvider); ok {
+				if _, ok := sourceSetProvider.sources.(StreamingDiscoverer); !ok {
+					return fmt.Errorf(
+						"%s: streaming discovery capability requires underlying source set StreamingDiscoverer",
+						def.Type,
+					)
+				}
+			}
+			if _, ok := provider.(StreamingDiscoverer); !ok {
+				return fmt.Errorf(
+					"%s: streaming discovery capability requires StreamingDiscoverer",
+					def.Type,
+				)
+			}
+			if caps.SharedContainerSource == CapabilitySupported {
+				if sourceSetProvider, ok := provider.(*SourceSetProvider); ok {
+					if _, ok := sourceSetProvider.sources.(ReconciliationSourceResolver); !ok {
+						return fmt.Errorf(
+							"%s: shared-container streaming requires underlying source set exact reconciliation rehydration",
+							def.Type,
+						)
+					}
+				}
+				if _, ok := provider.(ReconciliationSourceResolver); !ok {
+					return fmt.Errorf(
+						"%s: shared-container streaming requires exact reconciliation rehydration",
+						def.Type,
+					)
+				}
+			}
+		}
+		if caps.S3Discovery == CapabilitySupported {
+			provider := factory.NewProvider(ProviderConfig{})
+			if _, ok := provider.(S3Provider); !ok {
+				return fmt.Errorf(
+					"%s: S3 discovery capability requires S3Provider",
+					def.Type,
+				)
+			}
+		}
 	case ProviderMigrationImportOnly:
 		if !isImportOnlyAgentType(def.Type) {
 			return fmt.Errorf(
@@ -133,7 +203,7 @@ func validateProviderMigrationMode(
 
 func isImportOnlyAgentType(agent AgentType) bool {
 	switch agent {
-	case AgentClaudeAI, AgentChatGPT:
+	case AgentClaudeAI, AgentChatGPT, AgentGeminiApps:
 		return true
 	default:
 		return false

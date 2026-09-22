@@ -3,12 +3,16 @@ package cursorusage
 import (
 	"bytes"
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
+
+	"go.kenn.io/agentsview/internal/money"
 )
 
 const defaultBaseURL = "https://api.cursor.com"
@@ -34,8 +38,8 @@ type UsageEvent struct {
 	Model          string
 	Kind           string
 	TokenUsage     TokenUsage
-	ChargedCents   float64
-	CursorTokenFee float64
+	Charged        money.Money
+	CursorTokenFee money.Money
 	UserID         string
 	UserEmail      string
 	IsHeadless     bool
@@ -94,10 +98,10 @@ func (c *Client) ListUsageEvents(
 	ctx context.Context, q Query,
 ) (Page, error) {
 	if c == nil {
-		return Page{}, fmt.Errorf("nil client")
+		return Page{}, errors.New("nil client")
 	}
 	if strings.TrimSpace(c.APIKey) == "" {
-		return Page{}, fmt.Errorf("missing Cursor admin API key")
+		return Page{}, errors.New("missing Cursor admin API key")
 	}
 	if q.Page <= 0 {
 		q.Page = 1
@@ -151,7 +155,7 @@ func (c *Client) ListUsageEvents(
 	}
 
 	var decoded usageEventsEnvelope
-	if err := json.NewDecoder(resp.Body).Decode(&decoded); err != nil {
+	if err := json.UnmarshalRead(resp.Body, &decoded); err != nil {
 		return Page{}, fmt.Errorf("decoding filtered usage events: %w", err)
 	}
 
@@ -243,15 +247,15 @@ func (e usageEventsEnvelope) usageEvents() []rawUsageEvent {
 }
 
 type rawUsageEvent struct {
-	Timestamp      string     `json:"timestamp"`
-	Model          string     `json:"model"`
-	Kind           string     `json:"kind"`
-	TokenUsage     tokenUsage `json:"tokenUsage"`
-	ChargedCents   float64    `json:"chargedCents"`
-	CursorTokenFee float64    `json:"cursorTokenFee"`
-	UserID         string     `json:"userId"`
-	UserEmail      string     `json:"userEmail"`
-	IsHeadless     bool       `json:"isHeadless"`
+	Timestamp      string         `json:"timestamp"`
+	Model          string         `json:"model"`
+	Kind           string         `json:"kind"`
+	TokenUsage     tokenUsage     `json:"tokenUsage"`
+	ChargedCents   jsontext.Value `json:"chargedCents"`
+	CursorTokenFee jsontext.Value `json:"cursorTokenFee"`
+	UserID         string         `json:"userId"`
+	UserEmail      string         `json:"userEmail"`
+	IsHeadless     bool           `json:"isHeadless"`
 }
 
 type tokenUsage struct {
@@ -266,6 +270,14 @@ func parseUsageEvent(raw rawUsageEvent) (UsageEvent, error) {
 	if err != nil {
 		return UsageEvent{}, fmt.Errorf("parsing timestamp: %w", err)
 	}
+	charged, err := parseOptionalCents(raw.ChargedCents)
+	if err != nil {
+		return UsageEvent{}, fmt.Errorf("parsing charged cents: %w", err)
+	}
+	tokenFee, err := parseOptionalCents(raw.CursorTokenFee)
+	if err != nil {
+		return UsageEvent{}, fmt.Errorf("parsing Cursor token fee: %w", err)
+	}
 	return UsageEvent{
 		Timestamp: t,
 		Model:     strings.TrimSpace(raw.Model),
@@ -276,18 +288,32 @@ func parseUsageEvent(raw rawUsageEvent) (UsageEvent, error) {
 			CacheWriteTokens: raw.TokenUsage.CacheWriteTokens,
 			CacheReadTokens:  raw.TokenUsage.CacheReadTokens,
 		},
-		ChargedCents:   raw.ChargedCents,
-		CursorTokenFee: raw.CursorTokenFee,
+		Charged:        charged,
+		CursorTokenFee: tokenFee,
 		UserID:         strings.TrimSpace(raw.UserID),
 		UserEmail:      strings.TrimSpace(raw.UserEmail),
 		IsHeadless:     raw.IsHeadless,
 	}, nil
 }
 
+func parseOptionalCents(value jsontext.Value) (money.Money, error) {
+	if len(value) == 0 || value.Kind() == jsontext.KindNull {
+		return money.Money{}, nil
+	}
+	parsed, err := money.ParseCents(string(value))
+	if err != nil {
+		return money.Money{}, err
+	}
+	if parsed.Microdollars < 0 {
+		return money.Money{}, money.ErrNegative
+	}
+	return parsed, nil
+}
+
 func parseCursorTimestamp(raw string) (time.Time, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
-		return time.Time{}, fmt.Errorf("empty timestamp")
+		return time.Time{}, errors.New("empty timestamp")
 	}
 	if ms, err := strconv.ParseInt(raw, 10, 64); err == nil {
 		return time.Unix(0, ms*int64(time.Millisecond)).UTC(), nil

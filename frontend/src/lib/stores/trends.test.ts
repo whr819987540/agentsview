@@ -1,11 +1,15 @@
 import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { trends } from "./trends.svelte.js";
+import { selectionFromRange } from "../components/shared/rangeSelection.js";
 import { TrendsService } from "../api/generated/index";
-import type { TrendsTermsResponse } from "../api/types.js";
+import type { DbTrendsTermsResponse as TrendsTermsResponse } from "../api/generated/index.js";
+
+// Capture the store's shipped default range at import time, before the
+// beforeEach reset overwrites it.
+const DEFAULT_RANGE = { from: trends.from, to: trends.to };
 
 vi.mock("../api/runtime.js", () => ({
-  configureGeneratedClient: vi.fn(),
-  callGenerated: vi.fn((request: () => Promise<unknown>) => request()),
+  isAbortError: vi.fn(() => false),
 }));
 
 vi.mock("../api/generated/index", () => ({
@@ -43,14 +47,41 @@ function resetStore() {
 beforeEach(() => {
   resetStore();
   vi.clearAllMocks();
+
   trendsService.getApiV1TrendsTerms.mockResolvedValue(makeResponse());
 });
 
 describe("TrendsStore.fetchTerms", () => {
+  it("aborts the obsolete terms read when grouping changes", async () => {
+    trendsService.getApiV1TrendsTerms
+      .mockImplementationOnce(() => new Promise(() => {}))
+      .mockResolvedValueOnce(makeResponse());
+
+    void trends.fetchTerms();
+    await Promise.resolve();
+    await trends.setGranularity("month");
+
+    expect(vi.mocked(TrendsService.getApiV1TrendsTerms).mock.calls[0]?.[1]?.signal?.aborted).toBe(
+      true,
+    );
+  });
+
+  it("aborts the visible terms read on teardown", async () => {
+    trendsService.getApiV1TrendsTerms.mockImplementationOnce(() => new Promise(() => {}));
+
+    void trends.fetchTerms();
+    await Promise.resolve();
+    trends.cancelInFlightReads();
+
+    expect(vi.mocked(TrendsService.getApiV1TrendsTerms).mock.calls[0]?.[1]?.signal?.aborted).toBe(
+      true,
+    );
+  });
+
   it("fetches default terms with timezone and date range", async () => {
     await trends.fetchTerms();
 
-    expect(trendsService.getApiV1TrendsTerms).toHaveBeenCalledWith(
+    expect(trendsService.getApiV1TrendsTerms.mock.lastCall?.[0]).toEqual(
       expect.objectContaining({
         from: "2024-01-01",
         to: "2024-01-31",
@@ -67,7 +98,7 @@ describe("TrendsStore.fetchTerms", () => {
 
     await trends.fetchTerms();
 
-    expect(trendsService.getApiV1TrendsTerms).toHaveBeenCalledWith(
+    expect(trendsService.getApiV1TrendsTerms.mock.lastCall?.[0]).toEqual(
       expect.objectContaining({
         term: ["seam", "blast radius"],
       }),
@@ -95,18 +126,33 @@ describe("TrendsStore.fetchTerms", () => {
     expect(trends.response).toEqual(existing);
     expect(trends.loading.terms).toBe(false);
     expect(trends.errors.terms).toBe("boom");
-    expect(warn).toHaveBeenCalledWith(
-      "trends.terms refetch failed:",
-      expect.any(Error),
-    );
+    expect(warn).toHaveBeenCalledWith("trends.terms refetch failed:", expect.any(Error));
     warn.mockRestore();
   });
 
   it("setGranularity refetches with the new granularity", async () => {
     await trends.setGranularity("month");
 
-    expect(trendsService.getApiV1TrendsTerms).toHaveBeenCalledWith(
+    expect(trendsService.getApiV1TrendsTerms.mock.lastCall?.[0]).toEqual(
       expect.objectContaining({ granularity: "month" }),
     );
+  });
+});
+
+describe("TrendsStore default range", () => {
+  it("ships a 1y rolling default recognized as the relative preset", () => {
+    // Under the shared N-days-inclusive semantics, the default must resolve
+    // to the 365-day relative preset, not a 366-day custom range — otherwise
+    // TrendsPage's selectionFromRange() would show the default as custom.
+    const selection = selectionFromRange(DEFAULT_RANGE.from, DEFAULT_RANGE.to);
+    expect(selection).toEqual({ mode: "relative", days: 365 });
+  });
+
+  it("spans 365 calendar days inclusive of the end date", () => {
+    const from = new Date(`${DEFAULT_RANGE.from}T00:00:00`);
+    const to = new Date(`${DEFAULT_RANGE.to}T00:00:00`);
+    const dayMs = 24 * 60 * 60 * 1000;
+    const spanDays = Math.round((to.getTime() - from.getTime()) / dayMs) + 1;
+    expect(spanDays).toBe(365);
   });
 });

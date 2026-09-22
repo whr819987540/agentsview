@@ -9,17 +9,44 @@ import (
 	"path/filepath"
 	"testing"
 
+	_ "github.com/mattn/go-sqlite3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/dbtest"
+	"go.kenn.io/agentsview/internal/parser"
 )
+
+func TestDoctorSyncTraeEncryptedLayout(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "Trae", "User")
+	state := filepath.Join(root, "globalStorage", "state.vscdb")
+	require.NoError(t, os.MkdirAll(filepath.Dir(state), 0o755))
+	conn, err := sql.Open("sqlite3", state)
+	require.NoError(t, err)
+	_, err = conn.ExecContext(t.Context(), `CREATE TABLE ItemTable (key TEXT PRIMARY KEY, value TEXT)`)
+	require.NoError(t, err)
+	_, err = conn.ExecContext(t.Context(), `INSERT INTO ItemTable(key, value) VALUES (?, ?)`,
+		"memento/icube-ai-agent-storage",
+		`{"list":[{"sessionId":"stub","messages":[]}]}`)
+	require.NoError(t, err)
+	require.NoError(t, conn.Close())
+	modular := filepath.Join(filepath.Dir(root), "ModularData", "ai-agent", "database.db")
+	require.NoError(t, os.MkdirAll(filepath.Dir(modular), 0o755))
+	require.NoError(t, os.WriteFile(modular, []byte("encrypted header"), 0o644))
+
+	var out bytes.Buffer
+	writeDoctorTraeEncryptedLayouts(&out, doctorSyncReport{
+		AgentRoots:         []doctorAgentRoot{{Agent: parser.AgentTrae, Path: root, Exists: true}},
+		TraeEncryptedRoots: collectDoctorTraeEncryptedRoots(t.Context(), []doctorAgentRoot{{Agent: parser.AgentTrae, Path: root, Exists: true}}),
+	})
+	assert.Contains(t, out.String(), "unsupported encrypted transcript layout")
+}
 
 func TestDoctorSyncCurrentDatabaseReportsNormalStartupSync(t *testing.T) {
 	dataDir := testDataDir(t)
 
-	database, err := db.Open(filepath.Join(dataDir, "sessions.db"))
+	database, err := db.Open(t.Context(), filepath.Join(dataDir, "sessions.db"))
 	require.NoError(t, err, "open db")
 	require.NoError(t, database.Close(), "close db")
 
@@ -46,9 +73,9 @@ func TestDoctorSyncStaleDatabaseReportsLikelyAbortedResync(t *testing.T) {
 	dataDir := testDataDir(t)
 	dbPath := filepath.Join(dataDir, "sessions.db")
 
-	database, err := db.Open(dbPath)
+	database, err := db.Open(t.Context(), dbPath)
 	require.NoError(t, err, "open db")
-	require.NoError(t, database.UpsertSession(db.Session{
+	require.NoError(t, database.UpsertSession(t.Context(), db.Session{
 		ID:           "stale-session",
 		Project:      "proj",
 		Machine:      "local",
@@ -60,7 +87,7 @@ func TestDoctorSyncStaleDatabaseReportsLikelyAbortedResync(t *testing.T) {
 
 	conn, err := sql.Open("sqlite3", dbPath)
 	require.NoError(t, err, "raw sqlite open")
-	_, err = conn.Exec("PRAGMA user_version = 0")
+	_, err = conn.ExecContext(t.Context(), "PRAGMA user_version = 0")
 	require.NoError(t, err, "downgrade user_version")
 	require.NoError(t, conn.Close(), "close raw sqlite")
 
@@ -86,18 +113,70 @@ func TestDoctorSyncStaleDatabaseReportsLikelyAbortedResync(t *testing.T) {
 		"Likely cause: previous data-version resync likely aborted before completion")
 }
 
+func TestDoctorSyncReportsSessionsMissingSecretScan(t *testing.T) {
+	dataDir := testDataDir(t)
+	dbPath := filepath.Join(dataDir, "sessions.db")
+
+	database, err := db.Open(t.Context(), dbPath)
+	require.NoError(t, err, "open db")
+	for _, id := range []string{"suspect", "scanned"} {
+		require.NoError(t, database.UpsertSession(t.Context(), db.Session{
+			ID: id, Project: "proj", Machine: "local", Agent: "claude",
+			MessageCount: 1,
+		}), "insert session %s", id)
+	}
+	require.NoError(t, database.Close(), "close db")
+
+	// Both sessions carry current signals, but only "scanned" ever had
+	// findings persisted (any non-empty rules version).
+	conn, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err, "raw sqlite open")
+	_, err = conn.ExecContext(t.Context(),
+		`UPDATE sessions SET quality_signal_version = ?`,
+		db.CurrentQualitySignalVersion,
+	)
+	require.NoError(t, err, "set current signal versions")
+	_, err = conn.ExecContext(t.Context(),
+		`UPDATE sessions SET secrets_rules_version = 'v-old'
+		 WHERE id = 'scanned'`,
+	)
+	require.NoError(t, err, "mark scanned session")
+	require.NoError(t, conn.Close(), "close raw sqlite")
+
+	out, err := executeCommand(newRootCommand(), "doctor", "sync")
+	require.NoError(t, err, "doctor sync")
+
+	assert.Contains(t, out,
+		"1 session(s) have current quality signals but no persisted secret scan")
+	assert.Contains(t, out, `run "agentsview secrets scan"`)
+}
+
+func TestDoctorSyncSilentWithoutMissingSecretScans(t *testing.T) {
+	dataDir := testDataDir(t)
+
+	database, err := db.Open(t.Context(), filepath.Join(dataDir, "sessions.db"))
+	require.NoError(t, err, "open db")
+	require.NoError(t, database.Close(), "close db")
+
+	out, err := executeCommand(newRootCommand(), "doctor", "sync")
+	require.NoError(t, err, "doctor sync")
+
+	assert.NotContains(t, out, "secrets scan",
+		"clean archives must not suggest a rescan")
+}
+
 func TestDoctorSyncNewerDatabaseReportsRefusedStartup(t *testing.T) {
 	dataDir := testDataDir(t)
 	dbPath := filepath.Join(dataDir, "sessions.db")
 
-	database, err := db.Open(dbPath)
+	database, err := db.Open(t.Context(), dbPath)
 	require.NoError(t, err, "open db")
 	require.NoError(t, database.Close(), "close db")
 
 	futureVersion := db.CurrentDataVersion() + 10
 	conn, err := sql.Open("sqlite3", dbPath)
 	require.NoError(t, err, "raw sqlite open")
-	_, err = conn.Exec(fmt.Sprintf("PRAGMA user_version = %d", futureVersion))
+	_, err = conn.ExecContext(t.Context(), fmt.Sprintf("PRAGMA user_version = %d", futureVersion))
 	require.NoError(t, err, "set future user_version")
 	require.NoError(t, conn.Close(), "close raw sqlite")
 
@@ -112,16 +191,20 @@ func TestDoctorSyncNewerDatabaseReportsRefusedStartup(t *testing.T) {
 		"Startup sync decision: refuse startup (database requires newer agentsview)")
 	assert.Contains(t, out,
 		"Likely cause: SQLite user_version is newer than this binary")
-	assert.Contains(t, out, `Run "agentsview update"`)
+	assert.Contains(t, out,
+		fmt.Sprintf("Use an AgentsView build with data version %d or newer",
+			futureVersion))
+	assert.Contains(t, out,
+		fmt.Sprintf("restore an archive backup compatible with data version %d",
+			db.CurrentDataVersion()))
+	assert.NotContains(t, out, `Run "agentsview update"`)
 }
 
 func TestWriteDoctorSummaryMode(t *testing.T) {
 	var buf bytes.Buffer
 	writeDoctorSummaryMode(&buf, doctorSyncReport{
-		doctorDBInspection: doctorDBInspection{
-			AntigravityCLITotal:   12,
-			AntigravityCLISummary: 5,
-		},
+		AntigravityCLITotal:   12,
+		AntigravityCLISummary: 5,
 	})
 	out := buf.String()
 	assert.Contains(t, out, "antigravity-cli")
@@ -133,9 +216,7 @@ func TestWriteDoctorSummaryMode(t *testing.T) {
 func TestWriteDoctorSummaryModeSilentWhenNone(t *testing.T) {
 	var buf bytes.Buffer
 	writeDoctorSummaryMode(&buf, doctorSyncReport{
-		doctorDBInspection: doctorDBInspection{
-			AntigravityCLITotal: 12, AntigravityCLISummary: 0,
-		},
+		AntigravityCLITotal: 12, AntigravityCLISummary: 0,
 	})
 	assert.NotContains(t, buf.String(), "summary mode")
 }
@@ -143,11 +224,9 @@ func TestWriteDoctorSummaryModeSilentWhenNone(t *testing.T) {
 func TestWriteDoctorSummaryModeSilentOnErr(t *testing.T) {
 	var buf bytes.Buffer
 	writeDoctorSummaryMode(&buf, doctorSyncReport{
-		doctorDBInspection: doctorDBInspection{
-			AntigravityCLITotal:   12,
-			AntigravityCLISummary: 5,
-			AntigravityCountsErr:  errors.New("query failed"),
-		},
+		AntigravityCLITotal:   12,
+		AntigravityCLISummary: 5,
+		AntigravityCountsErr:  errors.New("query failed"),
 	})
 	assert.Empty(t, buf.String())
 }
@@ -155,9 +234,7 @@ func TestWriteDoctorSummaryModeSilentOnErr(t *testing.T) {
 func TestWriteDoctorUnknownSchema(t *testing.T) {
 	var buf bytes.Buffer
 	writeDoctorUnknownSchema(&buf, doctorSyncReport{
-		doctorDBInspection: doctorDBInspection{
-			AntigravityUnknownSchema: 3,
-		},
+		AntigravityUnknownSchema: 3,
 	})
 	out := buf.String()
 	assert.Contains(t, out, "3 session(s) on unrecognized Antigravity schema")
@@ -167,9 +244,7 @@ func TestWriteDoctorUnknownSchema(t *testing.T) {
 func TestWriteDoctorUnknownSchemaSilentWhenNone(t *testing.T) {
 	var buf bytes.Buffer
 	writeDoctorUnknownSchema(&buf, doctorSyncReport{
-		doctorDBInspection: doctorDBInspection{
-			AntigravityUnknownSchema: 0,
-		},
+		AntigravityUnknownSchema: 0,
 	})
 	assert.Empty(t, buf.String())
 }
@@ -177,10 +252,8 @@ func TestWriteDoctorUnknownSchemaSilentWhenNone(t *testing.T) {
 func TestWriteDoctorUnknownSchemaSilentOnErr(t *testing.T) {
 	var buf bytes.Buffer
 	writeDoctorUnknownSchema(&buf, doctorSyncReport{
-		doctorDBInspection: doctorDBInspection{
-			AntigravityUnknownSchema: 3,
-			AntigravityCountsErr:     errors.New("query failed"),
-		},
+		AntigravityUnknownSchema: 3,
+		AntigravityCountsErr:     errors.New("query failed"),
 	})
 	assert.Empty(t, buf.String())
 }
@@ -190,21 +263,21 @@ func TestInspectDoctorDBCountsAntigravityCLISummaryMode(t *testing.T) {
 	dbPath := filepath.Join(dir, "sessions.db")
 
 	database := dbtest.OpenTestDBAt(t, dbPath)
-	require.NoError(t, database.UpsertSession(db.Session{
+	require.NoError(t, database.UpsertSession(t.Context(), db.Session{
 		ID:                 "agy-summary",
 		Agent:              "antigravity-cli",
 		Machine:            "local",
 		Project:            "proj",
 		TranscriptFidelity: "summary",
 	}), "upsert summary session")
-	require.NoError(t, database.UpsertSession(db.Session{
+	require.NoError(t, database.UpsertSession(t.Context(), db.Session{
 		ID:                 "agy-full",
 		Agent:              "antigravity-cli",
 		Machine:            "local",
 		Project:            "proj",
 		TranscriptFidelity: "full",
 	}), "upsert full session")
-	require.NoError(t, database.UpsertSession(db.Session{
+	require.NoError(t, database.UpsertSession(t.Context(), db.Session{
 		ID:      "other-agent",
 		Agent:   "claude-code",
 		Machine: "local",
@@ -212,7 +285,7 @@ func TestInspectDoctorDBCountsAntigravityCLISummaryMode(t *testing.T) {
 	}), "upsert other-agent session")
 	require.NoError(t, database.Close(), "close db")
 
-	insp := inspectDoctorDB(dbPath)
+	insp := inspectDoctorDB(t.Context(), dbPath)
 	require.NoError(t, insp.AntigravityCountsErr, "antigravity counts query")
 	assert.Equal(t, 2, insp.AntigravityCLITotal, "AntigravityCLITotal")
 	assert.Equal(t, 1, insp.AntigravityCLISummary, "AntigravityCLISummary")
@@ -226,28 +299,28 @@ func TestInspectDoctorDBCountsUnknownSchema(t *testing.T) {
 	dbPath := filepath.Join(dir, "sessions.db")
 
 	database := dbtest.OpenTestDBAt(t, dbPath)
-	require.NoError(t, database.UpsertSession(db.Session{
+	require.NoError(t, database.UpsertSession(t.Context(), db.Session{
 		ID:            "agy-ide-unknown",
 		Agent:         "antigravity",
 		Machine:       "local",
 		Project:       "proj",
 		SourceVersion: "agy-schema:abc123def456",
 	}), "upsert IDE unknown-schema session")
-	require.NoError(t, database.UpsertSession(db.Session{
+	require.NoError(t, database.UpsertSession(t.Context(), db.Session{
 		ID:            "agy-cli-unknown",
 		Agent:         "antigravity-cli",
 		Machine:       "local",
 		Project:       "proj",
 		SourceVersion: "agy-schema:abc123def456",
 	}), "upsert CLI unknown-schema session")
-	require.NoError(t, database.UpsertSession(db.Session{
+	require.NoError(t, database.UpsertSession(t.Context(), db.Session{
 		ID:            "agy-known",
 		Agent:         "antigravity-cli",
 		Machine:       "local",
 		Project:       "proj",
 		SourceVersion: "1.0.7-1.0.10",
 	}), "upsert known-range session")
-	require.NoError(t, database.UpsertSession(db.Session{
+	require.NoError(t, database.UpsertSession(t.Context(), db.Session{
 		ID:            "piebald-generic",
 		Agent:         "piebald",
 		Machine:       "local",
@@ -256,7 +329,7 @@ func TestInspectDoctorDBCountsUnknownSchema(t *testing.T) {
 	}), "upsert non-antigravity session")
 	require.NoError(t, database.Close(), "close db")
 
-	insp := inspectDoctorDB(dbPath)
+	insp := inspectDoctorDB(t.Context(), dbPath)
 	require.NoError(t, insp.AntigravityCountsErr, "antigravity counts query")
 	assert.Equal(t, 2, insp.AntigravityUnknownSchema, "AntigravityUnknownSchema")
 }
@@ -267,10 +340,8 @@ func TestDoctorSyncReportStatErrorDoesNotRenderAsMissingDatabase(t *testing.T) {
 			DataDir: "/data",
 			DBPath:  "/data/sessions.db",
 		},
-		doctorDBInspection: doctorDBInspection{
-			DBExists: false,
-			DBError:  errors.New("stat /data/sessions.db: permission denied"),
-		},
+		DBExists: false,
+		DBError:  errors.New("stat /data/sessions.db: permission denied"),
 	}
 
 	var out bytes.Buffer

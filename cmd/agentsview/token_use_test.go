@@ -1,11 +1,12 @@
 package main
 
 import (
-	"context"
+	"database/sql"
 	"os"
 	"path/filepath"
 	"testing"
 
+	_ "github.com/mattn/go-sqlite3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.kenn.io/agentsview/internal/db"
@@ -34,12 +35,12 @@ func upsertSession(
 	if startedAt != "" {
 		s.StartedAt = &startedAt
 	}
-	require.NoError(t, d.UpsertSession(s), "upsert %s", id)
+	require.NoError(t, d.UpsertSession(t.Context(), s), "upsert %s", id)
 }
 
 func TestResolveSessionID_PrefixedInput_NoEvidence_UnchangedNotKnown(t *testing.T) {
 	d := newTestDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// A prefixed input with no DB row and no disk evidence is
 	// returned unchanged so downstream lookup/error messages
@@ -54,7 +55,7 @@ func TestResolveSessionID_PrefixedInput_NoEvidence_UnchangedNotKnown(t *testing.
 
 func TestResolveSessionID_HostPrefixedInput_ReturnedUnchanged(t *testing.T) {
 	d := newTestDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Host-prefixed IDs are unambiguously canonical remote IDs;
 	// resolution short-circuits without touching DB or disk.
@@ -66,7 +67,7 @@ func TestResolveSessionID_HostPrefixedInput_ReturnedUnchanged(t *testing.T) {
 
 func TestResolveSessionID_BareClaudeUUID_ExactMatch(t *testing.T) {
 	d := newTestDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Claude sessions have no prefix; the bare UUID is the
 	// canonical ID stored in sessions.id.
@@ -80,7 +81,7 @@ func TestResolveSessionID_BareClaudeUUID_ExactMatch(t *testing.T) {
 
 func TestResolveSessionID_BareCodexUUID_ResolvesToPrefixed(t *testing.T) {
 	d := newTestDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	bare := "019d5490-fe31-7e62-838c-8ba4193f245d"
 	stored := "codex:" + bare
@@ -93,7 +94,7 @@ func TestResolveSessionID_BareCodexUUID_ResolvesToPrefixed(t *testing.T) {
 
 func TestResolveSessionID_Ambiguous_MostRecentWins(t *testing.T) {
 	d := newTestDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	bare := "22222222-2222-2222-2222-222222222222"
 	// Older codex session.
@@ -108,7 +109,7 @@ func TestResolveSessionID_Ambiguous_MostRecentWins(t *testing.T) {
 
 func TestResolveSessionID_NotInDB_FoundOnDisk(t *testing.T) {
 	d := newTestDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Create a codex session file on disk: the probe path
 	// should resolve a bare raw UUID to the prefixed form.
@@ -130,7 +131,7 @@ func TestResolveSessionID_NotInDB_FoundOnDisk(t *testing.T) {
 
 func TestResolveSessionID_NotFoundAnywhere_PassThrough(t *testing.T) {
 	d := newTestDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	bare := "44444444-4444-4444-4444-444444444444"
 	got, known := resolveRawSessionID(ctx, d, nil, bare)
@@ -140,7 +141,7 @@ func TestResolveSessionID_NotFoundAnywhere_PassThrough(t *testing.T) {
 
 func TestResolveSessionID_BareClaudeAndPrefixedSameUUID_ClaudeExactWins(t *testing.T) {
 	d := newTestDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Edge: a bare Claude UUID that ALSO exists as a prefixed
 	// session (e.g. codex:<same-uuid>). The Claude row is an
@@ -156,7 +157,7 @@ func TestResolveSessionID_BareClaudeAndPrefixedSameUUID_ClaudeExactWins(t *testi
 
 func TestResolveSessionID_ExactMatchWinsOverNewerCollisions(t *testing.T) {
 	d := newTestDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Bare Claude session is the exact match but older than
 	// multiple prefixed sessions sharing the same suffix. The
@@ -177,7 +178,7 @@ func TestResolveSessionID_ExactMatchWinsOverNewerCollisions(t *testing.T) {
 
 func TestResolveSessionID_KimiRawID_ResolvesToPrefixed(t *testing.T) {
 	d := newTestDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Kimi raw IDs have the shape "<project-hash>:<session-uuid>".
 	// The stored canonical form prepends "kimi:".
@@ -192,7 +193,7 @@ func TestResolveSessionID_KimiRawID_ResolvesToPrefixed(t *testing.T) {
 
 func TestResolveSessionID_OpenClawRawID_ResolvesToPrefixed(t *testing.T) {
 	d := newTestDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// OpenClaw raw IDs have the shape "<agentId>:<sessionId>".
 	raw := "main:abc-123"
@@ -206,7 +207,7 @@ func TestResolveSessionID_OpenClawRawID_ResolvesToPrefixed(t *testing.T) {
 
 func TestResolveSessionID_CanonicalKimiID_ResolvesWhenInDB(t *testing.T) {
 	d := newTestDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// A canonical Kimi ID already in the DB resolves via the
 	// exact-match branch. A canonical ID with no DB row and no
@@ -222,7 +223,7 @@ func TestResolveSessionID_CanonicalKimiID_ResolvesWhenInDB(t *testing.T) {
 
 func TestResolveSessionID_CanonicalCodexID_OnDiskNotInDB(t *testing.T) {
 	d := newTestDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Canonical "codex:<uuid>" not yet synced but present on
 	// disk must resolve via the canonical disk probe, which strips
@@ -247,7 +248,7 @@ func TestResolveSessionID_CanonicalCodexID_OnDiskNotInDB(t *testing.T) {
 
 func TestResolveSessionID_ProviderAuthoritativeCursorOnDiskNotInDB(t *testing.T) {
 	d := newTestDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	cursorDir := t.TempDir()
 	rawID := "provider-cursor"
@@ -278,9 +279,101 @@ func TestResolveSessionID_ProviderAuthoritativeCursorOnDiskNotInDB(t *testing.T)
 	assert.True(t, known, "canonical provider disk probe")
 }
 
+func TestResolveSessionID_DevinCanonicalID_OnDiskNotInDB(t *testing.T) {
+	d := newTestDB(t)
+	ctx := t.Context()
+
+	root := t.TempDir()
+	cliDir := filepath.Join(root, "cli")
+	transcriptsDir := filepath.Join(cliDir, "transcripts")
+	require.NoError(t, os.MkdirAll(transcriptsDir, 0o755))
+	dbPath := filepath.Join(cliDir, "sessions.db")
+	devinDB, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, devinDB.Close()) })
+	_, err = devinDB.ExecContext(ctx, `
+		CREATE TABLE sessions (
+			id TEXT PRIMARY KEY,
+			title TEXT,
+			working_directory TEXT,
+			model TEXT,
+			created_at INTEGER,
+			last_activity_at INTEGER,
+			main_chain_id INTEGER,
+			hidden INTEGER NOT NULL DEFAULT 0
+		);
+		INSERT INTO sessions
+			(id, title, working_directory, model, created_at, last_activity_at, hidden)
+		VALUES
+			('session-123', 'Devin session', '/cwd/devin', 'devin-1', 1700000000000, 1700000001000, 0);
+	`)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(
+		filepath.Join(transcriptsDir, "session-123.json"),
+		[]byte(`{"messages":[]}`+"\n"),
+		0o644,
+	))
+
+	agentDirs := map[parser.AgentType][]string{
+		parser.AgentDevin: {root},
+	}
+	got, known := resolveRawSessionID(ctx, d, agentDirs, "devin:session-123")
+	assert.Equal(t, "devin:session-123", got)
+	assert.True(t, known,
+		"provider-backed Devin IDs should resolve via FindSource even though FileBased is false")
+}
+
+func TestResolveSessionID_GooseOnDiskNotInDB(t *testing.T) {
+	d := newTestDB(t)
+	ctx := t.Context()
+
+	root := t.TempDir()
+	sessionsDir := filepath.Join(root, "data", "sessions")
+	require.NoError(t, os.MkdirAll(sessionsDir, 0o755))
+	dbPath := filepath.Join(sessionsDir, parser.GooseDBName)
+	gooseDB, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, gooseDB.Close()) })
+	_, err = gooseDB.ExecContext(ctx, `
+		CREATE TABLE sessions (
+			id TEXT PRIMARY KEY,
+			working_dir TEXT NOT NULL,
+			created_at TIMESTAMP,
+			updated_at TIMESTAMP
+		);
+		CREATE TABLE messages (
+			id INTEGER PRIMARY KEY,
+			message_id TEXT,
+			session_id TEXT NOT NULL,
+			role TEXT NOT NULL,
+			content_json TEXT NOT NULL,
+			created_timestamp INTEGER NOT NULL,
+			timestamp TIMESTAMP,
+			tokens INTEGER,
+			metadata_json TEXT
+		);
+		INSERT INTO sessions (id, working_dir, created_at, updated_at)
+		VALUES ('session-123', '/cwd/goose', '2026-08-03 10:00:00', '2026-08-03 10:01:00');
+	`)
+	require.NoError(t, err)
+
+	agentDirs := map[parser.AgentType][]string{
+		parser.AgentGoose: {root},
+	}
+	got, known := resolveRawSessionID(ctx, d, agentDirs, "session-123")
+	assert.Equal(t, "goose:session-123", got)
+	assert.True(t, known,
+		"provider-backed Goose raw IDs should resolve before archive sync")
+
+	got, known = resolveRawSessionID(ctx, d, agentDirs, "goose:session-123")
+	assert.Equal(t, "goose:session-123", got)
+	assert.True(t, known,
+		"provider-backed Goose canonical IDs should resolve before archive sync")
+}
+
 func TestResolveSessionID_RawOpenClawCollidesWithCodexPrefix(t *testing.T) {
 	d := newTestDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// OpenClaw permits arbitrary alphanumeric-dash-underscore
 	// agent IDs, so a user may have one literally named "codex".
@@ -301,7 +394,7 @@ func TestResolveSessionID_RawOpenClawCollidesWithCodexPrefix(t *testing.T) {
 
 func TestResolveSessionID_UnderscoreID_NoFalseMatch(t *testing.T) {
 	d := newTestDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Underscore is a LIKE wildcard in SQLite. If the query
 	// uses LIKE naively, a raw id "20260403_aaa" would match
@@ -311,12 +404,12 @@ func TestResolveSessionID_UnderscoreID_NoFalseMatch(t *testing.T) {
 	// wins.
 	raw := "20260403_aaa"
 	decoy := "codex:20260403Xaaa"
-	real := "codex:" + raw
+	actualID := "codex:" + raw
 	upsertSession(t, d, decoy, "codex", "2026-04-16T10:00:00Z")
-	upsertSession(t, d, real, "codex", "2026-04-17T10:00:00Z")
+	upsertSession(t, d, actualID, "codex", "2026-04-17T10:00:00Z")
 
 	got, known := resolveRawSessionID(ctx, d, nil, raw)
-	assert.Equal(t, real, got, "underscore is literal")
+	assert.Equal(t, actualID, got, "underscore is literal")
 	assert.True(t, known)
 }
 
@@ -331,6 +424,9 @@ func TestAgentHasDiskSourceLookupIncludesProviderAuthoritativeAgents(t *testing.
 		parser.AgentQwenPaw,
 		parser.AgentOpenHands,
 		parser.AgentCursor,
+		parser.AgentDevin,
+		parser.AgentGoose,
+		parser.AgentWarp,
 		parser.AgentVibe,
 		parser.AgentClaude,
 		parser.AgentCowork,
@@ -339,7 +435,7 @@ func TestAgentHasDiskSourceLookupIncludesProviderAuthoritativeAgents(t *testing.
 		def, ok := parser.AgentByType(agent)
 		require.True(t, ok, "agent %s", agent)
 		assert.True(t, agentHasDiskSourceLookup(def),
-			"token-use disk probe must include provider-authoritative %s", agent)
+			"token-use source probe must include %s", agent)
 	}
 }
 

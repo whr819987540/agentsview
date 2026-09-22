@@ -10,6 +10,7 @@
 node_modules/
 frontend/dist/
 frontend/src/lib/paraglide/
+frontend/.paraglide/
 frontend/test-results/
 test-results/
 frontend/playwright-report/
@@ -20,6 +21,7 @@ internal/web/dist/*
 
 # Test/build artifacts
 /dist/
+/.sqlite-include/
 *.out
 coverage.out
 *.test
@@ -43,6 +45,8 @@ __pycache__/
 
 # Build caches
 .gocache
+# Per-checkout golangci-lint cache isolates sibling worktrees.
+/.golangci-cache/
 .cache
 .gomodcache/
 .gopath/
@@ -64,9 +68,9 @@ docs/.env*.local
 testdata/ssh/test_key
 
 # Local data
-data/
-sessions/
-html/
+/data/
+/sessions/
+/html/
 .superset/
 .github/hooks/
 .superpowers/
@@ -86,3 +90,4 @@ graphify-out/
 
 # vscode local history
 .history/**
+.env*

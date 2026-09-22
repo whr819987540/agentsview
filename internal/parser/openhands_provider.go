@@ -2,7 +2,7 @@ package parser
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -29,11 +29,9 @@ func (f openHandsProviderFactory) Capabilities() Capabilities {
 func (f openHandsProviderFactory) NewProvider(cfg ProviderConfig) Provider {
 	cfg = cfg.Clone()
 	return &openHandsProvider{
-		ProviderBase: ProviderBase{
-			Def:    cloneAgentDef(f.def),
-			Caps:   openHandsProviderCapabilities(),
-			Config: cfg,
-		},
+		Def:     cloneAgentDef(f.def),
+		Caps:    openHandsProviderCapabilities(),
+		Config:  cfg,
 		sources: newOpenHandsSourceSet(cfg.Roots),
 	}
 }
@@ -45,6 +43,10 @@ type openHandsProvider struct {
 
 func (p *openHandsProvider) Discover(ctx context.Context) ([]SourceRef, error) {
 	return p.sources.Discover(ctx)
+}
+
+func (p *openHandsProvider) DiscoverEach(ctx context.Context, yield func(SourceRef) error) error {
+	return p.sources.DiscoverEach(ctx, yield)
 }
 
 func (p *openHandsProvider) WatchPlan(ctx context.Context) (WatchPlan, error) {
@@ -82,10 +84,10 @@ func (p *openHandsProvider) Parse(
 	}
 	path, ok := p.sources.pathFromSource(req.Source)
 	if !ok {
-		return ParseOutcome{}, fmt.Errorf("openhands source path unavailable")
+		return ParseOutcome{}, errors.New("openhands source path unavailable")
 	}
 	machine := firstNonEmptyJSONLString(req.Machine, p.Config.Machine)
-	sess, msgs, err := p.parseSession(path, machine)
+	sess, msgs, err := p.parseSession(ctx, path, machine)
 	if err != nil {
 		return ParseOutcome{}, err
 	}
@@ -148,6 +150,29 @@ func (s openHandsSourceSet) Discover(ctx context.Context) ([]SourceRef, error) {
 	}
 	sortJSONLSources(sources)
 	return sources, nil
+}
+
+func (s openHandsSourceSet) DiscoverEach(ctx context.Context, yield func(SourceRef) error) error {
+	for _, root := range s.roots {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		err := streamDirectoryEntries(ctx, root, func(entry os.DirEntry) error {
+			if !entry.IsDir() || !IsValidSessionID(entry.Name()) {
+				return nil
+			}
+			if source, ok := s.sourceRef(root, filepath.Join(root, entry.Name())); ok {
+				if err := yield(source); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s openHandsSourceSet) WatchPlan(context.Context) (WatchPlan, error) {
@@ -270,7 +295,7 @@ func (s openHandsSourceSet) Fingerprint(
 	}
 	path, ok := s.pathFromSource(source)
 	if !ok {
-		return SourceFingerprint{}, fmt.Errorf("openhands source path unavailable")
+		return SourceFingerprint{}, errors.New("openhands source path unavailable")
 	}
 	snapshot, err := OpenHandsSnapshot(path)
 	if err != nil {
@@ -393,6 +418,7 @@ func openHandsProviderCapabilities() Capabilities {
 	return Capabilities{
 		Source: SourceCapabilities{
 			DiscoverSources:      CapabilitySupported,
+			StreamingDiscovery:   CapabilitySupported,
 			WatchSources:         CapabilitySupported,
 			ClassifyChangedPath:  CapabilitySupported,
 			FindSource:           CapabilitySupported,

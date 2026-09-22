@@ -2,6 +2,7 @@ package sync
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"io"
 	"os"
@@ -27,16 +28,17 @@ func TestProcessFileS3UsesObjectMetadataToSkipBeforeFetch(t *testing.T) {
 	mtime := time.Date(2026, 6, 24, 12, 0, 0, 0, time.UTC).UnixNano()
 
 	sess := db.Session{
-		ID:        "laptop~codex:" + uuid,
-		Project:   "agentsview",
-		Machine:   "laptop",
-		Agent:     "codex",
-		FilePath:  strPtr(path),
-		FileSize:  int64Ptr(size),
-		FileMtime: int64Ptr(mtime),
+		ID:          "laptop~codex:" + uuid,
+		Project:     "agentsview",
+		Machine:     "laptop",
+		Agent:       "codex",
+		FilePath:    strPtr(path),
+		FileSize:    int64Ptr(size),
+		FileMtime:   int64Ptr(mtime),
+		SessionName: strPtr("Stored title"),
 	}
-	require.NoError(t, database.UpsertSession(sess))
-	require.NoError(t, database.SetSessionDataVersion(
+	require.NoError(t, database.UpsertSession(t.Context(), sess))
+	require.NoError(t, database.SetSessionDataVersion(t.Context(),
 		sess.ID, db.CurrentDataVersion(),
 	))
 
@@ -56,7 +58,7 @@ func TestProcessFileS3UsesObjectMetadataToSkipBeforeFetch(t *testing.T) {
 	}
 
 	e := &Engine{db: database}
-	res := e.processFile(context.Background(), parser.DiscoveredFile{
+	res := e.processFile(t.Context(), parser.DiscoveredFile{
 		Agent:       parser.AgentCodex,
 		Path:        path,
 		Machine:     "laptop",
@@ -66,6 +68,257 @@ func TestProcessFileS3UsesObjectMetadataToSkipBeforeFetch(t *testing.T) {
 	require.NoError(t, res.err)
 	assert.True(t, res.skip, "unchanged S3 object should skip")
 	assert.False(t, fetched, "unchanged S3 object should not be fetched")
+}
+
+func TestProcessS3IcodemateReconcilesRemovedForkThenSkipsUnchanged(
+	t *testing.T,
+) {
+	database := openTestDB(t)
+	const uri = "s3://bucket/laptop/raw/icodemate/project/fork-session.jsonl"
+	mainLines := []string{
+		`{"type":"user","timestamp":"2024-01-01T10:00:00Z","uuid":"root","message":{"content":"start"}}`,
+		`{"type":"assistant","timestamp":"2024-01-01T10:00:01Z","uuid":"a1","parentUuid":"root","message":{"content":[{"type":"text","text":"main reply 1"}]}}`,
+		`{"type":"user","timestamp":"2024-01-01T10:00:02Z","uuid":"u2","parentUuid":"a1","message":{"content":"main prompt 2"}}`,
+		`{"type":"user","timestamp":"2024-01-01T10:00:03Z","uuid":"u3","parentUuid":"u2","message":{"content":"main prompt 3"}}`,
+		`{"type":"user","timestamp":"2024-01-01T10:00:04Z","uuid":"u4","parentUuid":"u3","message":{"content":"main prompt 4"}}`,
+		`{"type":"user","timestamp":"2024-01-01T10:00:05Z","uuid":"u5","parentUuid":"u4","message":{"content":"main prompt 5"}}`,
+	}
+	// The "fork" record is written last, so it is the live branch
+	// the main session follows; the earlier a1 chain is the
+	// abandoned branch persisted as "<id>-a1".
+	forkLine := `{"type":"assistant","timestamp":"2024-01-01T10:00:06Z","uuid":"fork","parentUuid":"root","message":{"content":[{"type":"text","text":"fork reply"}]}}`
+	content := strings.Join(append(mainLines, forkLine), "\n") + "\n"
+	mtime := time.Date(2026, 8, 22, 12, 0, 0, 0, time.UTC).UnixNano()
+	fingerprint := "s3:fingerprint:icodemate-forked"
+
+	oldFetch := fetchS3Object
+	t.Cleanup(func() { fetchS3Object = oldFetch })
+	var fetches int
+	fetchS3Object = func(got string) (io.ReadCloser, error) {
+		require.Equal(t, uri, got)
+		fetches++
+		return io.NopCloser(strings.NewReader(content)), nil
+	}
+
+	engine := NewEngine(t.Context(), database, EngineConfig{Machine: "local"})
+	t.Cleanup(engine.Close)
+	file := parser.DiscoveredFile{
+		Agent:             parser.AgentIcodemate,
+		Path:              uri,
+		Project:           "project",
+		Machine:           "laptop",
+		SourceSize:        int64(len(content)),
+		SourceMtime:       mtime,
+		SourceFingerprint: fingerprint,
+	}
+	first := engine.processFile(t.Context(), file)
+	require.NoError(t, first.err)
+	require.Len(t, first.results, 2)
+	jobs := make(chan syncJob, 1)
+	jobs <- syncJob{
+		path: file.Path, agent: file.Agent, machine: file.Machine,
+		processResult: first,
+	}
+	close(jobs)
+	firstStats := engine.collectAndBatch(
+		t.Context(), jobs, 1, 1, nil, syncWriteDefault,
+	)
+	require.Zero(t, firstStats.Failed)
+	require.Equal(t, 2, firstStats.Synced)
+	require.Equal(t, 1, fetches)
+
+	content = mainLines[0] + "\n{"
+	mtime += int64(time.Second)
+	fingerprint = "s3:fingerprint:icodemate-truncated"
+	file.SourceSize = int64(len(content))
+	file.SourceMtime = mtime
+	file.SourceFingerprint = fingerprint
+	truncated := engine.processFile(t.Context(), file)
+	require.NoError(t, truncated.err)
+	jobs = make(chan syncJob, 1)
+	jobs <- syncJob{
+		path: file.Path, agent: file.Agent, machine: file.Machine,
+		processResult: truncated,
+	}
+	close(jobs)
+	truncatedStats := engine.collectAndBatch(
+		t.Context(), jobs, 1, 1, nil, syncWriteDefault,
+	)
+	require.Equal(t, 1, truncatedStats.Failed)
+	require.Zero(t, truncatedStats.Synced)
+	require.Zero(t, truncatedStats.Tombstoned)
+	require.Equal(t, 2, fetches)
+
+	const forkID = "laptop~icodemate:fork-session-a1"
+	fork, err := database.GetSession(t.Context(), forkID)
+	require.NoError(t, err)
+	require.NotNil(t, fork,
+		"an incomplete source must preserve its archived branches")
+
+	content = strings.Join(mainLines, "\n") + "\n"
+	mtime += int64(time.Second)
+	fingerprint = "s3:fingerprint:icodemate-main-only"
+	file.SourceSize = int64(len(content))
+	file.SourceMtime = mtime
+	file.SourceFingerprint = fingerprint
+	second := engine.processFile(t.Context(), file)
+	require.NoError(t, second.err)
+	require.Len(t, second.results, 1)
+	jobs = make(chan syncJob, 1)
+	jobs <- syncJob{
+		path: file.Path, agent: file.Agent, machine: file.Machine,
+		processResult: second,
+	}
+	close(jobs)
+	secondStats := engine.collectAndBatch(
+		t.Context(), jobs, 1, 1, nil, syncWriteDefault,
+	)
+	require.Zero(t, secondStats.Failed)
+	require.Equal(t, 1, secondStats.Synced)
+	require.Equal(t, 1, secondStats.Tombstoned)
+	require.Equal(t, 3, fetches)
+
+	fork, err = database.GetSession(t.Context(), forkID)
+	require.NoError(t, err)
+	assert.NotNil(t, fork)
+	archivedFork, err := database.GetSessionFull(t.Context(), forkID)
+	require.NoError(t, err)
+	assertSourceMissingState(t, archivedFork)
+
+	engine.Close()
+	freshEngine := NewEngine(t.Context(), database, EngineConfig{Machine: "local"})
+	t.Cleanup(freshEngine.Close)
+	third := freshEngine.processFile(t.Context(), file)
+	require.NoError(t, third.err)
+	assert.True(t, third.skip)
+	assert.Equal(t, 3, fetches,
+		"a fresh engine must not fetch an unchanged complete source")
+}
+
+func TestProcessS3ClaudeForceParseBypassesPrimarylessFreshness(t *testing.T) {
+	database := openTestDB(t)
+	const uri = "s3://bucket/root/claude/project/force-replay.jsonl"
+	content := strings.Join([]string{
+		`{"type":"user","uuid":"u1","parentUuid":null,"timestamp":"2026-01-01T10:00:00Z","sessionId":"force-replay","sessionKind":"bg","message":{"content":"first question"}}`,
+		`{"type":"assistant","uuid":"a1","parentUuid":"u1","timestamp":"2026-01-01T10:00:05Z","sessionId":"force-replay","sessionKind":"bg","message":{"id":"msg_01","content":[{"type":"text","text":"first answer"}]}}`,
+	}, "\n") + "\n"
+	mtime := time.Date(2026, 8, 14, 12, 0, 0, 0, time.UTC).UnixNano()
+	fingerprint := "s3:fingerprint:force-replay"
+	parentID := "remote-box~force-replay"
+	staleID := parentID + "-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+	require.NoError(t, database.UpsertSession(t.Context(), db.Session{
+		ID:               staleID,
+		Project:          "project",
+		Machine:          "remote-box",
+		Agent:            "claude",
+		Cwd:              "/workspace/personal/project",
+		ParentSessionID:  &parentID,
+		RelationshipType: "fork",
+		FilePath:         strPtr(uri),
+		FileSize:         int64Ptr(int64(len(content))),
+		FileMtime:        int64Ptr(mtime),
+		FileHash:         strPtr(fingerprint),
+	}))
+	require.NoError(t, database.SetSessionDataVersion(t.Context(), staleID, 0))
+
+	oldFetch := fetchS3Object
+	t.Cleanup(func() { fetchS3Object = oldFetch })
+	fetched := false
+	fetchS3Object = func(got string) (io.ReadCloser, error) {
+		require.Equal(t, uri, got)
+		fetched = true
+		return io.NopCloser(strings.NewReader(content)), nil
+	}
+
+	engine := NewDiffEngine(t.Context(), database, EngineConfig{
+		Machine:            "local",
+		IncludeCwdPrefixes: []string{"/workspace/work"},
+	})
+	t.Cleanup(engine.Close)
+	marker := engine.claudeRowlessFreshnessCacheKey(uri, fingerprint)
+	engine.cacheSkip(marker, mtime)
+	file := parser.DiscoveredFile{
+		Agent:             parser.AgentClaude,
+		Path:              uri,
+		Machine:           "remote-box",
+		SourceSize:        int64(len(content)),
+		SourceMtime:       mtime,
+		SourceFingerprint: fingerprint,
+	}
+	info, err := s3SourceFileInfo(file)
+	require.NoError(t, err)
+
+	provider, ok := parser.S3ProviderFor(file.Agent)
+	require.True(t, ok)
+	res := engine.processS3Session(t.Context(), file, info, provider)
+	require.NoError(t, res.err)
+	assert.True(t, fetched,
+		"parse-diff must fetch and parse a primary-less S3 Claude source")
+}
+
+func TestProcessS3ClaudeChangedPrimarylessSourceUsesCurrentRowlessMarker(
+	t *testing.T,
+) {
+	database := openTestDB(t)
+	const uri = "s3://bucket/root/claude/project/changed-replay.jsonl"
+	content := strings.Join([]string{
+		`{"type":"user","uuid":"u1","parentUuid":null,"timestamp":"2026-01-01T10:00:00Z","sessionId":"changed-replay","sessionKind":"bg","message":{"content":"current question"}}`,
+		`{"type":"assistant","uuid":"a1","parentUuid":"u1","timestamp":"2026-01-01T10:00:05Z","sessionId":"changed-replay","sessionKind":"bg","message":{"id":"msg_01","content":[{"type":"text","text":"current answer"}]}}`,
+	}, "\n") + "\n"
+	currentMtime := time.Date(2026, 8, 14, 14, 0, 0, 0, time.UTC).UnixNano()
+	const currentFingerprint = "s3:fingerprint:changed-replay"
+	parentID := "remote-box~changed-replay"
+	staleID := parentID + "-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+	oldSize := int64(17)
+	oldMtime := currentMtime - int64(time.Hour)
+	require.NoError(t, database.UpsertSession(t.Context(), db.Session{
+		ID: staleID, Project: "project", Machine: "remote-box", Agent: "claude",
+		Cwd: "/workspace/personal/project", ParentSessionID: &parentID,
+		RelationshipType: "fork", FilePath: strPtr(uri),
+		FileSize: &oldSize, FileMtime: &oldMtime, FileHash: strPtr("old-hash"),
+	}))
+	require.NoError(t, database.SetSessionDataVersion(t.Context(), staleID, 0))
+
+	oldFetch := fetchS3Object
+	t.Cleanup(func() { fetchS3Object = oldFetch })
+	var fetches int
+	fetchS3Object = func(got string) (io.ReadCloser, error) {
+		require.Equal(t, uri, got)
+		fetches++
+		return io.NopCloser(strings.NewReader(content)), nil
+	}
+
+	engine := NewEngine(t.Context(), database, EngineConfig{
+		Machine:            "local",
+		IncludeCwdPrefixes: []string{"/workspace/work"},
+	})
+	t.Cleanup(engine.Close)
+	file := parser.DiscoveredFile{
+		Agent: parser.AgentClaude, Path: uri, Project: "project",
+		Machine: "remote-box", SourceSize: int64(len(content)),
+		SourceMtime: currentMtime, SourceFingerprint: currentFingerprint,
+	}
+
+	first := engine.processFile(t.Context(), file)
+	require.NoError(t, first.err)
+	require.Equal(t, 1, fetches)
+	jobs := make(chan syncJob, 1)
+	jobs <- syncJob{
+		path: file.Path, agent: file.Agent, machine: file.Machine,
+		processResult: first,
+	}
+	close(jobs)
+	stats := engine.collectAndBatch(
+		t.Context(), jobs, 1, 1, nil, syncWriteDefault,
+	)
+	require.Zero(t, stats.Failed)
+
+	second := engine.processFile(t.Context(), file)
+	require.NoError(t, second.err)
+	assert.True(t, second.skip,
+		"the current rowless marker must skip an unchanged replay-only source")
+	assert.Equal(t, 1, fetches,
+		"rowless freshness must avoid downloading the unchanged S3 object again")
 }
 
 func TestProcessFileS3SameMetadataDifferentFingerprintFetches(t *testing.T) {
@@ -87,8 +340,8 @@ func TestProcessFileS3SameMetadataDifferentFingerprintFetches(t *testing.T) {
 		FileMtime: int64Ptr(mtime),
 		FileHash:  strPtr("s3:fingerprint:old"),
 	}
-	require.NoError(t, database.UpsertSession(sess))
-	require.NoError(t, database.SetSessionDataVersion(
+	require.NoError(t, database.UpsertSession(t.Context(), sess))
+	require.NoError(t, database.SetSessionDataVersion(t.Context(),
 		sess.ID, db.CurrentDataVersion(),
 	))
 
@@ -102,7 +355,7 @@ func TestProcessFileS3SameMetadataDifferentFingerprintFetches(t *testing.T) {
 	}
 
 	e := &Engine{db: database}
-	res := e.processFile(context.Background(), parser.DiscoveredFile{
+	res := e.processFile(t.Context(), parser.DiscoveredFile{
 		Agent:             parser.AgentClaude,
 		Path:              path,
 		Project:           "test-proj",
@@ -143,7 +396,7 @@ func TestProcessFileS3ChangedFingerprintReplacesStoredMessages(t *testing.T) {
 	}
 
 	e := &Engine{db: database}
-	res := e.processFile(context.Background(), parser.DiscoveredFile{
+	res := e.processFile(t.Context(), parser.DiscoveredFile{
 		Agent:             parser.AgentClaude,
 		Path:              path,
 		Project:           "test-proj",
@@ -154,7 +407,7 @@ func TestProcessFileS3ChangedFingerprintReplacesStoredMessages(t *testing.T) {
 	})
 	require.NoError(t, res.err)
 	require.Len(t, res.results, 1)
-	written, _, failed := e.writeBatch([]pendingWrite{{
+	written, _, failed, _ := e.writeBatch([]pendingWrite{{
 		sess:         res.results[0].Session,
 		msgs:         res.results[0].Messages,
 		forceReplace: res.forceReplace,
@@ -163,7 +416,7 @@ func TestProcessFileS3ChangedFingerprintReplacesStoredMessages(t *testing.T) {
 	require.Equal(t, 0, failed)
 
 	content.Store(second)
-	res = e.processFile(context.Background(), parser.DiscoveredFile{
+	res = e.processFile(t.Context(), parser.DiscoveredFile{
 		Agent:             parser.AgentClaude,
 		Path:              path,
 		Project:           "test-proj",
@@ -175,7 +428,7 @@ func TestProcessFileS3ChangedFingerprintReplacesStoredMessages(t *testing.T) {
 	require.NoError(t, res.err)
 	require.False(t, res.skip)
 	require.Len(t, res.results, 1)
-	written, _, failed = e.writeBatch([]pendingWrite{{
+	written, _, failed, _ = e.writeBatch([]pendingWrite{{
 		sess:         res.results[0].Session,
 		msgs:         res.results[0].Messages,
 		forceReplace: res.forceReplace,
@@ -184,7 +437,7 @@ func TestProcessFileS3ChangedFingerprintReplacesStoredMessages(t *testing.T) {
 	require.Equal(t, 0, failed)
 
 	msgs, err := database.GetAllMessages(
-		context.Background(), "laptop~fingerprint-rewrite",
+		t.Context(), "laptop~fingerprint-rewrite",
 	)
 	require.NoError(t, err)
 	require.Len(t, msgs, 2)
@@ -214,7 +467,7 @@ func TestProcessFileS3ChangedFingerprintBypassesMtimeSkipCache(t *testing.T) {
 		db:        database,
 		skipCache: map[string]int64{path: mtime},
 	}
-	res := e.processFile(context.Background(), parser.DiscoveredFile{
+	res := e.processFile(t.Context(), parser.DiscoveredFile{
 		Agent:             parser.AgentClaude,
 		Path:              path,
 		Project:           "test-proj",
@@ -230,11 +483,173 @@ func TestProcessFileS3ChangedFingerprintBypassesMtimeSkipCache(t *testing.T) {
 	require.Len(t, res.results, 1)
 }
 
+func TestProcessFileS3RestoredSessionBypassesSkipCache(t *testing.T) {
+	database := openTestDB(t)
+	path := "s3://bucket/laptop/raw/claude/test-proj/restored.jsonl"
+	first := testjsonl.NewSessionBuilder().
+		AddClaudeUser("2024-01-01T00:00:00Z", "Before").
+		AddClaudeAssistant("2024-01-01T00:00:05Z", "old reply").
+		String()
+	second := testjsonl.NewSessionBuilder().
+		AddClaudeUser("2024-01-01T00:00:00Z", "After!").
+		AddClaudeAssistant("2024-01-01T00:00:05Z", "new reply").
+		String()
+	require.Len(t, second, len(first), "test fixture must keep size stable")
+	mtime := time.Date(2026, 6, 24, 12, 0, 0, 0, time.UTC).UnixNano()
+	const fingerprint = "s3:fingerprint:stable"
+
+	var content atomic.Value
+	content.Store(first)
+	oldFetch := fetchS3Object
+	t.Cleanup(func() { fetchS3Object = oldFetch })
+	var fetchCalls atomic.Int64
+	fetchS3Object = func(got string) (io.ReadCloser, error) {
+		require.Equal(t, path, got)
+		fetchCalls.Add(1)
+		return io.NopCloser(strings.NewReader(content.Load().(string))), nil
+	}
+
+	e := &Engine{
+		db:               database,
+		ephemeral:        true,
+		skipCache:        make(map[string]int64),
+		skipFingerprints: make(map[string]string),
+		skipHashKeys:     make(map[string]string),
+	}
+	file := parser.DiscoveredFile{
+		Agent:             parser.AgentClaude,
+		Path:              path,
+		Project:           "test-proj",
+		Machine:           "laptop",
+		SourceSize:        int64(len(first)),
+		SourceMtime:       mtime,
+		SourceFingerprint: fingerprint,
+	}
+	initial := e.processFile(t.Context(), file)
+	require.NoError(t, initial.err)
+	require.Len(t, initial.results, 1)
+	written, _, failed, _ := e.writeBatch([]pendingWrite{{
+		sess:         initial.results[0].Session,
+		msgs:         initial.results[0].Messages,
+		forceReplace: initial.forceReplace,
+	}}, syncWriteDefault, false)
+	require.Equal(t, 1, written)
+	require.Zero(t, failed)
+	e.cacheSkip(path, mtime, fingerprint)
+
+	require.NoError(t, database.SoftDeleteSession(t.Context(), "laptop~restored"))
+	content.Store(second)
+	restored, err := database.RestoreSession(t.Context(), "laptop~restored")
+	require.NoError(t, err)
+	require.EqualValues(t, 1, restored)
+	require.Less(t, database.GetSessionDataVersion(t.Context(), "laptop~restored"),
+		db.CurrentDataVersion())
+	fetchCalls.Store(0)
+
+	result := e.processFile(t.Context(), file)
+
+	require.NoError(t, result.err)
+	assert.False(t, result.skip,
+		"restore-invalidated data must bypass an unchanged S3 cache entry")
+	assert.EqualValues(t, 1, fetchCalls.Load())
+	require.Len(t, result.results, 1)
+	require.Len(t, result.results[0].Messages, 2)
+	assert.Equal(t, "After!", result.results[0].Messages[0].Content)
+	written, _, failed, _ = e.writeBatch([]pendingWrite{{
+		sess:         result.results[0].Session,
+		msgs:         result.results[0].Messages,
+		forceReplace: result.forceReplace,
+	}}, syncWriteDefault, false)
+	require.Equal(t, 1, written)
+	require.Zero(t, failed)
+	stored, err := database.GetAllMessages(t.Context(), "laptop~restored")
+	require.NoError(t, err)
+	require.Len(t, stored, 2)
+	assert.Equal(t, "After!", stored[0].Content)
+	assert.Equal(t, db.CurrentDataVersion(),
+		database.GetSessionDataVersion(t.Context(), "laptop~restored"))
+}
+
+func TestSyncAllSinceReparsesCursorS3ToolResultsFromVersion101(t *testing.T) {
+	database := openTestDB(t)
+	const root = "s3://bucket/laptop/raw/cursor"
+	const uri = root + "/demo-proj/11111111-2222-4333-8444-555555555555.txt"
+	const sessionID = "laptop~cursor:11111111-2222-4333-8444-555555555555"
+	const content = "assistant:\n[Tool call] Shell\n  command=ls\n[Tool result]\n  file1.go\n"
+	mtime := time.Date(2026, 6, 24, 12, 0, 0, 0, time.UTC)
+	oldFetch, oldStat := fetchS3Object, statS3Object
+	t.Cleanup(func() { fetchS3Object, statS3Object = oldFetch, oldStat })
+	var fetches atomic.Int32
+	fetchS3Object = func(got string) (io.ReadCloser, error) {
+		if got != uri {
+			return nil, missingS3ObjectError()
+		}
+		fetches.Add(1)
+		return io.NopCloser(strings.NewReader(content)), nil
+	}
+	statS3Object = func(string) (parser.S3Object, error) {
+		return parser.S3Object{}, missingS3ObjectError()
+	}
+	def, ok := parser.AgentByType(parser.AgentCursor)
+	require.True(t, ok)
+	// Stub remote discovery and transport; parsing and archive writes are real.
+	factory := processFixtureFactory{provider: &processFixtureProvider{
+		Def: def, Caps: parser.Capabilities{
+			Source: parser.SourceCapabilities{DiscoverSources: parser.CapabilitySupported},
+		},
+		discovered: []parser.SourceRef{{
+			Provider: parser.AgentCursor, Key: uri, DisplayPath: uri,
+			FingerprintKey: uri, ProjectHint: "demo-proj",
+			Opaque: parser.S3DiscoveredSource{
+				URI: uri, Project: "demo-proj",
+				Machine: "laptop", Size: int64(len(content)), MtimeNS: mtime.UnixNano(),
+			},
+		}},
+	}}
+	engine := NewEngine(t.Context(), database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{parser.AgentCursor: {root}},
+		Machine:   "local", DisableFilesystemProjectDiscovery: true,
+		ProviderFactories: []parser.ProviderFactory{factory},
+	})
+	t.Cleanup(engine.Close)
+	stats := engine.SyncAll(t.Context(), nil)
+	require.Zero(t, stats.Failed)
+	require.Equal(t, 1, stats.Synced)
+	// Recreate the old parser's missing output, keeping the S3 fingerprint intact.
+	require.NoError(t, database.Update(t.Context(), func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(t.Context(), "DELETE FROM tool_result_events WHERE session_id = ?", sessionID); err != nil {
+			return err
+		}
+		_, err := tx.ExecContext(t.Context(), "UPDATE tool_calls SET result_content = '', result_content_length = 0 WHERE session_id = ?", sessionID)
+		return err
+	}))
+	require.NoError(t, database.SetSessionDataVersion(t.Context(), sessionID, 101))
+	fetches.Store(0)
+	cutoff := mtime.Add(time.Hour)
+	stats = engine.SyncAllSince(t.Context(), cutoff, nil)
+	require.Zero(t, stats.Failed)
+	require.Equal(t, 1, stats.Synced, "old parser output must refresh despite the object cutoff")
+	messages, err := database.GetAllMessages(t.Context(), sessionID)
+	require.NoError(t, err)
+	require.Len(t, messages, 1)
+	require.Len(t, messages[0].ToolCalls, 1)
+	call := messages[0].ToolCalls[0]
+	require.Len(t, call.ResultEvents, 1)
+	assert.Equal(t, "file1.go", call.ResultEvents[0].Content)
+	assert.Equal(t, "file1.go", call.ResultContent)
+	assert.Equal(t, db.CurrentDataVersion(), database.GetSessionDataVersion(t.Context(), sessionID))
+	require.EqualValues(t, 1, fetches.Load())
+	stats = engine.SyncAllSince(t.Context(), cutoff, nil)
+	assert.Zero(t, stats.Failed)
+	assert.Zero(t, stats.Synced)
+	assert.EqualValues(t, 1, fetches.Load(), "current unchanged sources must not be fetched again")
+}
+
 func TestFilterFilesByMtimeKeepsS3ChangedFingerprint(t *testing.T) {
 	database := openTestDB(t)
 	path := "s3://bucket/laptop/raw/claude/test-proj/fingerprint.jsonl"
 	mtime := time.Date(2026, 6, 24, 12, 0, 0, 0, time.UTC).UnixNano()
-	require.NoError(t, database.UpsertSession(db.Session{
+	require.NoError(t, database.UpsertSession(t.Context(), db.Session{
 		ID:        "laptop~fingerprint",
 		Project:   "test-proj",
 		Machine:   "laptop",
@@ -244,9 +659,12 @@ func TestFilterFilesByMtimeKeepsS3ChangedFingerprint(t *testing.T) {
 		FileMtime: int64Ptr(mtime),
 		FileHash:  strPtr("s3:fingerprint:old"),
 	}))
+	require.NoError(t, database.SetSessionDataVersion(t.Context(),
+		"laptop~fingerprint", db.CurrentDataVersion(),
+	))
 
 	e := &Engine{db: database}
-	got := e.filterFilesByMtime(context.Background(), []parser.DiscoveredFile{{
+	got := e.filterFilesByMtime(t.Context(), []parser.DiscoveredFile{{
 		Agent:             parser.AgentClaude,
 		Path:              path,
 		Project:           "test-proj",
@@ -264,7 +682,7 @@ func TestFilterFilesByMtimeKeepsS3ChangedSize(t *testing.T) {
 	database := openTestDB(t)
 	path := "s3://bucket/laptop/raw/claude/test-proj/size.jsonl"
 	mtime := time.Date(2026, 6, 24, 12, 0, 0, 0, time.UTC).UnixNano()
-	require.NoError(t, database.UpsertSession(db.Session{
+	require.NoError(t, database.UpsertSession(t.Context(), db.Session{
 		ID:        "laptop~size",
 		Project:   "test-proj",
 		Machine:   "laptop",
@@ -273,9 +691,12 @@ func TestFilterFilesByMtimeKeepsS3ChangedSize(t *testing.T) {
 		FileSize:  int64Ptr(512),
 		FileMtime: int64Ptr(mtime),
 	}))
+	require.NoError(t, database.SetSessionDataVersion(t.Context(),
+		"laptop~size", db.CurrentDataVersion(),
+	))
 
 	e := &Engine{db: database}
-	got := e.filterFilesByMtime(context.Background(), []parser.DiscoveredFile{{
+	got := e.filterFilesByMtime(t.Context(), []parser.DiscoveredFile{{
 		Agent:       parser.AgentClaude,
 		Path:        path,
 		Project:     "test-proj",
@@ -322,7 +743,7 @@ func TestFilterFilesByMtimeKeepsOnlyS3CodexChangedIndexTitle(t *testing.T) {
 			size:  202,
 		},
 	} {
-		require.NoError(t, database.UpsertSession(db.Session{
+		require.NoError(t, database.UpsertSession(t.Context(), db.Session{
 			ID:          seed.id,
 			Project:     "repo",
 			Machine:     "laptop",
@@ -333,7 +754,7 @@ func TestFilterFilesByMtimeKeepsOnlyS3CodexChangedIndexTitle(t *testing.T) {
 			FileHash:    strPtr(seed.hash),
 			SessionName: strPtr(seed.title),
 		}))
-		require.NoError(t, database.SetSessionDataVersion(
+		require.NoError(t, database.SetSessionDataVersion(t.Context(),
 			seed.id, db.CurrentDataVersion(),
 		))
 	}
@@ -362,7 +783,7 @@ func TestFilterFilesByMtimeKeepsOnlyS3CodexChangedIndexTitle(t *testing.T) {
 	}
 
 	e := &Engine{db: database}
-	got := e.filterFilesByMtime(context.Background(), []parser.DiscoveredFile{
+	got := e.filterFilesByMtime(t.Context(), []parser.DiscoveredFile{
 		{
 			Agent:             parser.AgentCodex,
 			Path:              renamedPath,
@@ -398,7 +819,7 @@ func TestFilterFilesByMtimeDoesNotFetchOldS3CodexIndex(t *testing.T) {
 	indexMtime := time.Date(2026, 6, 24, 12, 30, 0, 0, time.UTC)
 	index := `{"id":"` + uuid + `","thread_name":"Renamed title","updated_at":"2026-06-24T12:30:00Z"}` + "\n"
 
-	require.NoError(t, database.UpsertSession(db.Session{
+	require.NoError(t, database.UpsertSession(t.Context(), db.Session{
 		ID:          "laptop~codex:" + uuid,
 		Project:     "repo",
 		Machine:     "laptop",
@@ -409,7 +830,7 @@ func TestFilterFilesByMtimeDoesNotFetchOldS3CodexIndex(t *testing.T) {
 		FileHash:    strPtr("s3:fingerprint:rollout"),
 		SessionName: strPtr("Old title"),
 	}))
-	require.NoError(t, database.SetSessionDataVersion(
+	require.NoError(t, database.SetSessionDataVersion(t.Context(),
 		"laptop~codex:"+uuid, db.CurrentDataVersion(),
 	))
 
@@ -437,7 +858,7 @@ func TestFilterFilesByMtimeDoesNotFetchOldS3CodexIndex(t *testing.T) {
 	}
 
 	e := &Engine{db: database}
-	got := e.filterFilesByMtime(context.Background(), []parser.DiscoveredFile{{
+	got := e.filterFilesByMtime(t.Context(), []parser.DiscoveredFile{{
 		Agent:             parser.AgentCodex,
 		Path:              path,
 		Machine:           "laptop",
@@ -461,7 +882,7 @@ func TestFilterFilesByMtimeKeepsS3CodexIndexFetchError(t *testing.T) {
 	mtime := time.Date(2026, 6, 24, 12, 0, 0, 0, time.UTC).UnixNano()
 	indexMtime := time.Date(2026, 6, 24, 12, 30, 0, 0, time.UTC)
 
-	require.NoError(t, database.UpsertSession(db.Session{
+	require.NoError(t, database.UpsertSession(t.Context(), db.Session{
 		ID:          "laptop~codex:" + uuid,
 		Project:     "repo",
 		Machine:     "laptop",
@@ -472,7 +893,7 @@ func TestFilterFilesByMtimeKeepsS3CodexIndexFetchError(t *testing.T) {
 		FileHash:    strPtr("s3:fingerprint:rollout"),
 		SessionName: strPtr("Old title"),
 	}))
-	require.NoError(t, database.SetSessionDataVersion(
+	require.NoError(t, database.SetSessionDataVersion(t.Context(),
 		"laptop~codex:"+uuid, db.CurrentDataVersion(),
 	))
 
@@ -499,7 +920,7 @@ func TestFilterFilesByMtimeKeepsS3CodexIndexFetchError(t *testing.T) {
 	}
 
 	e := &Engine{db: database}
-	got := e.filterFilesByMtime(context.Background(), []parser.DiscoveredFile{{
+	got := e.filterFilesByMtime(t.Context(), []parser.DiscoveredFile{{
 		Agent:             parser.AgentCodex,
 		Path:              path,
 		Machine:           "laptop",
@@ -513,7 +934,7 @@ func TestFilterFilesByMtimeKeepsS3CodexIndexFetchError(t *testing.T) {
 	assert.Equal(t, 1, fetchCalls)
 }
 
-func TestFilterFilesByMtimeKeepsS3CodexClearedIndexTitle(t *testing.T) {
+func TestFilterFilesByMtimeKeepsS3CodexExplicitBlankIndexTitle(t *testing.T) {
 	database := openTestDB(t)
 	const uuid = "11111111-1111-4111-8111-111111111111"
 	root := "s3://bucket/laptop/raw/codex"
@@ -523,7 +944,7 @@ func TestFilterFilesByMtimeKeepsS3CodexClearedIndexTitle(t *testing.T) {
 	mtime := time.Date(2026, 6, 24, 12, 0, 0, 0, time.UTC).UnixNano()
 	indexMtime := time.Date(2026, 6, 24, 12, 30, 0, 0, time.UTC)
 
-	require.NoError(t, database.UpsertSession(db.Session{
+	require.NoError(t, database.UpsertSession(t.Context(), db.Session{
 		ID:          "laptop~codex:" + uuid,
 		Project:     "repo",
 		Machine:     "laptop",
@@ -534,20 +955,77 @@ func TestFilterFilesByMtimeKeepsS3CodexClearedIndexTitle(t *testing.T) {
 		FileHash:    strPtr("s3:fingerprint:rollout"),
 		SessionName: strPtr("Old title"),
 	}))
-	require.NoError(t, database.SetSessionDataVersion(
+	require.NoError(t, database.SetSessionDataVersion(t.Context(),
+		"laptop~codex:"+uuid, db.CurrentDataVersion(),
+	))
+
+	index := `{"id":"` + uuid + `","thread_name":"","updated_at":"2026-06-24T12:30:00Z"}` + "\n"
+	oldStat := statS3Object
+	oldFetch := fetchS3Object
+	t.Cleanup(func() {
+		statS3Object = oldStat
+		fetchS3Object = oldFetch
+	})
+	statS3Object = func(got string) (parser.S3Object, error) {
+		require.Equal(t, indexPath, got)
+		return parser.S3Object{
+			URI:          indexPath,
+			Size:         int64(len(index)),
+			LastModified: indexMtime,
+			Fingerprint:  "s3:fingerprint:index",
+		}, nil
+	}
+	fetchS3Object = func(got string) (io.ReadCloser, error) {
+		require.Equal(t, indexPath, got)
+		return io.NopCloser(strings.NewReader(index)), nil
+	}
+
+	e := &Engine{db: database}
+	got := e.filterFilesByMtime(t.Context(), []parser.DiscoveredFile{{
+		Agent:             parser.AgentCodex,
+		Path:              path,
+		Machine:           "laptop",
+		SourceSize:        101,
+		SourceMtime:       mtime,
+		SourceFingerprint: "s3:fingerprint:rollout",
+	}}, indexMtime.Add(-time.Minute))
+
+	require.Len(t, got, 1)
+	assert.Equal(t, path, got[0].Path)
+}
+
+func TestFilterFilesByMtimeSkipsS3CodexAbsentIndexSignals(t *testing.T) {
+	database := openTestDB(t)
+	const uuid = "11111111-1111-4111-8111-111111111111"
+	root := "s3://bucket/laptop/raw/codex"
+	path := root + "/2026/06/24/rollout-2026-06-24T00-00-00-" +
+		uuid + ".jsonl"
+	indexPath := "s3://bucket/laptop/raw/session_index.jsonl"
+	mtime := time.Date(2026, 6, 24, 12, 0, 0, 0, time.UTC).UnixNano()
+
+	require.NoError(t, database.UpsertSession(t.Context(), db.Session{
+		ID:          "laptop~codex:" + uuid,
+		Project:     "repo",
+		Machine:     "laptop",
+		Agent:       "codex",
+		FilePath:    strPtr(path),
+		FileSize:    int64Ptr(101),
+		FileMtime:   int64Ptr(mtime),
+		FileHash:    strPtr("s3:fingerprint:rollout"),
+		SessionName: strPtr("Old title"),
+	}))
+	require.NoError(t, database.SetSessionDataVersion(t.Context(),
 		"laptop~codex:"+uuid, db.CurrentDataVersion(),
 	))
 
 	for _, tc := range []struct {
-		name, index string
+		name  string
+		index string
 	}{
+		{name: "index missing"},
 		{
-			name:  "blank title",
-			index: `{"id":"` + uuid + `","thread_name":"","updated_at":"2026-06-24T12:30:00Z"}` + "\n",
-		},
-		{
-			name:  "missing title row",
-			index: `{"id":"22222222-2222-4222-8222-222222222222","thread_name":"Other","updated_at":"2026-06-24T12:30:00Z"}` + "\n",
+			name:  "session entry missing",
+			index: `{"id":"22222222-2222-4222-8222-222222222222","thread_name":"Other"}` + "\n",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -557,89 +1035,43 @@ func TestFilterFilesByMtimeKeepsS3CodexClearedIndexTitle(t *testing.T) {
 				statS3Object = oldStat
 				fetchS3Object = oldFetch
 			})
+			var fetchCalls int
 			statS3Object = func(got string) (parser.S3Object, error) {
 				require.Equal(t, indexPath, got)
+				if tc.index == "" {
+					return parser.S3Object{}, missingS3ObjectError()
+				}
 				return parser.S3Object{
 					URI:          indexPath,
 					Size:         int64(len(tc.index)),
-					LastModified: indexMtime,
-					Fingerprint:  "s3:fingerprint:index",
+					LastModified: time.Unix(0, mtime).Add(time.Minute),
 				}, nil
 			}
 			fetchS3Object = func(got string) (io.ReadCloser, error) {
 				require.Equal(t, indexPath, got)
+				fetchCalls++
 				return io.NopCloser(strings.NewReader(tc.index)), nil
 			}
 
 			e := &Engine{db: database}
-			got := e.filterFilesByMtime(context.Background(), []parser.DiscoveredFile{{
+			got := e.filterFilesByMtime(t.Context(), []parser.DiscoveredFile{{
 				Agent:             parser.AgentCodex,
 				Path:              path,
 				Machine:           "laptop",
 				SourceSize:        101,
 				SourceMtime:       mtime,
 				SourceFingerprint: "s3:fingerprint:rollout",
-			}}, indexMtime.Add(-time.Minute))
+			}}, time.Unix(0, mtime).Add(time.Nanosecond))
 
-			require.Len(t, got, 1)
-			assert.Equal(t, path, got[0].Path)
+			assert.Empty(t, got,
+				"an absent index signal must not reparse an unchanged session")
+			if tc.index == "" {
+				assert.Equal(t, 0, fetchCalls)
+			} else {
+				assert.Equal(t, 1, fetchCalls)
+			}
 		})
 	}
-}
-
-func TestFilterFilesByMtimeKeepsS3CodexMissingIndexWhenTitleStored(t *testing.T) {
-	database := openTestDB(t)
-	const uuid = "11111111-1111-4111-8111-111111111111"
-	root := "s3://bucket/laptop/raw/codex"
-	path := root + "/2026/06/24/rollout-2026-06-24T00-00-00-" +
-		uuid + ".jsonl"
-	indexPath := "s3://bucket/laptop/raw/session_index.jsonl"
-	mtime := time.Date(2026, 6, 24, 12, 0, 0, 0, time.UTC).UnixNano()
-
-	require.NoError(t, database.UpsertSession(db.Session{
-		ID:          "laptop~codex:" + uuid,
-		Project:     "repo",
-		Machine:     "laptop",
-		Agent:       "codex",
-		FilePath:    strPtr(path),
-		FileSize:    int64Ptr(101),
-		FileMtime:   int64Ptr(mtime),
-		FileHash:    strPtr("s3:fingerprint:rollout"),
-		SessionName: strPtr("Old title"),
-	}))
-	require.NoError(t, database.SetSessionDataVersion(
-		"laptop~codex:"+uuid, db.CurrentDataVersion(),
-	))
-
-	oldStat := statS3Object
-	oldFetch := fetchS3Object
-	t.Cleanup(func() {
-		statS3Object = oldStat
-		fetchS3Object = oldFetch
-	})
-	var fetchCalls int
-	statS3Object = func(got string) (parser.S3Object, error) {
-		require.Equal(t, indexPath, got)
-		return parser.S3Object{}, missingS3ObjectError()
-	}
-	fetchS3Object = func(got string) (io.ReadCloser, error) {
-		fetchCalls++
-		return nil, missingS3ObjectError()
-	}
-
-	e := &Engine{db: database}
-	got := e.filterFilesByMtime(context.Background(), []parser.DiscoveredFile{{
-		Agent:             parser.AgentCodex,
-		Path:              path,
-		Machine:           "laptop",
-		SourceSize:        101,
-		SourceMtime:       mtime,
-		SourceFingerprint: "s3:fingerprint:rollout",
-	}}, time.Unix(0, mtime).Add(time.Nanosecond))
-
-	require.Len(t, got, 1)
-	assert.Equal(t, path, got[0].Path)
-	assert.Equal(t, 0, fetchCalls)
 }
 
 func TestPickPreferredCodexDiscoveredFileUsesS3MachinePrefix(t *testing.T) {
@@ -651,7 +1083,7 @@ func TestPickPreferredCodexDiscoveredFileUsesS3MachinePrefix(t *testing.T) {
 	archivedPath := root + "/archived_sessions/rollout-2026-06-24T00-00-00-" +
 		uuid + ".jsonl"
 
-	require.NoError(t, database.UpsertSession(db.Session{
+	require.NoError(t, database.UpsertSession(t.Context(), db.Session{
 		ID:       "laptop~codex:" + uuid,
 		Project:  "repo",
 		Machine:  "laptop",
@@ -659,7 +1091,7 @@ func TestPickPreferredCodexDiscoveredFileUsesS3MachinePrefix(t *testing.T) {
 		FilePath: strPtr(archivedPath),
 	}))
 
-	chosen := pickPreferredCodexDiscoveredFile(database, []parser.DiscoveredFile{
+	chosen := pickPreferredCodexDiscoveredFile(t.Context(), database, []parser.DiscoveredFile{
 		{
 			Agent:   parser.AgentCodex,
 			Path:    datedPath,
@@ -700,8 +1132,8 @@ func TestProcessFileS3CodexReparsesStaleProjectBeforeSkip(t *testing.T) {
 		FileSize:  int64Ptr(int64(len(content))),
 		FileMtime: int64Ptr(mtime),
 	}
-	require.NoError(t, database.UpsertSession(sess))
-	require.NoError(t, database.SetSessionDataVersion(
+	require.NoError(t, database.UpsertSession(t.Context(), sess))
+	require.NoError(t, database.SetSessionDataVersion(t.Context(),
 		sess.ID, db.CurrentDataVersion(),
 	))
 
@@ -717,7 +1149,7 @@ func TestProcessFileS3CodexReparsesStaleProjectBeforeSkip(t *testing.T) {
 	}
 
 	e := &Engine{db: database}
-	res := e.processFile(context.Background(), parser.DiscoveredFile{
+	res := e.processFile(t.Context(), parser.DiscoveredFile{
 		Agent:       parser.AgentCodex,
 		Path:        path,
 		Machine:     "laptop",
@@ -744,7 +1176,7 @@ func TestProcessFileS3CodexIndexFetchErrorDoesNotSkip(t *testing.T) {
 		String()
 	mtime := time.Date(2026, 6, 24, 12, 0, 0, 0, time.UTC).UnixNano()
 
-	require.NoError(t, database.UpsertSession(db.Session{
+	require.NoError(t, database.UpsertSession(t.Context(), db.Session{
 		ID:          "laptop~codex:" + uuid,
 		Project:     "repo",
 		Machine:     "laptop",
@@ -755,7 +1187,7 @@ func TestProcessFileS3CodexIndexFetchErrorDoesNotSkip(t *testing.T) {
 		FileHash:    strPtr("s3:fingerprint:rollout"),
 		SessionName: strPtr("Old title"),
 	}))
-	require.NoError(t, database.SetSessionDataVersion(
+	require.NoError(t, database.SetSessionDataVersion(t.Context(),
 		"laptop~codex:"+uuid, db.CurrentDataVersion(),
 	))
 
@@ -785,7 +1217,7 @@ func TestProcessFileS3CodexIndexFetchErrorDoesNotSkip(t *testing.T) {
 	}
 
 	e := &Engine{db: database}
-	res := e.processFile(context.Background(), parser.DiscoveredFile{
+	res := e.processFile(t.Context(), parser.DiscoveredFile{
 		Agent:             parser.AgentCodex,
 		Path:              path,
 		Machine:           "laptop",
@@ -819,8 +1251,8 @@ func TestProcessFileS3SameMetadataDifferentURIRewritesSourcePath(t *testing.T) {
 		FileSize:  int64Ptr(int64(len(content))),
 		FileMtime: int64Ptr(mtime),
 	}
-	require.NoError(t, database.UpsertSession(sess))
-	require.NoError(t, database.SetSessionDataVersion(
+	require.NoError(t, database.UpsertSession(t.Context(), sess))
+	require.NoError(t, database.SetSessionDataVersion(t.Context(),
 		sess.ID, db.CurrentDataVersion(),
 	))
 
@@ -834,7 +1266,7 @@ func TestProcessFileS3SameMetadataDifferentURIRewritesSourcePath(t *testing.T) {
 	}
 
 	e := &Engine{db: database}
-	res := e.processFile(context.Background(), parser.DiscoveredFile{
+	res := e.processFile(t.Context(), parser.DiscoveredFile{
 		Agent:       parser.AgentClaude,
 		Path:        newPath,
 		Project:     "test-proj",
@@ -847,7 +1279,7 @@ func TestProcessFileS3SameMetadataDifferentURIRewritesSourcePath(t *testing.T) {
 	require.True(t, fetched)
 	require.Len(t, res.results, 1)
 
-	written, _, failed := e.writeBatch([]pendingWrite{{
+	written, _, failed, _ := e.writeBatch([]pendingWrite{{
 		sess: res.results[0].Session,
 		msgs: res.results[0].Messages,
 	}}, syncWriteDefault, false)
@@ -855,7 +1287,7 @@ func TestProcessFileS3SameMetadataDifferentURIRewritesSourcePath(t *testing.T) {
 	require.Equal(t, 0, failed)
 
 	updated, err := database.GetSessionFull(
-		context.Background(), "laptop~path-change",
+		t.Context(), "laptop~path-change",
 	)
 	require.NoError(t, err)
 	require.NotNil(t, updated)
@@ -875,7 +1307,7 @@ func TestProcessFileS3FetchErrorDoesNotCacheSkip(t *testing.T) {
 	}
 
 	e := &Engine{db: database}
-	res := e.processFile(context.Background(), parser.DiscoveredFile{
+	res := e.processFile(t.Context(), parser.DiscoveredFile{
 		Agent:       parser.AgentClaude,
 		Path:        path,
 		Project:     "test-proj",
@@ -905,7 +1337,7 @@ func TestDedupeClaudeS3IncludesSourceMachine(t *testing.T) {
 		},
 	}
 
-	got := e.dedupeClaudeDiscoveredFiles(files)
+	got := e.dedupeClaudeDiscoveredFiles(t.Context(), files)
 
 	require.Len(t, got, 2)
 	assert.ElementsMatch(t, []string{
@@ -941,11 +1373,102 @@ func TestDedupeCodexS3IncludesSourceMachine(t *testing.T) {
 }
 
 func TestSyncS3MachineFromRootUsesRawAgentLayout(t *testing.T) {
-	assert.Equal(
-		t,
+	assert.Equal(t,
 		"laptop",
 		s3MachineFromRoot("s3://bucket/archive/raw/laptop/raw/claude"),
 	)
+	assert.Equal(t,
+		"laptop",
+		s3MachineFromRoot("s3://bucket/archive/raw/laptop/raw/cursor"),
+	)
+	assert.Empty(t, s3MachineFromRoot("s3://bucket/archive/raw/laptop/raw/qwen"))
+}
+
+func TestS3DiscoveredSessionIDUsesProvider(t *testing.T) {
+	tests := []struct {
+		name string
+		file parser.DiscoveredFile
+		want string
+	}{
+		{
+			name: "claude",
+			file: parser.DiscoveredFile{
+				Agent:   parser.AgentClaude,
+				Path:    "s3://bucket/laptop/raw/claude/proj/sess.jsonl",
+				Machine: "laptop",
+			},
+			want: "laptop~sess",
+		},
+		{
+			name: "codex",
+			file: parser.DiscoveredFile{
+				Agent: parser.AgentCodex,
+				Path: "s3://bucket/laptop/raw/codex/2026/06/24/" +
+					"rollout-2026-06-24T00-00-00-11111111-1111-4111-8111-111111111111.jsonl",
+				Machine: "laptop",
+			},
+			want: "laptop~codex:11111111-1111-4111-8111-111111111111",
+		},
+		{
+			name: "cursor",
+			file: parser.DiscoveredFile{
+				Agent:   parser.AgentCursor,
+				Path:    "s3://bucket/laptop/raw/cursor/proj/abc.jsonl",
+				Machine: "laptop",
+			},
+			want: "laptop~cursor:abc",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, s3DiscoveredSessionID(tt.file))
+		})
+	}
+}
+
+func TestSafeS3TempRelPathUsesProvider(t *testing.T) {
+	cursorProvider, ok := parser.S3ProviderFor(parser.AgentCursor)
+	require.True(t, ok)
+	got, err := safeS3TempRelPath(parser.DiscoveredFile{
+		Agent: parser.AgentCursor,
+		Path:  "s3://bucket/laptop/raw/cursor/demo-proj/abc.jsonl",
+	}, cursorProvider)
+	require.NoError(t, err)
+	assert.Equal(t, filepath.Join("demo-proj", "abc.jsonl"), got)
+
+	claudeProvider, ok := parser.S3ProviderFor(parser.AgentClaude)
+	require.True(t, ok)
+	got, err = safeS3TempRelPath(parser.DiscoveredFile{
+		Agent: parser.AgentClaude,
+		Path:  "s3://bucket/laptop/raw/claude/demo-proj/sess.jsonl",
+	}, claudeProvider)
+	require.NoError(t, err)
+	assert.Equal(t, filepath.Join("demo-proj", "sess.jsonl"), got)
+}
+
+func TestIsS3AgentRootSegmentUsesCapability(t *testing.T) {
+	assert.True(t, isS3AgentRootSegment("claude"))
+	assert.True(t, isS3AgentRootSegment("codex"))
+	assert.True(t, isS3AgentRootSegment("cursor"))
+	assert.False(t, isS3AgentRootSegment("qwen"))
+	assert.False(t, isS3AgentRootSegment("traex"))
+}
+
+func TestHydrateS3DiscoveredFileDerivesCursorProject(t *testing.T) {
+	e := &Engine{
+		db: openTestDB(t),
+		agentDirs: map[parser.AgentType][]string{
+			parser.AgentCursor: {"s3://bucket/laptop/raw/cursor"},
+		},
+	}
+	file := parser.DiscoveredFile{
+		Agent:       parser.AgentCursor,
+		Path:        "s3://bucket/laptop/raw/cursor/demo-proj/abc.jsonl",
+		SourceMtime: 1,
+	}
+	e.hydrateS3DiscoveredFile(t.Context(), "laptop~cursor:abc", &file)
+	assert.Equal(t, "laptop", file.Machine)
+	assert.Equal(t, "demo-proj", file.Project)
 }
 
 func TestSyncSingleSessionS3PreservesStoredMachine(t *testing.T) {
@@ -992,7 +1515,7 @@ func TestSyncSingleSessionS3PreservesStoredMachine(t *testing.T) {
 			parser.AgentClaude: {"s3://bucket/laptop/raw/claude"},
 		},
 	}
-	res := e.processFile(context.Background(), parser.DiscoveredFile{
+	res := e.processFile(t.Context(), parser.DiscoveredFile{
 		Agent:       parser.AgentClaude,
 		Path:        path,
 		Project:     "test-proj",
@@ -1002,14 +1525,14 @@ func TestSyncSingleSessionS3PreservesStoredMachine(t *testing.T) {
 	})
 	require.NoError(t, res.err)
 	require.Len(t, res.results, 1)
-	written, _, failed := e.writeBatch([]pendingWrite{{
+	written, _, failed, _ := e.writeBatch([]pendingWrite{{
 		sess: res.results[0].Session,
 		msgs: res.results[0].Messages,
 	}}, syncWriteDefault, false)
 	require.Equal(t, 1, written)
 	require.Equal(t, 0, failed)
 	initial, err := database.GetSessionFull(
-		context.Background(), "laptop~manual-id",
+		t.Context(), "laptop~manual-id",
 	)
 	require.NoError(t, err)
 	require.NotNil(t, initial)
@@ -1017,13 +1540,13 @@ func TestSyncSingleSessionS3PreservesStoredMachine(t *testing.T) {
 	currentContent.Store(second)
 	require.NoError(t, e.SyncSingleSession("laptop~manual-id"))
 
-	sess, err := database.GetSessionFull(context.Background(), "laptop~manual-id")
+	sess, err := database.GetSessionFull(t.Context(), "laptop~manual-id")
 	require.NoError(t, err)
 	require.NotNil(t, sess)
 	assert.Equal(t, "laptop", sess.Machine)
 	assert.Equal(t, initial.Project, sess.Project)
 	assert.Equal(t, path, derefString(sess.FilePath))
-	raw, err := database.GetSessionFull(context.Background(), "manual-id")
+	raw, err := database.GetSessionFull(t.Context(), "manual-id")
 	require.NoError(t, err)
 	assert.Nil(t, raw)
 }
@@ -1074,7 +1597,7 @@ func TestSyncSingleSessionS3WithoutMachineNamespaceUpdatesRawID(
 			parser.AgentClaude: {"s3://bucket/claude"},
 		},
 	}
-	res := e.processFile(context.Background(), parser.DiscoveredFile{
+	res := e.processFile(t.Context(), parser.DiscoveredFile{
 		Agent:       parser.AgentClaude,
 		Path:        path,
 		Project:     "test-proj",
@@ -1083,13 +1606,13 @@ func TestSyncSingleSessionS3WithoutMachineNamespaceUpdatesRawID(
 	})
 	require.NoError(t, res.err)
 	require.Len(t, res.results, 1)
-	written, _, failed := e.writeBatch([]pendingWrite{{
+	written, _, failed, _ := e.writeBatch([]pendingWrite{{
 		sess: res.results[0].Session,
 		msgs: res.results[0].Messages,
 	}}, syncWriteDefault, false)
 	require.Equal(t, 1, written)
 	require.Equal(t, 0, failed)
-	initial, err := database.GetSessionFull(context.Background(), "manual-id")
+	initial, err := database.GetSessionFull(t.Context(), "manual-id")
 	require.NoError(t, err)
 	require.NotNil(t, initial)
 	assert.Equal(t, "central", initial.Machine)
@@ -1097,17 +1620,17 @@ func TestSyncSingleSessionS3WithoutMachineNamespaceUpdatesRawID(
 	currentContent.Store(second)
 	require.NoError(t, e.SyncSingleSession("manual-id"))
 
-	sess, err := database.GetSessionFull(context.Background(), "manual-id")
+	sess, err := database.GetSessionFull(t.Context(), "manual-id")
 	require.NoError(t, err)
 	require.NotNil(t, sess)
-	msgs, err := database.GetAllMessages(context.Background(), "manual-id")
+	msgs, err := database.GetAllMessages(t.Context(), "manual-id")
 	require.NoError(t, err)
 	require.Len(t, msgs, 2)
 	assert.Equal(t, "Hello again", msgs[0].Content)
 	assert.Equal(t, "central", sess.Machine)
 	assert.Equal(t, path, derefString(sess.FilePath))
 	namespaced, err := database.GetSessionFull(
-		context.Background(), "central~manual-id",
+		t.Context(), "central~manual-id",
 	)
 	require.NoError(t, err)
 	assert.Nil(t, namespaced)
@@ -1117,7 +1640,7 @@ func TestSourceMtimeS3RawSessionUsesObjectMetadata(t *testing.T) {
 	database := openTestDB(t)
 	path := "s3://bucket/claude/test-proj/manual-id.jsonl"
 	mtime := time.Date(2026, 6, 24, 13, 2, 0, 0, time.UTC)
-	require.NoError(t, database.UpsertSession(db.Session{
+	require.NoError(t, database.UpsertSession(t.Context(), db.Session{
 		ID:        "manual-id",
 		Project:   "test-proj",
 		Machine:   "central",
@@ -1151,7 +1674,7 @@ func TestSourceMtimeS3RawSessionUsesObjectMetadata(t *testing.T) {
 		},
 	}
 
-	assert.Equal(t, mtime.UnixNano(), e.SourceMtime("manual-id"))
+	assert.Equal(t, mtime.UnixNano(), e.SourceMtime(t.Context(), "manual-id"))
 }
 
 func TestSourceMtimeS3HostPrefixedClaudeUsesSidecarMetadata(t *testing.T) {
@@ -1159,7 +1682,7 @@ func TestSourceMtimeS3HostPrefixedClaudeUsesSidecarMetadata(t *testing.T) {
 	path := "s3://bucket/laptop/raw/claude/test-proj/manual-id.jsonl"
 	transcriptMtime := time.Date(2026, 6, 24, 13, 5, 0, 0, time.UTC)
 	sidecarMtime := transcriptMtime.Add(time.Minute)
-	require.NoError(t, database.UpsertSession(db.Session{
+	require.NoError(t, database.UpsertSession(t.Context(), db.Session{
 		ID:        "laptop~manual-id",
 		Project:   "test-proj",
 		Machine:   "laptop",
@@ -1203,29 +1726,83 @@ func TestSourceMtimeS3HostPrefixedClaudeUsesSidecarMetadata(t *testing.T) {
 	assert.Equal(
 		t,
 		sidecarMtime.UnixNano(),
-		e.SourceMtime("laptop~manual-id"),
+		e.SourceMtime(t.Context(), "laptop~manual-id"),
 	)
+}
+
+func TestSourceMtimeS3IcodemateUsesSidecarMetadata(t *testing.T) {
+	database := openTestDB(t)
+	path := "s3://bucket/laptop/raw/icodemate/test-proj/manual-id.jsonl"
+	transcriptMtime := time.Date(2026, 6, 24, 13, 5, 0, 0, time.UTC)
+	sidecarMtime := transcriptMtime.Add(time.Minute)
+	require.NoError(t, database.UpsertSession(t.Context(), db.Session{
+		ID:        "laptop~icodemate:manual-id",
+		Project:   "test-proj",
+		Machine:   "laptop",
+		Agent:     "icodemate",
+		FilePath:  strPtr(path),
+		FileSize:  int64Ptr(128),
+		FileMtime: int64Ptr(transcriptMtime.UnixNano()),
+	}))
+
+	oldStat := statS3Object
+	oldStatClaude := statClaudeS3Session
+	t.Cleanup(func() {
+		statS3Object = oldStat
+		statClaudeS3Session = oldStatClaude
+	})
+	statS3Object = func(got string) (parser.S3Object, error) {
+		require.Equal(t, path, got)
+		return parser.S3Object{
+			URI:          path,
+			Size:         128,
+			LastModified: transcriptMtime,
+		}, nil
+	}
+	statClaudeS3Session = func(got string) (parser.S3Object, error) {
+		require.Equal(t, path, got)
+		return parser.S3Object{
+			URI:          path,
+			Size:         256,
+			LastModified: sidecarMtime,
+		}, nil
+	}
+
+	e := &Engine{
+		db:      database,
+		machine: "central",
+		agentDirs: map[parser.AgentType][]string{
+			parser.AgentIcodemate: {"s3://bucket/laptop/raw/icodemate"},
+		},
+	}
+
+	assert.Equal(t, sidecarMtime.UnixNano(),
+		e.SourceMtime(t.Context(), "laptop~icodemate:manual-id"))
 }
 
 func TestPickPreferredClaudeDiscoveredFileUsesS3Metadata(t *testing.T) {
 	database := openTestDB(t)
 	oldFile := parser.DiscoveredFile{
-		Agent:       parser.AgentClaude,
-		Path:        "s3://bucket/a/test-proj/session.jsonl",
-		Project:     "test-proj",
-		SourceSize:  100,
-		SourceMtime: time.Date(2026, 6, 24, 13, 3, 0, 0, time.UTC).UnixNano(),
+		Agent:           parser.AgentClaude,
+		Path:            "s3://bucket/a/test-proj/session.jsonl",
+		Project:         "test-proj",
+		SourceSize:      1000,
+		SourceMtime:     time.Date(2026, 6, 24, 13, 5, 0, 0, time.UTC).UnixNano(),
+		TranscriptSize:  100,
+		TranscriptMtime: time.Date(2026, 6, 24, 13, 3, 0, 0, time.UTC).UnixNano(),
 	}
 	newFile := parser.DiscoveredFile{
-		Agent:       parser.AgentClaude,
-		Path:        "s3://bucket/z/test-proj/session.jsonl",
-		Project:     "test-proj",
-		SourceSize:  200,
-		SourceMtime: time.Date(2026, 6, 24, 13, 4, 0, 0, time.UTC).UnixNano(),
+		Agent:           parser.AgentClaude,
+		Path:            "s3://bucket/z/test-proj/session.jsonl",
+		Project:         "test-proj",
+		SourceSize:      200,
+		SourceMtime:     time.Date(2026, 6, 24, 13, 4, 0, 0, time.UTC).UnixNano(),
+		TranscriptSize:  200,
+		TranscriptMtime: time.Date(2026, 6, 24, 13, 4, 0, 0, time.UTC).UnixNano(),
 	}
 	e := &Engine{db: database, machine: "central"}
 
-	got := e.pickPreferredClaudeDiscoveredFile(
+	got := e.pickPreferredClaudeDiscoveredFile(t.Context(),
 		"session", []parser.DiscoveredFile{oldFile, newFile},
 	)
 
@@ -1236,7 +1813,7 @@ func TestClaudeSourceMatchesStoredUsesS3Metadata(t *testing.T) {
 	database := openTestDB(t)
 	path := "s3://bucket/claude/test-proj/session.jsonl"
 	mtime := time.Date(2026, 6, 24, 13, 5, 0, 0, time.UTC).UnixNano()
-	require.NoError(t, database.UpsertSession(db.Session{
+	require.NoError(t, database.UpsertSession(t.Context(), db.Session{
 		ID:        "session",
 		Project:   "test-proj",
 		Machine:   "central",
@@ -1245,13 +1822,13 @@ func TestClaudeSourceMatchesStoredUsesS3Metadata(t *testing.T) {
 		FileSize:  int64Ptr(512),
 		FileMtime: int64Ptr(mtime),
 	}))
-	require.NoError(t, database.SetSessionDataVersion(
+	require.NoError(t, database.SetSessionDataVersion(t.Context(),
 		"session", db.CurrentDataVersion(),
 	))
 
 	e := &Engine{db: database, machine: "central"}
 
-	assert.True(t, e.claudeSourceMatchesStored("session", parser.DiscoveredFile{
+	assert.True(t, e.claudeSourceMatchesStored(t.Context(), "session", parser.DiscoveredFile{
 		Agent:       parser.AgentClaude,
 		Path:        path,
 		Project:     "test-proj",
@@ -1285,7 +1862,7 @@ func TestParseMaterializedS3SourcePreservesExclusionsWithoutResults(t *testing.T
 		Machine: "laptop",
 	}
 	res, err := e.parseMaterializedS3Source(
-		context.Background(), file, dir, tempPath,
+		t.Context(), file, dir, tempPath,
 	)
 	require.NoError(t, err)
 	assert.Empty(t, res.results, "a /usage probe yields no live sessions")
@@ -1303,7 +1880,7 @@ func TestFilterFilesByMtimeAppliesCutoffToProviderDiscoveredClaudeS3(t *testing.
 	database := openTestDB(t)
 	path := "s3://bucket/laptop/raw/claude/test-proj/old.jsonl"
 	mtime := time.Date(2026, 6, 24, 12, 0, 0, 0, time.UTC).UnixNano()
-	require.NoError(t, database.UpsertSession(db.Session{
+	require.NoError(t, database.UpsertSession(t.Context(), db.Session{
 		ID:        "laptop~old",
 		Project:   "test-proj",
 		Machine:   "laptop",
@@ -1313,6 +1890,9 @@ func TestFilterFilesByMtimeAppliesCutoffToProviderDiscoveredClaudeS3(t *testing.
 		FileMtime: int64Ptr(mtime),
 		FileHash:  strPtr("s3:fingerprint:stable"),
 	}))
+	require.NoError(t, database.SetSessionDataVersion(t.Context(),
+		"laptop~old", db.CurrentDataVersion(),
+	))
 
 	claudeFactory, ok := parser.ProviderFactoryByType(parser.AgentClaude)
 	require.True(t, ok, "claude provider factory must be registered")
@@ -1332,7 +1912,7 @@ func TestFilterFilesByMtimeAppliesCutoffToProviderDiscoveredClaudeS3(t *testing.
 	// Cutoff is after the object's mtime and the object is unchanged, so it must
 	// be filtered out. A registered factory means discoveredFileEffectiveMtime
 	// would (pre-fix) route the s3:// source into provider Fingerprint and error.
-	got := e.filterFilesByMtime(context.Background(), []parser.DiscoveredFile{{
+	got := e.filterFilesByMtime(t.Context(), []parser.DiscoveredFile{{
 		Agent:             parser.AgentClaude,
 		Path:              path,
 		Project:           "test-proj",
@@ -1346,4 +1926,422 @@ func TestFilterFilesByMtimeAppliesCutoffToProviderDiscoveredClaudeS3(t *testing.
 
 	assert.Empty(t, got,
 		"an unchanged old provider-discovered Claude S3 object must be cut off")
+}
+
+// scopeRecordingS3Factory is a Claude provider factory whose discovery emits a
+// fixed s3:// source and records the roots each provider was constructed with,
+// so a scoped pass's root filtering is observable.
+type scopeRecordingS3Factory struct {
+	source parser.SourceRef
+	roots  [][]string
+}
+
+func (f *scopeRecordingS3Factory) Definition() parser.AgentDef {
+	return parser.AgentDef{
+		Type:        parser.AgentClaude,
+		DisplayName: "Claude Code",
+		FileBased:   true,
+	}
+}
+
+func (f *scopeRecordingS3Factory) Capabilities() parser.Capabilities {
+	return parser.Capabilities{
+		Source: parser.SourceCapabilities{
+			DiscoverSources: parser.CapabilitySupported,
+		},
+	}
+}
+
+func (f *scopeRecordingS3Factory) NewProvider(
+	cfg parser.ProviderConfig,
+) parser.Provider {
+	f.roots = append(f.roots, append([]string(nil), cfg.Roots...))
+	return scopeRecordingS3Provider{
+		Def:    f.Definition(),
+		Caps:   f.Capabilities(),
+		source: f.source,
+	}
+}
+
+type scopeRecordingS3Provider struct {
+	parser.ProviderBase
+	source parser.SourceRef
+}
+
+func (p scopeRecordingS3Provider) Discover(
+	context.Context,
+) ([]parser.SourceRef, error) {
+	return []parser.SourceRef{p.source}, nil
+}
+
+func (p scopeRecordingS3Provider) FindSource(
+	context.Context, parser.FindSourceRequest,
+) (parser.SourceRef, bool, error) {
+	return parser.SourceRef{}, false, nil
+}
+
+func (p scopeRecordingS3Provider) Fingerprint(
+	context.Context, parser.SourceRef,
+) (parser.SourceFingerprint, error) {
+	return parser.SourceFingerprint{}, nil
+}
+
+func (p scopeRecordingS3Provider) Parse(
+	context.Context, parser.ParseRequest,
+) (parser.ParseOutcome, error) {
+	return parser.ParseOutcome{}, nil
+}
+
+// TestSyncRootsSinceScopedRemoteRootSyncsNewObject covers the seam the
+// daemon's periodic remote-source pass relies on: SyncRootsSince scoped to a
+// configured s3:// root discovers and syncs a new remote object, and the
+// provider is constructed with only the remote root so the pass never walks
+// the provider's local roots.
+func TestSyncRootsSinceScopedRemoteRootSyncsNewObject(t *testing.T) {
+	database := openTestDB(t)
+	localRoot := t.TempDir()
+	const remoteRoot = "s3://bucket/remote-box/raw/claude"
+	const uri = remoteRoot + "/test-proj/new-session.jsonl"
+	content := testjsonl.NewSessionBuilder().
+		AddClaudeUser("2024-01-01T00:00:00Z", "Hello from S3").
+		AddClaudeAssistant("2024-01-01T00:00:05Z", "Hi.").
+		String()
+	mtime := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC).UnixNano()
+
+	oldFetch := fetchS3Object
+	oldStat := statS3Object
+	t.Cleanup(func() {
+		fetchS3Object = oldFetch
+		statS3Object = oldStat
+	})
+	fetchS3Object = func(got string) (io.ReadCloser, error) {
+		require.Equal(t, uri, got)
+		return io.NopCloser(strings.NewReader(content)), nil
+	}
+	statS3Object = func(string) (parser.S3Object, error) {
+		return parser.S3Object{}, missingS3ObjectError()
+	}
+
+	factory := &scopeRecordingS3Factory{source: parser.SourceRef{
+		Provider:       parser.AgentClaude,
+		Key:            uri,
+		DisplayPath:    uri,
+		FingerprintKey: uri,
+		ProjectHint:    "test-proj",
+		Opaque: parser.S3DiscoveredSource{
+			URI:         uri,
+			Project:     "test-proj",
+			Machine:     "remote-box",
+			Size:        int64(len(content)),
+			MtimeNS:     mtime,
+			Fingerprint: "s3:fingerprint:new-session",
+		},
+	}}
+	engine := NewEngine(t.Context(), database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentClaude: {localRoot, remoteRoot},
+		},
+		Machine:           "local",
+		ProviderFactories: []parser.ProviderFactory{factory},
+		ProviderMigrationModes: map[parser.AgentType]parser.ProviderMigrationMode{
+			parser.AgentClaude: parser.ProviderMigrationProviderAuthoritative,
+		},
+	})
+	t.Cleanup(engine.Close)
+
+	// Reset after the engine-construction probe from buildProviderStatHashers
+	// which calls NewProvider with empty roots for the type assertion.
+	factory.roots = nil
+
+	stats := engine.SyncRootsSince(
+		t.Context(), []string{remoteRoot}, time.Time{}, nil,
+	)
+
+	assert.Equal(t, 1, stats.Synced, "the new S3 object must sync")
+	assert.Zero(t, stats.Failed)
+	require.Equal(t, [][]string{{remoteRoot}}, factory.roots,
+		"the scoped pass must construct the provider with only the remote root")
+	sess, err := database.GetSessionFull(
+		t.Context(), "remote-box~new-session",
+	)
+	require.NoError(t, err)
+	require.NotNil(t, sess, "the synced S3 session must be queryable")
+	assert.Equal(t, "remote-box", sess.Machine)
+	require.NotNil(t, sess.FilePath)
+	assert.Equal(t, uri, *sess.FilePath,
+		"the stored source must be the s3:// URI, not a temp path")
+}
+
+func TestSyncRootsSinceTombstonesStaleClaudeS3Fork(t *testing.T) {
+	database := openTestDB(t)
+	const remoteRoot = "s3://bucket/remote-box/raw/claude"
+	const uri = remoteRoot + "/test-proj/new-session.jsonl"
+	content := testjsonl.NewSessionBuilder().
+		AddClaudeUser("2024-01-01T00:00:00Z", "Hello from S3").
+		AddClaudeAssistant("2024-01-01T00:00:05Z", "Hi.").
+		String()
+	mtime := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC).UnixNano()
+	staleID := "remote-box~new-session-11111111-2222-4333-8444-555555555555"
+	parentID := "remote-box~new-session"
+	require.NoError(t, database.UpsertSession(t.Context(), db.Session{
+		ID:               staleID,
+		Project:          "test-proj",
+		Machine:          "remote-box",
+		Agent:            "claude",
+		ParentSessionID:  &parentID,
+		RelationshipType: "fork",
+		FilePath:         strPtr(uri),
+	}))
+	require.NoError(t, database.SetSessionDataVersion(t.Context(), staleID, 0))
+
+	oldFetch := fetchS3Object
+	oldStat := statS3Object
+	t.Cleanup(func() {
+		fetchS3Object = oldFetch
+		statS3Object = oldStat
+	})
+	fetchS3Object = func(got string) (io.ReadCloser, error) {
+		require.Equal(t, uri, got)
+		return io.NopCloser(strings.NewReader(content)), nil
+	}
+	statS3Object = func(string) (parser.S3Object, error) {
+		return parser.S3Object{}, missingS3ObjectError()
+	}
+
+	factory := &scopeRecordingS3Factory{source: parser.SourceRef{
+		Provider:       parser.AgentClaude,
+		Key:            uri,
+		DisplayPath:    uri,
+		FingerprintKey: uri,
+		ProjectHint:    "test-proj",
+		Opaque: parser.S3DiscoveredSource{
+			URI:         uri,
+			Project:     "test-proj",
+			Machine:     "remote-box",
+			Size:        int64(len(content)),
+			MtimeNS:     mtime,
+			Fingerprint: "s3:fingerprint:new-session",
+		},
+	}}
+	engine := NewEngine(t.Context(), database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentClaude: {remoteRoot},
+		},
+		Machine:           "local",
+		ProviderFactories: []parser.ProviderFactory{factory},
+		ProviderMigrationModes: map[parser.AgentType]parser.ProviderMigrationMode{
+			parser.AgentClaude: parser.ProviderMigrationProviderAuthoritative,
+		},
+	})
+	t.Cleanup(engine.Close)
+
+	first := engine.SyncRootsSince(
+		t.Context(), []string{remoteRoot}, time.Time{}, nil,
+	)
+	require.Zero(t, first.Failed)
+	stale, err := database.GetSessionFull(t.Context(), staleID)
+	require.NoError(t, err)
+	require.NotNil(t, stale)
+	assert.Nil(t, stale.DeletedAt,
+		"the first pass must preserve a fork without deletion authority")
+
+	second := engine.SyncRootsSince(
+		t.Context(), []string{remoteRoot}, time.Time{}, nil,
+	)
+	require.Zero(t, second.Failed)
+	stale, err = database.GetSessionFull(t.Context(), staleID)
+	require.NoError(t, err)
+	assertSourceMissingState(t, stale)
+}
+
+func TestSyncRootsSinceSkipsZeroResultClaudeS3SourceWithOnlyRejectedFork(
+	t *testing.T,
+) {
+	database := openTestDB(t)
+	const remoteRoot = "s3://bucket/remote-box/raw/claude"
+	const uri = remoteRoot + "/test-proj/replay-session.jsonl"
+	content := strings.Join([]string{
+		`{"type":"user","uuid":"u1","parentUuid":null,"timestamp":"2026-01-01T10:00:00Z","sessionId":"replay-session","sessionKind":"bg","message":{"content":"first question"}}`,
+		`{"type":"assistant","uuid":"a1","parentUuid":"u1","timestamp":"2026-01-01T10:00:05Z","sessionId":"replay-session","sessionKind":"bg","message":{"id":"msg_01","content":[{"type":"text","text":"first answer"}]}}`,
+	}, "\n") + "\n"
+	mtime := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC).UnixNano()
+	parentID := "remote-box~replay-session"
+	allowedID := parentID + "-11111111-2222-4333-8444-555555555555"
+	rejectedID := parentID + "-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+	for id, cwd := range map[string]string{
+		allowedID:  "/workspace/work/project",
+		rejectedID: "/workspace/personal/project",
+	} {
+		require.NoError(t, database.UpsertSession(t.Context(), db.Session{
+			ID:               id,
+			Project:          "test-proj",
+			Machine:          "remote-box",
+			Agent:            "claude",
+			Cwd:              cwd,
+			ParentSessionID:  &parentID,
+			RelationshipType: "fork",
+			FilePath:         strPtr(uri),
+			FileSize:         int64Ptr(int64(len(content))),
+			FileMtime:        int64Ptr(mtime),
+			FileHash:         strPtr("s3:fingerprint:replay-session"),
+		}))
+		require.NoError(t, database.SetSessionDataVersion(t.Context(), id, 0))
+	}
+	require.NoError(t, database.BaselineActiveSessionSourceOwnerships(
+		t.Context(), []db.SessionSourceOwnership{{
+			ID:       allowedID,
+			Machine:  "remote-box",
+			Agent:    "claude",
+			FilePath: uri,
+		}},
+	))
+
+	oldFetch := fetchS3Object
+	oldStat := statS3Object
+	t.Cleanup(func() {
+		fetchS3Object = oldFetch
+		statS3Object = oldStat
+	})
+	fetches := 0
+	fetchS3Object = func(got string) (io.ReadCloser, error) {
+		require.Equal(t, uri, got)
+		fetches++
+		return io.NopCloser(strings.NewReader(content)), nil
+	}
+	statS3Object = func(string) (parser.S3Object, error) {
+		return parser.S3Object{}, missingS3ObjectError()
+	}
+
+	factory := &scopeRecordingS3Factory{source: parser.SourceRef{
+		Provider:       parser.AgentClaude,
+		Key:            uri,
+		DisplayPath:    uri,
+		FingerprintKey: uri,
+		ProjectHint:    "test-proj",
+		Opaque: parser.S3DiscoveredSource{
+			URI:         uri,
+			Project:     "test-proj",
+			Machine:     "remote-box",
+			Size:        int64(len(content)),
+			MtimeNS:     mtime,
+			Fingerprint: "s3:fingerprint:replay-session",
+		},
+	}}
+	engine := NewEngine(t.Context(), database, EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentClaude: {remoteRoot},
+		},
+		Machine:            "local",
+		IncludeCwdPrefixes: []string{"/workspace/work"},
+		ProviderFactories:  []parser.ProviderFactory{factory},
+		ProviderMigrationModes: map[parser.AgentType]parser.ProviderMigrationMode{
+			parser.AgentClaude: parser.ProviderMigrationProviderAuthoritative,
+		},
+	})
+	t.Cleanup(engine.Close)
+
+	first := engine.SyncRootsSince(
+		t.Context(), []string{remoteRoot}, time.Time{}, nil,
+	)
+	require.Zero(t, first.Failed)
+	require.Equal(t, 1, fetches,
+		"an actionable stale fork must force a complete source parse")
+	allowed, err := database.GetSessionFull(t.Context(), allowedID)
+	require.NoError(t, err)
+	assertSourceMissingState(t, allowed)
+
+	second := engine.SyncRootsSince(
+		t.Context(), []string{remoteRoot}, time.Time{}, nil,
+	)
+	require.Zero(t, second.Failed)
+	assert.Equal(t, 1, second.Skipped)
+	assert.Equal(t, 1, fetches,
+		"unchanged source freshness must prevent another S3 download")
+	stale, err := database.GetSession(t.Context(), rejectedID)
+	require.NoError(t, err)
+	assert.NotNil(t, stale,
+		"the CWD-rejected stale fork must remain active")
+}
+
+func TestProcessS3ClaudeSourceMissingPrimaryUsesRowlessMarker(
+	t *testing.T,
+) {
+	database := openTestDB(t)
+	const uri = "s3://bucket/root/claude/project/missing-primary.jsonl"
+	content := strings.Join([]string{
+		`{"type":"user","uuid":"u1","parentUuid":null,"timestamp":"2026-01-01T10:00:00Z","sessionId":"missing-primary","sessionKind":"bg","message":{"content":"current question"}}`,
+		`{"type":"assistant","uuid":"a1","parentUuid":"u1","timestamp":"2026-01-01T10:00:05Z","sessionId":"missing-primary","sessionKind":"bg","message":{"id":"msg_01","content":[{"type":"text","text":"current answer"}]}}`,
+	}, "\n") + "\n"
+	currentMtime := time.Date(2026, 8, 14, 14, 0, 0, 0, time.UTC).UnixNano()
+	const currentFingerprint = "s3:fingerprint:missing-primary"
+	parentID := "remote-box~missing-primary"
+	staleID := parentID + "-aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+	oldSize := int64(17)
+	oldMtime := currentMtime - int64(time.Hour)
+	require.NoError(t, database.UpsertSession(t.Context(), db.Session{
+		ID: parentID, Project: "project", Machine: "remote-box",
+		Agent: "claude", Cwd: "/workspace/work/project", FilePath: strPtr(uri),
+		FileSize: &oldSize, FileMtime: &oldMtime, FileHash: strPtr("old-hash"),
+	}))
+	require.NoError(t, database.BaselineActiveSessionSourceOwnerships(
+		t.Context(), []db.SessionSourceOwnership{{
+			ID: parentID, Machine: "remote-box", Agent: "claude", FilePath: uri,
+		}},
+	))
+	tombstoned, err := database.MarkSessionSourceMissing(
+		t.Context(), "remote-box", "claude", parentID, uri,
+	)
+	require.NoError(t, err)
+	require.True(t, tombstoned, "seed a source-missing canonical primary")
+	require.NoError(t, database.UpsertSession(t.Context(), db.Session{
+		ID: staleID, Project: "project", Machine: "remote-box", Agent: "claude",
+		Cwd: "/workspace/personal/project", ParentSessionID: &parentID,
+		RelationshipType: "fork", FilePath: strPtr(uri),
+		FileSize: &oldSize, FileMtime: &oldMtime, FileHash: strPtr("old-hash"),
+	}))
+	require.NoError(t, database.SetSessionDataVersion(t.Context(), staleID, 0))
+
+	oldFetch := fetchS3Object
+	t.Cleanup(func() { fetchS3Object = oldFetch })
+	var fetches int
+	fetchS3Object = func(got string) (io.ReadCloser, error) {
+		require.Equal(t, uri, got)
+		fetches++
+		return io.NopCloser(strings.NewReader(content)), nil
+	}
+
+	engine := NewEngine(t.Context(), database, EngineConfig{
+		Machine:            "local",
+		IncludeCwdPrefixes: []string{"/workspace/work"},
+	})
+	t.Cleanup(engine.Close)
+	file := parser.DiscoveredFile{
+		Agent: parser.AgentClaude, Path: uri, Project: "project",
+		Machine: "remote-box", SourceSize: int64(len(content)),
+		SourceMtime: currentMtime, SourceFingerprint: currentFingerprint,
+	}
+
+	first := engine.processFile(t.Context(), file)
+	require.NoError(t, first.err)
+	require.Equal(t, 1, fetches)
+	jobs := make(chan syncJob, 1)
+	jobs <- syncJob{
+		path: file.Path, agent: file.Agent, machine: file.Machine,
+		processResult: first,
+	}
+	close(jobs)
+	stats := engine.collectAndBatch(
+		t.Context(), jobs, 1, 1, nil, syncWriteDefault,
+	)
+	require.Zero(t, stats.Failed)
+
+	second := engine.processFile(t.Context(), file)
+	require.NoError(t, second.err)
+	assert.True(t, second.skip,
+		"a source-missing primary must not hide the rowless marker")
+	assert.Equal(t, 1, fetches,
+		"rowless freshness must avoid downloading the unchanged S3 object again")
+	primary, err := database.GetSessionFull(t.Context(), parentID)
+	require.NoError(t, err)
+	assertSourceMissingState(t, primary)
 }

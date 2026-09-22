@@ -1,49 +1,26 @@
 // @vitest-environment jsdom
-import {
-  afterEach,
-  beforeEach,
-  describe,
-  expect,
-  it,
-  vi,
-} from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mount, tick, unmount } from "svelte";
-import type { Message } from "../../api/types.js";
+import type { DbMessage as Message } from "../../api/generated/index.js";
 import { messages } from "../../stores/messages.svelte.js";
+import { readProgress } from "../../stores/read-progress.svelte.js";
 import { sessions } from "../../stores/sessions.svelte.js";
 import { ui } from "../../stores/ui.svelte.js";
 import { setLocale } from "../../i18n/index.js";
 import { scrollMemory } from "./scroll-memory.js";
 
-interface VirtualRow {
-  key: string;
-  index: number;
-  start: number;
-  end: number;
-}
-
-const searchMock = vi.hoisted(() => ({
-  isOpen: false,
-  query: "",
-  matches: [] as Array<{ ordinal: number; sessionId: string }>,
-  currentMatchIndex: -1,
-  loading: false,
-  currentOrdinal: null as number | null,
-  close: vi.fn(),
-  next: vi.fn(),
-  prev: vi.fn(),
-}));
-
-vi.mock("../../stores/inSessionSearch.svelte.js", () => ({
-  inSessionSearch: searchMock,
-}));
-
-const inSessionSearch = searchMock;
-
 const virtualizerMock = vi.hoisted(() => ({
   options: { count: 0 },
   scrollOffset: 0,
-  getVirtualItems: vi.fn((): VirtualRow[] => []),
+  scrollRect: { height: 200 },
+  getVirtualItems: vi.fn<
+    () => Array<{
+      index: number;
+      key: string;
+      start: number;
+      end: number;
+    }>
+  >(() => []),
   getTotalSize: vi.fn(() => 120),
   measureElement: vi.fn(),
   scrollToIndex: vi.fn(),
@@ -52,9 +29,7 @@ const virtualizerMock = vi.hoisted(() => ({
 }));
 
 vi.mock("../../virtual/createVirtualizer.svelte.js", () => ({
-  createVirtualizer: (
-    optsFn: () => { count: number },
-  ) => ({
+  createVirtualizer: (optsFn: () => { count: number }) => ({
     get instance() {
       virtualizerMock.options.count = optsFn().count;
       return virtualizerMock;
@@ -95,28 +70,42 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
+function setVirtualRows(count: number) {
+  virtualizerMock.getVirtualItems.mockReturnValue(
+    Array.from({ length: count }, (_, index) => ({
+      index,
+      key: `row-${index}`,
+      start: index * 100,
+      end: index * 100 + 100,
+    })),
+  );
+}
+
 describe("MessageList follow cancellation", () => {
   let component: ReturnType<typeof mount> | undefined;
   let rafSpy: ReturnType<typeof vi.spyOn>;
 
   beforeEach(() => {
     vi.clearAllMocks();
-    virtualizerMock.getVirtualItems.mockImplementation(() => []);
-    virtualizerMock.getOffsetForIndex.mockImplementation(
-      () => undefined,
-    );
+    virtualizerMock.scrollOffset = 0;
+    virtualizerMock.scrollRect.height = 200;
     messages.clear();
     sessions.activeSessionId = "s1";
     messages.sessionId = "s1";
     messages.messages = [makeMessage(10)];
     messages.messageCount = 11;
+    messages.activeSessionToken = "current";
     messages.hasOlder = true;
     ui.followLatest = true;
     ui.followLatestRequest = 1;
     ui.sortNewestFirst = false;
+    ui.showAllBlocks();
+    ui.setTranscriptMode("normal");
     ui.selectedOrdinal = null;
     ui.pendingScrollOrdinal = null;
     ui.pendingScrollSession = null;
+    readProgress.reset();
+    setVirtualRows(1);
     rafSpy = vi
       .spyOn(window, "requestAnimationFrame")
       .mockImplementation((cb: FrameRequestCallback) => {
@@ -135,13 +124,7 @@ describe("MessageList follow cancellation", () => {
     messages.clear();
     sessions.activeSessionId = null;
     ui.followLatest = false;
-    inSessionSearch.isOpen = false;
-    inSessionSearch.query = "";
-    inSessionSearch.matches = [];
-    inSessionSearch.currentMatchIndex = -1;
-    inSessionSearch.currentOrdinal = null;
-    ui.showAllBlocks();
-    ui.bulkCollapseCommand = null;
+    readProgress.reset();
     document.body.innerHTML = "";
   });
 
@@ -170,181 +153,12 @@ describe("MessageList follow cancellation", () => {
     expect(document.body.textContent).toContain("正在加载消息...");
   });
 
-  it("centers the exact current search mark in a long message", async () => {
-    const message = makeMessage(10);
-    message.content = "before needle after";
-    message.content_length = message.content.length;
-    messages.messages = [message];
-    messages.hasOlder = false;
-    ui.followLatest = false;
-    ui.followLatestRequest = 0;
-    virtualizerMock.getVirtualItems.mockImplementation(() => [
-      { key: "k10", index: 0, start: 0, end: 1200 },
-    ]);
-    virtualizerMock.getOffsetForIndex.mockImplementation(() => [
-      0,
-      "start",
-    ]);
-    inSessionSearch.isOpen = true;
-    inSessionSearch.query = "needle";
-    inSessionSearch.matches = [{ ordinal: 10, sessionId: "s1" }];
-    inSessionSearch.currentMatchIndex = 0;
-    inSessionSearch.currentOrdinal = 10;
-
-    component = mount(MessageList, { target: document.body });
-    await tick();
-
-    const container = document.querySelector(
-      ".message-list-scroll",
-    ) as HTMLElement;
-    const rectSpy = vi
-      .spyOn(HTMLElement.prototype, "getBoundingClientRect")
-      .mockImplementation(function (this: HTMLElement) {
-        const top = this.classList.contains(
-          "search-highlight--current",
-        )
-          ? 700
-          : this === container ? 100 : 0;
-        const height = this.classList.contains(
-          "search-highlight--current",
-        )
-          ? 20
-          : this === container ? 400 : 0;
-        return {
-          top,
-          bottom: top + height,
-          left: 0,
-          right: 800,
-          width: 800,
-          height,
-          x: 0,
-          y: top,
-          toJSON: () => ({}),
-        };
-      });
-    const scope = document.querySelector(
-      '[data-message-ordinals="10"]',
-    ) as HTMLElement;
-    const mark = document.createElement("mark");
-    mark.className =
-      "search-highlight search-highlight--current";
-    scope.appendChild(mark);
-    Object.defineProperties(container, {
-      clientHeight: { configurable: true, value: 400 },
-      scrollHeight: { configurable: true, value: 1200 },
-      scrollTop: { configurable: true, value: 0, writable: true },
-    });
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    virtualizerMock.scrollToOffset.mockClear();
-
-    (
-      component as ReturnType<typeof mount> & {
-        scrollToOrdinal: (
-          ordinal: number,
-          searchQuery?: string,
-        ) => void;
-      }
-    ).scrollToOrdinal(10, "needle");
-
-    await vi.waitFor(() => {
-      expect(virtualizerMock.scrollToOffset).toHaveBeenCalledWith(
-        410,
-        { align: "start" },
-      );
-    });
-    rectSpy.mockRestore();
-  });
-
-  it("centers a match within a nested scrollable block", async () => {
-    messages.hasOlder = false;
-    virtualizerMock.getVirtualItems.mockImplementation(() => [
-      { key: "k10", index: 0, start: 0, end: 1200 },
-    ]);
-    virtualizerMock.getOffsetForIndex.mockImplementation(() => [
-      0,
-      "start",
-    ]);
-    inSessionSearch.isOpen = true;
-    inSessionSearch.query = "needle";
-    inSessionSearch.matches = [{ ordinal: 10, sessionId: "s1" }];
-    inSessionSearch.currentMatchIndex = 0;
-    inSessionSearch.currentOrdinal = 10;
-
-    component = mount(MessageList, { target: document.body });
-    await tick();
-
-    const container = document.querySelector(
-      ".message-list-scroll",
-    ) as HTMLElement;
-    const scope = document.querySelector(
-      '[data-message-ordinals="10"]',
-    ) as HTMLElement;
-    const nestedScroller = document.createElement("div");
-    nestedScroller.style.overflowY = "auto";
-    const mark = document.createElement("mark");
-    mark.className =
-      "search-highlight search-highlight--current";
-    nestedScroller.appendChild(mark);
-    scope.appendChild(nestedScroller);
-    Object.defineProperties(container, {
-      clientHeight: { configurable: true, value: 400 },
-      scrollHeight: { configurable: true, value: 1200 },
-      scrollTop: { configurable: true, value: 0, writable: true },
-    });
-    Object.defineProperties(nestedScroller, {
-      clientHeight: { configurable: true, value: 300 },
-      scrollHeight: { configurable: true, value: 900 },
-      scrollTop: { configurable: true, value: 0, writable: true },
-    });
-    const rectSpy = vi.spyOn(
-      HTMLElement.prototype,
-      "getBoundingClientRect",
-    ).mockImplementation(function (this: HTMLElement) {
-      const top = this === mark
-        ? 600
-        : this === nestedScroller ? 200
-        : this === container ? 100 : 0;
-      const height = this === mark
-        ? 20
-        : this === nestedScroller ? 300
-        : this === container ? 400 : 0;
-      return {
-        top,
-        bottom: top + height,
-        left: 0,
-        right: 800,
-        width: 800,
-        height,
-        x: 0,
-        y: top,
-        toJSON: () => ({}),
-      };
-    });
-    await new Promise((resolve) => setTimeout(resolve, 20));
-
-    (
-      component as ReturnType<typeof mount> & {
-        scrollToOrdinal: (
-          ordinal: number,
-          searchQuery?: string,
-        ) => void;
-      }
-    ).scrollToOrdinal(10, "needle");
-
-    await vi.waitFor(() => {
-      expect(nestedScroller.scrollTop).toBe(260);
-    });
-    rectSpy.mockRestore();
-  });
-
   it("keeps delayed ordinal navigation alive after follow latest is disabled", async () => {
     const loaded = deferred<void>();
-    const ensureSpy = vi
-      .spyOn(messages, "ensureOrdinalLoaded")
-      .mockImplementation(async () => {
-        await loaded.promise;
-        messages.messages = [makeMessage(0), makeMessage(10)];
-      });
+    const ensureSpy = vi.spyOn(messages, "ensureOrdinalLoaded").mockImplementation(async () => {
+      await loaded.promise;
+      messages.messages = [makeMessage(0), makeMessage(10)];
+    });
 
     component = mount(MessageList, { target: document.body });
     await tick();
@@ -368,6 +182,348 @@ describe("MessageList follow cancellation", () => {
       align: "start",
     });
   });
+
+  it("renders an unknown revision divider at the earliest message", async () => {
+    messages.messages = [makeMessage(0), makeMessage(1), makeMessage(2), makeMessage(3)];
+    messages.messageCount = 4;
+    messages.activeSessionToken = "current";
+    setVirtualRows(4);
+    readProgress.baseline("s1", "previous", 1);
+
+    component = mount(MessageList, { target: document.body });
+    await tick();
+
+    const divider = document.querySelector(".read-progress-divider");
+    expect(divider?.textContent).toContain("New messages");
+    expect(divider?.closest(".virtual-row")?.getAttribute("data-index")).toBe("0");
+  });
+
+  it("suppresses the newest-first divider when no read history exists", async () => {
+    messages.messages = [makeMessage(0), makeMessage(1), makeMessage(2), makeMessage(3)];
+    messages.messageCount = 4;
+    messages.activeSessionToken = "current";
+    ui.sortNewestFirst = true;
+    setVirtualRows(4);
+    readProgress.baseline("s1", "previous", 1);
+
+    component = mount(MessageList, { target: document.body });
+    await tick();
+
+    const divider = document.querySelector(".read-progress-divider");
+    expect(divider).toBeNull();
+  });
+
+  it("does not mark newest-first updates read while only older rows are visible", async () => {
+    messages.messages = [
+      makeMessage(0),
+      makeMessage(1),
+      makeMessage(2),
+      makeMessage(3),
+      makeMessage(4),
+    ];
+    messages.messageCount = 5;
+    messages.activeSessionToken = "current";
+    ui.sortNewestFirst = true;
+    setVirtualRows(5);
+    virtualizerMock.scrollOffset = 300;
+    readProgress.baseline("s1", "previous", 1);
+
+    component = mount(MessageList, { target: document.body });
+    await tick();
+    document.querySelector<HTMLElement>(".message-list-scroll")?.dispatchEvent(new Event("scroll"));
+
+    await new Promise((resolve) => window.setTimeout(resolve, 20));
+    expect(readProgress.get("s1")?.token).toBe("previous");
+  });
+
+  it("requires conservative unread endpoints after a direct boundary jump", async () => {
+    messages.messages = [
+      makeMessage(0),
+      makeMessage(1),
+      makeMessage(2),
+      makeMessage(3),
+      makeMessage(4),
+    ];
+    messages.messageCount = 5;
+    messages.activeSessionToken = "current";
+    ui.sortNewestFirst = true;
+    virtualizerMock.getVirtualItems.mockReturnValue([
+      { index: 2, key: "row-2", start: 0, end: 100 },
+    ]);
+    readProgress.baseline("s1", "previous", 1);
+
+    component = mount(MessageList, { target: document.body });
+    await tick();
+    await new Promise((resolve) => window.setTimeout(resolve, 20));
+
+    expect(readProgress.get("s1")?.token).toBe("previous");
+
+    virtualizerMock.getVirtualItems.mockReturnValue([
+      { index: 0, key: "row-0", start: 0, end: 100 },
+      { index: 4, key: "row-4", start: 100, end: 200 },
+    ]);
+    document.querySelector<HTMLElement>(".message-list-scroll")?.dispatchEvent(new Event("scroll"));
+    await new Promise((resolve) => window.setTimeout(resolve, 20));
+
+    expect(readProgress.get("s1")?.token).toBe("current");
+  });
+
+  it("acknowledges focused-mode traversal when the raw boundary is hidden", async () => {
+    messages.messages = [
+      { ...makeMessage(0), role: "user" },
+      { ...makeMessage(1), role: "assistant" },
+      { ...makeMessage(2), role: "assistant" },
+      { ...makeMessage(3), role: "user" },
+      { ...makeMessage(4), role: "assistant" },
+    ];
+    messages.messageCount = 5;
+    messages.activeSessionToken = "current";
+    ui.sortNewestFirst = true;
+    ui.setTranscriptMode("focused");
+    setVirtualRows(4);
+    readProgress.baseline("s1", "previous", 0);
+
+    component = mount(MessageList, { target: document.body });
+    await tick();
+    await new Promise((resolve) => window.setTimeout(resolve, 20));
+
+    expect(readProgress.get("s1")?.token).toBe("previous");
+
+    virtualizerMock.scrollOffset = 200;
+    document.querySelector<HTMLElement>(".message-list-scroll")?.dispatchEvent(new Event("scroll"));
+    await new Promise((resolve) => window.setTimeout(resolve, 20));
+
+    expect(readProgress.get("s1")?.token).toBe("current");
+  });
+
+  it("hides system boundary cards when the system block is filtered out", async () => {
+    messages.messages = [
+      {
+        ...makeMessage(0),
+        role: "user",
+        content: "<task-notification>\n<status>completed</status>\n</task-notification>",
+        is_system: true,
+        source_subtype: "task_notification",
+      },
+    ];
+    messages.messageCount = 1;
+    setVirtualRows(1);
+
+    component = mount(MessageList, { target: document.body });
+    await tick();
+    expect(document.querySelector(".system-boundary")).not.toBeNull();
+
+    ui.setBlockVisible("system", false);
+    await tick();
+
+    expect(document.querySelector(".system-boundary")).toBeNull();
+  });
+
+  it("keeps a code-only message visible as a collapsed placeholder when Code is filtered", async () => {
+    const content = ["```latex", "\\subsection{Deployment Considerations}", "```"].join("\n");
+    messages.messages = [
+      {
+        ...makeMessage(0),
+        role: "assistant",
+        content,
+        content_length: content.length,
+      },
+    ];
+    messages.messageCount = 1;
+    ui.setBlockVisible("code", false);
+    setVirtualRows(1);
+
+    component = mount(MessageList, { target: document.body });
+    await tick();
+
+    const toggle = document.querySelector<HTMLButtonElement>(".code-fence-toggle");
+    expect(toggle).not.toBeNull();
+    expect(toggle?.textContent?.replace(/\s+/g, " ").trim()).toBe(
+      "Code block collapsed · latex · Expand",
+    );
+    expect(document.querySelector(".code-content")).toBeNull();
+  });
+
+  it("acknowledges traversal when a block filter hides the raw boundary", async () => {
+    messages.messages = [
+      { ...makeMessage(0), role: "assistant" },
+      { ...makeMessage(1), role: "user" },
+      { ...makeMessage(2), role: "user" },
+    ];
+    messages.messageCount = 3;
+    messages.activeSessionToken = "current";
+    ui.setBlockVisible("assistant", false);
+    setVirtualRows(2);
+    readProgress.baseline("s1", "previous", 0);
+
+    component = mount(MessageList, { target: document.body });
+    await tick();
+    await new Promise((resolve) => window.setTimeout(resolve, 20));
+
+    expect(readProgress.get("s1")?.token).toBe("current");
+  });
+
+  it("rechecks visible progress when filters change after mounting", async () => {
+    messages.messages = [
+      { ...makeMessage(0), role: "user" },
+      { ...makeMessage(1), role: "assistant" },
+      { ...makeMessage(2), role: "user" },
+    ];
+    messages.messageCount = 3;
+    messages.activeSessionToken = "current";
+    ui.sortNewestFirst = true;
+    setVirtualRows(2);
+    readProgress.baseline("s1", "previous", 0);
+
+    component = mount(MessageList, { target: document.body });
+    await tick();
+    await new Promise((resolve) => window.setTimeout(resolve, 20));
+    expect(readProgress.get("s1")?.token).toBe("previous");
+
+    ui.setBlockVisible("assistant", false);
+    await tick();
+    await new Promise((resolve) => window.setTimeout(resolve, 20));
+
+    expect(readProgress.get("s1")?.token).toBe("current");
+  });
+
+  it("marks a short newest-first transcript read when its unread boundary is initially visible", async () => {
+    messages.messages = [makeMessage(0), makeMessage(1)];
+    messages.messageCount = 2;
+    messages.activeSessionToken = "current";
+    ui.sortNewestFirst = true;
+    setVirtualRows(2);
+    readProgress.baseline("s1", "previous", 0);
+
+    component = mount(MessageList, { target: document.body });
+    await tick();
+    await new Promise((resolve) => window.setTimeout(resolve, 20));
+
+    expect(readProgress.get("s1")?.token).toBe("current");
+  });
+
+  it("does not acknowledge an earlier edit from the unchanged newest row", async () => {
+    messages.messages = [makeMessage(0), makeMessage(1), makeMessage(2)];
+    messages.messageCount = 3;
+    messages.activeSessionToken = "current";
+    messages.activeSessionUnreadOrdinal = 0;
+    ui.sortNewestFirst = true;
+    setVirtualRows(1);
+    readProgress.baseline("s1", "previous", 2);
+
+    component = mount(MessageList, { target: document.body });
+    await tick();
+    await new Promise((resolve) => window.setTimeout(resolve, 20));
+
+    expect(readProgress.get("s1")?.token).toBe("previous");
+
+    virtualizerMock.getVirtualItems.mockReturnValue([
+      { index: 2, key: "row-2", start: 0, end: 100 },
+    ]);
+    document.querySelector<HTMLElement>(".message-list-scroll")?.dispatchEvent(new Event("scroll"));
+    await new Promise((resolve) => window.setTimeout(resolve, 20));
+
+    expect(readProgress.get("s1")?.token).toBe("current");
+  });
+
+  it("conservatively traverses history when a reopened revision also appends", async () => {
+    messages.messages = [makeMessage(0), makeMessage(1), makeMessage(2), makeMessage(3)];
+    messages.messageCount = 4;
+    messages.activeSessionToken = "current";
+    messages.activeSessionUnreadOrdinal = null;
+    ui.sortNewestFirst = true;
+    virtualizerMock.getVirtualItems.mockReturnValue([
+      { index: 0, key: "row-0", start: 0, end: 100 },
+    ]);
+    readProgress.baseline("s1", "previous", 2);
+
+    component = mount(MessageList, { target: document.body });
+    await tick();
+    await new Promise((resolve) => window.setTimeout(resolve, 20));
+
+    expect(readProgress.get("s1")?.token).toBe("previous");
+
+    virtualizerMock.getVirtualItems.mockReturnValue([
+      { index: 3, key: "row-3", start: 0, end: 100 },
+    ]);
+    document.querySelector<HTMLElement>(".message-list-scroll")?.dispatchEvent(new Event("scroll"));
+    await new Promise((resolve) => window.setTimeout(resolve, 20));
+
+    expect(readProgress.get("s1")?.token).toBe("current");
+  });
+
+  it("keeps an appended unread boundary immutable before traversal", async () => {
+    messages.messages = [
+      makeMessage(0),
+      makeMessage(1),
+      makeMessage(2),
+      makeMessage(3),
+      makeMessage(4),
+    ];
+    messages.messageCount = 5;
+    messages.activeSessionToken = "current";
+    messages.activeSessionUnreadOrdinal = null;
+    virtualizerMock.getVirtualItems.mockReturnValue([
+      { index: 4, key: "row-4", start: 0, end: 100 },
+    ]);
+    readProgress.baseline("s1", "previous", 1);
+
+    component = mount(MessageList, { target: document.body });
+    await tick();
+    await new Promise((resolve) => window.setTimeout(resolve, 20));
+
+    expect(readProgress.get("s1")).toMatchObject({
+      token: "previous",
+      ordinal: 1,
+    });
+  });
+
+  it("does not acknowledge a boundary hidden by a visible ordinal gap", async () => {
+    messages.messages = [makeMessage(0), makeMessage(1), makeMessage(2)];
+    messages.messageCount = 3;
+    messages.activeSessionToken = "current";
+    messages.activeSessionUnreadOrdinal = 1;
+    virtualizerMock.getVirtualItems.mockReturnValue([
+      { index: 0, key: "row-0", start: 0, end: 100 },
+      { index: 2, key: "row-2", start: 100, end: 200 },
+    ]);
+    readProgress.baseline("s1", "previous", 2);
+
+    component = mount(MessageList, { target: document.body });
+    await tick();
+    await new Promise((resolve) => window.setTimeout(resolve, 20));
+
+    expect(readProgress.get("s1")?.token).toBe("previous");
+  });
+
+  it("skips a hidden system ordinal when inferring an appended boundary", async () => {
+    messages.messages = [makeMessage(0), { ...makeMessage(1), is_system: true }, makeMessage(2)];
+    messages.messageCount = 3;
+    messages.activeSessionToken = "current";
+    messages.activeSessionUnreadOrdinal = null;
+    setVirtualRows(2);
+    readProgress.baseline("s1", "previous", 0);
+
+    component = mount(MessageList, { target: document.body });
+    await tick();
+    await new Promise((resolve) => window.setTimeout(resolve, 20));
+
+    expect(readProgress.get("s1")?.token).toBe("current");
+  });
+
+  it("acknowledges a revised transcript with only system messages", async () => {
+    messages.messages = [{ ...makeMessage(0), is_system: true }];
+    messages.messageCount = 1;
+    messages.activeSessionToken = "current";
+    setVirtualRows(0);
+    readProgress.baseline("s1", "previous", 0);
+
+    component = mount(MessageList, { target: document.body });
+    await tick();
+    await new Promise((resolve) => window.setTimeout(resolve, 20));
+
+    expect(readProgress.get("s1")?.token).toBe("current");
+  });
 });
 
 describe("MessageList scroll position memory", () => {
@@ -382,9 +538,7 @@ describe("MessageList scroll position memory", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     virtualizerMock.getVirtualItems.mockImplementation(() => []);
-    virtualizerMock.getOffsetForIndex.mockImplementation(
-      () => undefined,
-    );
+    virtualizerMock.getOffsetForIndex.mockImplementation(() => undefined);
     virtualizerMock.scrollOffset = 0;
     scrollMemory.clear();
     messages.clear();
@@ -420,49 +574,37 @@ describe("MessageList scroll position memory", () => {
     ui.followLatest = false;
     ui.pendingScrollOrdinal = null;
     ui.pendingScrollSession = null;
-    document.body.innerHTML = "";
+    document.body.replaceChildren();
+    setLocale("en");
   });
 
   it("records the viewport anchor on scroll", async () => {
-    virtualizerMock.getVirtualItems.mockImplementation(
-      () => virtualRows,
-    );
+    virtualizerMock.getVirtualItems.mockImplementation(() => virtualRows);
     virtualizerMock.scrollOffset = 130;
 
     component = mount(MessageList, { target: document.body });
     await tick();
 
-    const container = document.querySelector(
-      ".message-list-scroll",
-    );
+    const container = document.querySelector(".message-list-scroll");
     expect(container).not.toBeNull();
     container!.dispatchEvent(new Event("scroll"));
 
     await vi.waitFor(() => {
-      expect(scrollMemory.get("s1")).toEqual({
-        ordinal: 1,
-        offsetPx: 10,
-      });
+      expect(scrollMemory.get("s1")).toEqual({ ordinal: 1, offsetPx: 10 });
     });
   });
 
   it("restores the remembered position once messages are loaded", async () => {
     scrollMemory.remember("s1", { ordinal: 1, offsetPx: 10 });
-    virtualizerMock.getVirtualItems.mockImplementation(
-      () => virtualRows,
-    );
-    virtualizerMock.getOffsetForIndex.mockImplementation(() => [
-      120,
-      "start",
-    ]);
+    virtualizerMock.getVirtualItems.mockImplementation(() => virtualRows);
+    virtualizerMock.getOffsetForIndex.mockImplementation(() => [120, "start"]);
 
     component = mount(MessageList, { target: document.body });
 
     await vi.waitFor(() => {
-      expect(virtualizerMock.scrollToOffset).toHaveBeenCalledWith(
-        130,
-        { align: "start" },
-      );
+      expect(virtualizerMock.scrollToOffset).toHaveBeenCalledWith(130, {
+        align: "start",
+      });
     });
   });
 
@@ -470,13 +612,8 @@ describe("MessageList scroll position memory", () => {
     scrollMemory.remember("s1", { ordinal: 1, offsetPx: 10 });
     ui.pendingScrollOrdinal = 0;
     ui.pendingScrollSession = "s1";
-    virtualizerMock.getVirtualItems.mockImplementation(
-      () => virtualRows,
-    );
-    virtualizerMock.getOffsetForIndex.mockImplementation(() => [
-      120,
-      "start",
-    ]);
+    virtualizerMock.getVirtualItems.mockImplementation(() => virtualRows);
+    virtualizerMock.getOffsetForIndex.mockImplementation(() => [120, "start"]);
 
     component = mount(MessageList, { target: document.body });
     await tick();
@@ -490,21 +627,15 @@ describe("MessageList scroll position memory", () => {
     scrollMemory.remember("s1", { ordinal: 0, offsetPx: 55 });
     ui.followLatest = true;
     ui.followLatestRequest = 1;
-    virtualizerMock.getVirtualItems.mockImplementation(
-      () => virtualRows,
-    );
-    virtualizerMock.getOffsetForIndex.mockImplementation(() => [
-      120,
-      "start",
-    ]);
+    virtualizerMock.getVirtualItems.mockImplementation(() => virtualRows);
+    virtualizerMock.getOffsetForIndex.mockImplementation(() => [120, "start"]);
 
     component = mount(MessageList, { target: document.body });
     await tick();
     await new Promise((r) => setTimeout(r, 20));
 
-    // Follow latest scrolls without the anchor's pixel offset.
-    expect(
-      virtualizerMock.scrollToOffset,
-    ).not.toHaveBeenCalledWith(175, expect.anything());
+    expect(virtualizerMock.scrollToOffset).not.toHaveBeenCalledWith(55, {
+      align: "start",
+    });
   });
 });

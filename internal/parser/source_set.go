@@ -55,12 +55,40 @@ type SourceSetProvider struct {
 	sources SourceSet
 }
 
+var _ StreamingDiscoverer = (*SourceSetProvider)(nil)
+
 func (p *SourceSetProvider) Discover(ctx context.Context) ([]SourceRef, error) {
 	return p.sources.Discover(ctx)
 }
 
+func (p *SourceSetProvider) DiscoverEach(
+	ctx context.Context, yield func(SourceRef) error,
+) error {
+	discoverer, ok := p.sources.(StreamingDiscoverer)
+	if !ok {
+		return UnsupportedProviderFeatureError{
+			Provider: p.Def.Type,
+			Feature:  "streaming discovery",
+		}
+	}
+	return discoverer.DiscoverEach(ctx, yield)
+}
+
 func (p *SourceSetProvider) WatchPlan(ctx context.Context) (WatchPlan, error) {
 	return p.sources.WatchPlan(ctx)
+}
+
+func (p *SourceSetProvider) WatchRoots(
+	ctx context.Context,
+) ([]WatchRoot, error) {
+	if planner, ok := p.sources.(WatchRootPlanner); ok {
+		return planner.WatchRoots(ctx)
+	}
+	plan, err := p.sources.WatchPlan(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return watchRootMetadata(plan.Roots), nil
 }
 
 func (p *SourceSetProvider) SourcesForChangedPath(
@@ -68,6 +96,56 @@ func (p *SourceSetProvider) SourcesForChangedPath(
 	req ChangedPathRequest,
 ) ([]SourceRef, error) {
 	return p.sources.SourcesForChangedPath(ctx, req)
+}
+
+func (p *SourceSetProvider) ChangedPathRelevance(
+	ctx context.Context, req ChangedPathRequest,
+) (ChangedPathRelevance, error) {
+	resolver, ok := p.sources.(ChangedPathRelevanceProvider)
+	if !ok {
+		return ChangedPathUnclassified, nil
+	}
+	return resolver.ChangedPathRelevance(ctx, req)
+}
+
+// reconciliationContainerTopologyProvider is implemented by source sets whose
+// members are virtual children of a physical container. The provider-level
+// scope resolver widens a request naming the container, a sidecar, or one
+// member to the container's whole membership; without it a container-path
+// request would prove only the bare path, which admits no member source and
+// pages no member row — a successful no-op over sessions the caller asked
+// about.
+type reconciliationContainerTopologyProvider interface {
+	ReconciliationContainer(requested string) (string, bool)
+}
+
+// ResolveReconciliationScopes applies the source set's container topology
+// when it declares one, and otherwise inherits the generic directory plan.
+func (p *SourceSetProvider) ResolveReconciliationScopes(
+	ctx context.Context, req ReconciliationScopeRequest,
+) (ReconciliationScopePlan, error) {
+	topology, ok := p.sources.(reconciliationContainerTopologyProvider)
+	if !ok {
+		return p.ProviderBase.ResolveReconciliationScopes(ctx, req)
+	}
+	if err := ValidateReconciliationScopeRoots(
+		p.Def.Type, p.Config.Roots, req.Roots,
+	); err != nil {
+		return ReconciliationScopePlan{}, err
+	}
+	return containerAwareReconciliationScopePlan(
+		p.Config.Roots, req.Roots, topology.ReconciliationContainer,
+	), nil
+}
+
+func (p *SourceSetProvider) StoredSourceHintScopes(
+	req ChangedPathRequest,
+) []StoredSourceHintScope {
+	resolver, ok := p.sources.(StoredSourceHintScopeProvider)
+	if !ok {
+		return nil
+	}
+	return resolver.StoredSourceHintScopes(req)
 }
 
 func (p *SourceSetProvider) FindSource(
@@ -94,6 +172,94 @@ func (p *SourceSetProvider) Parse(
 	return p.sources.Parse(ctx, req)
 }
 
+func (p *SourceSetProvider) SourceForReconciliation(
+	ctx context.Context, path, project string,
+) (SourceRef, bool, error) {
+	resolver, ok := p.sources.(ReconciliationSourceResolver)
+	if !ok {
+		return SourceRef{}, false, nil
+	}
+	return resolver.SourceForReconciliation(ctx, path, project)
+}
+
+func (p *SourceSetProvider) SourceForReconciliationWithState(
+	ctx context.Context, path, project string, state ReconciliationSourceState,
+) (SourceRef, bool, error) {
+	resolver, ok := p.sources.(ReconciliationSourceStateResolver)
+	if !ok {
+		return p.SourceForReconciliation(ctx, path, project)
+	}
+	return resolver.SourceForReconciliationWithState(ctx, path, project, state)
+}
+
+func (p *SourceSetProvider) ReconciliationSourceState(ctx context.Context,
+	source SourceRef,
+) (ReconciliationSourceState, bool) {
+	provider, ok := p.sources.(ReconciliationSourceStateProvider)
+	if !ok {
+		return ReconciliationSourceState{}, false
+	}
+	return provider.ReconciliationSourceState(ctx, source)
+}
+
+func (p *SourceSetProvider) ApplyReconciliationSourceState(ctx context.Context,
+	source *SourceRef, state ReconciliationSourceState,
+) error {
+	provider, ok := p.sources.(ReconciliationSourceStateProvider)
+	if !ok {
+		if state.Version == 0 {
+			return nil
+		}
+		return UnsupportedProviderFeatureError{
+			Provider: p.Def.Type, Feature: "reconciliation source state",
+		}
+	}
+	return provider.ApplyReconciliationSourceState(ctx, source, state)
+}
+
+func (p *SourceSetProvider) ReconciliationMemberIdentity(
+	fullSessionID string,
+) string {
+	resolver, ok := p.sources.(ReconciliationMemberIdentityResolver)
+	if !ok {
+		return ""
+	}
+	return resolver.ReconciliationMemberIdentity(fullSessionID)
+}
+
+func (p *SourceSetProvider) PersistentArchiveSource(
+	path string, fullSessionID string,
+) (string, bool) {
+	resolver, ok := p.sources.(PersistentArchiveSourceResolver)
+	if !ok {
+		return "", false
+	}
+	return resolver.PersistentArchiveSource(path, fullSessionID)
+}
+
+// MultiFileStatHasher is the optional inner-source-set shape of
+// parser.MultiFileStatHasher. A SourceSet-backed base that owns a
+// multi-file on-disk layout (currently codebuffSourceSet) implements
+// ComputeMultiFileStatHash on the inner SourceSet, and SourceSetProvider
+// forwards that method here so the engine's provider-level type
+// assertion against MultiFileStatHasher succeeds. Without the
+// forwarding, the provider wrapping the hasher leaves the engine's
+// providerStatHashers cache empty and the per-component freshness
+// digest is never populated for any multi-file agent.
+
+// ComputeMultiFileStatHash implements parser.MultiFileStatHasher by
+// delegating to the wrapped SourceSet when it advertises the optional
+// hasher shape. Returns 0 when the inner source set is single-file
+// (Claude, Codex, Roocode, ...) and the engine should keep using the
+// existing size/mtime composite freshness path.
+func (p *SourceSetProvider) ComputeMultiFileStatHash(chatPath string) uint64 {
+	hasher, ok := p.sources.(MultiFileStatHasher)
+	if !ok {
+		return 0
+	}
+	return hasher.ComputeMultiFileStatHash(chatPath)
+}
+
 // SourceSetFactory is the generic ProviderFactory for any SourceSet-backed
 // provider. build constructs the SourceSet from the cloned per-provider config
 // (roots, machine, path rewriter), so a base captures whatever config it needs
@@ -104,14 +270,19 @@ type SourceSetFactory struct {
 	build func(cfg ProviderConfig) SourceSet
 }
 
+// NewSourceSetFactory advertises StreamingDiscovery up front because every
+// source-set base streams. A wrapper still cannot invent streaming for a
+// collecting source set: NewProvider downgrades the capability when the built
+// SourceSet does not implement StreamingDiscoverer.
 func NewSourceSetFactory(
 	def AgentDef,
 	caps Capabilities,
 	build func(cfg ProviderConfig) SourceSet,
 ) ProviderFactory {
+	caps.Source.StreamingDiscovery = CapabilitySupported
 	return SourceSetFactory{
 		def:   cloneAgentDef(def),
-		caps:  caps,
+		caps:  withWatchRootPlanningCapability(caps),
 		build: build,
 	}
 }
@@ -126,12 +297,21 @@ func (f SourceSetFactory) Capabilities() Capabilities {
 
 func (f SourceSetFactory) NewProvider(cfg ProviderConfig) Provider {
 	cfg = cfg.Clone()
+	sources := f.build(cfg)
+	caps := f.caps
+	if _, ok := sources.(StreamingDiscoverer); !ok {
+		caps.Source.StreamingDiscovery = CapabilityUnsupported
+	}
+	if _, ok := sources.(ReconciliationSourceResolver); !ok {
+		caps.Source.SharedContainerSource = CapabilityUnsupported
+	}
+	if _, ok := sources.(StoredSourceHintScopeProvider); !ok {
+		caps.Source.StoredSourceHints = CapabilityUnsupported
+	}
 	return &SourceSetProvider{
-		ProviderBase: ProviderBase{
-			Def:    cloneAgentDef(f.def),
-			Caps:   f.caps,
-			Config: cfg,
-		},
-		sources: f.build(cfg),
+		Def:     cloneAgentDef(f.def),
+		Caps:    caps,
+		Config:  cfg,
+		sources: sources,
 	}
 }

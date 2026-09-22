@@ -1,10 +1,12 @@
 <script lang="ts">
+  import { Card } from "@kenn-io/kit-ui";
   import { onDestroy, onMount, tick, untrack } from "svelte";
   import {
     usage,
     buildUsageUrlParams,
     mergeUsageAndSessionUrlParams,
     parseWindowDays,
+    type UsageMode,
   } from "../../stores/usage.svelte.js";
   import {
     sessions,
@@ -15,6 +17,7 @@
   import { events } from "../../stores/events.svelte.js";
   import { router } from "../../stores/router.svelte.js";
   import { sync } from "../../stores/sync.svelte.js";
+  import { settings } from "../../stores/settings.svelte.js";
   import RangePicker from "../shared/RangePicker.svelte";
   import {
     resolveRange,
@@ -31,20 +34,58 @@
   import SessionActiveFilters from "../filters/SessionActiveFilters.svelte";
   import FilterDropdown from "./FilterDropdown.svelte";
   import RefreshControl from "../shared/RefreshControl.svelte";
+  import UsageModePicker from "./UsageModePicker.svelte";
+  import TokenTypePicker from "./TokenTypePicker.svelte";
+  import {
+    usageModeFromParams,
+    withUsageMode,
+  } from "./usageMode.js";
+  import {
+    selectedTokenTypesFromParams,
+    withSelectedTokenTypes,
+    type UsageTokenType,
+  } from "../../stores/usageTokenTypes.js";
   import {
     yokedDates,
     panelDateState,
     type PanelDateState,
   } from "../../stores/yokedDates.svelte.js";
   import { m } from "../../i18n/index.js";
+  import { usageChartColorMaps } from "../../utils/usageChartColors.js";
 
   let mounted = false;
   let unsubEvents: (() => void) | undefined;
 
-  const projectItems = $derived(
-    sessions.projects.map((p) => ({
-      name: p.name,
-      count: p.session_count,
+  const chartColorMaps = $derived(
+    usageChartColorMaps(
+      usage.timeSeriesSummary,
+      settings.chartPalette,
+    ),
+  );
+
+  // Keep projects already returned by the summary so a project remains
+  // available after filtering removes it or the page is remounted.
+
+  $effect(() => {
+    const fromSummary = usage.summary?.projectTotals ?? [];
+    const counts = usage.isTimeRangeSummaryProvisional
+      ? {}
+      : usage.summary?.sessionCounts.byProject ?? {};
+    untrack(() => usage.mergeKnownProjects(fromSummary, counts));
+  });
+
+  const projectItems = $derived(usage.knownProjects);
+
+  const legacyExcludedProjectCount = $derived(
+    usage.excludedProjects
+      ? usage.excludedProjects.split(",").filter(Boolean).length
+      : 0,
+  );
+
+  const agentItems = $derived(
+    sessions.agents.map((a) => ({
+      name: a.name,
+      count: a.session_count,
     })),
   );
 
@@ -105,9 +146,7 @@
 
   // Seed from URL/local model filters before a response arrives.
   $effect(() => {
-    const filtered = [
-      usage.selectedModels,
-    ].filter(Boolean).join(",");
+    const filtered = usage.excludedModels;
     untrack(() => {
       if (!filtered) return;
       mergeIntoKnownModels(filtered.split(","));
@@ -117,13 +156,10 @@
   const modelItems = $derived(
     knownModels.map((m) => ({ name: m })),
   );
-  const selectedModels = $derived(
-    usage.selectedModels
-      ? usage.selectedModels.split(",").filter(Boolean)
-      : [],
-  );
   const unsupportedUsageMessage = $derived.by(() => {
-    const kind = usage.summary?.unsupportedUsage?.kind;
+    const kind = usage.isTimeRangeSummaryProvisional
+      ? undefined
+      : usage.summary?.unsupportedUsage?.kind;
     if (kind === "copilot-no-token-data") {
       return m.usage_summary_unsupported_copilot_no_token_data();
     }
@@ -169,7 +205,7 @@
   // apply params that are actually present in the URL.
   const USAGE_FILTER_KEYS = new Set([
     "from", "to", "window_days",
-    "model", "exclude_model",
+    "exclude_model", "exclude_agent",
   ]);
   const SESSION_FILTER_KEYS = new Set([
     "project", "machine", "agent",
@@ -193,11 +229,46 @@
   let urlInitRan = $state(false);
   let urlWritebackReady = $state(false);
   let initialFetchDone = $state(false);
+
+  function selectUsageMode(mode: UsageMode): void {
+    if (!usage.setMode(mode)) return;
+    router.replaceParams(withSelectedTokenTypes(
+      withUsageMode(router.params, mode),
+      usage.selectedTokenTypes,
+      mode,
+    ));
+    void usage.fetchTopSessions();
+  }
+
+  function selectTokenTypes(selected: UsageTokenType[]): void {
+    if (!usage.setSelectedTokenTypes(selected)) return;
+    router.replaceParams(withSelectedTokenTypes(
+      withUsageMode(router.params, usage.mode),
+      usage.selectedTokenTypes,
+      usage.mode,
+    ));
+    void usage.fetchTopSessions();
+  }
+
   $effect(() => {
     const route = router.route;
     const params = router.params;
     untrack(() => {
+      if (route === "token-usage") {
+        router.replace("usage", withUsageMode(params, "token"));
+        return;
+      }
       if (route !== "usage") return;
+      const nextMode = usageModeFromParams(params);
+      const modeChanged = usage.setMode(nextMode);
+      const tokenTypesChanged = nextMode === "token"
+        ? usage.setSelectedTokenTypes(
+            selectedTokenTypesFromParams(params),
+          )
+        : false;
+      if ((modeChanged || tokenTypesChanged) && urlInitRan) {
+        void usage.fetchTopSessions();
+      }
       const hasDateParam = !!params["from"] || !!params["to"];
       const parsedWindowDays = parseWindowDays(params["window_days"]);
       const supportedSessionParams =
@@ -213,14 +284,6 @@
       let changed = false;
       let sessionChanged = false;
 
-      // Sync pin state from URL: dated URL pins, undated URL unpins.
-      // Runs before the !hasFilterKeys early return so a fully bare URL
-      // (no exclude_* either) still flips the pin off.
-      if (usage.isPinned !== hasDateParam) {
-        usage.isPinned = hasDateParam;
-        changed = true;
-      }
-
       if (!hasDateParam && parsedWindowDays === null) {
         const seed = yokedDates.seedForPanel();
         const state = seed
@@ -231,6 +294,13 @@
           : null;
         if (state) {
           changed = applyUsagePanelDate(state) || changed;
+        } else {
+          changed = applyUsagePanelDate({
+            from: usage.from,
+            to: usage.to,
+            mode: "rolling",
+            windowDays: usage.windowDays,
+          }) || changed;
         }
       }
 
@@ -297,14 +367,14 @@
         usage.excludedProjects = newExProject;
         changed = true;
       }
-      if (usage.excludedModels) {
-        usage.excludedModels = "";
+      const newExAgent = params["exclude_agent"] ?? "";
+      if (newExAgent !== usage.excludedAgents) {
+        usage.excludedAgents = newExAgent;
         changed = true;
       }
-      const newModel = params["model"] ?? "";
-      if (newModel !== usage.selectedModels) {
-        usage.selectedModels = newModel;
-        if (newModel) usage.excludedModels = "";
+      const newExModel = params["exclude_model"] ?? "";
+      if (newExModel !== usage.excludedModels) {
+        usage.excludedModels = newExModel;
         changed = true;
       }
       if ((changed || sessionChanged) && urlInitRan) {
@@ -323,13 +393,20 @@
       isPinned: usage.isPinned,
       windowDays: usage.windowDays,
       excludedProjects: usage.excludedProjects,
+      excludedProjectKeys: usage.excludedProjectKeys,
       excludedAgents: usage.excludedAgents,
       excludedModels: usage.excludedModels,
-      selectedModels: usage.selectedModels,
     };
-    const nextParams = mergeUsageAndSessionUrlParams(
-      buildUsageUrlParams(state),
-      sessionUrlParams,
+    const nextParams = withSelectedTokenTypes(
+      withUsageMode(
+        mergeUsageAndSessionUrlParams(
+          buildUsageUrlParams(state),
+          sessionUrlParams,
+        ),
+        usage.mode,
+      ),
+      usage.selectedTokenTypes,
+      usage.mode,
     );
     const ready = urlInitRan && urlWritebackReady;
     untrack(() => {
@@ -354,6 +431,9 @@
 
   onMount(() => {
     mounted = true;
+    // The Agent dropdown reads sessions.agents, which is otherwise loaded
+    // lazily by the sidebar filter control; a direct /usage visit needs it too.
+    sessions.loadAgents();
     // SSE events only flag new data; RefreshControl owns the periodic refresh
     // and the manual button. The initial and filter-change fetches run from the
     // effects above once URL/filter state is hydrated.
@@ -364,6 +444,7 @@
   });
 
   onDestroy(() => {
+    usage.cancelInFlightReads();
     unsubEvents?.();
   });
 </script>
@@ -371,6 +452,18 @@
 <div class="usage-page">
   <div class="usage-toolbar">
     <div class="toolbar-controls">
+      <UsageModePicker
+        value={usage.mode}
+        onChange={selectUsageMode}
+      />
+
+      {#if usage.mode === "token"}
+        <TokenTypePicker
+          value={usage.selectedTokenTypes}
+          onChange={selectTokenTypes}
+        />
+      {/if}
+
       <div class="usage-filter-anchor">
         <SessionFilterControl
           showDisplay={false}
@@ -394,18 +487,28 @@
       <FilterDropdown
         label={m.analytics_col_project()}
         items={projectItems}
-        excludedCsv={usage.excludedProjects}
-        onToggle={(name) => usage.toggleProject(name)}
+        excludedCsv={usage.excludedProjectKeys}
+        unlistedExcludedCount={legacyExcludedProjectCount}
+        onToggle={(key) => usage.toggleProjectKey(key)}
         onSelectAll={() => usage.selectAllProjects()}
         onDeselectAll={() =>
-          usage.deselectAllProjects(projectItems.map((p) => p.name))}
+          usage.deselectAllProjectKeys(projectItems.map((p) => p.id))}
+      />
+
+      <FilterDropdown
+        label={m.analytics_col_agent()}
+        items={agentItems}
+        excludedCsv={usage.excludedAgents}
+        onToggle={(name) => usage.toggleAgent(name)}
+        onSelectAll={() => usage.selectAllAgents()}
+        onDeselectAll={() =>
+          usage.deselectAllAgents(agentItems.map((a) => a.name))}
       />
 
       <FilterDropdown
         label={m.usage_model()}
         items={modelItems}
-        excludedCsv={usage.selectedModels}
-        mode="include"
+        excludedCsv={usage.excludedModels}
         onToggle={(name) => usage.toggleModel(name)}
         onSelectAll={() => usage.selectAllModels()}
         onDeselectAll={() =>
@@ -414,8 +517,10 @@
 
       <RefreshControl
         lastUpdatedAt={usage.lastUpdatedAt}
+        queryDurationMs={usage.lastQueryDurationMs}
+        querySteps={usage.lastQuerySteps}
         busy={usage.isQuerying}
-        onRefresh={() => usage.fetchAll()}
+        onRefresh={() => usage.fetchAll({ preserveTimeRange: true })}
         label={m.usage_refresh()}
         title={m.shared_refresh()}
       />
@@ -424,9 +529,8 @@
   </div>
 
   <SessionActiveFilters
-    modelFilters={selectedModels}
     onClearProjects={() => usage.selectAllProjects()}
-    onRemoveModel={(model) => usage.toggleModel(model)}
+    onClearAgents={() => usage.selectAllAgents()}
     onClearModels={() => usage.selectAllModels()}
   />
 
@@ -440,33 +544,39 @@
     {/if}
 
     {#if unsupportedUsageMessage}
-      <div class="usage-note" role="status">
-        {unsupportedUsageMessage}
-      </div>
+      <Card level="default" padding="none" class="usage-note">
+        <div role="status">
+          {unsupportedUsageMessage}
+        </div>
+      </Card>
     {/if}
 
     <UsageSummaryCards />
 
-    <div class="chart-panel wide">
-      <CostTimeSeriesChart />
-    </div>
+    <Card level="default" padding="none" class="chart-panel wide">
+      <CostTimeSeriesChart
+        colorMap={chartColorMaps[usage.toggles.timeSeries.groupBy]}
+      />
+    </Card>
 
-    <div class="chart-panel wide">
-      <AttributionPanel />
-    </div>
+    <Card level="default" padding="none" class="chart-panel wide">
+      <AttributionPanel
+        colorMap={chartColorMaps[usage.toggles.attribution.groupBy]}
+      />
+    </Card>
 
     <div class="bottom-grid">
-      <div class="chart-panel bounded">
+      <Card level="default" padding="none" class="chart-panel bounded">
         <TopSessionsTable />
-      </div>
-      <div class="chart-panel bounded">
+      </Card>
+      <Card level="default" padding="none" class="chart-panel bounded">
         <CacheEfficiencyPanel />
-      </div>
+      </Card>
     </div>
 
-    <div class="chart-panel wide">
+    <Card level="default" padding="none" class="chart-panel wide">
       <UsagePairwiseComparisonPanel />
-    </div>
+    </Card>
   </div>
 </div>
 
@@ -513,12 +623,9 @@
     transition: opacity 0.12s;
   }
 
-  .usage-note {
+  .usage-content :global(.usage-note) {
     padding: 12px 14px;
-    background: var(--bg-surface);
-    border: 1px solid var(--border-muted);
     border-left: 4px solid var(--accent-blue);
-    border-radius: var(--radius-md);
     color: var(--text-secondary);
   }
 
@@ -551,15 +658,12 @@
     animation: query-progress 1s ease-in-out infinite;
   }
 
-  .chart-panel {
-    background: var(--bg-surface);
-    border: 1px solid var(--border-muted);
-    border-radius: var(--radius-md);
+  .usage-content :global(.chart-panel) {
     padding: 12px;
     min-width: 0;
   }
 
-  .chart-panel.wide {
+  .usage-content :global(.chart-panel.wide) {
     width: 100%;
   }
 
@@ -570,12 +674,12 @@
     align-items: start;
   }
 
-  .chart-panel.bounded {
+  .usage-content :global(.chart-panel.bounded) {
     max-height: min(420px, 48vh);
     overflow: auto;
   }
 
-  @media (max-width: 800px) {
+  @media (max-width: 760px) {
     .bottom-grid {
       grid-template-columns: 1fr;
     }

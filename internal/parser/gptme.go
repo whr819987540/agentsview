@@ -1,7 +1,7 @@
 package parser
 
 import (
-	"encoding/json"
+	"encoding/json/v2"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -28,6 +28,7 @@ func (p *gptmeProvider) parseSession(
 	defer f.Close()
 
 	lr := newLineReader(f, maxLineSize)
+	defer releaseLineReader(lr)
 	var (
 		messages     []ParsedMessage
 		startedAt    time.Time
@@ -119,6 +120,7 @@ func (p *gptmeProvider) parseSession(
 			messages = append(messages, ParsedMessage{
 				Ordinal:       ordinal,
 				Role:          RoleAssistant,
+				SourceSubtype: SourceSubtypeToolResult,
 				Content:       content,
 				Timestamp:     ts,
 				ContentLength: len(content),
@@ -200,7 +202,7 @@ func applyGptmeTokenUsage(pm *ParsedMessage, line string) {
 		"cache_read_input_tokens":     cacheRead,
 		"cache_creation_input_tokens": cacheWrite,
 	}
-	j, err := json.Marshal(normalized)
+	j, err := json.Marshal(normalized, json.Deterministic(true))
 	if err != nil {
 		return
 	}

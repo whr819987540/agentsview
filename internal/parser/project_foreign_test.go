@@ -1,6 +1,7 @@
 package parser
 
 import (
+	"context"
 	"errors"
 	"os"
 	"runtime"
@@ -163,18 +164,31 @@ func TestExtractProjectFromCwd_HomePathWithoutAutofs_StillWalks(t *testing.T) {
 	autofsPrefixes = nil
 	resetAutofsProbes()
 
-	orig := osStat
-	defer func() { osStat = orig }()
-	var count atomic.Int64
-	osStat = func(path string) (os.FileInfo, error) {
-		count.Add(1)
-		return orig(path)
-	}
+	realDir := t.TempDir()
+	realInfo, err := os.Stat(realDir)
+	require.NoError(t, err)
 
+	orig := osStat
+	origLstat := osLstat
+	defer func() { osStat = orig; osLstat = origLstat }()
+	var count atomic.Int64
 	cwd := "/home/nobody-agentsview-test/code/example"
+	// The walk types .git candidates through osLstat and falls back to
+	// osStat elsewhere; count both so the assertion tracks the walk
+	// regardless of which seam a level uses.
+	statFn := func(path string) (os.FileInfo, error) {
+		count.Add(1)
+		if path == cwd {
+			return realInfo, nil
+		}
+		return nil, os.ErrNotExist
+	}
+	osStat = statFn
+	osLstat = statFn
+
 	_ = ExtractProjectFromCwdWithBranch(cwd, "")
-	assert.NotZero(t, count.Load(),
-		"osStat never called for /home path with empty "+
+	assert.GreaterOrEqual(t, count.Load(), int64(2),
+		"stat never called for /home path with empty "+
 			"autofs config; walk must proceed for a real mount")
 }
 
@@ -208,7 +222,7 @@ server.example:/export on /corp/home (autofs, nobrowse)
 func TestDetectAutofsPrefixes(t *testing.T) {
 	origSrc := autofsMountSource
 	defer func() { autofsMountSource = origSrc }()
-	autofsMountSource = func() ([]byte, error) {
+	autofsMountSource = func(ctx context.Context) ([]byte, error) {
 		return []byte(
 			"map auto_home on /System/Volumes/Data/home " +
 				"(autofs, automounted, nobrowse)\n" +
@@ -217,7 +231,7 @@ func TestDetectAutofsPrefixes(t *testing.T) {
 		), nil
 	}
 
-	got := detectAutofsPrefixes()
+	got := detectAutofsPrefixes(t.Context())
 	if runtime.GOOS != "darwin" {
 		assert.Nil(t, got, "detectAutofsPrefixes() on %s", runtime.GOOS)
 		return
@@ -266,8 +280,6 @@ func TestExtractProjectFromCwd_AutofsConcurrent_SingleProbe(t *testing.T) {
 		}()
 	}
 	started.Wait()
-	// Give the workers a moment to actually enter the probe.
-	time.Sleep(50 * time.Millisecond)
 	close(release)
 	done.Wait()
 
@@ -325,8 +337,8 @@ func TestExtractProjectFromCwd_AutofsProbe_TTLExpires(t *testing.T) {
 func TestDetectAutofsPrefixes_MountFails(t *testing.T) {
 	origSrc := autofsMountSource
 	defer func() { autofsMountSource = origSrc }()
-	autofsMountSource = func() ([]byte, error) {
+	autofsMountSource = func(ctx context.Context) ([]byte, error) {
 		return nil, errors.New("mock mount failure")
 	}
-	assert.Nil(t, detectAutofsPrefixes(), "detectAutofsPrefixes() with mount failure")
+	assert.Nil(t, detectAutofsPrefixes(t.Context()), "detectAutofsPrefixes() with mount failure")
 }

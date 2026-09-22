@@ -1,7 +1,7 @@
 package sync
 
 import (
-	"encoding/json"
+	"encoding/json/v2"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -20,7 +20,7 @@ func TestSyncStats_RecordSkip(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var s SyncStats
-			for i := 0; i < tt.skips; i++ {
+			for range tt.skips {
 				s.RecordSkip()
 			}
 			assert.Equal(t, tt.want, s.Skipped)
@@ -359,12 +359,37 @@ func TestAnomalyStats_IsZero(t *testing.T) {
 			a:    AnomalyStats{Sanitize: SanitizeStats{ModelClamped: 1}},
 			want: false,
 		},
+		{
+			name: "unsupported source layout only",
+			a:    AnomalyStats{UnsupportedSourceLayoutsTotal: 1},
+			want: false,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			assert.Equal(t, tt.want, tt.a.IsZero())
 		})
 	}
+}
+
+func TestAnomalyStats_RecordUnsupportedSourceLayouts(t *testing.T) {
+	var a AnomalyStats
+	a.RecordUnsupportedSourceLayouts("trae", 2)
+	a.RecordUnsupportedSourceLayouts("trae", 1)
+	a.RecordUnsupportedSourceLayouts("trae", 0)
+	assert.Equal(t, 3, a.UnsupportedSourceLayoutsTotal)
+	assert.Equal(t, 3, a.UnsupportedSourceLayoutsByAgent["trae"])
+}
+
+func TestAnomalyAccumulator_DedupesUnsupportedSource(t *testing.T) {
+	var acc anomalyAccumulator
+	acc.recordUnsupportedSourceLayout("trae", "state.vscdb")
+	acc.recordUnsupportedSourceLayout("trae", "state.vscdb")
+
+	var stats SyncStats
+	acc.applyTo(&stats)
+	assert.Equal(t, 1, stats.Anomalies.UnsupportedSourceLayoutsTotal)
+	assert.Equal(t, 1, stats.Anomalies.UnsupportedSourceLayoutsByAgent["trae"])
 }
 
 func TestProgress_Percent(t *testing.T) {
@@ -424,4 +449,30 @@ func TestSyncStatsJSONOmitsZeroAnomalies(t *testing.T) {
 		"malformed counts must still serialize")
 	assert.NotContains(t, got, "sanitize",
 		"malformed-only run must not emit an empty sanitize object")
+}
+
+func TestSyncStatsCwdUpdatedSurvivesWorkerJSONRoundTrip(t *testing.T) {
+	stats := SyncStats{}
+	stats.RecordCwdUpdated(2)
+	require.True(t, stats.hasSessionChanges())
+	require.True(t, stats.shouldEmitSync())
+
+	payload, err := json.Marshal(stats)
+	require.NoError(t, err)
+	var restored SyncStats
+	require.NoError(t, json.Unmarshal(payload, &restored))
+
+	assert.Equal(t, 2, restored.CwdUpdated,
+		"worker-process passes marshal SyncStats; cwd-only updates must survive")
+	assert.True(t, restored.hasSessionChanges())
+	assert.True(t, restored.shouldEmitSync())
+}
+
+func TestMergeReconciliationSyncStatsCarriesCwdUpdated(t *testing.T) {
+	var dst SyncStats
+	src := SyncStats{CwdUpdated: 3}
+	mergeReconciliationSyncStats(&dst, src)
+	assert.Equal(t, 3, dst.CwdUpdated)
+	assert.True(t, dst.hasSessionChanges(),
+		"a cwd-only reconciliation must still notify session consumers")
 }

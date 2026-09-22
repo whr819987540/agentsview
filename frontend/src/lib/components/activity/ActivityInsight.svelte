@@ -1,21 +1,23 @@
 <script lang="ts">
+  import { EmptyState, Spinner, Typeahead, type TypeaheadOption } from "@kenn-io/kit-ui";
   import { m } from "../../i18n/index.js";
-  import { InsightsService } from "../../api/generated/index";
-  import { configureGeneratedClient } from "../../api/runtime.js";
+  import { InsightsService, type DbInsight } from "../../api/generated/index";
+  import {
+    isAbortError,
+  } from "../../api/runtime.js";
   import {
     generateInsight,
     type GenerateInsightHandle,
   } from "../../api/client.js";
   import { sync } from "../../stores/sync.svelte.js";
   import { insights } from "../../stores/insights.svelte.js";
-  import { router, getBasePath } from "../../stores/router.svelte.js";
-  import { renderMarkdown } from "../../utils/markdown.js";
+  import { router } from "../../stores/router.svelte.js";
+  import { ui } from "../../stores/ui.svelte.js";
+  import { loadAssetImages, renderMarkdown } from "../../utils/markdown.js";
   import { highlightCodeFences } from "../../utils/highlight-fences.js";
-  import type { Insight, InsightsResponse, AgentName } from "../../api/types.js";
+  import type { AgentName } from "../../api/types.js";
   import { LightbulbIcon, PlusIcon } from "../../icons.js";
-  import OptionTypeahead, {
-    type TypeaheadOption,
-  } from "../layout/OptionTypeahead.svelte";
+  import { LatestRead } from "../../utils/latest-read.js";
 
   let {
     dateFrom,
@@ -23,7 +25,7 @@
     timezone = "",
   }: { dateFrom: string; dateTo: string; timezone?: string } = $props();
 
-  let insight: Insight | null = $state(null);
+  let insight: DbInsight | null = $state(null);
   let loading = $state(false);
   let generating = $state(false);
   let phase = $state("");
@@ -37,13 +39,14 @@
   let genVersion = 0;
   // The in-flight generation, so we can abort it on range change/unmount.
   let handle: GenerateInsightHandle | null = null;
+  const insightListRead = new LatestRead();
 
   /**
-   * Open the standalone Insights page prefilled for this panel's range.
+   * Open Generated insights prefilled for this panel's range.
    * Modified or middle clicks fall through to the browser so the href opens in
    * a new tab/window; a plain left click is intercepted for SPA navigation.
    */
-  function openInsightsPage(e: MouseEvent) {
+  function openGeneratedInsights(e: MouseEvent) {
     if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button !== 0) {
       return;
     }
@@ -52,19 +55,19 @@
     insights.setDateFrom(dateFrom);
     insights.setDateTo(dateTo);
     insights.setProject("");
-    router.navigate("insights");
+    router.navigate("recall", { tab: "generated" });
   }
 
   const insightGenerationAvailable = $derived(
-    sync.serverVersion?.insight_generation_available === true ||
-      sync.serverVersion?.read_only !== true,
+    sync.serverVersion?.insight_generation_available ??
+      (sync.serverVersion?.read_only !== true),
   );
   const generationUnavailable = $derived(
     sync.serverVersion === null || !insightGenerationAvailable,
   );
   const unavailableTitle = $derived(
     sync.serverVersion !== null && !insightGenerationAvailable
-      ? m.activity_insight_unavailable_read_only()
+      ? m.insights_page_generate_disabled()
       : sync.serverVersion === null
         ? m.activity_insight_waiting_server()
         : m.activity_insight_generate_insight(),
@@ -90,40 +93,45 @@
     const from = dateFrom;
     const to = dateTo;
     const v = ++fetchVersion;
+    const signal = insightListRead.begin();
     abortGeneration();
     error = null;
     generating = false;
     loading = true;
 
-    configureGeneratedClient();
     InsightsService.getApiV1Insights({
-      type: "daily_activity",
-      dateFrom: from,
-      dateTo: to,
-    })
+        type: "daily_activity",
+        date_from: from,
+        date_to: to,
+      }, { signal })
       .then((res) => {
-        if (v !== fetchVersion) return;
+        if (v !== fetchVersion || !insightListRead.isCurrent(signal)) return;
         // The list endpoint treats date_from/date_to as range BOUNDS, so a
         // multi-day range also returns narrower insights nested inside it
         // (e.g. a single day) and project-scoped ones. This panel shows the
         // global insight for the exact range, so match both bounds and drop
         // project-scoped rows before taking the newest.
-        const list = (res as unknown as InsightsResponse).insights.filter(
+        const list = res.insights.filter(
           (i) => !i.project && i.date_from === from && i.date_to === to,
         );
         insight = list[0] ?? null;
         loading = false;
       })
-      .catch(() => {
+      .catch((e) => {
+        if (isAbortError(e) || !insightListRead.isCurrent(signal)) return;
         if (v !== fetchVersion) return;
         insight = null;
         loading = false;
-      });
+      })
+      .finally(() => insightListRead.finish(signal));
 
-    return abortGeneration;
+    return () => {
+      insightListRead.cancel();
+      abortGeneration();
+    };
   });
 
-  // The agent choice is shared with the standalone Insights page via the
+  // The agent choice is shared with the Generated insights panel via the
   // insights store, so picking one here and there stays in sync.
   function onAgentChange(value: string) {
     insights.setAgent(value as AgentName);
@@ -181,16 +189,16 @@
     </span>
     <a
       class="insights-link"
-      href={getBasePath() + "/insights"}
-      onclick={openInsightsPage}
+      href={router.buildHref("recall", { tab: "generated" })}
+      onclick={openGeneratedInsights}
     >
-      {m.activity_insight_open_insights_page()}
+      {m.activity_insight_open_generated()}
     </a>
   </header>
 
   {#snippet agentPicker()}
     <div class="agent-typeahead">
-      <OptionTypeahead
+      <Typeahead
         options={agentOptions}
         value={insights.agent}
         disabled={generationUnavailable}
@@ -207,7 +215,7 @@
     <div class="state muted">{m.activity_insight_loading()}</div>
   {:else if generating}
     <div class="state generating">
-      <span class="spinner"></span>
+      <span aria-hidden="true"><Spinner size={12} /></span>
       <span>{m.activity_insight_generating_phase({ phase })}</span>
     </div>
   {:else if error}
@@ -229,27 +237,25 @@
     <article
       class="markdown-body"
       use:highlightCodeFences={{ content: insight.content }}
+      use:loadAssetImages={insight.content}
     >
-      {@html renderMarkdown(insight.content)}
+      {@html renderMarkdown(insight.content, {
+        renderUnknownXmlBlocksAsPreformatted: ui.renderUnknownXmlBlocksAsPreformatted,
+      })}
     </article>
   {:else}
-    <div class="empty-state">
-      <span class="empty-text">
-        {m.activity_insight_empty_text()}
-      </span>
-      <div class="gen-row">
-        {@render agentPicker()}
-        <button
-          class="generate-btn"
-          onclick={handleGenerate}
-          disabled={generationUnavailable}
-          title={unavailableTitle}
-        >
-          <PlusIcon size="12" strokeWidth="2.2" aria-hidden="true" />
-          {m.activity_insight_generate()}
-        </button>
-      </div>
-    </div>
+    <EmptyState title={m.activity_insight_empty_text()}>
+      {@render agentPicker()}
+      <button
+        class="generate-btn"
+        onclick={handleGenerate}
+        disabled={generationUnavailable}
+        title={unavailableTitle}
+      >
+        <PlusIcon size="12" strokeWidth="2.2" aria-hidden="true" />
+        {m.activity_insight_generate()}
+      </button>
+    </EmptyState>
   {/if}
 </section>
 
@@ -302,38 +308,13 @@
   .state {
     display: flex;
     align-items: center;
-    gap: 10px;
+    gap: var(--space-4);
     font-size: 12px;
     color: var(--text-muted);
   }
 
   .state.error {
     color: var(--accent-red);
-  }
-
-  .spinner {
-    width: 12px;
-    height: 12px;
-    border: 1.5px solid var(--accent-blue);
-    border-top-color: transparent;
-    border-radius: 50%;
-    animation: spin 0.7s linear infinite;
-    flex-shrink: 0;
-  }
-
-  .empty-state {
-    display: flex;
-    flex-direction: column;
-    align-items: flex-start;
-    gap: 12px;
-    padding: 8px 0;
-  }
-
-  .empty-text {
-    font-size: 12px;
-    color: var(--text-muted);
-    line-height: 1.5;
-    max-width: 420px;
   }
 
   .gen-row {
@@ -352,7 +333,7 @@
   .generate-btn {
     display: inline-flex;
     align-items: center;
-    gap: 5px;
+    gap: var(--space-2);
     height: 28px;
     padding: 0 12px;
     border-radius: var(--radius-sm);
@@ -362,32 +343,23 @@
     color: var(--accent-blue-foreground);
     letter-spacing: 0.01em;
     transition: opacity 0.12s, transform 0.1s, box-shadow 0.12s;
-    box-shadow: 0 1px 2px rgba(37, 99, 235, 0.2);
+    box-shadow: 0 1px 2px color-mix(in srgb, var(--accent-blue) 20%, transparent);
   }
 
   .generate-btn:hover:not(:disabled) {
     opacity: 0.92;
-    box-shadow: 0 2px 6px rgba(37, 99, 235, 0.3);
+    box-shadow: 0 2px 6px color-mix(in srgb, var(--accent-blue) 30%, transparent);
   }
 
   .generate-btn:active:not(:disabled) {
-    transform: scale(0.98);
+    transform: var(--press-transform);
     box-shadow: none;
   }
 
   .generate-btn:disabled {
-    opacity: 0.45;
+    opacity: var(--opacity-disabled);
     box-shadow: none;
     cursor: default;
-  }
-
-  @keyframes spin {
-    from {
-      transform: rotate(0deg);
-    }
-    to {
-      transform: rotate(360deg);
-    }
   }
 
   /* ── Markdown Content ── */
@@ -447,7 +419,7 @@
     border-radius: var(--radius-sm);
   }
 
-  .markdown-body :global(pre) {
+  .markdown-body :global(pre:not(.unknown-xml-block)) {
     background: var(--bg-inset);
     padding: 10px 14px;
     border-radius: var(--radius-md);

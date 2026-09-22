@@ -3,16 +3,39 @@ package postgres
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 
 	"go.kenn.io/agentsview/internal/db"
 )
 
+func lockPinnedMessagesSession(
+	ctx context.Context, tx *sql.Tx, sessionID string,
+) error {
+	var lockedSessionID string
+	err := tx.QueryRowContext(ctx, `
+		SELECT id
+		FROM sessions
+		WHERE id = $1
+		FOR UPDATE`,
+		sessionID,
+	).Scan(&lockedSessionID)
+	if err == sql.ErrNoRows {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf(
+			"locking pg pins for session %s: %w", sessionID, err,
+		)
+	}
+	return nil
+}
+
 // StarSession marks a session as starred in the shared PG dashboard
 // metadata. Returns false when the session does not exist.
-func (s *Store) StarSession(sessionID string) (bool, error) {
-	res, err := s.pg.Exec(`
+func (s *Store) StarSession(ctx context.Context, sessionID string) (bool, error) {
+	res, err := s.pg.ExecContext(ctx, `
 		INSERT INTO starred_sessions (session_id)
 		SELECT $1 WHERE EXISTS (
 			SELECT 1 FROM sessions WHERE id = $1
@@ -29,11 +52,11 @@ func (s *Store) StarSession(sessionID string) (bool, error) {
 	}
 
 	var exists int
-	err = s.pg.QueryRow(
+	err = s.pg.QueryRowContext(ctx,
 		`SELECT 1 FROM sessions WHERE id = $1`,
 		sessionID,
 	).Scan(&exists)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
 	if err != nil {
@@ -44,8 +67,8 @@ func (s *Store) StarSession(sessionID string) (bool, error) {
 
 // UnstarSession removes a session star from the shared PG dashboard
 // metadata.
-func (s *Store) UnstarSession(sessionID string) error {
-	if _, err := s.pg.Exec(
+func (s *Store) UnstarSession(ctx context.Context, sessionID string) error {
+	if _, err := s.pg.ExecContext(ctx,
 		`DELETE FROM starred_sessions WHERE session_id = $1`,
 		sessionID,
 	); err != nil {
@@ -80,18 +103,18 @@ func (s *Store) ListStarredSessionIDs(
 
 // BulkStarSessions stars multiple existing sessions in one transaction.
 // Unknown session IDs are skipped.
-func (s *Store) BulkStarSessions(sessionIDs []string) error {
+func (s *Store) BulkStarSessions(ctx context.Context, sessionIDs []string) error {
 	if len(sessionIDs) == 0 {
 		return nil
 	}
 
-	tx, err := s.pg.Begin()
+	tx, err := s.pg.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("beginning star transaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	stmt, err := tx.Prepare(`
+	stmt, err := tx.PrepareContext(ctx, `
 		INSERT INTO starred_sessions (session_id)
 		SELECT $1 WHERE EXISTS (
 			SELECT 1 FROM sessions WHERE id = $1
@@ -103,7 +126,7 @@ func (s *Store) BulkStarSessions(sessionIDs []string) error {
 	defer stmt.Close()
 
 	for _, id := range sessionIDs {
-		if _, err := stmt.Exec(id); err != nil {
+		if _, err := stmt.ExecContext(ctx, id); err != nil {
 			return fmt.Errorf("starring session %s: %w", id, err)
 		}
 	}
@@ -116,11 +139,20 @@ func (s *Store) BulkStarSessions(sessionIDs []string) error {
 // On conflict, ordinal and source_uuid are refreshed from the current
 // message so the pin tracks whatever is at message_id today;
 // created_at is preserved by being absent from the SET clause.
-func (s *Store) PinMessage(
+func (s *Store) PinMessage(ctx context.Context,
 	sessionID string, messageID int64, note *string,
 ) (int64, error) {
+	tx, err := s.pg.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("beginning pin transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := lockPinnedMessagesSession(ctx, tx, sessionID); err != nil {
+		return 0, err
+	}
+
 	var id int64
-	err := s.pg.QueryRow(`
+	err = tx.QueryRowContext(ctx, `
 		WITH upsert AS (
 			INSERT INTO pinned_messages (
 				session_id, message_id, ordinal, source_uuid, note
@@ -139,23 +171,40 @@ func (s *Store) PinMessage(
 		SELECT id FROM upsert`,
 		sessionID, messageID, note,
 	).Scan(&id)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
+		if err := tx.Commit(); err != nil {
+			return 0, fmt.Errorf("committing empty pin transaction: %w", err)
+		}
 		return 0, nil
 	}
 	if err != nil {
 		return 0, fmt.Errorf("pinning message: %w", err)
 	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("committing pin transaction: %w", err)
+	}
 	return id, nil
 }
 
 // UnpinMessage removes a shared PG pin.
-func (s *Store) UnpinMessage(sessionID string, messageID int64) error {
-	if _, err := s.pg.Exec(
+func (s *Store) UnpinMessage(ctx context.Context, sessionID string, messageID int64) error {
+	tx, err := s.pg.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("beginning unpin transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if err := lockPinnedMessagesSession(ctx, tx, sessionID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx,
 		`DELETE FROM pinned_messages
 		 WHERE session_id = $1 AND message_id = $2`,
 		sessionID, messageID,
 	); err != nil {
 		return fmt.Errorf("unpinning message: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("committing unpin transaction: %w", err)
 	}
 	return nil
 }

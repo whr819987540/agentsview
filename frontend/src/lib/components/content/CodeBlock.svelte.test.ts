@@ -1,215 +1,119 @@
 // @vitest-environment jsdom
-import { describe, it, expect, afterEach, beforeEach, vi } from "vitest";
-import { mount, unmount, tick } from "svelte";
-import CodeBlock from "./CodeBlock.svelte";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
+import { mount, tick, unmount } from "svelte";
 import { setLocale } from "../../i18n/index.js";
+import { currentRangeForBlock } from "../../search/search-block.svelte.js";
+import CodeBlock from "./CodeBlock.svelte";
 import { ui } from "../../stores/ui.svelte.js";
-
-function marks(el: HTMLElement): string[] {
-  return Array.from(el.querySelectorAll("mark.search-highlight")).map(
-    (m) => m.textContent ?? "",
-  );
-}
-
-function styledSpans(el: HTMLElement): HTMLSpanElement[] {
-  return Array.from(el.querySelectorAll("span")).filter(
-    (s) => (s as HTMLSpanElement).style.color !== "",
-  ) as HTMLSpanElement[];
-}
-
-describe("CodeBlock syntax highlighting and search marks", () => {
-  let component: ReturnType<typeof mount>;
-
-  beforeEach(() => {
-    ui.showAllBlocks();
-    ui.bulkCollapseCommand = null;
-    Object.defineProperty(document, "execCommand", {
-      value: vi.fn(() => true),
-      configurable: true,
-    });
+const state = vi.hoisted(() => ({ query: "", current: -1, count: 0 }));
+const copyMock = vi.hoisted(() => vi.fn().mockResolvedValue(true));
+vi.mock("../../utils/clipboard.js", () => ({ copyToClipboard: copyMock }));
+vi.mock("../../stores/inSessionSearch.svelte.js", () => ({
+  inSessionSearch: {
+    get isActive() {
+      return !!state.query;
+    },
+    get debouncedQuery() {
+      return state.query;
+    },
+    countForBlock: () => state.count,
+    isCurrentBlock: () => state.current >= 0,
+    currentOccurrence: () => state.current,
+    navigationRevision: 0,
+  },
+}));
+let component: ReturnType<typeof mount> | undefined;
+async function render(content: string, language?: string) {
+  component = mount(CodeBlock, {
+    target: document.body,
+    props: { content, language, searchKey: "7:code:0" },
   });
-
-  afterEach(() => {
-    setLocale("en");
-    if (component) unmount(component);
-    document.body.innerHTML = "";
-    ui.showAllBlocks();
-    ui.bulkCollapseCommand = null;
-  });
-
-  it("renders copy labels in Simplified Chinese", async () => {
+  await tick();
+  return document.querySelector<HTMLElement>(".code-content")!;
+}
+beforeEach(() => {
+  state.query = "";
+  state.current = -1;
+  state.count = 0;
+  copyMock.mockClear();
+  ui.showAllBlocks();
+  ui.bulkCollapseCommand = null;
+});
+afterEach(async () => {
+  if (component) await unmount(component);
+  component = undefined;
+  document.body.replaceChildren();
+  setLocale("en");
+  ui.showAllBlocks();
+  ui.bulkCollapseCommand = null;
+});
+describe("CodeBlock", () => {
+  it("localizes copy labels and preserves raw code", async () => {
     setLocale("zh-CN");
-    component = mount(CodeBlock, {
-      target: document.body,
-      props: {
-        content: "const answer = 42;",
-        language: "typescript",
-      },
-    });
+    const source = "const value = 1;\n";
+    await render(source);
+    const button = document.querySelector<HTMLButtonElement>('button[aria-label="复制代码块"]')!;
+    expect(button.getAttribute("title")).toBe("复制代码");
+    button.click();
+    await Promise.resolve();
     await tick();
-
-    const copyButton = document.querySelector<HTMLButtonElement>(
-      "button.copy-btn",
-    );
-    expect(copyButton?.getAttribute("aria-label")).toBe("复制代码块");
-    expect(copyButton?.getAttribute("title")).toBe("复制代码");
+    expect(copyMock).toHaveBeenCalledWith(source);
+    expect(document.querySelector("code")?.textContent).toBe(source);
   });
-
-  it("marks survive Shiki swap", async () => {
-    component = mount(CodeBlock, {
-      target: document.body,
-      props: {
-        language: "typescript",
-        content: "const foo = 1;\nconst bar = foo;",
-        highlightQuery: "foo",
-        isCurrentHighlight: false,
-      },
-    });
-
-    const codeEl = document.body.querySelector("code")!;
-    expect(codeEl).not.toBeNull();
-
-    // Wait for Shiki to inject syntax-colored spans.
+  it("keeps cross-token ranges after asynchronous syntax coloring", async () => {
+    state.query = "const target";
+    state.current = 0;
+    state.count = 1;
+    const node = await render("const target = 42;\n", "ts");
     await vi.waitFor(
       () => {
-        if (!codeEl.innerHTML.includes("<span")) throw new Error("not yet");
+        expect(node.querySelector("span[style]")).not.toBeNull();
+        expect(currentRangeForBlock(node)?.toString()).toBe("const target");
       },
-      { timeout: 10_000 },
+      { timeout: 10000 },
     );
-
-    // Give the re-apply effect time to settle after the Shiki swap.
-    await tick();
-    await tick();
-
-    expect(styledSpans(codeEl).length).toBeGreaterThanOrEqual(1);
-    expect(marks(document.body)).toContain("foo");
+    expect(
+      new Set(
+        Array.from(node.querySelectorAll("span[style]"), (span) => span.getAttribute("style")),
+      ).size,
+    ).toBeGreaterThanOrEqual(2);
+    expect(node.textContent).toBe("const target = 42;\n");
+    expect(node.querySelector("mark")).toBeNull();
+  });
+  it("rebuilds a different query after remount without nested wrappers", async () => {
+    state.query = "first";
+    state.current = 0;
+    state.count = 1;
+    let node = await render("first second");
+    expect(currentRangeForBlock(node)?.toString()).toBe("first");
+    await unmount(component!);
+    component = undefined;
+    state.query = "second";
+    node = await render("first second");
+    expect(currentRangeForBlock(node)?.toString()).toBe("second");
+    expect(node.querySelector("mark")).toBeNull();
+  });
+  it("retains source and search when the language is unsupported", async () => {
+    state.query = "needle";
+    state.current = 0;
+    state.count = 1;
+    const node = await render("<needle>&\n", "not-a-language");
+    expect(node.textContent).toBe("<needle>&\n");
+    expect(currentRangeForBlock(node)?.toString()).toBe("needle");
+    expect(node.querySelector("needle")).toBeNull();
+  });
+  it("does not create search ranges without an active query", async () => {
+    const node = await render("needle needle");
+    expect(currentRangeForBlock(node)).toBeUndefined();
+    expect(node.querySelector("mark")).toBeNull();
   });
 
-  it("query change after Shiki resolved updates marks correctly", async () => {
-    // Mount with initial query "foo" and wait for Shiki + marks.
-    component = mount(CodeBlock, {
-      target: document.body,
-      props: {
-        language: "typescript",
-        content: "const foo = 1;\nconst bar = foo;",
-        highlightQuery: "foo",
-        isCurrentHighlight: false,
-      },
-    });
-
-    const codeEl = document.body.querySelector("code")!;
-
-    // Wait for Shiki to resolve and marks for "foo" to appear.
-    await vi.waitFor(
-      () => {
-        if (!codeEl.innerHTML.includes("<span")) throw new Error("shiki not yet");
-      },
-      { timeout: 10_000 },
-    );
-    await tick();
-    await tick();
-
-    expect(marks(document.body)).toContain("foo");
-
-    // Unmount and remount with a different query to simulate a query change.
-    unmount(component);
-    document.body.innerHTML = "";
-
-    component = mount(CodeBlock, {
-      target: document.body,
-      props: {
-        language: "typescript",
-        content: "const foo = 1;\nconst bar = foo;",
-        highlightQuery: "bar",
-        isCurrentHighlight: false,
-      },
-    });
-
-    const codeEl2 = document.body.querySelector("code")!;
-
-    // Wait for Shiki to resolve again and marks for "bar" to appear.
-    await vi.waitFor(
-      () => {
-        if (!codeEl2.innerHTML.includes("<span")) throw new Error("shiki not yet");
-      },
-      { timeout: 10_000 },
-    );
-    await tick();
-    await tick();
-
-    const foundMarks = marks(document.body);
-    expect(foundMarks).toContain("bar");
-    // Old query must not be marked.
-    expect(foundMarks).not.toContain("foo");
-  });
-
-  it("unknown language falls back gracefully and still marks", async () => {
-    component = mount(CodeBlock, {
-      target: document.body,
-      props: {
-        language: "definitelynotalang",
-        content: "some special token here",
-        highlightQuery: "special",
-        isCurrentHighlight: false,
-      },
-    });
-
-    // highlightToHtml resolves null quickly for unknown languages; use
-    // deterministic microtask flushing instead of a wall-clock wait.
-    await vi.waitFor(
-      () => {
-        // The action must have run; marks are set once tick settles.
-        if (marks(document.body).length === 0) throw new Error("not yet");
-      },
-      { timeout: 5_000 },
-    );
-    await tick();
-
-    const codeEl = document.body.querySelector("code")!;
-    // No Shiki spans expected for an unknown language.
-    expect(styledSpans(codeEl)).toHaveLength(0);
-    // Search marks must still be applied.
-    expect(marks(document.body)).toContain("special");
-  });
-
-  it("no double-marking after Shiki resolves with query active", async () => {
-    const content = "const foo = 1;\nconst bar = foo;";
-    // "foo" appears exactly twice in the content.
-    const expectedCount = 2;
-
-    component = mount(CodeBlock, {
-      target: document.body,
-      props: {
-        language: "typescript",
-        content,
-        highlightQuery: "foo",
-        isCurrentHighlight: false,
-      },
-    });
-
-    const codeEl = document.body.querySelector("code")!;
-    await vi.waitFor(
-      () => {
-        if (!codeEl.innerHTML.includes("<span")) throw new Error("not yet");
-      },
-      { timeout: 10_000 },
-    );
-    await tick();
-    await tick();
-
-    const markEls = document.body.querySelectorAll("mark.search-highlight");
-    expect(markEls).toHaveLength(expectedCount);
-  });
-
-  it("collapses from a bulk command, preserves preview, and still copies", async () => {
+  it("collapses from a bulk command, keeps a preview, and still copies", async () => {
     const content = "const answer = 42;\nconsole.log(answer);";
     ui.collapseVisibleBlocks();
     component = mount(CodeBlock, {
       target: document.body,
-      props: {
-        language: "typescript",
-        content,
-      },
+      props: { content, language: "typescript", searchKey: "7:code:0" },
     });
     await tick();
 
@@ -219,16 +123,13 @@ describe("CodeBlock syntax highlighting and search marks", () => {
     );
 
     const copyButton = document.querySelector<HTMLButtonElement>(
-      "button.copy-btn",
+      "button.kit-copy-btn",
     );
     expect(copyButton).not.toBeNull();
     copyButton!.click();
     await Promise.resolve();
     await tick();
-
-    expect(copyButton!.getAttribute("aria-label")).toBe(
-      "Copied code block",
-    );
+    expect(copyMock).toHaveBeenCalledWith(content);
 
     document
       .querySelector<HTMLButtonElement>(
@@ -241,4 +142,5 @@ describe("CodeBlock syntax highlighting and search marks", () => {
       "const answer = 42;",
     );
   });
+
 });

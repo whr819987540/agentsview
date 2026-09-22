@@ -1,7 +1,7 @@
 package db
 
 import (
-	"context"
+	"database/sql"
 	"testing"
 	"time"
 
@@ -18,7 +18,7 @@ func TestDeleteSession_LargeSessionFTSDelete(t *testing.T) {
 	requireFTS(t, d)
 
 	start := time.Now()
-	require.NoError(t, d.DeleteSession(largeSessionFixtureID), "DeleteSession")
+	require.NoError(t, d.DeleteSession(t.Context(), largeSessionFixtureID), "DeleteSession")
 	elapsed := time.Since(start)
 	require.LessOrEqual(t, elapsed, largeSessionPerfCeiling,
 		"DeleteSession took %s, want < 10s (per-row FTS trigger regression?)",
@@ -29,7 +29,7 @@ func TestDeleteSession_LargeSessionFTSDelete(t *testing.T) {
 	requireMessagesDeleteTriggerRestored(t, d)
 
 	var neighborPins int
-	err := d.getReader().QueryRow(
+	err := d.getReader().QueryRow(t.Context(),
 		"SELECT count(*) FROM pinned_messages WHERE session_id LIKE ?",
 		largeSessionNeighborPrefix+"-%",
 	).Scan(&neighborPins)
@@ -44,7 +44,7 @@ func TestFindSessionIDsByPartial(t *testing.T) {
 	insertSession(t, d, "abcdef-3333-4444", "proj")
 	insertSession(t, d, "fedcba-5555", "proj")
 
-	ctx := context.Background()
+	ctx := t.Context()
 
 	got, err := d.FindSessionIDsByPartial(ctx, "abcdef", 5)
 	require.NoError(t, err, "FindSessionIDsByPartial")
@@ -70,7 +70,7 @@ func TestFindSessionIDsByPartialLiteralCaseSensitive(t *testing.T) {
 	insertSession(t, d, "abc%def", "proj")
 	insertSession(t, d, "ABCdef", "proj")
 
-	ctx := context.Background()
+	ctx := t.Context()
 
 	got, err := d.FindSessionIDsByPartial(ctx, "c_d", 10)
 	require.NoError(t, err, "underscore lookup")
@@ -84,6 +84,44 @@ func TestFindSessionIDsByPartialLiteralCaseSensitive(t *testing.T) {
 	require.NoError(t, err, "case-sensitive lookup")
 	assert.ElementsMatch(t, []string{"abc_def", "abcXdef", "abc%def"}, got)
 	assert.NotContains(t, got, "ABCdef")
+}
+
+func TestFindSessionIDsByRawSuffix(t *testing.T) {
+	d := testDB(t)
+	insertSession(t, d, "plain-id", "exact")
+	insertSession(t, d, "codex:uuid", "agent")
+	insertSession(t, d, "host~uuid", "host")
+	insertSession(t, d, "host~uuid-fork", "fork")
+	insertSession(t, d, "host~P-E", "entry")
+	insertSession(t, d, "host~wild_%_literal", "wild")
+	insertSession(t, d, "host~trashed", "trash")
+	require.NoError(t, d.SoftDeleteSession(t.Context(), "host~trashed"))
+
+	ctx := t.Context()
+	got, err := d.FindSessionIDsByRawSuffix(ctx, "uuid", 2)
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{"codex:uuid", "host~uuid"}, got)
+	uuidIDs := append([]string(nil), got...)
+
+	got, err = d.FindSessionIDsByRawSuffix(ctx, "plain-id", 2)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"plain-id"}, got)
+	exactIDs := append([]string(nil), got...)
+
+	got, err = d.FindSessionIDsByRawSuffix(ctx, "wild_%_literal", 2)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"host~wild_%_literal"}, got)
+	wildcardIDs := append([]string(nil), got...)
+
+	got, err = d.FindSessionIDsByRawSuffix(ctx, "trashed", 2)
+	require.NoError(t, err)
+	assert.Empty(t, got)
+	trashedIDs := append([]string(nil), got...)
+
+	got, err = d.FindSessionIDsByRawSuffix(ctx, "E", 2)
+	require.NoError(t, err)
+	assert.Empty(t, got)
+	t.Logf("head: sqlite_uuid=%v exact=%v wildcard=%v trashed=%v entry=%v", uuidIDs, exactIDs, wildcardIDs, trashedIDs, got)
 }
 
 func TestListSessions_OutcomeFilter(t *testing.T) {
@@ -105,7 +143,7 @@ func TestListSessions_OutcomeFilter(t *testing.T) {
 			s.MessageCount = 5
 			s.UserMessageCount = 3
 		})
-		err := d.UpdateSessionSignals(tc.id, SessionSignalUpdate{
+		err := d.UpdateSessionSignals(t.Context(), tc.id, SessionSignalUpdate{
 			Outcome: tc.outcome,
 		})
 		require.NoError(t, err, "UpdateSessionSignals %s", tc.id)
@@ -141,7 +179,7 @@ func TestListSessions_HealthGradeFilter(t *testing.T) {
 			s.MessageCount = 5
 			s.UserMessageCount = 3
 		})
-		err := d.UpdateSessionSignals(tc.id, SessionSignalUpdate{
+		err := d.UpdateSessionSignals(t.Context(), tc.id, SessionSignalUpdate{
 			HealthGrade: new(tc.grade),
 			HealthScore: new(tc.score),
 		})
@@ -174,7 +212,7 @@ func TestListSessions_MinToolFailuresFilter(t *testing.T) {
 			s.MessageCount = 5
 			s.UserMessageCount = 3
 		})
-		err := d.UpdateSessionSignals(tc.id, SessionSignalUpdate{
+		err := d.UpdateSessionSignals(t.Context(), tc.id, SessionSignalUpdate{
 			ToolFailureSignalCount: tc.failures,
 		})
 		require.NoError(t, err, "UpdateSessionSignals %s", tc.id)
@@ -196,10 +234,10 @@ func TestListSessions_MinToolFailuresFilter(t *testing.T) {
 
 func TestUpsertSession_DisplayNameUpdateBehavior(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	sessionName := "My Chat Title"
-	err := d.UpsertSession(Session{
+	err := d.UpsertSession(ctx, Session{
 		ID:           "claude-ai:dn-test",
 		Project:      "claude.ai",
 		Machine:      "local",
@@ -219,7 +257,7 @@ func TestUpsertSession_DisplayNameUpdateBehavior(t *testing.T) {
 	// Re-upsert with a different session_name: should overwrite (agent names
 	// are always refreshed on re-parse; only display_name is user-protected).
 	newName := "Updated Title"
-	err = d.UpsertSession(Session{
+	err = d.UpsertSession(ctx, Session{
 		ID:           "claude-ai:dn-test",
 		Project:      "claude.ai",
 		Machine:      "local",
@@ -252,7 +290,7 @@ func TestUpsertSessionDoesNotAdvanceDataVersion(t *testing.T) {
 
 	// New session: data_version stays 0 even when the
 	// caller passes a non-zero value on the struct.
-	require.NoError(t, d.UpsertSession(Session{
+	require.NoError(t, d.UpsertSession(t.Context(), Session{
 		ID:           "dv-1",
 		Project:      "p",
 		Machine:      "m",
@@ -260,14 +298,14 @@ func TestUpsertSessionDoesNotAdvanceDataVersion(t *testing.T) {
 		MessageCount: 1,
 		DataVersion:  CurrentDataVersion(),
 	}), "UpsertSession (insert)")
-	assert.Equal(t, 0, d.GetSessionDataVersion("dv-1"),
+	assert.Equal(t, 0, d.GetSessionDataVersion(t.Context(), "dv-1"),
 		"after insert, data_version")
 
 	// Stamp a current value to simulate a successful write.
-	require.NoError(t, d.SetSessionDataVersion(
+	require.NoError(t, d.SetSessionDataVersion(t.Context(),
 		"dv-1", CurrentDataVersion(),
 	), "SetSessionDataVersion")
-	assert.Equal(t, CurrentDataVersion(), d.GetSessionDataVersion("dv-1"),
+	assert.Equal(t, CurrentDataVersion(), d.GetSessionDataVersion(t.Context(), "dv-1"),
 		"after Set, data_version")
 
 	// Re-upserting (e.g. as part of an incremental sync)
@@ -275,7 +313,7 @@ func TestUpsertSessionDoesNotAdvanceDataVersion(t *testing.T) {
 	// struct's value (here 0), and must NOT replace it
 	// with a future "current" value before the rewrite
 	// succeeds.
-	require.NoError(t, d.UpsertSession(Session{
+	require.NoError(t, d.UpsertSession(t.Context(), Session{
 		ID:           "dv-1",
 		Project:      "p",
 		Machine:      "m",
@@ -283,19 +321,60 @@ func TestUpsertSessionDoesNotAdvanceDataVersion(t *testing.T) {
 		MessageCount: 5,
 		DataVersion:  0,
 	}), "UpsertSession (update)")
-	assert.Equal(t, CurrentDataVersion(), d.GetSessionDataVersion("dv-1"),
+	assert.Equal(t, CurrentDataVersion(), d.GetSessionDataVersion(t.Context(), "dv-1"),
 		"after re-upsert, data_version (must be preserved across UpsertSession)")
+}
+
+func TestSetSessionDataVersionsIsAtomic(t *testing.T) {
+	d := testDB(t)
+	for _, id := range []string{"source-main", "source-fork"} {
+		require.NoError(t, d.UpsertSession(t.Context(), Session{
+			ID: id, Project: "p", Machine: "m", Agent: "claude",
+		}))
+		require.NoError(t, d.SetSessionDataVersion(t.Context(), id, 1))
+	}
+
+	raw, err := sql.Open("sqlite3", d.Path())
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, raw.Close()) })
+	_, err = raw.ExecContext(t.Context(), `
+		CREATE TRIGGER fail_fork_promotion
+		BEFORE UPDATE OF data_version ON sessions
+		WHEN NEW.id = 'source-fork' AND NEW.data_version > OLD.data_version
+		BEGIN
+			SELECT RAISE(FAIL, 'injected fork promotion failure');
+		END;
+	`)
+	require.NoError(t, err)
+
+	err = d.SetSessionDataVersions(
+		[]string{"source-main", "source-fork"}, CurrentDataVersion(),
+	)
+	require.ErrorContains(t, err, "injected fork promotion failure")
+	assert.Equal(t, 1, d.GetSessionDataVersion(t.Context(), "source-main"),
+		"a later member failure must roll back an earlier promotion")
+	assert.Equal(t, 1, d.GetSessionDataVersion(t.Context(), "source-fork"))
+
+	_, err = raw.ExecContext(t.Context(), `DROP TRIGGER fail_fork_promotion`)
+	require.NoError(t, err)
+	require.NoError(t, d.SetSessionDataVersions(
+		[]string{"source-main", "source-fork"}, CurrentDataVersion(),
+	))
+	assert.Equal(t, CurrentDataVersion(),
+		d.GetSessionDataVersion(t.Context(), "source-main"))
+	assert.Equal(t, CurrentDataVersion(),
+		d.GetSessionDataVersion(t.Context(), "source-fork"))
 }
 
 func TestSessionTranscriptFidelityRoundTrips(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	s := Session{
 		ID:                 "antigravity-cli:fidelity-rt",
 		Agent:              "antigravity-cli",
 		TranscriptFidelity: "summary",
 	}
-	require.NoError(t, d.UpsertSession(s))
+	require.NoError(t, d.UpsertSession(ctx, s))
 
 	got, err := d.GetSession(ctx, s.ID)
 	require.NoError(t, err)
@@ -305,7 +384,7 @@ func TestSessionTranscriptFidelityRoundTrips(t *testing.T) {
 
 func TestUpsertSessionTerminationStatus(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	clean := "clean"
 	pending := "tool_call_pending"
@@ -331,7 +410,7 @@ func TestUpsertSessionTerminationStatus(t *testing.T) {
 				UserMessageCount:  1,
 				TerminationStatus: tc.val,
 			}
-			require.NoError(t, d.UpsertSession(s), "upsert")
+			require.NoError(t, d.UpsertSession(ctx, s), "upsert")
 
 			got, err := d.GetSession(ctx, id)
 			require.NoError(t, err, "get")
@@ -349,7 +428,7 @@ func TestUpsertSessionTerminationStatus(t *testing.T) {
 
 func TestListSessionsTerminationFilter(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	clean := "clean"
 	pending := "tool_call_pending"
@@ -373,7 +452,7 @@ func TestListSessionsTerminationFilter(t *testing.T) {
 			UserMessageCount:  2,
 			TerminationStatus: term,
 		}
-		require.NoError(t, d.UpsertSession(s), "upsert %s", id)
+		require.NoError(t, d.UpsertSession(ctx, s), "upsert %s", id)
 	}
 
 	// Active (< 10 min idle): regardless of termination_status,
@@ -466,7 +545,7 @@ func getSessionRow(t *testing.T, d *DB, id string) Session {
 	t.Helper()
 	var s Session
 	s.ID = id
-	requireNoError(t, d.getWriter().QueryRow(
+	requireNoError(t, d.getWriter().QueryRow(t.Context(),
 		"SELECT display_name, session_name FROM sessions WHERE id = ?", id).
 		Scan(&s.DisplayName, &s.SessionName), "get session row")
 	return s
@@ -476,7 +555,7 @@ func TestUpsertSessionNameOwnership(t *testing.T) {
 	d := testDB(t)
 
 	// Agent name lands on a fresh row via session_name.
-	requireNoError(t, d.UpsertSession(Session{
+	requireNoError(t, d.UpsertSession(t.Context(), Session{
 		ID: "s1", Project: "p", Machine: "local", Agent: "claude",
 		SessionName: Ptr("agent-one"),
 	}), "insert agent name")
@@ -486,7 +565,7 @@ func TestUpsertSessionNameOwnership(t *testing.T) {
 	assert.Nil(t, got.DisplayName, "display_name not set by upsert")
 
 	// A newer agent name overwrites session_name.
-	requireNoError(t, d.UpsertSession(Session{
+	requireNoError(t, d.UpsertSession(t.Context(), Session{
 		ID: "s1", Project: "p", Machine: "local", Agent: "claude",
 		SessionName: Ptr("agent-two"),
 	}), "update agent name")
@@ -495,10 +574,10 @@ func TestUpsertSessionNameOwnership(t *testing.T) {
 	assert.Nil(t, got.DisplayName, "display_name still not set by upsert")
 
 	// A manual rename sets display_name.
-	requireNoError(t, d.RenameSession("s1", Ptr("user-name")), "rename")
+	requireNoError(t, d.RenameSession(t.Context(), "s1", Ptr("user-name")), "rename")
 
 	// A subsequent agent name must NOT overwrite the user's display_name.
-	requireNoError(t, d.UpsertSession(Session{
+	requireNoError(t, d.UpsertSession(t.Context(), Session{
 		ID: "s1", Project: "p", Machine: "local", Agent: "claude",
 		SessionName: Ptr("agent-three"),
 	}), "agent after user")
@@ -516,10 +595,10 @@ func TestUpsertSessionNameOwnership(t *testing.T) {
 // via ListSessionsModifiedBetween, not GetSessionFull.
 func TestGetSessionFullPopulatesSessionName(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Insert a session with an agent-provided session_name.
-	requireNoError(t, d.UpsertSession(Session{
+	requireNoError(t, d.UpsertSession(ctx, Session{
 		ID:           "s-ns",
 		Project:      "p",
 		Machine:      "local",
@@ -539,7 +618,7 @@ func TestGetSessionFullPopulatesSessionName(t *testing.T) {
 	assert.Equal(t, "Agent Title", *s.DisplayName, "visible name before rename")
 
 	// After a manual rename, display_name is set; session_name is unchanged.
-	requireNoError(t, d.RenameSession("s-ns", Ptr("User Title")), "rename")
+	requireNoError(t, d.RenameSession(ctx, "s-ns", Ptr("User Title")), "rename")
 	s, err = d.GetSessionFull(ctx, "s-ns")
 	require.NoError(t, err, "GetSessionFull after rename")
 	require.NotNil(t, s, "session not found after rename")
@@ -549,14 +628,159 @@ func TestGetSessionFullPopulatesSessionName(t *testing.T) {
 	assert.Equal(t, "Agent Title", *s.SessionName, "SessionName unchanged after rename")
 }
 
+func TestSessionIdentity(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+
+	insertSession(t, d, "sqlite-identity", "sqlite-identity", func(s *Session) {
+		s.Agent = "claude"
+		s.AgentLabel = "Claude Triage"
+		s.Entrypoint = "sdk-cli"
+		s.SessionKind = "bg"
+		s.SessionName = Ptr("Agent Title")
+		s.StartedAt = Ptr("2024-06-15T08:00:00Z")
+		s.EndedAt = Ptr("2024-06-15T09:00:00Z")
+		s.CreatedAt = "2024-06-15T08:00:00Z"
+		s.UserMessageCount = 1
+	})
+
+	index, err := d.GetSidebarSessionIndex(ctx, SessionFilter{
+		Project: "sqlite-identity",
+	})
+	require.NoError(t, err)
+	require.Len(t, index.Sessions, 1)
+	assert.Equal(t, "sqlite-identity", index.Sessions[0].ID)
+	assert.Equal(t, "Claude Triage", index.Sessions[0].AgentLabel)
+	assert.Equal(t, "sdk-cli", index.Sessions[0].Entrypoint)
+	assert.Equal(t, "bg", index.Sessions[0].SessionKind)
+	require.NotNil(t, index.Sessions[0].DisplayName)
+	assert.Equal(t, "Agent Title", *index.Sessions[0].DisplayName)
+}
+
+func TestSessionIdentityAbsent(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+
+	insertSession(t, d, "sqlite-identity-absent", "sqlite-identity-absent", func(s *Session) {
+		s.Agent = "claude"
+		s.StartedAt = Ptr("2024-06-15T08:00:00Z")
+		s.CreatedAt = "2024-06-15T08:00:00Z"
+		s.UserMessageCount = 1
+	})
+
+	session, err := d.GetSession(ctx, "sqlite-identity-absent")
+	require.NoError(t, err)
+	assert.Empty(t, session.AgentLabel)
+	assert.Empty(t, session.Entrypoint)
+
+	index, err := d.GetSidebarSessionIndex(ctx, SessionFilter{
+		Project: "sqlite-identity-absent",
+	})
+	require.NoError(t, err)
+	require.Len(t, index.Sessions, 1)
+	assert.Empty(t, index.Sessions[0].AgentLabel)
+	assert.Empty(t, index.Sessions[0].Entrypoint)
+	assert.Empty(t, index.Sessions[0].SessionKind)
+}
+
+func TestSessionKindAndPromptSourcePersist(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+
+	insertSession(t, d, "sk-persist", "sk-persist", func(s *Session) {
+		s.Agent = "claude"
+		s.Entrypoint = "sdk-cli"
+		s.SessionKind = "bg"
+		s.MessageCount = 2
+		s.UserMessageCount = 2
+	})
+	insertMessages(t, d,
+		Message{
+			SessionID: "sk-persist", Ordinal: 0, Role: "user",
+			Content: "first", PromptSource: "typed",
+		},
+		Message{
+			SessionID: "sk-persist", Ordinal: 1, Role: "user",
+			Content: "second", PromptSource: "queued",
+		},
+	)
+
+	session, err := d.GetSession(ctx, "sk-persist")
+	require.NoError(t, err)
+	assert.Equal(t, "bg", session.SessionKind)
+	assert.Equal(t, "sdk-cli", session.Entrypoint)
+
+	msgs, err := d.GetMessages(ctx, "sk-persist", 0, 10, true)
+	require.NoError(t, err)
+	require.Len(t, msgs, 2)
+	assert.Equal(t, "typed", msgs[0].PromptSource)
+	assert.Equal(t, "queued", msgs[1].PromptSource)
+}
+
+func TestSessionKindAndPromptSourceDefaultEmpty(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+
+	// A session/message written without the new fields reads back empty,
+	// so historical rows and other agents are unaffected.
+	insertSession(t, d, "sk-default", "sk-default", func(s *Session) {
+		s.Agent = "codex"
+	})
+	insertMessages(t, d, Message{
+		SessionID: "sk-default", Ordinal: 0, Role: "user", Content: "x",
+	})
+
+	session, err := d.GetSession(ctx, "sk-default")
+	require.NoError(t, err)
+	assert.Empty(t, session.SessionKind)
+
+	msgs, err := d.GetMessages(ctx, "sk-default", 0, 10, true)
+	require.NoError(t, err)
+	require.Len(t, msgs, 1)
+	assert.Empty(t, msgs[0].PromptSource)
+}
+
+func TestGetSessionName(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+
+	require.NoError(t, d.UpsertSession(ctx, Session{
+		ID: "null-name", Project: "p", Machine: "local", Agent: "codex",
+	}), "upsert session with null name")
+	require.NoError(t, d.UpsertSession(ctx, Session{
+		ID: "stored-name", Project: "p", Machine: "local", Agent: "codex",
+		SessionName: Ptr("Agent Title"),
+	}), "upsert session with stored name")
+
+	tests := []struct {
+		name      string
+		id        string
+		wantName  string
+		wantFound bool
+	}{
+		{name: "missing", id: "missing", wantFound: false},
+		{name: "null", id: "null-name", wantFound: true},
+		{name: "stored", id: "stored-name", wantName: "Agent Title", wantFound: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			name, found, err := d.GetSessionName(ctx, tt.id)
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantName, name)
+			assert.Equal(t, tt.wantFound, found)
+		})
+	}
+}
+
 func TestRenameSessionSetsAndClears(t *testing.T) {
 	d := testDB(t)
-	requireNoError(t, d.UpsertSession(Session{
+	requireNoError(t, d.UpsertSession(t.Context(), Session{
 		ID: "s1", Project: "p", Machine: "local", Agent: "claude",
 		SessionName: Ptr("Agent Name"),
 	}), "upsert")
 
-	requireNoError(t, d.RenameSession("s1", Ptr("User Name")), "rename")
+	requireNoError(t, d.RenameSession(t.Context(), "s1", Ptr("User Name")), "rename")
 	got := getSessionRow(t, d, "s1")
 	require.NotNil(t, got.DisplayName, "display_name set after rename")
 	assert.Equal(t, "User Name", *got.DisplayName)
@@ -564,7 +788,7 @@ func TestRenameSessionSetsAndClears(t *testing.T) {
 	require.NotNil(t, got.SessionName, "session_name not cleared by rename")
 	assert.Equal(t, "Agent Name", *got.SessionName)
 
-	requireNoError(t, d.RenameSession("s1", nil), "clear")
+	requireNoError(t, d.RenameSession(t.Context(), "s1", nil), "clear")
 	got = getSessionRow(t, d, "s1")
 	assert.Nil(t, got.DisplayName, "display_name cleared")
 	// session_name persists after clearing the user rename.
@@ -574,10 +798,10 @@ func TestRenameSessionSetsAndClears(t *testing.T) {
 
 func TestSessionNameCOALESCEInGetSession(t *testing.T) {
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	// Session with only session_name — GetSession should return it via COALESCE.
-	requireNoError(t, d.UpsertSession(Session{
+	requireNoError(t, d.UpsertSession(ctx, Session{
 		ID: "s1", Project: "p", Machine: "local", Agent: "claude",
 		SessionName: Ptr("Agent Title"), MessageCount: 1,
 	}), "upsert with session_name")
@@ -587,14 +811,14 @@ func TestSessionNameCOALESCEInGetSession(t *testing.T) {
 	assert.Equal(t, "Agent Title", *s.DisplayName, "COALESCE returns session_name when no user rename")
 
 	// User renames — display_name wins.
-	requireNoError(t, d.RenameSession("s1", Ptr("User Title")), "rename")
+	requireNoError(t, d.RenameSession(ctx, "s1", Ptr("User Title")), "rename")
 	s, err = d.GetSession(ctx, "s1")
 	require.NoError(t, err)
 	require.NotNil(t, s.DisplayName)
 	assert.Equal(t, "User Title", *s.DisplayName, "display_name wins over session_name")
 
 	// Clear rename — session_name visible again.
-	requireNoError(t, d.RenameSession("s1", nil), "clear rename")
+	requireNoError(t, d.RenameSession(ctx, "s1", nil), "clear rename")
 	s, err = d.GetSession(ctx, "s1")
 	require.NoError(t, err)
 	require.NotNil(t, s.DisplayName)

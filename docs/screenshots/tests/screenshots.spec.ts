@@ -6,12 +6,15 @@ const DIR = process.env.SCREENSHOT_DIR || join(
 );
 
 const FULL = { width: 1440, height: 900 };
+// Imported session IDs can contain original machine names.
+const CAPTURE_STYLE = '.session-id { visibility: hidden !important; }';
 
 // PG serve instance for pg-sync screenshots (machine labels, etc.)
 const PG_BASE_URL = process.env.PG_BASE_URL || '';
 
 async function snap(page: Page, name: string) {
   await page.screenshot({
+    style: CAPTURE_STYLE,
     path: join(DIR, `${name}.png`),
     type: 'png',
   });
@@ -19,8 +22,38 @@ async function snap(page: Page, name: string) {
 
 async function snapEl(loc: Locator, name: string) {
   await loc.screenshot({
+    style: CAPTURE_STYLE,
     path: join(DIR, `${name}.png`),
     type: 'png',
+  });
+}
+
+async function snapRange(
+  page: Page,
+  first: Locator,
+  last: Locator,
+  name: string
+) {
+  const firstBox = await first.boundingBox();
+  const lastBox = await last.boundingBox();
+  if (!firstBox || !lastBox) {
+    throw new Error(`cannot resolve screenshot bounds for ${name}`);
+  }
+  const x = Math.min(firstBox.x, lastBox.x);
+  const right = Math.max(
+    firstBox.x + firstBox.width,
+    lastBox.x + lastBox.width
+  );
+  await page.screenshot({
+    style: CAPTURE_STYLE,
+    path: join(DIR, `${name}.png`),
+    type: 'png',
+    clip: {
+      x,
+      y: firstBox.y,
+      width: right - x,
+      height: lastBox.y + lastBox.height - firstBox.y,
+    },
   });
 }
 
@@ -104,6 +137,7 @@ test.describe('Dashboard', () => {
     const clickable = page.locator('.heatmap-cell.clickable');
     if (await clickable.count() > 0) {
       await clickable.first().click();
+      await page.mouse.move(0, 0);
       await page.waitForTimeout(2000);
       await snap(page, 'heatmap-filtered');
       // Click again to deselect
@@ -116,32 +150,20 @@ test.describe('Dashboard', () => {
   });
 
   test('hour of week heatmap', async ({ page }) => {
-    const panels = page.locator('.chart-panel');
-    const count = await panels.count();
-    for (let i = 0; i < count; i++) {
-      const text = await panels.nth(i).textContent();
-      if (text && (text.includes('Hour') || text.includes('Week'))) {
-        await snapEl(panels.nth(i), 'hour-of-week');
-        break;
-      }
-    }
+    const heatmap = page.locator('.how-container');
+    await expect(heatmap.locator('.how-chart')).toBeVisible();
+    await snapEl(heatmap, 'hour-of-week');
   });
 
   test('activity timeline', async ({ page }) => {
     const timeline = page.locator('.timeline-container');
     if (await timeline.count() > 0) {
       await timeline.scrollIntoViewIfNeeded();
-      await page.waitForSelector('.timeline-svg', {
+      await timeline.locator('.timeline-chart').waitFor({
         timeout: 10_000,
       });
       await page.waitForTimeout(500);
-      // Capture the parent chart-panel that wraps the timeline
-      const panel = page.locator(
-        '.chart-panel:has(.timeline-container)'
-      );
-      if (await panel.count() > 0) {
-        await snapEl(panel, 'activity-timeline');
-      }
+      await snapEl(timeline, 'activity-timeline');
     }
   });
 
@@ -200,7 +222,12 @@ test.describe('Dashboard', () => {
       if (text && (text.includes('Shape') || text.includes('Distribution'))) {
         await panels.nth(i).scrollIntoViewIfNeeded();
         await page.waitForTimeout(300);
-        await snapEl(panels.nth(i), 'session-shape');
+        await snapRange(
+          page,
+          panels.nth(i).locator('.shape-header'),
+          panels.nth(i).locator('.shape-footer'),
+          'session-shape'
+        );
         break;
       }
     }
@@ -232,6 +259,18 @@ test.describe('Dashboard', () => {
     await panel.scrollIntoViewIfNeeded();
     await page.waitForTimeout(500);
     await snapEl(panel, 'top-skills');
+  });
+
+  test('skill usage over time', async ({ page }) => {
+    const panel = page.locator('.chart-panel:has(.trend-container)');
+    await expect(panel).toBeVisible({ timeout: 10_000 });
+    await panel.scrollIntoViewIfNeeded();
+    await expect(
+      panel.getByRole('heading', { name: 'Skill Usage Over Time' })
+    ).toBeVisible();
+    await expect(panel.locator('.chart-svg')).toBeVisible();
+    await page.waitForTimeout(500);
+    await snapEl(panel, 'skill-trends');
   });
 
   test('velocity metrics', async ({ page }) => {
@@ -277,30 +316,23 @@ test.describe('Dashboard', () => {
   test('dashboard model filter', async ({ page }) => {
     // The dashboard toolbar Model dropdown reuses the shared
     // FilterDropdown (label "Model") in include mode. Open it and
-    // include the first listed model so the screenshot shows the open
+    // include a Claude model so the screenshot shows the open
     // panel, the resulting "Model: <name>" trigger label, and the
     // active-filter chip the ActiveFilters row renders beneath it.
-    const trigger = page.locator(
-      '.analytics-toolbar .filter-dropdown .filter-trigger',
+    const modelDropdown = page.locator(
+      '.analytics-toolbar .kit-filter-dropdown',
       { hasText: 'Model' }
     );
+    const trigger = modelDropdown.locator('.kit-filter-dropdown__btn');
     await expect(trigger).toBeVisible({ timeout: 5_000 });
     await trigger.click();
-    await page.waitForSelector(
-      '.analytics-toolbar .filter-dropdown .dropdown-panel',
-      { timeout: 5_000 }
+    await modelDropdown.locator('.kit-filter-dropdown__panel').waitFor(
+      { state: 'visible', timeout: 5_000 }
     );
 
-    // In include mode the first .dropdown-row is the "All models"
-    // reset row; the actual models follow. Include the first real
-    // model if one exists so a filter chip appears.
-    const rows = page.locator(
-      '.analytics-toolbar .filter-dropdown .dropdown-row'
-    );
-    if (await rows.count() > 1) {
-      await rows.nth(1).click();
-      await page.waitForTimeout(1500);
-    }
+    const rows = modelDropdown.locator('.kit-filter-dropdown__item');
+    await rows.filter({ hasText: /claude/i }).first().click();
+    await page.waitForTimeout(1500);
     await snap(page, 'analytics-model-filter');
 
     // Clean up: clicking the "All models" row clears the filter.
@@ -315,7 +347,19 @@ test.describe('Dashboard', () => {
 
 test.describe('Activity dashboard', () => {
   async function navigateToActivity(page: Page, path = '/activity') {
-    await page.goto(path);
+    // Anchor the range to the fixture, so a release run never captures an empty today.
+    const response = await page.request.get('/api/v1/sessions?limit=1');
+    const latest = (await response.json()).sessions[0];
+    const timestamp = new Date(
+      latest.ended_at || latest.started_at || latest.created_at
+    );
+    expect(
+      timestamp.getTime(), 'latest session must have a valid activity date'
+    ).not.toBeNaN();
+    const date = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'America/Chicago',
+    }).format(timestamp);
+    await page.goto(`${path}${path.includes('?') ? '&' : '?'}date=${date}`);
     await page.waitForSelector('.activity-page', { timeout: 10_000 });
     await expect(
       page.locator('.activity-page .summary-cards .card').first()
@@ -371,6 +415,17 @@ test.describe('Activity dashboard', () => {
   });
 
   test('activity insight', async ({ page }) => {
+    // Use a fixed example instead of invoking an external agent CLI.
+    await page.route('**/api/v1/insights?*', async (route) => {
+      const params = new URL(route.request().url()).searchParams;
+      await route.fulfill({ json: { insights: [{
+        id: 1, type: 'daily_activity', project: null,
+        date_from: params.get('date_from'),
+        date_to: params.get('date_to'),
+        agent: 'claude', model: 'claude-opus-4-1',
+        content: '## Activity summary\n\nWork focused on AgentsView documentation and the roborev review engine.\n\n### What changed\n\n- Clarified setup instructions and refreshed the documentation screenshots.\n- Improved how review findings are grouped before they reach the reader.\n\n### Follow up\n\nReview the updated guides alongside the release notes before publishing.',
+      }] } });
+    });
     await navigateToActivity(page, '/activity?preset=week');
     const panel = page.locator(
       '.activity-page .chart-panel:has(.activity-insight)'
@@ -378,11 +433,230 @@ test.describe('Activity dashboard', () => {
     await expect(panel).toBeVisible({ timeout: 10_000 });
     await panel.scrollIntoViewIfNeeded();
     await page.waitForTimeout(500);
+    await expect(panel.locator('.markdown-body')).toBeVisible();
     await snapEl(panel, 'activity-insight');
   });
 });
 
-// ── Session browser ─────────────────────────────────────
+// ── Data workspace ───────────────────────────────────────
+
+test.describe('Data workspace', () => {
+  test.beforeEach(async ({ page }) => {
+    await page.setViewportSize(FULL);
+    await waitForApp(page);
+    await page.goto('/data');
+    await expect(page.locator('.data-page')).toBeVisible({
+      timeout: 10_000,
+    });
+    await expect(page.locator('.project-row').first()).toBeVisible({
+      timeout: 10_000,
+    });
+  });
+
+  test('project inventory', async ({ page }) => {
+    await expect(page.locator('.summary-strip')).toContainText(
+      'projects'
+    );
+    await snap(page, 'data-inventory');
+  });
+
+  test('selected project workspace', async ({ page }) => {
+    await page.route(
+      '**/api/v1/data/project-reclassification/candidates?*',
+      async (route) => {
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({
+            candidates: [
+              {
+                id: 'agentsview-main',
+                machine: 'dev-laptop',
+                suggested_prefix: '/workspace/agentsview/main',
+                evidence_kind: 'worktree_root',
+                evidence_root: '/workspace/agentsview/main',
+                contributing_sessions: 126,
+                distinct_cwds: 4,
+                available: true,
+                examples: [
+                  {
+                    session_id: 'data-session-1',
+                    cwd: '/workspace/agentsview/main',
+                  },
+                ],
+              },
+              {
+                id: 'agentsview-release-docs',
+                machine: 'dev-laptop',
+                suggested_prefix: '/workspace/agentsview/release-docs',
+                evidence_kind: 'worktree_root',
+                evidence_root: '/workspace/agentsview/release-docs',
+                contributing_sessions: 38,
+                distinct_cwds: 2,
+                available: true,
+                examples: [
+                  {
+                    session_id: 'data-session-2',
+                    cwd: '/workspace/agentsview/release-docs',
+                  },
+                ],
+              },
+              {
+                id: 'agentsview-recall-browser',
+                machine: 'dev-laptop',
+                suggested_prefix: '/workspace/agentsview/recall-browser',
+                evidence_kind: 'worktree_root',
+                evidence_root: '/workspace/agentsview/recall-browser',
+                contributing_sessions: 17,
+                distinct_cwds: 1,
+                available: true,
+                examples: [
+                  {
+                    session_id: 'data-session-3',
+                    cwd: '/workspace/agentsview/recall-browser',
+                  },
+                ],
+              },
+            ],
+          }),
+        });
+      }
+    );
+    const agentsviewRow = page.locator('.project-row', {
+      hasText: 'agentsview',
+    }).first();
+    await expect(agentsviewRow).toBeVisible();
+    await agentsviewRow.click();
+    await expect(page.locator('.pane-detail')).toBeVisible({
+      timeout: 10_000,
+    });
+    await expect(
+      page.getByText('Finding session folders…', { exact: true })
+    ).toBeHidden({ timeout: 10_000 });
+    await snap(page, 'data-workspace');
+    await page.getByRole('radio', { name: 'All folders', exact: true }).click();
+    await expect(
+      page.getByRole('button', { name: 'Save 3 corrections' })
+    ).toBeVisible();
+    await snap(page, 'project-mapping-bulk');
+  });
+});
+
+// ── Recall corpus browser ───────────────────────────────────
+
+test.describe('Recall corpus browser', () => {
+  test('corpus entries and extraction coverage', async ({ page }) => {
+    await page.setViewportSize(FULL);
+    await page.route('**/api/v1/recall/entries?*', async (route) => {
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          entries: [
+            {
+              id: 'recall-docs-1',
+              type: 'procedure',
+              scope: 'project',
+              status: 'accepted',
+              review_state: 'human_reviewed',
+              title: 'Verify docs against source behavior',
+              body: 'Trace user-facing claims to implementation and tests before publishing release documentation.',
+              trigger: 'When documenting a release.',
+              uncertainty: 'Screenshots still require visual review.',
+              project: 'agentsview',
+              agent: 'claude',
+              source_session_id: 'docs-session-1',
+              source_run_id: 'release-docs-2026-08',
+              extractor_method: 'reviewed_import',
+              model: 'local-review-model',
+              transferable: true,
+              provenance_ok: true,
+              created_at: '2026-08-01T16:00:00Z',
+              updated_at: '2026-08-01T16:00:00Z',
+              evidence: [
+                {
+                  id: 1,
+                  entry_id: 'recall-docs-1',
+                  session_id: 'docs-session-1',
+                  message_start_ordinal: 12,
+                  message_end_ordinal: 18,
+                },
+              ],
+            },
+            {
+              id: 'recall-docs-2',
+              type: 'warning',
+              scope: 'global',
+              status: 'accepted',
+              review_state: 'unreviewed_auto',
+              title: 'Keep artifact transport limits visible',
+              body: 'Describe folder transport as an early workflow.',
+              source_session_id: 'docs-session-2',
+              transferable: false,
+              provenance_ok: true,
+              created_at: '2026-08-01T15:00:00Z',
+              updated_at: '2026-08-01T15:00:00Z',
+            },
+          ],
+          trusted_only: false,
+          next_cursor: '',
+        }),
+      });
+    });
+    await page.route(
+      '**/api/v1/recall/extraction/status',
+      async (route) => {
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({
+            configured: true,
+            fingerprint: 'release-docs-2026-08',
+            generations: [
+              {
+                fingerprint: 'release-docs-2026-08',
+                state: 'active',
+                model: 'local-review-model',
+                segmenter: 'conversation-v1',
+                created_at: '2026-08-01T14:00:00Z',
+                updated_at: '2026-08-01T16:00:00Z',
+              },
+            ],
+            source_runs: ['release-docs-2026-08'],
+            stats: {
+              pending: 3,
+              partial: 1,
+              done: 42,
+              failed: 0,
+              units_done: 128,
+              units_total: 132,
+              entries: 57,
+            },
+            eligible_backlog: 4,
+          }),
+        });
+      }
+    );
+
+    await page.goto('/recall');
+    const pageRoot = page.locator('.recall-page');
+    await expect(pageRoot).toBeVisible({ timeout: 10_000 });
+    await expect(pageRoot).toContainText(
+      'Verify docs against source behavior'
+    );
+    await expect(pageRoot).toContainText('42 done');
+
+    await page.getByRole('button', {
+      name: 'Expand Verify docs against source behavior',
+    }).click();
+    await expect(pageRoot).toContainText(
+      'Trace user-facing claims to implementation and tests'
+    );
+    await snap(page, 'recall-corpus');
+  });
+});
+
+// ── Session browser ─────────────────────────────────────────
 
 test.describe('Session browser', () => {
   test.beforeEach(async ({ page }) => {
@@ -400,10 +674,17 @@ test.describe('Session browser', () => {
   test('project filter', async ({ page }) => {
     // The project filter is a typeahead in the header. Open it and pick the
     // first real project (index 0 is the "All Projects" option).
-    const trigger = page.locator('.typeahead-trigger').first();
+    const trigger = page.locator(
+      '.project-picker .kit-typeahead__trigger'
+    ).first();
     await trigger.click();
-    await page.waitForSelector('.typeahead-option', { timeout: 5_000 });
-    const options = page.locator('.typeahead-option');
+    await page.waitForSelector(
+      '.project-picker .kit-typeahead__option',
+      { timeout: 5_000 }
+    );
+    const options = page.locator(
+      '.project-picker .kit-typeahead__option'
+    );
     if (await options.count() > 1) {
       await options.nth(1).click();
       await page.waitForTimeout(1000);
@@ -416,6 +697,8 @@ test.describe('Session browser', () => {
     if (await filterBtn.count() > 0) {
       await filterBtn.click();
       await page.waitForTimeout(300);
+      await page.getByRole('button', { name: '10', exact: true })
+        .scrollIntoViewIfNeeded();
       await snap(page, 'session-filters');
     }
   });
@@ -503,9 +786,105 @@ test.describe('Message viewer', () => {
     await waitForApp(page);
   });
 
+  async function findVisibleToolBlock(page: Page): Promise<Locator> {
+    let tool = page.locator('.tool-block').first();
+    if (await tool.count() > 0 && await tool.isVisible()) {
+      return tool;
+    }
+
+    const rows = page.locator('.message, .virtual-row');
+    const count = await rows.count();
+    for (let i = 0; i < Math.min(count, 60); i++) {
+      await rows.nth(i).scrollIntoViewIfNeeded();
+      await page.waitForTimeout(150);
+      tool = page.locator('.tool-block').first();
+      if (await tool.count() > 0 && await tool.isVisible()) {
+        return tool;
+      }
+    }
+
+    throw new Error('no visible .tool-block found in selected session');
+  }
+
+  async function findVisibleToolBlockWithOutput(
+    scope: Page | Locator
+  ): Promise<Locator> {
+    const tools = scope.locator('.tool-block');
+    const toolCount = await tools.count();
+    for (let i = 0; i < toolCount; i++) {
+      const tool = tools.nth(i);
+      if (!(await tool.isVisible())) continue;
+
+      const header = tool.locator('.tool-header');
+      const isExpanded =
+        (await tool.locator('.tool-chevron.open').count()) > 0;
+      if (!isExpanded && (await header.count()) > 0) {
+        await header.click();
+        await tool.page().waitForTimeout(100);
+      }
+      if (
+        await tool.locator('.output-header').isVisible().catch(() => false)
+      ) {
+        return tool;
+      }
+    }
+
+    throw new Error(
+      'no visible .tool-block with output found in selected session'
+    );
+  }
+
   test('full message view', async ({ page }) => {
     await selectRichSession(page);
     await snap(page, 'message-viewer');
+  });
+
+  test('Codex desktop resume menu', async ({ page }) => {
+    const response = await page.request.get('/api/v1/sessions?agent=codex&limit=200');
+    const session = (await response.json()).sessions.find(
+      (session: { id: string }) => !session.id.includes('~')
+    );
+    expect(session, 'fixture needs a local Codex session').toBeDefined();
+    await page.goto(`/sessions/${encodeURIComponent(session.id)}`);
+    await expect(page.locator('.message').first()).toBeVisible({
+      timeout: 10_000,
+    });
+
+    const resumeButton = page.locator('.resume-btn');
+    await expect(resumeButton).toBeVisible({ timeout: 5_000 });
+    await resumeButton.click();
+
+    const menu = page.locator('.open-menu');
+    const desktopLink = menu.getByTestId('codex-desktop-link');
+    await expect(menu).toBeVisible();
+    await expect(desktopLink).toHaveAttribute(
+      'href',
+      /^codex:\/\/threads\//
+    );
+    await snapEl(menu, 'session-resume-menu');
+  });
+
+  test('remote session resume command', async ({ page }) => {
+    const response = await page.request.get('/api/v1/sessions?agent=claude&limit=1');
+    const source = (await response.json()).sessions[0];
+    expect(source, 'remote resume screenshot requires a Claude session in the source archive').toBeDefined();
+    const remote = { ...source, id: `work-desktop~${source.id.split('~').pop()}`, machine: 'work-desktop' };
+    const remotePath = `/api/v1/sessions/${encodeURIComponent(remote.id)}`;
+    await page.route(`**${remotePath}**`, async (route) => {
+      const url = new URL(route.request().url());
+      if (url.pathname === remotePath) return route.fulfill({ json: remote });
+      if (url.pathname.endsWith('/directory')) return route.fulfill({ json: { path: '' } });
+      await route.continue({
+        url: url.href.replace(encodeURIComponent(remote.id), encodeURIComponent(source.id)),
+      });
+    });
+    await page.goto(`/sessions/${encodeURIComponent(remote.id)}`);
+    await expect(page.locator('.message').first()).toBeVisible();
+    await page.locator('.resume-btn').click();
+    const menu = page.locator('.open-menu');
+    await expect(menu.getByRole('button', { name: 'Copy command', exact: true })).toBeVisible();
+    await expect(menu.getByRole('button')).toHaveCount(1);
+    await snap(page, 'remote-resume-command');
   });
 
   test('thinking blocks', async ({ page }) => {
@@ -578,6 +957,78 @@ test.describe('Message viewer', () => {
         }
       }
     }
+  });
+
+  test('formatted tool output', async ({ page }) => {
+    const toolOutputId = process.env.SCREENSHOT_TOOL_OUTPUT_SESSION_ID;
+    const toolOutputOrdinal =
+      process.env.SCREENSHOT_TOOL_OUTPUT_MESSAGE_ORDINAL;
+    let toolScope: Page | Locator = page;
+    if (toolOutputId || toolOutputOrdinal) {
+      if (!toolOutputId || toolOutputOrdinal === undefined) {
+        throw new Error(
+          'tool-output screenshot requires both session id and message ordinal'
+        );
+      }
+      const ordinal = Number(toolOutputOrdinal);
+      if (!Number.isSafeInteger(ordinal) || ordinal < 0) {
+        throw new Error('tool-output screenshot ordinal must be non-negative');
+      }
+      await page.goto(
+        '/sessions/' + encodeURIComponent(toolOutputId) +
+          '?msg=' + encodeURIComponent(String(ordinal))
+      );
+      const selectedRow = page.locator('.virtual-row.selected');
+      await expect(selectedRow).toBeVisible({ timeout: 15_000 });
+      toolScope = selectedRow;
+    } else {
+      await selectRichSession(page);
+    }
+
+    const tool = await findVisibleToolBlockWithOutput(toolScope);
+
+    const outputHeader = tool.locator('.output-header');
+    await expect(outputHeader).toBeVisible({ timeout: 5_000 });
+    if (!(await tool.locator('.output-mode').isVisible().catch(() => false))) {
+      await outputHeader.click();
+      await page.waitForTimeout(300);
+    }
+
+    const formatted = tool.getByRole('radio', {
+      name: 'Formatted',
+      exact: true,
+    });
+    await expect(formatted).toBeVisible({ timeout: 5_000 });
+    await formatted.click();
+    await expect(tool.locator('.formatted-output')).toBeVisible({
+      timeout: 5_000,
+    });
+    await page.waitForTimeout(500);
+    await snapRange(
+      page,
+      tool.locator('.output-header-row'),
+      tool.locator('.formatted-output'),
+      'tool-output-formatted'
+    );
+  });
+
+  test('copy buttons on tool block', async ({ page }) => {
+    await selectRichSession(page);
+
+    const tool = await findVisibleToolBlock(page);
+    const header = tool.locator('.tool-header');
+    const isExpanded = (await tool.locator('.tool-chevron.open').count()) > 0;
+    if (!isExpanded && (await header.count()) > 0) {
+      await header.click();
+      await page.waitForTimeout(300);
+    }
+
+    if ((await tool.locator('.tool-copy').count()) === 0) {
+      throw new Error('visible .tool-block has no copy buttons');
+    }
+    await tool.hover();
+    await page.waitForTimeout(600);
+    await snapEl(tool, 'tool-block-copy-btn');
   });
 
   test('tool call groups', async ({ page }) => {
@@ -662,39 +1113,46 @@ test.describe('Message viewer', () => {
 
     // Hover over a message to reveal the copy button
     const message = page.locator('.message').first();
-    if (await message.count() > 0) {
-      await message.hover();
-      await page.waitForTimeout(300);
+    await expect(message).toBeVisible({ timeout: 5_000 });
+    await message.hover();
+    await page.waitForTimeout(300);
 
-      const copyBtn = message.locator('.copy-btn');
-      if (await copyBtn.count() > 0) {
-        await snapEl(message, 'message-copy-btn');
-      }
-    }
+    const copyBtn = message.locator('.message-header .kit-copy-btn').first();
+    await expect(copyBtn).toBeVisible({ timeout: 5_000 });
+    await snapEl(message, 'message-copy-btn');
   });
 
   test('copy button on code block', async ({ page }) => {
+    const codeBlockId = process.env.SCREENSHOT_CODE_BLOCK_SESSION_ID;
+    if (codeBlockId) {
+      await page.goto('/sessions/' + encodeURIComponent(codeBlockId));
+      await page.waitForSelector('.code-block', { timeout: 15_000 });
+      await page.waitForTimeout(500);
+    }
+
     // Walk sessions until we find one with at least one fenced
     // code block. We scan more aggressively than selectRichSession
     // because most sessions have only inline code or no code at
     // all, and we need a `.code-block` (CodeBlock.svelte:34) for
     // this test to be meaningful.
-    const items = page.locator('.session-item');
-    const total = await items.count();
-    const max = Math.min(40, total);
-    let found = false;
-    for (let i = 0; i < max; i++) {
-      await items.nth(i).click();
-      await page.waitForSelector('.message', { timeout: 10_000 });
-      await page.waitForTimeout(400);
-      if (await page.locator('.code-block').first().count() > 0) {
-        found = true;
-        break;
+    if (!codeBlockId) {
+      const items = page.locator('.session-item');
+      const total = await items.count();
+      const max = Math.min(40, total);
+      let found = false;
+      for (let i = 0; i < max; i++) {
+        await items.nth(i).click();
+        await page.waitForSelector('.message', { timeout: 10_000 });
+        await page.waitForTimeout(400);
+        if (await page.locator('.code-block').first().count() > 0) {
+          found = true;
+          break;
+        }
       }
-    }
-    if (!found) {
-      test.skip(true,
-        `No .code-block found in the first ${max} sessions`);
+      if (!found) {
+        test.skip(true,
+          `No .code-block found in the first ${max} sessions`);
+      }
     }
 
     // Capture just the top of a code block where the copy
@@ -717,6 +1175,7 @@ test.describe('Message viewer', () => {
       throw new Error('code-block has no bounding box');
     }
     await page.screenshot({
+      style: CAPTURE_STYLE,
       path: join(DIR, 'code-block-copy-btn.png'),
       type: 'png',
       clip: {
@@ -757,6 +1216,46 @@ test.describe('Command palette', () => {
     await page.waitForTimeout(1500);
     await snap(page, 'search-results');
   });
+
+  test('semantic search setup', async ({ page }) => {
+    await page.keyboard.press('Control+k');
+    const palette = page.locator('.palette-overlay');
+    await expect(palette).toBeVisible({ timeout: 5_000 });
+
+    await palette.getByRole('radio', { name: 'Semantic' }).click();
+    await palette.locator('.palette-input').fill(
+      'database connection pooling'
+    );
+
+    const setup = palette.locator('.semantic-setup');
+    await expect(setup).toContainText(
+      "Semantic search isn't set up",
+      { timeout: 10_000 }
+    );
+    await expect(setup).toContainText('[vector]');
+    await expect(setup).toContainText('agentsview embeddings build');
+    await snapEl(setup, 'semantic-search-setup');
+  });
+
+  test('project and date search filters', async ({ page }) => {
+    await page.keyboard.press('Control+k');
+    const palette = page.locator('.palette-overlay');
+    await palette.locator('.palette-input').fill('implement');
+    await palette.getByTitle('Select project', { exact: true }).click();
+    await page.getByRole('option', { name: /^agentsview \(/ }).first().click();
+    await expect(palette.locator('.palette-item').first()).toBeVisible();
+    await palette.getByRole('button', { name: 'All time', exact: true }).click();
+    await expect(page.getByRole('radio', { name: 'Calendar', exact: true })).toBeVisible();
+    await snap(page, 'search-filters');
+  });
+
+  test('open session by ID', async ({ page }) => {
+    await page.keyboard.press('Control+g');
+    const dialog = page.getByRole('dialog');
+    await expect(dialog.getByRole('textbox', { name: 'Session ID or UUID' })).toBeVisible();
+    await expect(dialog.getByRole('button', { name: 'Open session', exact: true })).toBeVisible();
+    await snap(page, 'open-session');
+  });
 });
 
 // ── Modals ──────────────────────────────────────────────
@@ -768,83 +1267,81 @@ test.describe('Modals', () => {
   });
 
   test('shortcuts modal', async ({ page }) => {
-    await page.keyboard.press('?');
-    await page.waitForSelector('.shortcuts-overlay', {
-      timeout: 5_000,
+    await page.locator(
+      'button[aria-label="Keyboard shortcuts"]'
+    ).click();
+    const dialog = page.getByRole('dialog', {
+      name: 'Keyboard Shortcuts',
     });
+    await expect(dialog).toBeVisible({ timeout: 5_000 });
     await page.waitForTimeout(300);
-    await snap(page, 'shortcuts-modal');
+    await snapEl(dialog, 'shortcuts-modal');
   });
 
   test('resync modal', async ({ page }) => {
     // Resync now lives in Settings: open it, then trigger the modal.
-    await page.locator('button[title="Settings"]').click();
-    await page.waitForSelector('.resync-btn', { timeout: 5_000 });
-    await page.locator('.resync-btn').click();
-    await page.waitForSelector('.resync-panel', { timeout: 5_000 });
+    await page.goto('/settings');
+    await page.waitForSelector('.settings-page', { timeout: 5_000 });
+    await page.getByRole('button', {
+      name: 'Full Resync',
+      exact: true,
+    }).click();
+    const dialog = page.getByRole('dialog', { name: 'Full Resync' });
+    await expect(dialog).toBeVisible({ timeout: 5_000 });
     await page.waitForTimeout(300);
-    await snap(page, 'resync-modal');
+    await snapEl(dialog, 'resync-modal');
     await page.keyboard.press('Escape');
   });
 
   test('publish modal', async ({ page }) => {
     await selectFirstSession(page);
-    // 'p' publishes the active session. With no GitHub token configured the
-    // modal settles on its setup view, so no real gist URL is created.
-    await page.keyboard.press('p');
-    await page.waitForSelector('.publish-panel', { timeout: 5_000 });
+    await page.locator(
+      'button[aria-label="Publish to Gist"]'
+    ).click();
+    await page.locator('.export-dropdown .overflow-item', {
+      hasText: 'Publish public Gist',
+    }).click();
+    const dialog = page.getByRole('dialog', {
+      name: 'Publish to public GitHub Gist',
+    });
+    await expect(dialog).toBeVisible({ timeout: 5_000 });
     // With no token, the modal settles on the setup view (token input); wait
     // for it so the snap is the stable setup state, not the initial spinner.
     await page
       .locator('.token-input')
       .waitFor({ state: 'visible', timeout: 6_000 })
       .catch(() => {});
-    await snap(page, 'publish-modal');
+    await snapEl(dialog, 'publish-modal');
     await page.keyboard.press('Escape');
   });
 });
 
-// ── Insights ────────────────────────────────────────────
+// ── Recall and Quality ──────────────────────────────────
 
-test.describe('Insights', () => {
+test.describe('Recall and Quality', () => {
   test.beforeEach(async ({ page }) => {
     await page.setViewportSize(FULL);
     await waitForApp(page);
   });
 
-  async function navigateToInsights(page: Page) {
-    // Insights lives under the More dropdown as of 0.21.0
-    const moreBtn = page.locator('.nav-btn', { hasText: 'More' });
-    await expect(moreBtn).toBeVisible({ timeout: 5_000 });
-    await moreBtn.click();
-    const insightsItem = page.locator(
-      '.more-item', { hasText: 'Insights' }
-    );
-    await expect(insightsItem).toBeVisible({ timeout: 5_000 });
-    await insightsItem.click();
-    await page.waitForSelector('.insights-page', {
+  async function navigateToGeneratedInsights(page: Page) {
+    await page.goto('/recall?tab=generated');
+    await page.waitForSelector('.generated-insights-panel', {
       timeout: 10_000,
     });
     await page.waitForTimeout(1000);
   }
 
-  test('full insights page', async ({ page }) => {
-    await navigateToInsights(page);
-
-    // Select the first completed insight (weekly analysis)
-    const rows = page.locator('.insight-row');
-    if (await rows.count() > 0) {
-      await rows.first().click();
-      await page.waitForTimeout(500);
-    }
-    await snap(page, 'insights');
+  test('quality page', async ({ page }) => {
+    await page.goto('/quality');
+    await page.waitForSelector('.quality-page', { timeout: 10_000 });
+    await page.waitForTimeout(1000);
+    await snap(page, 'quality');
   });
 
-  test('insight content', async ({ page }) => {
-    await navigateToInsights(page);
+  test('generated insights', async ({ page }) => {
+    await navigateToGeneratedInsights(page);
 
-    // Select the first generated insight and snap its rendered detail.
-    // extract-db.sh seeds the archive with safe, synthetic reports.
     const items = page.locator('.generated-list button');
     await items.first().waitFor({ state: 'visible', timeout: 10_000 });
     await items.first().click();
@@ -852,7 +1349,25 @@ test.describe('Insights', () => {
       timeout: 10_000,
     });
     await page.waitForTimeout(400);
-    await snapEl(page.locator('.generated-detail'), 'insight-content');
+    await snapEl(
+      page.locator('.recall-page'),
+      'recall-generated-insights'
+    );
+  });
+
+  test('session insight action in header', async ({ page }) => {
+    await selectFirstSession(page);
+
+    const breadcrumb = page.locator('.session-breadcrumb').first();
+    await expect(breadcrumb).toBeVisible({ timeout: 5_000 });
+    const insightButton = breadcrumb.locator(
+      'button.insight-btn[aria-label="Agent Analysis"]'
+    );
+    await expect(insightButton).toBeVisible({ timeout: 5_000 });
+    await insightButton.hover();
+    await page.waitForTimeout(300);
+
+    await snapEl(breadcrumb, 'session-insight-action');
   });
 });
 
@@ -937,41 +1452,200 @@ test.describe('Settings', () => {
     await page.waitForTimeout(500);
   }
 
+  async function openSettingsPanel(
+    page: Page,
+    navigationLabel: string,
+    headingLabel: string = navigationLabel
+  ) {
+    const navigation = page.getByRole('navigation', {
+      name: 'Settings',
+    });
+    await navigation.getByRole('button', {
+      name: navigationLabel,
+    }).click();
+
+    const heading = page.getByRole('heading', {
+      level: 3,
+      name: headingLabel,
+      exact: true,
+    });
+    const section = page.locator('section').filter({ has: heading });
+    await expect(section).toBeVisible({ timeout: 5_000 });
+    return section;
+  }
+
   test('settings page', async ({ page }) => {
     await openSettings(page);
     await snap(page, 'settings');
   });
 
+  test('settings archive image retention', async ({ page }) => {
+    // Save only in this browser's response fixture; other captures keep their policy.
+    await page.route('**/api/v1/settings', async (route) => {
+      if (route.request().method() !== 'PUT') return route.continue();
+      const current = await (await page.request.get('/api/v1/settings')).json();
+      await route.fulfill({ json: { ...current, ...route.request().postDataJSON() } });
+    });
+    await openSettings(page);
+    const section = await openSettingsPanel(page, 'Archive content');
+    const offload = section.getByRole('radio', { name: 'Offload', exact: true });
+    await offload.click();
+    await expect(offload).toHaveAttribute('aria-checked', 'true');
+    await expect(section.getByRole('status')).toContainText('Restart');
+    await snapEl(section, 'settings-archive-content');
+  });
+
+  test('settings alternate agent homes', async ({ page }) => {
+    await page.route('**/api/v1/settings', async (route) => {
+      const response = await route.fetch();
+      const settings = await response.json();
+      for (const provider of settings.session_providers) {
+        if (provider.id !== 'codex') continue;
+        provider.dirs = ['~/.codex/sessions', '~/.codex-work/sessions'];
+        provider.homes = ['~/.codex-work'];
+      }
+      await route.fulfill({ response, json: settings });
+    });
+    await openSettings(page);
+    const section = await openSettingsPanel(page, 'Session Providers');
+    const card = section.locator('.provider-row').filter({
+      has: page.locator('.provider-name', { hasText: /^Codex$/ }),
+    });
+    await expect(card.getByRole('textbox', { name: 'New Codex home directory' })).toBeVisible();
+    await expect(card.locator('.provider-home')).toContainText('~/.codex-work');
+    await snapEl(card, 'settings-agent-homes');
+  });
+
+  test('settings image cleanup preview', async ({ page }) => {
+    await page.route('**/api/v1/data/strip-images/preview', (route) => route.fulfill({
+      json: {
+        sessions: 3, changed: 3, payloads: 5, stored_bytes: 8192, decoded_bytes: 4096,
+        projects: [
+          { project: 'agentsview', sessions: 2, changed: 2, payloads: 4, stored_bytes: 6144, decoded_bytes: 3072 },
+          { project: 'roborev', sessions: 1, changed: 1, payloads: 1, stored_bytes: 2048, decoded_bytes: 1024 },
+        ],
+      },
+    }));
+    await openSettings(page);
+    const section = await openSettingsPanel(page, 'Tool-result images');
+    await section.getByRole('button', { name: 'Preview', exact: true }).click();
+    await expect(section).toContainText('5 image payloads');
+    await expect(section.getByRole('button', { name: 'Remove image payloads' })).toBeVisible();
+    await snapEl(section, 'settings-image-cleanup');
+  });
+
   test('settings remote access section', async ({ page }) => {
     await openSettings(page);
-
-    // Find the settings-section that contains "Remote Access"
-    const remoteSection = page.locator(
-      '.settings-section:has(.section-title:text("Remote Access"))'
+    const remoteSection = await openSettingsPanel(
+      page,
+      'Remote access',
+      'Remote Access'
     );
-    await expect(remoteSection).toBeVisible({ timeout: 5_000 });
     await remoteSection.scrollIntoViewIfNeeded();
     await page.waitForTimeout(500);
 
     await snapEl(remoteSection, 'settings-remote');
   });
 
-  test('worktree project mappings section', async ({ page }) => {
+  test('settings chart color palette', async ({ page }) => {
     await openSettings(page);
-
-    // SettingsSection renders a heading with the title prop;
-    // match the section that contains the "Worktree mappings"
-    // header text, the same pattern used for Remote Access above.
-    const worktreeSection = page.locator(
-      '.settings-section:has-text("Worktree mappings")'
+    const appearanceSection = await openSettingsPanel(
+      page,
+      'Appearance'
     );
-    await expect(worktreeSection.first()).toBeVisible({
+    await appearanceSection.scrollIntoViewIfNeeded();
+    await expect(
+      appearanceSection.getByText('Chart colors', { exact: true })
+    ).toBeVisible();
+    await expect(
+      appearanceSection.getByRole('radio', {
+        name: 'Matplotlib',
+      })
+    ).toBeVisible();
+    await snapEl(appearanceSection, 'settings-chart-colors');
+  });
+
+  test('settings embedding build progress', async ({ page }) => {
+    let statusPolls = 0;
+    const startedAt = new Date(Date.now() - 65_000).toISOString();
+
+    await page.route('**/api/v1/embeddings/status', async (route) => {
+      statusPolls += 1;
+      const done = 240 + statusPolls * 120;
+      await route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          build_id: 38,
+          dimension: 256,
+          done,
+          estimate_ready: true,
+          eta_milliseconds: 40_000,
+          model: 'qwen3-embedding:0.6b',
+          phase: 'embedding',
+          rate_per_second: 10,
+          running: true,
+          started_at: startedAt,
+          total: 1000,
+        }),
+      });
+    });
+    await page.route(
+      '**/api/v1/embeddings/generations',
+      async (route) => {
+        await route.fulfill({
+          status: 200,
+          contentType: 'application/json',
+          body: JSON.stringify({
+            generations: [
+              {
+                dimension: 256,
+                embedded: 360,
+                fingerprint: 'docs-screenshot-generation',
+                id: 38,
+                missing: 640,
+                model: 'qwen3-embedding:0.6b',
+                state: 'building',
+              },
+            ],
+          }),
+        });
+      }
+    );
+
+    await openSettings(page);
+    const embeddingsSection = await openSettingsPanel(
+      page,
+      'Embeddings'
+    );
+    await embeddingsSection.scrollIntoViewIfNeeded();
+    await expect(
+      embeddingsSection.getByRole('progressbar', {
+        name: 'Embedding progress',
+      })
+    ).toBeVisible();
+    await expect(embeddingsSection.getByText(/^ETA /)).toBeVisible({
       timeout: 5_000,
     });
-    await worktreeSection.first().scrollIntoViewIfNeeded();
+
+    await snapEl(embeddingsSection, 'settings-embeddings');
+  });
+
+  test('worktree project mappings section', async ({ page }) => {
+    // Mapping rules moved from Settings to the Data page's Rules view.
+    await page.goto('/data?view=rules');
+
+    const rulesView = page.locator('section.rules-view');
+    await expect(rulesView).toBeVisible({ timeout: 5_000 });
+    await rulesView.scrollIntoViewIfNeeded();
+    const mappingPath = rulesView.getByRole('textbox', {
+      name: 'Path prefix',
+    });
+    await mappingPath.fill('~/code/project.worktrees');
+    await expect(mappingPath).toHaveValue('~/code/project.worktrees');
     await page.waitForTimeout(500);
 
-    await snapEl(worktreeSection.first(), 'worktree-mappings');
+    await snapEl(rulesView, 'worktree-mappings');
   });
 });
 
@@ -990,7 +1664,7 @@ test.describe('About', () => {
     });
     await versionEl.first().click();
 
-    const dialog = page.locator('.about-modal');
+    const dialog = page.getByRole('dialog', { name: 'AgentsView' });
     await expect(dialog).toBeVisible({ timeout: 5_000 });
     await snapEl(dialog, 'about-dialog');
     await page.keyboard.press('Escape');
@@ -1007,24 +1681,26 @@ test.describe('In-session search', () => {
   });
 
   test('search bar with matches', async ({ page }) => {
-    // Open in-session search with Cmd+F
-    await page.keyboard.press('Meta+f');
-    await page.waitForSelector(
-      '.session-search, .in-session-search, .find-bar',
-      { timeout: 5_000 }
-    );
+    await page.locator('.find-btn').click();
+    await page.waitForSelector('.kit-find-bar', { timeout: 5_000 });
     await page.waitForTimeout(300);
 
-    // Type a common word to get matches
-    const input = page.locator(
-      '.session-search input, ' +
-      '.in-session-search input, ' +
-      '.find-bar input'
-    );
-    await input.fill('the');
+    // Search for text present in the selected transcript, in any language.
+    const text = await page.locator('.message .text-content:visible')
+      .filter({ hasText: /\S/ }).first().innerText();
+    const query = text.match(/[\p{L}\p{N}]{3,24}/u)?.[0]
+      ?? text.trim().split(/\s+/)[0];
+    const input = page.locator('.kit-find-bar__input');
+    await input.fill(query);
     await page.waitForTimeout(1000);
 
     await snap(page, 'in-session-search');
+
+    await page.getByRole('button', { name: 'Show search results' }).click();
+    await expect(page.getByRole('region', { name: 'Search results' })).toBeVisible();
+    await expect(page.locator('.find-overview-rail')).toBeVisible();
+    await expect(page.locator('.find-result-button').first()).toBeVisible();
+    await snap(page, 'in-session-search-results');
 
     // Close search
     await page.keyboard.press('Escape');
@@ -1040,7 +1716,40 @@ test.describe('Token usage', () => {
   });
 
   test('token usage in session header', async ({ page }) => {
-    await selectRichSession(page);
+    // The archive may have no Codex assistant/model messages or recorded tokens.
+    const session = {
+      id: 'screenshot-token-usage', agent: 'codex', project: 'agentsview', machine: 'local',
+      first_message: 'Review the changes.',
+      started_at: '2026-09-01T15:00:00Z', ended_at: '2026-09-01T15:02:00Z',
+      created_at: '2026-09-01T15:00:00Z', message_count: 2, user_message_count: 1,
+      peak_context_tokens: 32000, total_output_tokens: 1200,
+      has_peak_context_tokens: true, has_total_output_tokens: true, is_automated: false,
+    };
+    const messages = [
+      {
+        id: 1, session_id: session.id, ordinal: 0, role: 'user',
+        content: session.first_message, content_length: session.first_message.length,
+        timestamp: session.started_at, model: '', thinking_text: '',
+        has_thinking: false, has_tool_use: false, is_system: false,
+        context_tokens: 0, output_tokens: 0, has_context_tokens: false, has_output_tokens: false,
+      },
+      {
+        id: 2, session_id: session.id, ordinal: 1, role: 'assistant',
+        content: 'The changes are ready.', content_length: 22,
+        timestamp: session.ended_at, model: 'gpt-5.4', reasoning_effort: 'high', thinking_text: '',
+        has_thinking: false, has_tool_use: false, is_system: false,
+        context_tokens: 32000, output_tokens: 1200, has_context_tokens: true, has_output_tokens: true,
+      },
+    ];
+    const sessionPath = `/api/v1/sessions/${session.id}`;
+    await page.route(`**${sessionPath}`, (route) => route.fulfill({ json: session }));
+    await page.route(`**${sessionPath}/messages*`, (route) => route.fulfill({
+      json: { messages, count: messages.length },
+    }));
+    await page.goto(`/sessions/${session.id}`);
+    await expect(page.locator('.model-badge__model')).toHaveText('gpt-5.4');
+    await expect(page.locator('.model-badge .model-badge__effort')).toHaveText('high');
+    await expect(page.getByRole('button', { name: 'Copy link to session', exact: true })).toBeVisible();
     await page.waitForTimeout(500);
 
     // Token badge lives in SessionBreadcrumb
@@ -1129,6 +1838,7 @@ test.describe('Follow latest', () => {
     const padX = 100;
     const padY = 14;
     await page.screenshot({
+      style: CAPTURE_STYLE,
       path: join(DIR, 'follow-latest-toggle.png'),
       type: 'png',
       clip: {
@@ -1526,9 +2236,7 @@ test.describe('Dashboard session health', () => {
 
 test.describe('Usage dashboard', () => {
   async function navigateToUsage(page: Page) {
-    const navBtn = page.locator('.nav-btn', { hasText: 'Usage' });
-    await expect(navBtn).toBeVisible({ timeout: 5_000 });
-    await navBtn.click();
+    await page.goto('/usage');
     await page.waitForSelector('.usage-page', { timeout: 10_000 });
     // Wait for summary + charts to finish loading
     await expect(
@@ -1597,15 +2305,15 @@ test.describe('Usage dashboard', () => {
 
   test('model filter dropdown open', async ({ page }) => {
     // Click the Model filter trigger in the toolbar
-    const trigger = page.locator(
-      '.usage-toolbar .filter-dropdown .filter-trigger',
+    const modelDropdown = page.locator(
+      '.usage-toolbar .kit-filter-dropdown',
       { hasText: 'Model' }
     );
+    const trigger = modelDropdown.locator('.kit-filter-dropdown__btn');
     await expect(trigger).toBeVisible({ timeout: 5_000 });
     await trigger.click();
-    await page.waitForSelector(
-      '.filter-dropdown .dropdown-panel',
-      { timeout: 5_000 }
+    await modelDropdown.locator('.kit-filter-dropdown__panel').waitFor(
+      { state: 'visible', timeout: 5_000 }
     );
     await page.waitForTimeout(300);
     await snap(page, 'usage-filter-dropdown');

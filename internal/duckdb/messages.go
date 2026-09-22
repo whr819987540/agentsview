@@ -4,6 +4,8 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"slices"
+	"strings"
 	"time"
 
 	"go.kenn.io/agentsview/internal/db"
@@ -24,9 +26,10 @@ func (s *Store) GetMessages(
 	rows, err := s.queryContext(ctx, `
 		SELECT id, session_id, ordinal, role, content, thinking_text,
 			timestamp, has_thinking, has_tool_use, content_length,
-			is_system, model, token_usage, context_tokens, output_tokens,
+			is_system, model, reasoning_effort, token_usage, context_tokens, output_tokens,
+			provider_id,
 			has_context_tokens, has_output_tokens, claude_message_id,
-			claude_request_id, source_type, source_subtype, source_uuid,
+			claude_request_id, source_type, source_subtype, prompt_source, source_uuid,
 			source_parent_uuid, is_sidechain, is_compact_boundary
 		FROM messages
 		WHERE session_id = ? AND ordinal `+op+` ?
@@ -48,13 +51,177 @@ func (s *Store) GetMessages(
 	return msgs, nil
 }
 
+// GetMessagesWindow mirrors internal/db's GetMessagesWindow: linear mode
+// (optionally role-filtered) delegates to GetMessages when Roles is empty;
+// Around mode merges three queries (before/anchor/after) into one ascending
+// slice. The anchor query has no role predicate so the anchor row is always
+// present regardless of Roles; before/after apply the role filter first, so
+// Before/After count role-matching messages, not raw ordinal distance.
+func (s *Store) GetMessagesWindow(
+	ctx context.Context, sessionID string, w db.MessageWindow,
+) ([]db.Message, error) {
+	if w.Around != nil {
+		return s.getMessagesAroundAnchor(ctx, sessionID, w)
+	}
+	from := 0
+	if w.From != nil {
+		from = *w.From
+	}
+	if len(w.Roles) == 0 {
+		return s.GetMessages(ctx, sessionID, from, w.Limit, w.Asc)
+	}
+	return s.getMessagesLinearRoleFiltered(ctx, sessionID, from, w.Limit, w.Asc, w.Roles)
+}
+
+func (s *Store) getMessagesLinearRoleFiltered(
+	ctx context.Context,
+	sessionID string, from, limit int, asc bool, roles []string,
+) ([]db.Message, error) {
+	if limit <= 0 || limit > db.MaxMessageLimit {
+		limit = db.DefaultMessageLimit
+	}
+	dir := "ASC"
+	op := ">="
+	if !asc {
+		dir = "DESC"
+		op = "<="
+	}
+	roleClause, roleArgs := duckRoleFilterClause(roles)
+	query := `
+		SELECT id, session_id, ordinal, role, content, thinking_text,
+			timestamp, has_thinking, has_tool_use, content_length,
+			is_system, model, reasoning_effort, token_usage, context_tokens, output_tokens,
+			provider_id,
+			has_context_tokens, has_output_tokens, claude_message_id,
+			claude_request_id, source_type, source_subtype, prompt_source, source_uuid,
+			source_parent_uuid, is_sidechain, is_compact_boundary
+		FROM messages
+		WHERE session_id = ? AND ordinal ` + op + ` ?` + roleClause + `
+		ORDER BY ordinal ` + dir + `
+		LIMIT ?`
+	args := append([]any{sessionID, from}, roleArgs...)
+	args = append(args, limit)
+
+	rows, err := s.queryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("querying duckdb role-filtered messages: %w", err)
+	}
+	defer rows.Close()
+	msgs, err := scanMessages(rows)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.attachToolCalls(ctx, msgs); err != nil {
+		return nil, err
+	}
+	return msgs, nil
+}
+
+func (s *Store) getMessagesAroundAnchor(
+	ctx context.Context, sessionID string, w db.MessageWindow,
+) ([]db.Message, error) {
+	anchor := *w.Around
+	beforeLimit := max(w.Before, 0)
+	afterLimit := max(w.After, 0)
+	roleClause, roleArgs := duckRoleFilterClause(w.Roles)
+
+	beforeQuery := `
+		SELECT id, session_id, ordinal, role, content, thinking_text,
+			timestamp, has_thinking, has_tool_use, content_length,
+			is_system, model, reasoning_effort, token_usage, context_tokens, output_tokens,
+			provider_id,
+			has_context_tokens, has_output_tokens, claude_message_id,
+			claude_request_id, source_type, source_subtype, prompt_source, source_uuid,
+			source_parent_uuid, is_sidechain, is_compact_boundary
+		FROM messages
+		WHERE session_id = ? AND ordinal < ?` + roleClause + `
+		ORDER BY ordinal DESC LIMIT ?`
+	beforeArgs := append([]any{sessionID, anchor}, roleArgs...)
+	beforeArgs = append(beforeArgs, beforeLimit)
+	before, err := s.queryMessageRows(ctx, beforeQuery, beforeArgs...)
+	if err != nil {
+		return nil, fmt.Errorf("querying duckdb before-window messages: %w", err)
+	}
+	slices.Reverse(before)
+
+	anchorQuery := `
+		SELECT id, session_id, ordinal, role, content, thinking_text,
+			timestamp, has_thinking, has_tool_use, content_length,
+			is_system, model, reasoning_effort, token_usage, context_tokens, output_tokens,
+			provider_id,
+			has_context_tokens, has_output_tokens, claude_message_id,
+			claude_request_id, source_type, source_subtype, prompt_source, source_uuid,
+			source_parent_uuid, is_sidechain, is_compact_boundary
+		FROM messages WHERE session_id = ? AND ordinal = ?`
+	anchorMsgs, err := s.queryMessageRows(ctx, anchorQuery, sessionID, anchor)
+	if err != nil {
+		return nil, fmt.Errorf("querying duckdb anchor message: %w", err)
+	}
+
+	afterQuery := `
+		SELECT id, session_id, ordinal, role, content, thinking_text,
+			timestamp, has_thinking, has_tool_use, content_length,
+			is_system, model, reasoning_effort, token_usage, context_tokens, output_tokens,
+			provider_id,
+			has_context_tokens, has_output_tokens, claude_message_id,
+			claude_request_id, source_type, source_subtype, prompt_source, source_uuid,
+			source_parent_uuid, is_sidechain, is_compact_boundary
+		FROM messages
+		WHERE session_id = ? AND ordinal > ?` + roleClause + `
+		ORDER BY ordinal ASC LIMIT ?`
+	afterArgs := append([]any{sessionID, anchor}, roleArgs...)
+	afterArgs = append(afterArgs, afterLimit)
+	after, err := s.queryMessageRows(ctx, afterQuery, afterArgs...)
+	if err != nil {
+		return nil, fmt.Errorf("querying duckdb after-window messages: %w", err)
+	}
+
+	msgs := make([]db.Message, 0, len(before)+len(anchorMsgs)+len(after))
+	msgs = append(msgs, before...)
+	msgs = append(msgs, anchorMsgs...)
+	msgs = append(msgs, after...)
+	if err := s.attachToolCalls(ctx, msgs); err != nil {
+		return nil, err
+	}
+	return msgs, nil
+}
+
+// queryMessageRows runs query and scans the resulting message rows without
+// attaching tool calls; callers batch that across the merged window set.
+func (s *Store) queryMessageRows(
+	ctx context.Context, query string, args ...any,
+) ([]db.Message, error) {
+	rows, err := s.queryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanMessages(rows)
+}
+
+// duckRoleFilterClause returns an "AND role IN (...)" clause and its bind
+// args for the given roles, or ("", nil) when roles is empty.
+func duckRoleFilterClause(roles []string) (string, []any) {
+	if len(roles) == 0 {
+		return "", nil
+	}
+	placeholders := make([]string, len(roles))
+	args := make([]any, len(roles))
+	for i, r := range roles {
+		placeholders[i] = "?"
+		args[i] = r
+	}
+	return " AND role IN (" + strings.Join(placeholders, ",") + ")", args
+}
+
 func (s *Store) GetAllMessages(ctx context.Context, sessionID string) ([]db.Message, error) {
 	rows, err := s.queryContext(ctx, `
 		SELECT id, session_id, ordinal, role, content, thinking_text,
 			timestamp, has_thinking, has_tool_use, content_length,
-			is_system, model, token_usage, context_tokens, output_tokens,
+			is_system, model, reasoning_effort, token_usage, context_tokens, output_tokens,
+			provider_id,
 			has_context_tokens, has_output_tokens, claude_message_id,
-			claude_request_id, source_type, source_subtype, source_uuid,
+			claude_request_id, source_type, source_subtype, prompt_source, source_uuid,
 			source_parent_uuid, is_sidechain, is_compact_boundary
 		FROM messages
 		WHERE session_id = ?
@@ -108,6 +275,37 @@ func (s *Store) GetInputOutline(
 	return items, rows.Err()
 }
 
+func (s *Store) GetResumeModelCounts(
+	ctx context.Context, sessionID string,
+) ([]db.ModelCount, error) {
+	rows, err := s.queryContext(ctx, `
+		SELECT model, COUNT(*)
+		FROM messages
+		WHERE session_id = ?
+			AND role = 'assistant'
+			AND model != ''
+			AND model != '<synthetic>'
+		GROUP BY model`,
+		sessionID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("querying duckdb resume model counts: %w", err)
+	}
+	defer rows.Close()
+	var counts []db.ModelCount
+	for rows.Next() {
+		var count db.ModelCount
+		if err := rows.Scan(&count.Model, &count.Count); err != nil {
+			return nil, fmt.Errorf("scanning duckdb resume model count: %w", err)
+		}
+		counts = append(counts, count)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating duckdb resume model counts: %w", err)
+	}
+	return counts, nil
+}
+
 func scanMessages(rows *sql.Rows) ([]db.Message, error) {
 	var msgs []db.Message
 	for rows.Next() {
@@ -117,17 +315,23 @@ func scanMessages(rows *sql.Rows) ([]db.Message, error) {
 		if err := rows.Scan(
 			&m.ID, &m.SessionID, &m.Ordinal, &m.Role, &m.Content,
 			&m.ThinkingText, &ts, &m.HasThinking, &m.HasToolUse,
-			&m.ContentLength, &m.IsSystem, &m.Model, &tokenUsage,
+			&m.ContentLength, &m.IsSystem, &m.Model, &m.ReasoningEffort, &tokenUsage,
 			&m.ContextTokens, &m.OutputTokens,
+			&m.ProviderID,
 			&m.HasContextTokens, &m.HasOutputTokens,
 			&m.ClaudeMessageID, &m.ClaudeRequestID,
-			&m.SourceType, &m.SourceSubtype, &m.SourceUUID,
+			&m.SourceType, &m.SourceSubtype, &m.PromptSource, &m.SourceUUID,
 			&m.SourceParentUUID, &m.IsSidechain, &m.IsCompactBoundary,
 		); err != nil {
 			return nil, fmt.Errorf("scanning duckdb message: %w", err)
 		}
 		m.Timestamp = formatDBTime(ts)
-		m.TokenUsage = []byte(tokenUsage)
+		// This assigned []byte(tokenUsage) unconditionally, so the ""
+		// nearly every row holds became a non-nil, zero-length
+		// jsontext.Value and every duckdb serve response failed to
+		// marshal. Validation happens only here, on read (see
+		// db.DecodeStoredTokenUsage).
+		m.TokenUsage = db.DecodeStoredTokenUsage(tokenUsage)
 		msgs = append(msgs, m)
 	}
 	return msgs, rows.Err()
@@ -183,7 +387,13 @@ func (s *Store) attachToolCalls(ctx context.Context, msgs []db.Message) error {
 	if err := rows.Err(); err != nil {
 		return err
 	}
-	return s.attachToolResultEvents(ctx, msgs, index, sessionID)
+	if err := s.attachToolResultEvents(ctx, msgs, index, sessionID); err != nil {
+		return err
+	}
+	// Mirrors the SQLite load boundary: a summary the call's single result
+	// event already carries is not stored, so refill it here.
+	db.RestoreMessageResultContent(msgs)
+	return nil
 }
 
 func (s *Store) attachToolResultEvents(
@@ -265,7 +475,9 @@ func (s *Store) GetSessionActivity(ctx context.Context, sessionID string) (*db.S
 		row := populated[idx]
 		switch msg.Role {
 		case "user":
-			row.userCount++
+			if msg.SourceSubtype != "tool_result" {
+				row.userCount++
+			}
 		case "assistant":
 			row.asstCount++
 		}
@@ -318,7 +530,10 @@ func (s *Store) queryTurnRows(
 	ctx context.Context, sess *db.Session,
 ) ([]db.TurnRow, error) {
 	rows, err := s.queryContext(ctx, `
-		SELECT id, ordinal, timestamp, has_tool_use
+		SELECT id, ordinal, timestamp, has_tool_use,
+			role, is_system,
+			CASE WHEN `+db.DuckDBSystemPrefixSQL("content", "role")+` THEN FALSE ELSE TRUE END,
+			COALESCE(source_subtype, ''), content_length
 		FROM messages
 		WHERE session_id = ?
 		ORDER BY ordinal`,
@@ -333,7 +548,7 @@ func (s *Store) queryTurnRows(
 	for rows.Next() {
 		var r db.TurnRow
 		var ts any
-		if err := rows.Scan(&r.MessageID, &r.Ordinal, &ts, &r.HasToolUse); err != nil {
+		if err := rows.Scan(&r.MessageID, &r.Ordinal, &ts, &r.HasToolUse, &r.Role, &r.IsSystem, &r.IsSystemPrefixed, &r.SourceSubtype, &r.ContentLength); err != nil {
 			return nil, fmt.Errorf("scanning duckdb timing turn: %w", err)
 		}
 		r.Timestamp = formatDBTime(ts)
@@ -366,8 +581,34 @@ func (s *Store) queryCallRows(
 		SELECT tc.message_id, COALESCE(tc.tool_use_id, ''),
 			tc.tool_name, tc.category, tc.skill_name,
 			tc.subagent_session_id, COALESCE(tc.input_json, ''),
-			s_sub.started_at, s_sub.ended_at
+			(
+				SELECT tre.timestamp
+				FROM tool_result_events tre
+				WHERE tre.session_id = tc.session_id
+					AND tre.tool_call_message_ordinal = m.ordinal
+					AND tre.call_index = tc.call_index
+					AND tre.source = 'tool_execution'
+					AND tre.status = 'started'
+					AND tre.timestamp IS NOT NULL
+				ORDER BY tre.event_index ASC
+				LIMIT 1
+			) AS execution_started_at,
+			(
+				SELECT tre.timestamp
+				FROM tool_result_events tre
+				WHERE tre.session_id = tc.session_id
+					AND tre.tool_call_message_ordinal = m.ordinal
+					AND tre.call_index = tc.call_index
+					AND tre.source = 'tool_execution'
+					AND tre.status IN ('completed', 'errored')
+					AND tre.timestamp IS NOT NULL
+				ORDER BY tre.event_index DESC
+				LIMIT 1
+			) AS execution_completed_at
+			,s_sub.started_at
+			,s_sub.ended_at
 		FROM tool_calls tc
+		JOIN messages m ON m.id = tc.message_id
 		LEFT JOIN sessions s_sub ON s_sub.id = tc.subagent_session_id
 		WHERE tc.session_id = ?
 		ORDER BY tc.message_id, tc.call_index`,
@@ -379,14 +620,14 @@ func (s *Store) queryCallRows(
 	defer rows.Close()
 
 	var out []db.CallRow
-	now := time.Now().UTC().Format(time.RFC3339)
 	for rows.Next() {
 		var r db.CallRow
 		var skill, sub sql.NullString
-		var startedAt, endedAt any
+		var executionStarted, executionCompleted, subagentStarted, subagentEnded any
 		if err := rows.Scan(
 			&r.MessageID, &r.ToolUseID, &r.ToolName, &r.Category,
-			&skill, &sub, &r.InputJSON, &startedAt, &endedAt,
+			&skill, &sub, &r.InputJSON, &executionStarted, &executionCompleted,
+			&subagentStarted, &subagentEnded,
 		); err != nil {
 			return nil, fmt.Errorf("scanning duckdb timing call: %w", err)
 		}
@@ -397,10 +638,11 @@ func (s *Store) queryCallRows(
 		if sub.Valid {
 			value := sub.String
 			r.SubagentSessionID = &value
-			if dur, ok := timingMillis(formatDBTime(startedAt), firstNonEmpty(formatDBTime(endedAt), now)); ok {
-				r.DurationMs = &dur
-			}
 		}
+		r.ExecutionStart = formatDBTime(executionStarted)
+		r.ExecutionEnd = formatDBTime(executionCompleted)
+		r.SubagentStart = formatDBTime(subagentStarted)
+		r.SubagentEnd = formatDBTime(subagentEnded)
 		out = append(out, r)
 	}
 	return out, rows.Err()

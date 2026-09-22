@@ -6,9 +6,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -17,8 +19,10 @@ import (
 	"github.com/spf13/cobra"
 
 	"go.kenn.io/agentsview/internal/config"
+	"go.kenn.io/agentsview/internal/db"
 	mcpserver "go.kenn.io/agentsview/internal/mcp"
 	"go.kenn.io/agentsview/internal/service"
+	"go.kenn.io/agentsview/internal/servicehttp"
 )
 
 func newMCPCommand() *cobra.Command {
@@ -32,7 +36,7 @@ func newMCPCommand() *cobra.Command {
 StreamableHTTP, exposing read-only tools for searching and reading
 recorded agent sessions: search_sessions, list_sessions,
 get_session_overview, get_messages, search_content, and
-get_usage_summary.
+get_usage_summary, plus query_recall for distilled session knowledge.
 
 The server reads through the daemon path. By default each tool call talks to
 the local agentsview daemon, starting it when needed so a long-lived MCP server
@@ -94,6 +98,13 @@ Add to your MCP client config (e.g. Claude Desktop):
 					return err
 				}
 				opts.Token = token
+				opts.DiscoveryDirectory = filepath.Join(cfg.DataDir, "mcp")
+				opts.BackendURL, _ = cmd.Flags().GetString("server")
+				if opts.BackendURL == "" && !pgReadRequested(cmd) {
+					if runtime := FindDaemonRuntime(cfg.DataDir, cfg.AuthToken); runtime != nil {
+						opts.BackendURL = urlFromDaemonRuntime(runtime)
+					}
+				}
 				serveErr = mcpserver.ServeHTTP(ctx, opts, addr)
 			} else {
 				serveErr = mcpserver.ServeStdio(ctx, opts)
@@ -127,6 +138,7 @@ Add to your MCP client config (e.g. Claude Desktop):
 	cmd.Flags().Bool("pg", false,
 		"Read session data from configured PostgreSQL")
 
+	cmd.AddCommand(newMCPStatusCommand())
 	return cmd
 }
 
@@ -148,7 +160,13 @@ func resolveMCPService(
 		if err != nil {
 			return nil, nil, err
 		}
-		return service.NewHTTPBackend(remote, token, false),
+		capabilities, err := servicehttp.ProbeHTTPServerCapabilities(
+			cmd.Context(), remote, token,
+		)
+		if err != nil {
+			return nil, nil, err
+		}
+		return servicehttp.NewHTTPBackendForServer(remote, token, capabilities),
 			func() {}, nil
 	}
 	cfg, err := config.LoadPFlags(cmd.Flags())
@@ -174,6 +192,14 @@ func newMCPDaemonService(cfg config.Config) service.SessionService {
 	return &mcpDaemonService{cfg: cfg}
 }
 
+func (s *mcpDaemonService) SupportsRecallQueries() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	runtime := FindDaemonRuntime(s.cfg.DataDir, s.cfg.AuthToken)
+	return runtime == nil || !runtime.ReadOnly
+}
+
 func (s *mcpDaemonService) daemonService(
 	ctx context.Context,
 ) (service.SessionService, error) {
@@ -193,7 +219,7 @@ func (s *mcpDaemonService) daemonService(
 		)
 	}
 	s.cfg.AuthToken = cfg.AuthToken
-	return service.NewHTTPBackend(tr.URL, cfg.AuthToken, tr.ReadOnly), nil
+	return servicehttp.NewHTTPBackend(tr.URL, cfg.AuthToken, tr.ReadOnly, tr.BrowserURL), nil
 }
 
 func (s *mcpDaemonService) Get(
@@ -214,6 +240,16 @@ func (s *mcpDaemonService) FindSessionIDsByPartial(
 		return nil, err
 	}
 	return svc.FindSessionIDsByPartial(ctx, partial, limit)
+}
+
+func (s *mcpDaemonService) FindSessionIDsByRawSuffix(
+	ctx context.Context, raw string, limit int,
+) ([]string, error) {
+	svc, err := s.daemonService(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return svc.FindSessionIDsByRawSuffix(ctx, raw, limit)
 }
 
 func (s *mcpDaemonService) List(
@@ -324,6 +360,46 @@ func (s *mcpDaemonService) UsagePairwiseComparison(
 		return nil, err
 	}
 	return svc.UsagePairwiseComparison(ctx, req)
+}
+
+func (s *mcpDaemonService) ListRecallEntries(
+	ctx context.Context, f service.RecallFilter,
+) (*service.RecallList, error) {
+	svc, err := s.daemonService(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return svc.ListRecallEntries(ctx, f)
+}
+
+func (s *mcpDaemonService) GetRecallEntry(
+	ctx context.Context, id string,
+) (*db.RecallEntry, error) {
+	svc, err := s.daemonService(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return svc.GetRecallEntry(ctx, id)
+}
+
+func (s *mcpDaemonService) QueryRecallEntries(
+	ctx context.Context, req service.RecallQuery,
+) (*service.RecallQueryResult, error) {
+	svc, err := s.daemonService(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return svc.QueryRecallEntries(ctx, req)
+}
+
+func (s *mcpDaemonService) ImportRecallEntries(
+	ctx context.Context, r io.Reader, opts db.RecallImportOptions,
+) (*db.RecallImportResult, error) {
+	svc, err := s.daemonService(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return svc.ImportRecallEntries(ctx, r, opts)
 }
 
 func (s *mcpDaemonService) ListSecrets(

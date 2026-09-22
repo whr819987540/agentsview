@@ -8,19 +8,22 @@ import (
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/service"
 	"go.kenn.io/agentsview/internal/update"
+
+	"github.com/danielgtaylor/huma/v2"
 )
 
 func (s *Server) registerMetadataRoutes() {
-	group := newRouteGroup(s.api, "/api/v1", "Metadata")
+	group := huma.NewGroup(s.api, "/api/v1")
+	configureRouteGroup(group, "Metadata")
 
-	get(s, group, "/projects", "List projects", s.humaListProjects)
-	get(s, group, "/machines", "List machines", s.humaListMachines)
-	get(s, group, "/branches", "List branches", s.humaListBranches)
-	get(s, group, "/agents", "List agents", s.humaListAgents)
-	get(s, group, "/stats", "Get stats", s.humaGetStats)
-	get(s, group, "/session-stats", "Get session stats", s.humaGetSessionStats)
-	get(s, group, "/version", "Get server version", s.humaGetVersion)
-	get(s, group, "/update/check", "Check for updates", s.humaCheckUpdate)
+	s.get(group, "/projects", "List projects", s.humaListProjects)
+	s.get(group, "/machines", "List machines", s.humaListMachines)
+	s.get(group, "/branches", "List branches", s.humaListBranches)
+	s.get(group, "/agents", "List agents", s.humaListAgents)
+	s.get(group, "/stats", "Get stats", s.humaGetStats)
+	s.get(group, "/session-stats", "Get session stats", s.humaGetSessionStats)
+	s.get(group, "/version", "Get server version", s.humaGetVersion)
+	s.get(group, "/update/check", "Check for updates", s.humaCheckUpdate)
 }
 
 type statsInput struct {
@@ -28,6 +31,7 @@ type statsInput struct {
 }
 
 type sessionStatsInput struct {
+	BoolIncludeInput
 	Since                 string   `query:"since" doc:"Start of window"`
 	Until                 string   `query:"until" doc:"End of window"`
 	Agent                 string   `query:"agent" doc:"Filter by agent"`
@@ -43,7 +47,21 @@ type projectsResponse struct {
 }
 
 type machinesResponse struct {
-	Machines []string `json:"machines"`
+	Machines       []string          `json:"machines"`
+	MachineLabels  map[string]string `json:"machine_labels"`
+	MachineAliases map[string]string `json:"machine_aliases"`
+}
+
+func (s *Server) machineAliases(ctx context.Context) (map[string]string, error) {
+	aliases, err := s.db.GetMachineAliases(ctx)
+	if err != nil {
+		return nil, err
+	}
+	// The old local sentinel belongs only to this archive, never a shared mirror.
+	if _, local := s.db.(*db.DB); local && s.cfg.InstallationID != "" {
+		aliases["local"] = s.cfg.InstallationID
+	}
+	return aliases, nil
 }
 
 type branchesResponse struct {
@@ -74,15 +92,18 @@ func (s *Server) humaGetSessionStats(
 		githubToken = s.githubToken(ctx)
 	}
 	stats, err := s.sessions.Stats(ctx, service.StatsFilter{
-		Since:                 in.Since,
-		Until:                 in.Until,
-		Agent:                 in.Agent,
-		IncludeProjects:       in.IncludeProjects,
-		ExcludeProjects:       in.ExcludeProjects,
-		Timezone:              in.Timezone,
-		IncludeGitOutcomes:    in.IncludeGitOutcomes,
-		IncludeGitHubOutcomes: in.IncludeGitHubOutcomes,
-		GHToken:               githubToken,
+		ApplyDefaultVisibility: true,
+		Since:                  in.Since,
+		Until:                  in.Until,
+		Agent:                  in.Agent,
+		IncludeOneShot:         in.IncludeOneShot,
+		IncludeAutomated:       in.IncludeAutomated,
+		IncludeProjects:        in.IncludeProjects,
+		ExcludeProjects:        in.ExcludeProjects,
+		Timezone:               in.Timezone,
+		IncludeGitOutcomes:     in.IncludeGitOutcomes,
+		IncludeGitHubOutcomes:  in.IncludeGitHubOutcomes,
+		GHToken:                githubToken,
 	})
 	if err != nil {
 		if handled := handleHumaContextError(err); handled != nil {
@@ -91,8 +112,7 @@ func (s *Server) humaGetSessionStats(
 		if handled := handleHumaReadOnly(err); handled != nil {
 			return nil, handled
 		}
-		var inputErr *db.StatsInputError
-		if errors.As(err, &inputErr) {
+		if inputErr, ok := errors.AsType[*db.StatsInputError](err); ok {
 			return nil, apiError(http.StatusBadRequest, inputErr.Msg)
 		}
 		return nil, internalError("session stats error", err)
@@ -119,7 +139,15 @@ func (s *Server) humaListMachines(
 	if err != nil {
 		return nil, serverError(err)
 	}
-	return &jsonOutput[machinesResponse]{Body: machinesResponse{Machines: machines}}, nil
+	labels, err := s.db.GetMachineLabels(ctx)
+	if err != nil {
+		return nil, serverError(err)
+	}
+	aliases, err := s.machineAliases(ctx)
+	if err != nil {
+		return nil, serverError(err)
+	}
+	return &jsonOutput[machinesResponse]{Body: machinesResponse{Machines: machines, MachineLabels: labels, MachineAliases: aliases}}, nil
 }
 
 func (s *Server) humaListBranches(
@@ -148,11 +176,13 @@ func (s *Server) humaGetVersion(
 	_ context.Context,
 	_ *emptyInput,
 ) (*jsonOutput[VersionInfo], error) {
-	return &jsonOutput[VersionInfo]{Body: s.version}, nil
+	version := s.version
+	version.InsightGenerationAvailable = supportsInsightGeneration(s.db)
+	return &jsonOutput[VersionInfo]{Body: version}, nil
 }
 
 func (s *Server) humaCheckUpdate(
-	_ context.Context,
+	ctx context.Context,
 	_ *emptyInput,
 ) (*jsonOutput[updateCheckResponse], error) {
 	if s.cfg.DisableUpdateCheck {
@@ -164,9 +194,9 @@ func (s *Server) humaCheckUpdate(
 	if checkFn == nil {
 		checkFn = update.CheckForUpdate
 	}
-	info, err := checkFn(s.version.Version, false, s.dataDir)
+	info, err := checkFn(ctx, s.version.Version, false, s.dataDir)
 	if err != nil || info == nil {
-		return &jsonOutput[updateCheckResponse]{
+		return &jsonOutput[updateCheckResponse]{ //nolint:nilerr // Optional update metadata falls back to the installed version.
 			Body: updateCheckResponse{CurrentVersion: s.version.Version},
 		}, nil
 	}

@@ -1,0 +1,352 @@
+package postgres
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"log"
+	"strings"
+
+	"go.kenn.io/agentsview/internal/db"
+)
+
+type automatedAuditPGProgress struct {
+	RowsPrefetched int
+	RowsFullText   int
+}
+
+const fullAutomationCandidatesPG = `SELECT
+	s.id,
+	s.agent,
+	s.session_kind,
+	s.first_message,
+	s.user_message_count,
+	s.is_automated,
+	s.prompt_evidence_discarded,
+	(
+		SELECT m.content
+		FROM messages m
+		WHERE m.session_id = s.id
+		  AND m.role = 'user'
+		  AND COALESCE(m.source_subtype, '') <> 'tool_result'
+		  AND COALESCE(m.is_system, false) = false
+		  AND btrim(m.content) <> ''
+		ORDER BY m.ordinal
+		LIMIT 1
+	) AS first_user_message
+ FROM sessions s`
+
+func backfillIsAutomatedPGWithProgress(
+	ctx context.Context, pg *sql.DB,
+) (automatedAuditPGProgress, error) {
+	var progress automatedAuditPGProgress
+	current := db.ClassifierHash()
+	var stored string
+	err := pg.QueryRowContext(ctx,
+		`SELECT value FROM sync_metadata WHERE key = $1`,
+		db.ClassifierHashKey,
+	).Scan(&stored)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return progress, fmt.Errorf(
+			"probing PG classifier hash: %w", err,
+		)
+	}
+
+	var setIDs, clearIDs []string
+	classifier := db.SnapshotAutomationClassifier()
+	if stored == current {
+		setIDs, clearIDs, err = auditAutomatedMatchingHashPG(
+			ctx, pg, classifier, &progress,
+		)
+	} else {
+		setIDs, clearIDs, err = auditAutomatedFullPG(
+			ctx, pg, classifier, &progress,
+		)
+	}
+	if err != nil {
+		return progress, err
+	}
+
+	if err := batchUpdateAutomatedPG(ctx, pg, setIDs, true); err != nil {
+		return progress, err
+	}
+	if err := batchUpdateAutomatedPG(ctx, pg, clearIDs, false); err != nil {
+		return progress, err
+	}
+	if len(setIDs) > 0 || len(clearIDs) > 0 {
+		log.Printf(
+			"pg migration: recomputed is_automated"+
+				" (set %d, cleared %d)",
+			len(setIDs), len(clearIDs),
+		)
+	}
+
+	if _, err := pg.ExecContext(ctx,
+		`INSERT INTO sync_metadata (key, value)
+		 VALUES ($1, $2)
+		 ON CONFLICT (key) DO UPDATE
+		 SET value = EXCLUDED.value`,
+		db.ClassifierHashKey, current,
+	); err != nil {
+		return progress, fmt.Errorf(
+			"storing PG classifier hash: %w", err,
+		)
+	}
+	return progress, nil
+}
+
+func auditAutomatedFullPG(
+	ctx context.Context,
+	pg *sql.DB,
+	classifier db.AutomationClassifier,
+	progress *automatedAuditPGProgress,
+) (setIDs, clearIDs []string, err error) {
+	rows, err := pg.QueryContext(ctx, fullAutomationCandidatesPG)
+	if err != nil {
+		return nil, nil, fmt.Errorf(
+			"querying PG automated backfill candidates: %w", err,
+		)
+	}
+	defer rows.Close()
+	setIDs, clearIDs, count, err := scanFullAutomationCandidatesPG(
+		rows, classifier,
+	)
+	if closeErr := rows.Close(); err == nil && closeErr != nil {
+		err = closeErr
+	}
+	progress.RowsFullText += count
+	return setIDs, clearIDs, err
+}
+
+func auditAutomatedMatchingHashPG(
+	ctx context.Context,
+	pg *sql.DB,
+	classifier db.AutomationClassifier,
+	progress *automatedAuditPGProgress,
+) (setIDs, clearIDs []string, err error) {
+	// Fetch bytea prefixes because the classifier's evidence limit is bytes,
+	// not characters. This also avoids affected PostgreSQL minors rejecting
+	// valid multibyte text when text substring operates on compressed TOAST.
+	rows, err := pg.QueryContext(ctx,
+		`SELECT
+			s.id,
+			s.agent,
+			s.session_kind,
+			s.user_message_count,
+			s.is_automated,
+			s.prompt_evidence_discarded,
+			CASE WHEN s.user_message_count <= 1
+				THEN substring(
+					convert_to(first_user.content, 'UTF8') FROM 1 FOR $1
+				)
+			END AS first_user_prefix,
+			CASE WHEN s.user_message_count <= 1
+				THEN octet_length(first_user.content)
+			END AS first_user_length,
+			CASE
+				WHEN s.user_message_count <= 1
+				 AND s.first_message IS NOT NULL
+				THEN substring(
+					convert_to(s.first_message, 'UTF8') FROM 1 FOR $1
+				)
+			END AS first_message_prefix,
+			CASE
+				WHEN s.user_message_count <= 1
+				 AND s.first_message IS NOT NULL
+				THEN octet_length(s.first_message)
+			END AS first_message_length
+		 FROM sessions s
+		 LEFT JOIN LATERAL (
+			SELECT m.content
+			FROM messages m
+			WHERE m.session_id = s.id
+			  AND m.role = 'user'
+			  AND COALESCE(m.source_subtype, '') <> 'tool_result'
+			  AND COALESCE(m.is_system, false) = false
+			  AND btrim(m.content) <> ''
+			ORDER BY m.ordinal
+			LIMIT 1
+		 ) first_user ON s.user_message_count <= 1`,
+		db.AutomationEvidencePrefixBytes,
+	)
+	if err != nil {
+		return nil, nil, fmt.Errorf(
+			"querying bounded PG automated audit candidates: %w", err,
+		)
+	}
+	defer rows.Close()
+
+	var unresolved []string
+	for rows.Next() {
+		var (
+			id                      string
+			agent                   string
+			sessionKind             string
+			userMessageCount        int
+			rowAutomated            bool
+			promptEvidenceDiscarded bool
+			firstUserPrefix         []byte
+			firstUserLength         sql.NullInt64
+			firstMessagePrefix      []byte
+			firstMessageLength      sql.NullInt64
+		)
+		if err := rows.Scan(
+			&id,
+			&agent,
+			&sessionKind,
+			&userMessageCount,
+			&rowAutomated,
+			&promptEvidenceDiscarded,
+			&firstUserPrefix,
+			&firstUserLength,
+			&firstMessagePrefix,
+			&firstMessageLength,
+		); err != nil {
+			_ = rows.Close()
+			return nil, nil, fmt.Errorf(
+				"scanning bounded PG automated audit candidate: %w", err,
+			)
+		}
+		progress.RowsPrefetched++
+		if db.IsAutomatedSessionMetadata(agent, sessionKind) {
+			setIDs, clearIDs = appendAutomationFlagChangePG(
+				setIDs, clearIDs, id, rowAutomated, true,
+			)
+			continue
+		}
+
+		// Usage-only archives discard both text candidates. With at most
+		// one prompt, missing text cannot disprove the stored verdict.
+		if promptEvidenceDiscarded && userMessageCount <= 1 && firstUserLength.Int64 == 0 && firstMessageLength.Int64 == 0 {
+			continue
+		}
+
+		want, conclusive := classifier.VerdictFromEvidence(
+			userMessageCount,
+			automationEvidencePG(firstUserPrefix, firstUserLength),
+			automationEvidencePG(firstMessagePrefix, firstMessageLength),
+		)
+		if !conclusive {
+			unresolved = append(unresolved, id)
+			continue
+		}
+		setIDs, clearIDs = appendAutomationFlagChangePG(
+			setIDs, clearIDs, id, rowAutomated, want,
+		)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, nil, err
+	}
+
+	const batchSize = 500
+	for start := 0; start < len(unresolved); start += batchSize {
+		end := min(start+batchSize, len(unresolved))
+		batch := unresolved[start:end]
+		pb := &paramBuilder{}
+		placeholders := make([]string, len(batch))
+		for i, id := range batch {
+			placeholders[i] = pb.add(id)
+		}
+		batchSet, batchClear, count, err := func() ([]string, []string, int, error) {
+			fullRows, err := pg.QueryContext(
+				ctx,
+				fullAutomationCandidatesPG+
+					" WHERE s.id IN ("+strings.Join(placeholders, ",")+")",
+				pb.args...,
+			)
+			if err != nil {
+				return nil, nil, 0, fmt.Errorf(
+					"querying unresolved PG automated audit candidates: %w", err,
+				)
+			}
+			defer fullRows.Close()
+			batchSet, batchClear, count, scanErr := scanFullAutomationCandidatesPG(fullRows, classifier)
+			if closeErr := fullRows.Close(); scanErr == nil && closeErr != nil {
+				scanErr = closeErr
+			}
+			if scanErr != nil {
+				return nil, nil, 0, scanErr
+			}
+			return batchSet, batchClear, count, nil
+		}()
+		if err != nil {
+			return nil, nil, err
+		}
+		progress.RowsFullText += count
+		setIDs = append(setIDs, batchSet...)
+		clearIDs = append(clearIDs, batchClear...)
+	}
+	return setIDs, clearIDs, nil
+}
+
+func scanFullAutomationCandidatesPG(
+	rows *sql.Rows,
+	classifier db.AutomationClassifier,
+) (setIDs, clearIDs []string, count int, err error) {
+	for rows.Next() {
+		var (
+			id                      string
+			agent                   string
+			sessionKind             string
+			firstMessage            sql.NullString
+			firstUser               sql.NullString
+			userCount               int
+			rowAutomated            bool
+			promptEvidenceDiscarded bool
+		)
+		if err := rows.Scan(
+			&id, &agent, &sessionKind,
+			&firstMessage, &userCount, &rowAutomated, &promptEvidenceDiscarded, &firstUser,
+		); err != nil {
+			return nil, nil, count, fmt.Errorf(
+				"scanning PG automated audit candidate: %w", err,
+			)
+		}
+		count++
+		want := db.IsAutomatedSessionMetadata(agent, sessionKind)
+		// Match the bounded audit: retain the verdict when classification
+		// needs prompt text that the source archive no longer stores.
+		if promptEvidenceDiscarded && !want && userCount <= 1 && firstUser.String == "" && firstMessage.String == "" {
+			continue
+		}
+		want = want || classifier.IsAutomatedFromTextCandidates(
+			userCount, firstUser, firstMessage,
+		)
+		setIDs, clearIDs = appendAutomationFlagChangePG(
+			setIDs, clearIDs, id, rowAutomated, want,
+		)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, count, err
+	}
+	return setIDs, clearIDs, count, nil
+}
+
+func automationEvidencePG(
+	prefix []byte,
+	fullByteLength sql.NullInt64,
+) db.AutomationTextEvidence {
+	return db.AutomationTextEvidence{
+		Prefix:         prefix,
+		FullByteLength: fullByteLength.Int64,
+		Valid:          fullByteLength.Valid,
+	}
+}
+
+func appendAutomationFlagChangePG(
+	setIDs, clearIDs []string,
+	id string,
+	rowAutomated, want bool,
+) ([]string, []string) {
+	if want && !rowAutomated {
+		setIDs = append(setIDs, id)
+	} else if !want && rowAutomated {
+		clearIDs = append(clearIDs, id)
+	}
+	return setIDs, clearIDs
+}

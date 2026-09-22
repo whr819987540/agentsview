@@ -91,6 +91,33 @@ func analyticsUTCRange(
 	return from, to
 }
 
+func pgAnalyticsMessageWindow(f db.AnalyticsFilter, col string, pb *paramBuilder) string {
+	from, to := analyticsUTCRange(f)
+	var preds []string
+	if f.From != "" {
+		preds = append(preds, col+" >= "+pb.add(from)+"::timestamptz")
+	}
+	if f.To != "" {
+		if t, err := time.Parse(time.RFC3339, to); err == nil {
+			to = t.Add(time.Second).Format(time.RFC3339)
+		}
+		preds = append(preds, col+" < "+pb.add(to)+"::timestamptz")
+	}
+	if len(preds) == 0 {
+		return ""
+	}
+	return "(" + col + " IS NULL OR (" + strings.Join(preds, " AND ") + "))"
+}
+
+func pgAnalyticsToolSessionWindow(f db.AnalyticsFilter, pb *paramBuilder) string {
+	sessionPred := pgAnalyticsMessageWindow(f, pgDateCol, pb)
+	if sessionPred == "" {
+		return ""
+	}
+	messagePred := pgAnalyticsMessageWindow(f, "wm.timestamp", pb)
+	return "(" + sessionPred + " OR EXISTS (SELECT 1 FROM messages wm WHERE wm.session_id = sessions.id AND " + messagePred + "))"
+}
+
 // buildAnalyticsWhere builds a WHERE clause with PG
 // placeholders. dateCol is the date expression.
 func buildAnalyticsWhere(
@@ -1058,12 +1085,12 @@ func (s *Store) GetAnalyticsActivity(
 	}
 
 	query := `SELECT ` + pgDateColS + `, s.agent, s.id,
-		m.role, m.has_thinking, COUNT(*)
+		m.role, m.has_thinking, COALESCE(m.source_subtype, ''), COUNT(*)
 		FROM sessions s
 		LEFT JOIN messages m ON m.session_id = s.id
 		WHERE ` + strings.Join(preds, " AND ") + `
 		GROUP BY s.id, ` + pgDateColS +
-		`, s.agent, m.role, m.has_thinking`
+		`, s.agent, m.role, m.has_thinking, m.source_subtype`
 
 	rows, err := s.pg.QueryContext(
 		ctx, query, pb.args...,
@@ -1084,11 +1111,12 @@ func (s *Store) GetAnalyticsActivity(
 		var tsVal *time.Time
 		var agent, sid string
 		var role *string
+		var sourceSubtype string
 		var hasThinking *bool
 		var count int
 		if err := rows.Scan(
 			&tsVal, &agent, &sid, &role,
-			&hasThinking, &count,
+			&hasThinking, &sourceSubtype, &count,
 		); err != nil {
 			return db.ActivityResponse{},
 				fmt.Errorf(
@@ -1125,7 +1153,9 @@ func (s *Store) GetAnalyticsActivity(
 			entry.ByAgent[agent] += count
 			switch *role {
 			case "user":
-				entry.UserMessages += count
+				if sourceSubtype != "tool_result" {
+					entry.UserMessages += count
+				}
 			case "assistant":
 				entry.AssistantMessages += count
 			}
@@ -2034,6 +2064,7 @@ func (s *Store) queryAutonomyChunk(
 	ph := pgInPlaceholders(chunk, pb)
 	q := `SELECT session_id,
 		SUM(CASE WHEN role='user' AND is_system=false
+			AND COALESCE(source_subtype, '') <> 'tool_result'
 			THEN 1 ELSE 0 END),
 		SUM(CASE WHEN role='assistant'
 			AND has_tool_use=true THEN 1 ELSE 0 END)
@@ -2074,6 +2105,9 @@ func (s *Store) GetAnalyticsTools(
 ) (db.ToolsAnalyticsResponse, error) {
 	pb := &paramBuilder{}
 	where := buildAnalyticsWhereWithoutDate(f, pb)
+	if pred := pgAnalyticsToolSessionWindow(f, pb); pred != "" {
+		where += " AND " + pred
+	}
 
 	sessQ := `SELECT id, ` + pgDateCol + `, agent
 		FROM sessions WHERE ` + where
@@ -2122,6 +2156,7 @@ func (s *Store) GetAnalyticsTools(
 	resp := db.ToolsAnalyticsResponse{
 		ByCategory: []db.ToolCategoryCount{},
 		ByAgent:    []db.ToolAgentBreakdown{},
+		ByTool:     []db.ToolUsageAnalysis{},
 		Trend:      []db.ToolTrendEntry{},
 	}
 
@@ -2129,13 +2164,7 @@ func (s *Store) GetAnalyticsTools(
 		return resp, nil
 	}
 
-	type toolRow struct {
-		sessionID string
-		category  string
-		count     int
-		date      string
-	}
-	var toolRows []toolRow
+	var toolRows []db.ToolAnalyticsRow
 
 	err = pgQueryChunked(sessionIDs,
 		func(chunk []string) error {
@@ -2145,9 +2174,13 @@ func (s *Store) GetAnalyticsTools(
 			preds = appendPGAnalyticsCSVFilter(
 				preds, "m.model", f.Model, chunkPB,
 			)
-			msgTSExpr := `COALESCE(TO_CHAR(m.timestamp AT TIME ZONE 'UTC', ` +
+			if pred := pgAnalyticsMessageWindow(f, "m.timestamp", chunkPB); pred != "" {
+				preds = append(preds, pred)
+			}
+			msgTSExpr := `COALESCE(TO_CHAR(MAX(m.timestamp) AT TIME ZONE 'UTC', ` +
 				`'YYYY-MM-DD"T"HH24:MI:SS"Z"'), '')`
-			q := `SELECT tc.session_id, tc.category, COUNT(*),
+			q := `SELECT tc.session_id, tc.category,
+				TRIM(COALESCE(tc.tool_name, '')), COUNT(*),
 				` + msgTSExpr + `
 				FROM tool_calls tc
 				LEFT JOIN messages m
@@ -2155,7 +2188,8 @@ func (s *Store) GetAnalyticsTools(
 					AND m.ordinal = tc.message_ordinal`
 			q += `
 				WHERE ` + strings.Join(preds, " AND ") + `
-				GROUP BY tc.session_id, tc.category, ` + msgTSExpr
+				GROUP BY tc.session_id, tc.category,
+					TRIM(COALESCE(tc.tool_name, '')), date_trunc('minute', m.timestamp)`
 			rows, qErr := s.pg.QueryContext(
 				ctx, q, chunkPB.args...,
 			)
@@ -2166,10 +2200,10 @@ func (s *Store) GetAnalyticsTools(
 			}
 			defer rows.Close()
 			for rows.Next() {
-				var sid, cat, ts string
+				var sid, cat, toolName, ts string
 				var count int
 				if err := rows.Scan(
-					&sid, &cat, &count, &ts,
+					&sid, &cat, &toolName, &count, &ts,
 				); err != nil {
 					return fmt.Errorf(
 						"scanning tool_call: %w", err,
@@ -2185,11 +2219,13 @@ func (s *Store) GetAnalyticsTools(
 				if !keep {
 					continue
 				}
-				toolRows = append(toolRows, toolRow{
-					sessionID: sid,
-					category:  cat,
-					count:     count,
-					date:      date,
+				toolRows = append(toolRows, db.ToolAnalyticsRow{
+					SessionID: sid,
+					Category:  cat,
+					ToolName:  toolName,
+					Agent:     info.agent,
+					Count:     count,
+					Date:      date,
 				})
 			}
 			return rows.Err()
@@ -2201,115 +2237,19 @@ func (s *Store) GetAnalyticsTools(
 	if len(toolRows) == 0 {
 		return resp, nil
 	}
-
-	catCounts := make(map[string]int)
-	agentCats := make(map[string]map[string]int)
-	trendBuckets := make(map[string]map[string]int)
-
-	for _, tr := range toolRows {
-		info := sessionMap[tr.sessionID]
-		catCounts[tr.category] += tr.count
-
-		if agentCats[info.agent] == nil {
-			agentCats[info.agent] = make(map[string]int)
-		}
-		agentCats[info.agent][tr.category] += tr.count
-
-		week := bucketDate(tr.date, "week")
-		if trendBuckets[week] == nil {
-			trendBuckets[week] = make(map[string]int)
-		}
-		trendBuckets[week][tr.category] += tr.count
-	}
-
-	for _, count := range catCounts {
-		resp.TotalCalls += count
-	}
-
-	resp.ByCategory = make(
-		[]db.ToolCategoryCount, 0, len(catCounts),
-	)
-	for cat, count := range catCounts {
-		pct := math.Round(
-			float64(count)/
-				float64(resp.TotalCalls)*1000,
-		) / 10
-		resp.ByCategory = append(resp.ByCategory,
-			db.ToolCategoryCount{
-				Category: cat, Count: count, Pct: pct,
-			})
-	}
-	sort.Slice(resp.ByCategory, func(i, j int) bool {
-		if resp.ByCategory[i].Count !=
-			resp.ByCategory[j].Count {
-			return resp.ByCategory[i].Count >
-				resp.ByCategory[j].Count
-		}
-		return resp.ByCategory[i].Category <
-			resp.ByCategory[j].Category
-	})
-
-	agentKeys := make([]string, 0, len(agentCats))
-	for k := range agentCats {
-		agentKeys = append(agentKeys, k)
-	}
-	sort.Strings(agentKeys)
-	resp.ByAgent = make(
-		[]db.ToolAgentBreakdown, 0, len(agentKeys),
-	)
-	for _, agent := range agentKeys {
-		cats := agentCats[agent]
-		total := 0
-		for _, c := range cats {
-			total += c
-		}
-		catList := make(
-			[]db.ToolCategoryCount, 0, len(cats),
-		)
-		for cat, count := range cats {
-			pct := math.Round(
-				float64(count)/float64(total)*1000,
-			) / 10
-			catList = append(catList, db.ToolCategoryCount{
-				Category: cat, Count: count, Pct: pct,
-			})
-		}
-		sort.Slice(catList, func(i, j int) bool {
-			if catList[i].Count != catList[j].Count {
-				return catList[i].Count > catList[j].Count
-			}
-			return catList[i].Category <
-				catList[j].Category
-		})
-		resp.ByAgent = append(resp.ByAgent,
-			db.ToolAgentBreakdown{
-				Agent:      agent,
-				Total:      total,
-				Categories: catList,
-			})
-	}
-
-	resp.Trend = make(
-		[]db.ToolTrendEntry, 0, len(trendBuckets),
-	)
-	for week, cats := range trendBuckets {
-		resp.Trend = append(resp.Trend, db.ToolTrendEntry{
-			Date: week, ByCat: cats,
-		})
-	}
-	sort.Slice(resp.Trend, func(i, j int) bool {
-		return resp.Trend[i].Date < resp.Trend[j].Date
-	})
-
-	return resp, nil
+	return db.BuildToolsAnalytics(toolRows), nil
 }
 
-// GetAnalyticsSkills returns skill usage analytics.
+// GetAnalyticsSkills returns skill usage analytics. granularity picks
+// the trend bucket size (day, week, or month); empty defaults to week.
 func (s *Store) GetAnalyticsSkills(
-	ctx context.Context, f db.AnalyticsFilter,
+	ctx context.Context, f db.AnalyticsFilter, granularity string,
 ) (db.SkillsAnalyticsResponse, error) {
 	pb := &paramBuilder{}
 	where := buildAnalyticsWhereWithoutDate(f, pb)
+	if pred := pgAnalyticsToolSessionWindow(f, pb); pred != "" {
+		where += " AND " + pred
+	}
 
 	sessQ := `SELECT id, ` + pgDateCol + `, agent, project
 		FROM sessions WHERE ` + where
@@ -2350,7 +2290,9 @@ func (s *Store) GetAnalyticsSkills(
 			fmt.Errorf("iterating skill sessions: %w", err)
 	}
 	if len(sessionIDs) == 0 {
-		return db.BuildSkillsAnalytics(nil), nil
+		return db.BuildSkillsAnalytics(
+			nil, f.From, f.To, granularity,
+		), nil
 	}
 
 	var skillRows []db.SkillAnalyticsRow
@@ -2365,10 +2307,13 @@ func (s *Store) GetAnalyticsSkills(
 			preds = appendPGAnalyticsCSVFilter(
 				preds, "m.model", f.Model, chunkPB,
 			)
+			if pred := pgAnalyticsMessageWindow(f, "m.timestamp", chunkPB); pred != "" {
+				preds = append(preds, pred)
+			}
 			q := `SELECT tc.session_id,
 					TRIM(COALESCE(tc.skill_name, '')),
 					COUNT(*),
-					m.timestamp
+					MAX(m.timestamp)
 				FROM tool_calls tc
 				LEFT JOIN messages m
 					ON m.session_id = tc.session_id
@@ -2376,7 +2321,7 @@ func (s *Store) GetAnalyticsSkills(
 				WHERE ` + strings.Join(preds, " AND ") + `
 				GROUP BY tc.session_id,
 					TRIM(COALESCE(tc.skill_name, '')),
-					m.timestamp`
+					date_trunc('minute', m.timestamp)`
 			rows, qErr := s.pg.QueryContext(
 				ctx, q, chunkPB.args...,
 			)
@@ -2420,7 +2365,9 @@ func (s *Store) GetAnalyticsSkills(
 		return db.SkillsAnalyticsResponse{}, err
 	}
 
-	return db.BuildSkillsAnalytics(skillRows), nil
+	return db.BuildSkillsAnalytics(
+		skillRows, f.From, f.To, granularity,
+	), nil
 }
 
 // --- Velocity ---
@@ -3319,13 +3266,14 @@ func (s *Store) signalMessages(
 		for sessionID, scopedRows := range rowsBySession {
 			for _, row := range scopedRows {
 				out[sessionID] = append(out[sessionID], db.SignalMessage{
-					SessionID:  row.SessionID,
-					Ordinal:    row.Ordinal,
-					Role:       row.Role,
-					Content:    row.Content,
-					Timestamp:  row.Timestamp,
-					IsSystem:   row.IsSystem,
-					HasToolUse: row.HasToolUse,
+					SessionID:     row.SessionID,
+					Ordinal:       row.Ordinal,
+					Role:          row.Role,
+					SourceSubtype: row.SourceSubtype,
+					Content:       row.Content,
+					Timestamp:     row.Timestamp,
+					IsSystem:      row.IsSystem,
+					HasToolUse:    row.HasToolUse,
 				})
 			}
 		}
@@ -3341,7 +3289,7 @@ func (s *Store) signalMessages(
 		q := `SELECT session_id, ordinal, role, content,
 					COALESCE(to_char(timestamp AT TIME ZONE 'UTC',
 						'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'), ''),
-					is_system, has_tool_use
+					is_system, has_tool_use, COALESCE(source_subtype, '')
 				FROM messages
 				WHERE session_id IN (` + strings.Join(placeholders, ",") + `)`
 		if len(filterModels) == 1 {
@@ -3370,7 +3318,7 @@ func (s *Store) signalMessages(
 			if err := msgRows.Scan(
 				&m.SessionID, &m.Ordinal, &m.Role,
 				&m.Content, &m.Timestamp,
-				&m.IsSystem, &m.HasToolUse,
+				&m.IsSystem, &m.HasToolUse, &m.SourceSubtype,
 			); err != nil {
 				return fmt.Errorf(
 					"scanning signal message: %w", err,
@@ -3410,6 +3358,7 @@ func (s *Store) populateFrustrationMarkers(
 		q := `SELECT session_id, ordinal, content, is_system
 			FROM messages
 			WHERE role = 'user'
+			  AND COALESCE(source_subtype, '') <> 'tool_result'
 			  AND session_id IN (` + strings.Join(placeholders, ",") + `)`
 		msgRows, err := s.pg.QueryContext(ctx, q, pb.args...)
 		if err != nil {

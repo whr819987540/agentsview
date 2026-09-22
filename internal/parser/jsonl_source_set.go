@@ -3,6 +3,8 @@ package parser
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -110,6 +112,15 @@ type JSONLSourceSetOptions struct {
 	// providers describe companions once as transcript->companions and the base
 	// drives watch, freshness, and changed-path mapping from that single hook.
 	CompanionFiles func(transcriptPath string) []string
+	// RejectSymlinkCompanions makes companion freshness use Lstat and ignore
+	// symlinked companions. The default preserves legacy followed-symlink
+	// behavior for existing JSONL providers.
+	RejectSymlinkCompanions bool
+
+	// CompanionTranscript is the inverse of CompanionFiles: it derives the
+	// owning transcript path from a changed sidecar path so companion events
+	// resolve without scanning the archive. See WithCompanionTranscript.
+	CompanionTranscript func(companionPath string) (string, bool)
 }
 
 // JSONLSourceSet discovers, watches, locates, and fingerprints JSONL-like
@@ -157,22 +168,45 @@ func jsonlSourceSetFromOptions(
 
 // Discover returns stable, deduped source references for configured roots.
 func (s JSONLSourceSet) Discover(ctx context.Context) ([]SourceRef, error) {
-	var sources []SourceRef
-	seen := make(map[string]struct{})
+	return collectDiscoveredSources(ctx, s.DiscoverEach)
+}
+
+func (s JSONLSourceSet) DiscoverEach(
+	ctx context.Context, yield func(SourceRef) error,
+) error {
+	var incomplete error
 	for _, root := range s.roots {
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return err
 		}
 		info, err := os.Stat(root)
-		if err != nil || !info.IsDir() {
+		if errors.Is(err, os.ErrNotExist) {
 			continue
 		}
-		if err := s.discoverDir(ctx, root, root, &sources, seen); err != nil {
-			return nil, err
+		if err != nil {
+			incomplete = errors.Join(incomplete, incompleteDiscoveryError(
+				s.provider, "stat JSONL root "+root, err,
+			))
+			continue
+		}
+		if !info.IsDir() {
+			err := errors.New("not a directory")
+			incomplete = errors.Join(incomplete, incompleteDiscoveryError(
+				s.provider, "stat JSONL root "+root, err,
+			))
+			continue
+		}
+		if err := s.discoverDirEach(ctx, root, root, yield); err != nil {
+			if cause, ok := discoveryYieldCause(err); ok {
+				return cause
+			}
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			incomplete = errors.Join(incomplete, err)
 		}
 	}
-	sortJSONLSources(sources)
-	return sources, nil
+	return incomplete
 }
 
 // WatchPlan returns one watch root for each configured JSONL root. When a
@@ -197,6 +231,26 @@ func (s JSONLSourceSet) WatchPlan(ctx context.Context) (WatchPlan, error) {
 		})
 	}
 	return WatchPlan{Roots: roots}, nil
+}
+
+// WatchRoots returns configured root metadata without discovering transcripts
+// or enumerating companion basenames. WatchPlan remains archive-aware for
+// parser callers that still consume include globs.
+func (s JSONLSourceSet) WatchRoots(
+	ctx context.Context,
+) ([]WatchRoot, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	roots := make([]WatchRoot, 0, len(s.roots))
+	for _, root := range s.roots {
+		roots = append(roots, WatchRoot{
+			Path:        root,
+			Recursive:   s.options.Recursive,
+			DebounceKey: string(s.provider) + ":jsonl:" + root,
+		})
+	}
+	return roots, nil
 }
 
 // companionGlobs enumerates the distinct sidecar basenames across all
@@ -274,6 +328,33 @@ func (s JSONLSourceSet) SourcesForChangedPath(
 		}
 	}
 	return []SourceRef{source}, nil
+}
+
+// SourceForReconciliation rebuilds an exact source that streaming discovery
+// already admitted. It deliberately avoids changed-path classification, whose
+// duplicate-resolution fallback can rediscover the entire archive once per
+// candidate during streamed reconciliation.
+func (s JSONLSourceSet) SourceForReconciliation(
+	ctx context.Context, path, _ string,
+) (SourceRef, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return SourceRef{}, false, err
+	}
+	path = filepath.Clean(path)
+	info, err := s.sourcePathInfo(path)
+	if err != nil || !info.Mode().IsRegular() {
+		return SourceRef{}, false, nil //nolint:nilerr // Unavailable source paths are represented by the found=false outcome.
+	}
+	for _, root := range s.roots {
+		if !s.pathAllowedByRoot(root, path) ||
+			!s.sourcePathAllowedByDescendPath(root, path) ||
+			!s.pathIncluded(root, path) {
+			continue
+		}
+		source, ok := s.sourceRef(root, path, info)
+		return source, ok, nil
+	}
+	return SourceRef{}, false, nil
 }
 
 // FindSource resolves persisted source hints or a raw filename-stem session ID.
@@ -357,7 +438,7 @@ func (s JSONLSourceSet) Fingerprint(
 		return SourceFingerprint{}, err
 	}
 	if !ok {
-		return SourceFingerprint{}, fmt.Errorf("jsonl source path unavailable")
+		return SourceFingerprint{}, errors.New("jsonl source path unavailable")
 	}
 	info, err := os.Stat(path)
 	if err != nil {
@@ -419,8 +500,12 @@ func (s JSONLSourceSet) foldCompanionFingerprint(
 		hasher = h
 	}
 	folded := false
+	companionInfo := siblingMetadataFileInfo
+	if s.options.RejectSymlinkCompanions {
+		companionInfo = siblingMetadataFileInfoStrict
+	}
 	for _, companion := range companions {
-		info, err := siblingMetadataFileInfo(companion)
+		info, err := companionInfo(companion)
 		if err != nil {
 			return err
 		}
@@ -441,7 +526,7 @@ func (s JSONLSourceSet) foldCompanionFingerprint(
 		folded = true
 	}
 	if hasher != nil && folded {
-		fingerprint.Hash = fmt.Sprintf("%x", hasher.Sum(nil))
+		fingerprint.Hash = hex.EncodeToString(hasher.Sum(nil))
 	}
 	return nil
 }
@@ -497,57 +582,87 @@ func (s JSONLSourceSet) Parse(
 }
 
 var (
-	_ SourceSet = JSONLSourceSet{}
-	_ SourceSet = DirectoryJSONLSourceSet{}
+	_ SourceSet           = JSONLSourceSet{}
+	_ WatchRootPlanner    = JSONLSourceSet{}
+	_ StreamingDiscoverer = JSONLSourceSet{}
+	_ SourceSet           = DirectoryJSONLSourceSet{}
+	_ WatchRootPlanner    = DirectoryJSONLSourceSet{}
 )
 
-func (s JSONLSourceSet) discoverDir(
+func (s JSONLSourceSet) discoverDirEach(
 	ctx context.Context,
 	root string,
 	dir string,
-	sources *[]SourceRef,
-	seen map[string]struct{},
+	yield func(SourceRef) error,
 ) error {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return ctxErr
-		}
-		return nil
-	}
-	for _, entry := range entries {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
+	var incomplete error
+	err := streamDirectoryEntries(ctx, dir, func(entry os.DirEntry) error {
 		path := filepath.Join(dir, entry.Name())
-		if s.shouldDescend(entry, dir) {
+		descend, descendErr := s.shouldDescend(entry, dir)
+		if descendErr != nil {
+			incomplete = errors.Join(incomplete, incompleteDiscoveryError(
+				s.provider, "resolve symlinked JSONL directory "+path, descendErr,
+			))
+			return nil
+		}
+		if descend {
 			if s.options.Recursive && s.descendPathIncluded(root, path) {
-				if err := s.discoverDir(
-					ctx, root, path, sources, seen,
-				); err != nil {
-					return err
+				if err := s.discoverDirEach(ctx, root, path, yield); err != nil {
+					if _, ok := discoveryYieldCause(err); ok || ctx.Err() != nil {
+						return err
+					}
+					incomplete = errors.Join(incomplete, err)
 				}
 			}
-			continue
+			return nil
 		}
 		info, err := s.sourceFileInfo(entry, path)
-		if err != nil || !info.Mode().IsRegular() {
-			continue
+		if err != nil {
+			incomplete = errors.Join(incomplete, incompleteDiscoveryError(
+				s.provider, "stat JSONL source "+path, err,
+			))
+			return nil
+		}
+		if !info.Mode().IsRegular() {
+			return nil
 		}
 		source, ok := s.sourceRef(root, path, info)
 		if !ok {
-			continue
+			return nil
 		}
-		addJSONLSource(source, sources, seen)
+		if err := yield(source); err != nil {
+			return discoveryYieldError{cause: err}
+		}
+		return nil
+	})
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
 	}
-	return nil
+	if err != nil {
+		if _, ok := discoveryYieldCause(err); ok {
+			return err
+		}
+		incomplete = errors.Join(incomplete, incompleteDiscoveryError(
+			s.provider, "read JSONL directory "+dir, err,
+		))
+	}
+	return incomplete
 }
 
-func (s JSONLSourceSet) shouldDescend(entry os.DirEntry, dir string) bool {
+// shouldDescend reports whether recursive discovery should descend into
+// entry. A followed symlink whose target cannot be statted returns an error
+// rather than false: silently treating it as absent would let reconciliation
+// read an authoritative-empty discovery and tombstone the sessions beneath it.
+func (s JSONLSourceSet) shouldDescend(
+	entry os.DirEntry, dir string,
+) (bool, error) {
 	if entry.IsDir() {
-		return true
+		return true, nil
 	}
-	return s.options.FollowSymlinkDirs && isDirOrSymlink(entry, dir)
+	if !s.options.FollowSymlinkDirs {
+		return false, nil
+	}
+	return streamingDirOrSymlinkCandidate(entry, dir)
 }
 
 func (s JSONLSourceSet) sourceFileInfo(
@@ -571,7 +686,7 @@ func (s JSONLSourceSet) sourceForPath(
 	path = filepath.Clean(path)
 	info, err := s.sourcePathInfo(path)
 	if err != nil || !info.Mode().IsRegular() {
-		return SourceRef{}, false, nil
+		return SourceRef{}, false, nil //nolint:nilerr // Unavailable source paths are represented by the found=false outcome.
 	}
 	for _, root := range s.roots {
 		if !s.pathAllowedByRoot(root, path) {
@@ -628,9 +743,11 @@ func (s JSONLSourceSet) sourceForMissingPath(
 }
 
 // sourceForCompanionPath resolves a changed sidecar path back to the transcript
-// source that owns it. It scans discovered transcripts and returns the one whose
-// CompanionFiles list contains the changed path, so a companion write triggers a
-// re-parse of its transcript.
+// source that owns it, so a companion write triggers a re-parse of its
+// transcript. With a configured CompanionTranscript inverse, the owning
+// transcript is derived directly and resolved through the same per-path lookup
+// a transcript event uses; without one, it falls back to scanning discovered
+// transcripts for the one whose CompanionFiles list contains the changed path.
 func (s JSONLSourceSet) sourceForCompanionPath(
 	ctx context.Context,
 	path string,
@@ -639,6 +756,22 @@ func (s JSONLSourceSet) sourceForCompanionPath(
 		return SourceRef{}, false, nil
 	}
 	path = filepath.Clean(path)
+	if s.options.CompanionTranscript != nil {
+		transcript, ok := s.options.CompanionTranscript(path)
+		if !ok {
+			return SourceRef{}, false, nil
+		}
+		transcript = filepath.Clean(transcript)
+		// The forward hook stays authoritative: a path the transcript does
+		// not claim as a companion must not remap to it.
+		if !slices.ContainsFunc(
+			s.options.CompanionFiles(transcript),
+			func(companion string) bool { return samePath(companion, path) },
+		) {
+			return SourceRef{}, false, nil
+		}
+		return s.sourceForPath(ctx, transcript)
+	}
 	sources, err := s.Discover(ctx)
 	if err != nil {
 		return SourceRef{}, false, err
@@ -738,6 +871,13 @@ func (s JSONLSourceSet) discoveredSourceForCandidate(
 	ctx context.Context,
 	candidate SourceRef,
 ) (SourceRef, bool, error) {
+	if s.options.Key == nil {
+		// Keys default to the absolute source path, so they are unique by
+		// construction: discovery cannot hold a different preferred ref for
+		// this key, and scanning the archive would only re-derive candidate.
+		// Skipping it keeps per-event work bounded by the changed path.
+		return candidate, true, nil
+	}
 	discovered, err := s.Discover(ctx)
 	if err != nil {
 		return SourceRef{}, false, err
@@ -927,6 +1067,15 @@ func firstNonEmptyJSONLString(values ...string) string {
 }
 
 func hashJSONLSourceFile(path string) (string, error) {
+	return hashJSONLSourceFileContext(context.Background(), path)
+}
+
+func hashJSONLSourceFileContext(
+	ctx context.Context, path string,
+) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return "", fmt.Errorf("open %s: %w", path, err)
@@ -934,8 +1083,20 @@ func hashJSONLSourceFile(path string) (string, error) {
 	defer f.Close()
 
 	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
+	if _, err := io.Copy(h, checkedContextReader{ctx: ctx, reader: f}); err != nil {
 		return "", fmt.Errorf("hash %s: %w", path, err)
 	}
-	return fmt.Sprintf("%x", h.Sum(nil)), nil
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+type checkedContextReader struct {
+	ctx    context.Context
+	reader io.Reader
+}
+
+func (r checkedContextReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.reader.Read(p)
 }

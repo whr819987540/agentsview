@@ -6,8 +6,9 @@
     localDateStr,
     type Automation,
   } from "../../stores/activity.svelte.js";
-  import { events } from "../../stores/events.svelte.js";
+  import type { ActivityReportProgress } from "../../api/activity-report.js";
   import { sync } from "../../stores/sync.svelte.js";
+  import { sessions } from "../../stores/sessions.svelte.js";
   import { router } from "../../stores/router.svelte.js";
   import {
     yokedDates,
@@ -15,11 +16,9 @@
     rangeToActivityParams,
     type PanelDateState,
   } from "../../stores/yokedDates.svelte.js";
-  import RefreshControl from "../shared/RefreshControl.svelte";
   import ProjectTypeahead from "../layout/ProjectTypeahead.svelte";
-  import OptionTypeahead, {
-    type TypeaheadOption,
-  } from "../layout/OptionTypeahead.svelte";
+  import { Card, Typeahead, type TypeaheadOption } from "@kenn-io/kit-ui";
+  import RefreshControl from "../shared/RefreshControl.svelte";
   import {
     addDays,
     endOfMonth,
@@ -56,24 +55,87 @@
   let activityYokeReady = $state(false);
   let lastActivityDateSignature = "";
 
-  // Page-local drill-down: clicking a Concurrency bucket filters the sessions
-  // table to the sessions active in that slot. Deliberately not URL-synced — it
-  // is a transient selection that resets whenever the report reloads.
-  let slotFilter = $state<{
-    idx: number;
+  // Page-local drill-down: dragging across Concurrency buckets filters the
+  // sessions table to sessions active anywhere in that range. Deliberately not
+  // URL-synced; it is a transient selection that resets when the report reloads.
+  let rangeFilter = $state<{
+    start: number;
+    end: number;
     label: string;
-    sessionIds: string[];
   } | null>(null);
+  let rangeReportGeneration = -1;
 
-  // A reloaded report (range/filter change) gets fresh buckets and sessions, so
-  // a slot index/membership captured against the old report is stale; clear it.
+  // Every successful full-report load gets fresh buckets and sessions, even
+  // when its deterministic report_id is unchanged. Clear any slot membership
+  // captured against the previous generation.
   $effect(() => {
-    void activity.report;
-    slotFilter = null;
+    const generation = activity.reportGeneration;
+    if (generation !== rangeReportGeneration) {
+      rangeReportGeneration = generation;
+      rangeFilter = null;
+    }
   });
 
+  async function selectRange(
+    sel: { start: number; end: number; label: string } | null,
+  ) {
+    const generation = activity.reportGeneration;
+    if (
+      await activity.loadSessionPage({
+        bucketRange: sel ? { start: sel.start, end: sel.end } : null,
+      })
+      && activity.reportGeneration === generation
+    ) {
+      rangeFilter = sel;
+    }
+  }
+
+  async function sortSessions(
+    sort: import("../../api/activity-report.js").ActivitySessionSort,
+    direction: "asc" | "desc",
+  ) {
+    await activity.loadSessionPage({ sort, direction });
+  }
+
+  function reportProgressLabel(progress: ActivityReportProgress | null): string {
+    if (!progress) return m.activity_loading_report();
+    switch (progress.phase) {
+      case "loading_sessions":
+        return m.activity_loading_sessions();
+      case "loading_usage":
+        return m.activity_loading_usage();
+      case "scanning_activity":
+        return m.activity_report_progress({
+          count: progress.rows_processed ?? 0,
+        });
+      case "finalizing":
+      case "done":
+        return m.activity_finalizing_report();
+    }
+  }
+
+  const refreshStatus = $derived(
+    activity.loading ? reportProgressLabel(activity.progress) : undefined,
+  );
+
   const earliestSession = $derived(sync.stats?.earliest_session ?? null);
-  const today = $derived(localDateStr(new Date()));
+  let today = $state(localDateStr(new Date()));
+  let todayRolloverTimer: ReturnType<typeof setTimeout> | undefined;
+
+  function scheduleTodayRollover(): void {
+    const now = new Date();
+    today = localDateStr(now);
+    const nextMidnight = new Date(
+      now.getFullYear(),
+      now.getMonth(),
+      now.getDate() + 1,
+    );
+    todayRolloverTimer = setTimeout(() => {
+      today = localDateStr(new Date());
+      scheduleTodayRollover();
+    }, nextMidnight.getTime() - now.getTime());
+  }
+
   const agentOptions = $derived.by((): TypeaheadOption[] => [
     {
       name: "",
@@ -87,18 +149,41 @@
       count: agent.session_count,
     })),
   ]);
-  const machineOptions = $derived.by((): TypeaheadOption[] => [
-    {
-      name: "",
-      label: m.activity_all_machines(),
-      displayLabel: m.activity_all_machines(),
-    },
-    ...activity.machines.map((machine) => ({
-      name: machine,
-      label: machine,
-      displayLabel: machine,
-    })),
-  ]);
+  // Machines sharing a friendly label get a short ID fragment so they stay
+  // distinguishable. Full IDs are non-shrinking meta and would squeeze the
+  // label to zero width in the compact menu, so unique labels get no meta.
+  function shortMachineId(machine: string, peers: string[]): string {
+    const head = machine.slice(0, 8);
+    if (peers.every((peer) => peer === machine || peer.slice(0, 8) !== head)) return head;
+    const tail = machine.slice(-8);
+    if (peers.every((peer) => peer === machine || peer.slice(-8) !== tail)) return `…${tail}`;
+    return machine;
+  }
+  const machineOptions = $derived.by((): TypeaheadOption[] => {
+    const byLabel = new Map<string, string[]>();
+    for (const machine of activity.machines) {
+      const label = sessions.machineLabel(machine);
+      byLabel.set(label, [...(byLabel.get(label) ?? []), machine]);
+    }
+    return [
+      {
+        name: "",
+        label: m.activity_all_machines(),
+        displayLabel: m.activity_all_machines(),
+      },
+      ...activity.machines.map((machine) => {
+        const label = sessions.machineLabel(machine);
+        const peers = byLabel.get(label) ?? [];
+        const shortId = peers.length > 1 ? shortMachineId(machine, peers) : undefined;
+        return {
+          name: machine,
+          label,
+          displayLabel: shortId ? `${label} (${shortId})` : label,
+          meta: shortId,
+        };
+      }),
+    ];
+  });
   const automationOptions: TypeaheadOption[] = $derived([
     {
       name: "all",
@@ -261,6 +346,7 @@
   }
 
   onMount(() => {
+    scheduleTodayRollover();
     // Register as a consumer so a completed sync refreshes the filter
     // dropdowns while this page is on screen; detach on unmount.
     const detach = activity.attach();
@@ -274,14 +360,12 @@
     // range/filters are set before this first load. RefreshControl handles the
     // periodic refresh after that.
     activity.load();
-    // SSE events only flag that newer data exists; they never refetch the
-    // report directly. Refetching on every event flips `loading` and blanks the
-    // dashboard, so it is bounded to the RefreshControl scheduler and the
-    // manual button.
-    const unsubEvents = events.subscribe(() => activity.markNewData());
     return () => {
+      activity.cancelInFlightReads();
+      if (todayRolloverTimer !== undefined) {
+        clearTimeout(todayRolloverTimer);
+      }
       detach();
-      unsubEvents();
     };
   });
 
@@ -314,7 +398,7 @@
     />
 
     <div class="toolbar-typeahead">
-      <OptionTypeahead
+      <Typeahead
         options={agentOptions}
         value={activity.agent}
         fallbackLabel={m.activity_all_agents()}
@@ -326,7 +410,7 @@
     </div>
 
     <div class="toolbar-typeahead">
-      <OptionTypeahead
+      <Typeahead
         options={machineOptions}
         value={activity.machine}
         fallbackLabel={m.activity_all_machines()}
@@ -338,7 +422,7 @@
     </div>
 
     <div class="toolbar-typeahead compact">
-      <OptionTypeahead
+      <Typeahead
         options={automationOptions}
         value={activity.automation}
         fallbackLabel={m.activity_all_sessions()}
@@ -349,12 +433,17 @@
       />
     </div>
 
-    <RefreshControl
-      lastUpdatedAt={activity.lastUpdatedAt}
-      busy={activity.loading}
-      onRefresh={() => activity.load({ background: true })}
-      label={m.activity_refresh()}
-    />
+    <div class="activity-refresh" aria-live="polite">
+      <RefreshControl
+        lastUpdatedAt={activity.lastUpdatedAt}
+        queryDurationMs={activity.lastQueryDurationMs}
+        querySteps={activity.lastQuerySteps}
+        busy={activity.loading}
+        status={refreshStatus}
+        onRefresh={() => activity.load({ background: true })}
+        label={m.activity_refresh()}
+      />
+    </div>
   </div>
 
   <div class="activity-content">
@@ -365,24 +454,30 @@
          error states only show before the first report exists. -->
     {#if activity.report}
       <SummaryCards report={activity.report} />
-      <div class="chart-panel">
+      <Card level="default" padding="none" class="chart-panel">
         <ConcurrencyTimeline
           report={activity.report}
-          selectedBucket={slotFilter?.idx ?? null}
-          onSelectBucket={(sel) => (slotFilter = sel)}
+          selectedRange={rangeFilter}
+          onSelectRange={selectRange}
         />
-      </div>
-      <div class="chart-panel">
+      </Card>
+      <Card level="default" padding="none" class="chart-panel">
         <SessionsTable
           report={activity.report}
-          filterIds={slotFilter?.sessionIds ?? null}
-          filterLabel={slotFilter?.label ?? ""}
-          onClearFilter={() => (slotFilter = null)}
+          filterActive={rangeFilter !== null}
+          filterLabel={rangeFilter?.label ?? ""}
+          loading={activity.sessionsLoading}
+          error={activity.sessionsError}
+          sortKey={activity.sessionsSort}
+          sortDir={activity.sessionsDirection}
+          onClearFilter={() => selectRange(null)}
+          onSort={sortSessions}
+          onNext={(cursor) => activity.loadSessionPage({ cursor })}
         />
-      </div>
-      <div class="chart-panel">
+      </Card>
+      <Card level="default" padding="none" class="chart-panel">
         <Breakdowns report={activity.report} />
-      </div>
+      </Card>
     {:else if activity.loading}
       <div class="status">{m.activity_loading_report()}</div>
     {:else if activity.error}
@@ -403,15 +498,16 @@
          single-day fallback (a deep link to a week/month/custom range would
          otherwise fetch an insight for the wrong span while the report loads). -->
     {#if activity.report}
-      <div class="chart-panel">
+      <Card level="default" padding="none" class="chart-panel">
         <ActivityInsight
           dateFrom={insightFrom}
           dateTo={insightTo}
           timezone={activity.timezone}
         />
-      </div>
+      </Card>
     {/if}
   </div>
+
 </div>
 
 <style>
@@ -443,6 +539,15 @@
     --typeahead-max-width: 150px;
   }
 
+  /* The control reserves its own text widths (see shared/RefreshControl),
+   * so it needs no clamp here: the age box clips a long progress status
+   * instead of pushing the toolbar around. */
+  .activity-refresh {
+    flex: 0 0 auto;
+    max-width: 100%;
+    min-width: 0;
+  }
+
   .activity-content {
     flex: 1;
     overflow-y: auto;
@@ -452,10 +557,7 @@
     gap: 16px;
   }
 
-  .chart-panel {
-    background: var(--bg-surface);
-    border: 1px solid var(--border-muted);
-    border-radius: var(--radius-md);
+  .activity-content :global(.chart-panel) {
     padding: 12px;
     min-width: 0;
   }

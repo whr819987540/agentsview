@@ -1,29 +1,36 @@
-import type { AgentInfo, ProjectInfo } from "../api/types.js";
+import type { QueryStep } from "../utils/refresh.js";
+import type {
+  DbAgentInfo as AgentInfo,
+  DbProjectInfo as ProjectInfo,
+} from "../api/generated/index.js";
 import type { Report } from "../api/types/activity.js";
-import { ActivityService, MetadataService } from "../api/generated/index";
-import { configureGeneratedClient } from "../api/runtime.js";
+import { m } from "../i18n/index.js";
+import { MetadataService } from "../api/generated/index";
+import { isAbortError } from "../api/runtime.js";
+import {
+  fetchActivityReport,
+  fetchActivitySessions,
+  type ActivityReportProgress,
+  type ActivityBucketRange,
+  type ActivitySessionPageOptions,
+  type ActivitySessionSort,
+} from "../api/activity-report.js";
 import { sync } from "./sync.svelte.js";
+import { events } from "./events.svelte.js";
 import { router } from "./router.svelte.js";
 import { localDateStr, rollingRange } from "../utils/dates.js";
+import { LatestRead } from "../utils/latest-read.js";
+import type { DataChangedEvent } from "../api/client.js";
 
 export { localDateStr };
 
 type Preset = "day" | "week" | "month" | "custom";
 
-const PRESETS: ReadonlySet<string> = new Set<Preset>([
-  "day",
-  "week",
-  "month",
-  "custom",
-]);
+const PRESETS: ReadonlySet<string> = new Set<Preset>(["day", "week", "month", "custom"]);
 
 export type Automation = "all" | "interactive" | "automated";
 
-const AUTOMATIONS: ReadonlySet<string> = new Set<Automation>([
-  "all",
-  "interactive",
-  "automated",
-]);
+const AUTOMATIONS: ReadonlySet<string> = new Set<Automation>(["all", "interactive", "automated"]);
 
 function parseWindowDays(raw: string | undefined): number | null {
   if (!raw) return null;
@@ -45,6 +52,60 @@ function customToInstant(to: string): string {
   return end.toISOString();
 }
 
+export type ActivityQueryParams = import("../api/generated/index.js").GetApiV1ActivityReportParams;
+
+// Step names for the report stream's phases; "done" only closes the
+// previous phase.
+const REPORT_PHASE_STEPS: Record<ActivityReportProgress["phase"], string | null> = {
+  loading_sessions: "sessions",
+  loading_usage: "usage",
+  scanning_activity: "scan",
+  finalizing: "finalize",
+  done: null,
+};
+
+/**
+ * Splits a report fetch into per-phase steps from the timestamps of its
+ * progress events. Request latency before the first event counts toward
+ * the first phase; a fetch that reports no phases is a single "report"
+ * step.
+ */
+class ReportPhaseTimer {
+  private readonly steps: QueryStep[] = [];
+  private current: string | null = null;
+  private currentStartedAt: number;
+
+  constructor(private readonly startedAt: number) {
+    this.currentStartedAt = startedAt;
+  }
+
+  observe(phase: ActivityReportProgress["phase"], at: number): void {
+    const step = REPORT_PHASE_STEPS[phase];
+    if (step === this.current) return;
+    this.close(at);
+    this.current = step;
+    // Request latency before the first event belongs to the first phase.
+    this.currentStartedAt = this.steps.length === 0 ? this.startedAt : at;
+  }
+
+  finish(at: number): QueryStep[] {
+    this.close(at);
+    return this.steps.length > 0
+      ? this.steps
+      : [{ name: "report", startMs: 0, durationMs: at - this.startedAt }];
+  }
+
+  private close(at: number): void {
+    if (this.current === null) return;
+    this.steps.push({
+      name: this.current,
+      startMs: this.currentStartedAt - this.startedAt,
+      durationMs: at - this.currentStartedAt,
+    });
+    this.current = null;
+  }
+}
+
 class ActivityStore {
   preset = $state<Preset>("day");
   date: string = $state(localDateStr(new Date()));
@@ -57,11 +118,28 @@ class ActivityStore {
   machine: string = $state("");
   automation: Automation = $state("all");
   report: Report | null = $state(null);
+  // Monotonic identity for successful full-report loads. report_id is
+  // deterministic for unchanged inputs, so it cannot signal that page-local
+  // drill-down state must be cleared after a manual refresh.
+  reportGeneration = $state(0);
   loading = $state(false);
+  progress: ActivityReportProgress | null = $state(null);
   error: string | null = $state(null);
+  sessionsLoading = $state(false);
+  sessionsError: string | null = $state(null);
+  sessionsSort: ActivitySessionSort = $state("agent_minutes");
+  sessionsDirection: "asc" | "desc" = $state("desc");
+  sessionsBucketRange: ActivityBucketRange | null = $state(null);
   // Epoch ms of the last successful report fetch, powering the "Updated Xm ago"
   // refresh label. null until the first load completes.
   lastUpdatedAt: number | null = $state(null);
+  // Wall-clock ms of the most recent report fetch, request start to data
+  // applied, shown next to the refresh label. null until the first load.
+  lastQueryDurationMs: number | null = $state(null);
+  // How that time split across the report's server-side phases, measured
+  // between the progress events the report stream emits. A plain JSON
+  // response (no stream) yields a single "report" step.
+  lastQuerySteps: QueryStep[] = $state([]);
   // Set when an SSE event arrives after the first load, signalling that newer
   // data exists. Mirrors the analytics/usage stores: marking is cheap, and the
   // actual refetch is left to the manual refresh button and the periodic
@@ -79,8 +157,11 @@ class ActivityStore {
   machines: string[] = $state([]);
 
   private loadVersion = 0;
+  private reportRead = new LatestRead();
+  private sessionsRead = new LatestRead();
+  private filterOptionsRead = new LatestRead();
   #filterOptionsLoaded = false;
-  #filterOptionsPromise: Promise<void> | null = null;
+  #filterOptionsPromise: Promise<boolean> | null = null;
   #filterOptionsVersion = 0;
   #attached = 0;
 
@@ -101,6 +182,13 @@ class ActivityStore {
     this.hasNewData = true;
   }
 
+  handleDataChangedEvent(event: DataChangedEvent): void {
+    this.markNewData();
+    if (event.scope !== "sessions" && event.scope !== "sync") return;
+    this.invalidateFilterOptions();
+    if (this.attached) void this.loadFilterOptions();
+  }
+
   private materializeRollingWindow(): boolean {
     if (this.preset !== "custom" || this.rollingWindowDays === null) {
       return false;
@@ -114,8 +202,31 @@ class ActivityStore {
     return true;
   }
 
-  async load({ background = false }: { background?: boolean } = {}) {
+  /** Build the complete Activity request scope for the report fetch. */
+  queryParams(): ActivityQueryParams {
+    const fromParam =
+      this.preset === "custom" && this.from
+        ? new Date(this.from + "T00:00:00").toISOString()
+        : undefined;
+    const toParam = this.preset === "custom" && this.to ? customToInstant(this.to) : undefined;
+    return {
+      preset: this.preset,
+      date: this.date,
+      from: fromParam,
+      to: toParam,
+      timezone: this.timezone,
+      bucket: (this.bucket || undefined) as "5m" | "15m" | "1h" | "1d" | "1w" | undefined,
+      project: this.project || undefined,
+      agent: this.agent || undefined,
+      machine: this.machine || undefined,
+      automation: this.automation,
+    };
+  }
+
+  async load({ background = false }: { background?: boolean } = {}): Promise<boolean> {
     const v = ++this.loadVersion;
+    const startedAt = performance.now();
+    const signal = this.reportRead.begin();
     if (this.materializeRollingWindow()) {
       this.writeUrl();
     }
@@ -123,57 +234,39 @@ class ActivityStore {
     // input or a partial deep link) the backend rejects the request, so hold
     // the current view until both are set instead of flashing an error.
     if (this.preset === "custom" && (!this.from || !this.to)) {
+      this.reportRead.finish(signal);
       this.loading = false;
-      return;
+      return false;
     }
     this.loading = true;
+    this.progress = null;
     this.error = null;
-    configureGeneratedClient();
+    const phases = new ReportPhaseTimer(startedAt);
     try {
-      // Custom date-only inputs (YYYY-MM-DD, browser local zone) become
-      // half-open local instants: from = local 00:00 of `from`, to = local
-      // 00:00 of the day after `to`. Non-custom presets rely on preset+date, so
-      // send no range. An empty input maps to undefined so selecting "custom"
-      // before picking dates never builds an Invalid Date. A malformed
-      // hand-edited date throws here, inside the try, so load() still resets
-      // loading rather than leaving it stuck true.
-      const fromParam =
-        this.preset === "custom" && this.from
-          ? new Date(this.from + "T00:00:00").toISOString()
-          : undefined;
-      const toParam =
-        this.preset === "custom" && this.to
-          ? customToInstant(this.to)
-          : undefined;
-      const res = await ActivityService.getApiV1ActivityReport({
-        preset: this.preset,
-        date: this.date,
-        from: fromParam,
-        to: toParam,
-        timezone: this.timezone,
-        // The store keeps bucket as a free-form override string (populated by
-        // the Task 4 control); the generated client narrows it to the server's
-        // accepted set. An out-of-set value is rejected server-side.
-        bucket: (this.bucket || undefined) as
-          | "5m"
-          | "15m"
-          | "1h"
-          | "1d"
-          | "1w"
-          | undefined,
-        project: this.project || undefined,
-        agent: this.agent || undefined,
-        machine: this.machine || undefined,
-        automation: this.automation,
+      const res = await fetchActivityReport(this.queryParams(), signal, (progress) => {
+        phases.observe(progress.phase, performance.now());
+        if (v === this.loadVersion && this.reportRead.isCurrent(signal)) {
+          this.progress = progress;
+        }
       });
-      if (v !== this.loadVersion) return;
-      this.report = res as unknown as Report;
+      if (v !== this.loadVersion || !this.reportRead.isCurrent(signal)) return false;
+      this.sessionsRead.cancel();
+      this.sessionsLoading = false;
+      this.sessionsError = null;
+      this.sessionsSort = "agent_minutes";
+      this.sessionsDirection = "desc";
+      this.sessionsBucketRange = null;
+      this.report = res;
+      this.reportGeneration++;
       this.lastUpdatedAt = Date.now();
+      const finishedAt = performance.now();
+      this.lastQueryDurationMs = finishedAt - startedAt;
+      this.lastQuerySteps = phases.finish(finishedAt);
       this.hasNewData = false;
-      this.loading = false;
+      return true;
     } catch (e) {
-      if (v !== this.loadVersion) return;
-      this.loading = false;
+      if (isAbortError(e) || v !== this.loadVersion || !this.reportRead.isCurrent(signal))
+        return false;
       // A failed background refresh keeps the last good report on screen so a
       // transient blip never blanks the report-first dashboard; the growing
       // "Updated Xm ago" label signals the staleness. With no report yet (a
@@ -181,11 +274,87 @@ class ActivityStore {
       // is nothing to preserve, so fall through and surface the error rather
       // than leave a misleading empty state. First loads and range/filter
       // changes are always foreground and clear on error.
-      if (background && this.report !== null) return;
+      if (background && this.report !== null) return false;
       this.report = null;
-      this.error =
-        e instanceof Error ? e.message : "Failed to load activity report";
+      this.error = e instanceof Error ? e.message : m.activity_report_load_failed();
+      return false;
+    } finally {
+      if (this.reportRead.finish(signal)) {
+        this.loading = false;
+        this.progress = null;
+      }
     }
+  }
+
+  async loadSessionPage(options: ActivitySessionPageOptions = {}): Promise<boolean> {
+    const report = this.report;
+    if (!report?.report_id) return false;
+    const startedAt = performance.now();
+    const signal = this.sessionsRead.begin();
+    const sort = options.sort ?? this.sessionsSort;
+    const direction = options.direction ?? this.sessionsDirection;
+    const bucketRange =
+      options.bucketRange === undefined
+        ? (this.sessionsBucketRange ?? undefined)
+        : options.bucketRange;
+    this.sessionsLoading = true;
+    this.sessionsError = null;
+    try {
+      const page = await fetchActivitySessions(
+        report.report_id,
+        {
+          limit: options.limit ?? 200,
+          cursor: options.cursor,
+          sort,
+          direction,
+          bucketRange,
+        },
+        signal,
+      );
+      if (!this.sessionsRead.isCurrent(signal) || this.report?.report_id !== report.report_id) {
+        return false;
+      }
+      if (page.refresh_required && page.report) {
+        this.report = page.report;
+        this.reportGeneration++;
+        this.sessionsSort = "agent_minutes";
+        this.sessionsDirection = "desc";
+        this.sessionsBucketRange = null;
+        this.lastUpdatedAt = Date.now();
+        const durationMs = performance.now() - startedAt;
+        this.lastQueryDurationMs = durationMs;
+        this.lastQuerySteps = [{ name: "report", startMs: 0, durationMs }];
+        this.hasNewData = false;
+        return true;
+      }
+      this.sessionsSort = sort;
+      this.sessionsDirection = direction;
+      this.sessionsBucketRange = bucketRange ? { ...bucketRange } : null;
+      this.report = {
+        ...report,
+        report_id: page.report_id,
+        by_session: page.sessions,
+        sessions_next_cursor: page.next_cursor,
+        sessions_total: page.total,
+      };
+      return true;
+    } catch (e) {
+      if (isAbortError(e) || !this.sessionsRead.isCurrent(signal)) return false;
+      this.sessionsError = e instanceof Error ? e.message : m.activity_sessions_load_failed();
+      return false;
+    } finally {
+      if (this.sessionsRead.finish(signal)) this.sessionsLoading = false;
+    }
+  }
+
+  cancelInFlightReads(): void {
+    this.loadVersion++;
+    this.reportRead.cancel();
+    this.sessionsRead.cancel();
+    this.filterOptionsRead.cancel();
+    this.#filterOptionsPromise = null;
+    this.loading = false;
+    this.sessionsLoading = false;
   }
 
   /**
@@ -197,46 +366,53 @@ class ActivityStore {
    * request. A transient failure leaves the cache un-loaded so the next call
    * retries; lists that did succeed keep their values in the meantime.
    */
-  async loadFilterOptions() {
-    if (this.#filterOptionsLoaded) return;
+  async loadFilterOptions(): Promise<boolean> {
+    if (this.#filterOptionsLoaded) return true;
     if (this.#filterOptionsPromise) return this.#filterOptionsPromise;
     const ver = this.#filterOptionsVersion;
-    const opts = { includeOneShot: true, includeAutomated: true };
-    this.#filterOptionsPromise = (async () => {
-      configureGeneratedClient();
+    const signal = this.filterOptionsRead.begin();
+    const opts = { include_one_shot: true, include_automated: true };
+    let request!: Promise<boolean>;
+    request = (async () => {
       let ok = true;
       try {
-        const res = (await MetadataService.getApiV1Projects(
-          opts,
-        )) as unknown as { projects: ProjectInfo[] };
-        if (ver === this.#filterOptionsVersion) this.projects = res.projects;
-      } catch {
+        const res = await MetadataService.getApiV1Projects(opts, { signal });
+        if (ver === this.#filterOptionsVersion && this.filterOptionsRead.isCurrent(signal))
+          this.projects = res.projects;
+      } catch (e) {
+        if (isAbortError(e) || !this.filterOptionsRead.isCurrent(signal)) return false;
         ok = false; // keep the current list; retry on the next call
       }
       try {
-        const res = (await MetadataService.getApiV1Agents(
-          opts,
-        )) as unknown as { agents: AgentInfo[] };
-        if (ver === this.#filterOptionsVersion) this.agents = res.agents;
-      } catch {
+        const res = await MetadataService.getApiV1Agents(opts, { signal });
+        if (ver === this.#filterOptionsVersion && this.filterOptionsRead.isCurrent(signal))
+          this.agents = res.agents;
+      } catch (e) {
+        if (isAbortError(e) || !this.filterOptionsRead.isCurrent(signal)) return false;
         ok = false;
       }
       try {
-        const res = (await MetadataService.getApiV1Machines(
-          opts,
-        )) as unknown as { machines: string[] };
-        if (ver === this.#filterOptionsVersion) this.machines = res.machines;
-      } catch {
+        const res = await MetadataService.getApiV1Machines(opts, { signal });
+        if (ver === this.#filterOptionsVersion && this.filterOptionsRead.isCurrent(signal))
+          this.machines = res.machines;
+      } catch (e) {
+        if (isAbortError(e) || !this.filterOptionsRead.isCurrent(signal)) return false;
         ok = false;
       }
-      if (ver === this.#filterOptionsVersion) {
+      const current =
+        ver === this.#filterOptionsVersion && this.filterOptionsRead.isCurrent(signal);
+      if (current) {
         // Cache only a fully successful load so a transient failure is
         // retried rather than frozen as a permanent empty list.
         this.#filterOptionsLoaded = ok;
-        this.#filterOptionsPromise = null;
       }
-    })();
-    return this.#filterOptionsPromise;
+      return current && ok;
+    })().finally(() => {
+      if (this.#filterOptionsPromise === request) this.#filterOptionsPromise = null;
+      this.filterOptionsRead.finish(signal);
+    });
+    this.#filterOptionsPromise = request;
+    return request;
   }
 
   /**
@@ -298,9 +474,7 @@ class ActivityStore {
       this.to = range.to;
       this.rollingWindowDays = windowDays;
     } else {
-      this.preset = PRESETS.has(params.preset ?? "")
-        ? (params.preset as Preset)
-        : "day";
+      this.preset = PRESETS.has(params.preset ?? "") ? (params.preset as Preset) : "day";
       this.date = params.date || localDateStr(new Date());
       this.from = params.from ?? "";
       this.to = params.to ?? "";
@@ -376,11 +550,7 @@ class ActivityStore {
     this.writeUrl();
   }
 
-  setCustomRange(
-    from: string,
-    to: string,
-    rollingWindowDays: number | null = null,
-  ) {
+  setCustomRange(from: string, to: string, rollingWindowDays: number | null = null) {
     this.preset = "custom";
     this.date = from;
     this.from = from;
@@ -403,11 +573,7 @@ class ActivityStore {
       // Advance one calendar month, clamping the day to the target month's last
       // day so e.g. Jan 31 -> Feb 28 instead of overflowing into March.
       const target = new Date(d.getFullYear(), d.getMonth() + direction, 1);
-      const lastDay = new Date(
-        target.getFullYear(),
-        target.getMonth() + 1,
-        0,
-      ).getDate();
+      const lastDay = new Date(target.getFullYear(), target.getMonth() + 1, 0).getDate();
       target.setDate(Math.min(d.getDate(), lastDay));
       d.setTime(target.getTime());
     } else {
@@ -439,6 +605,11 @@ class ActivityStore {
 }
 
 export const activity = new ActivityStore();
+
+// Keep the singleton's project metadata coherent even while ActivityPage is
+// unmounted. An attached page refetches immediately; otherwise the invalidated
+// cache is populated lazily on the next visit.
+events.subscribe((event) => activity.handleDataChangedEvent(event));
 
 // Refresh the activity filter options after any sync/import, mirroring the
 // sessions store, so newly imported projects/agents/machines appear in the

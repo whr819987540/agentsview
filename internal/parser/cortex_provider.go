@@ -2,12 +2,15 @@ package parser
 
 import (
 	"context"
-	"fmt"
+	"errors"
 	"path/filepath"
 	"strings"
 )
 
-var _ Provider = (*cortexProvider)(nil)
+var (
+	_ Provider         = (*cortexProvider)(nil)
+	_ WatchRootPlanner = (*cortexProvider)(nil)
+)
 
 type cortexProviderFactory struct {
 	def AgentDef
@@ -28,11 +31,9 @@ func (f cortexProviderFactory) Capabilities() Capabilities {
 func (f cortexProviderFactory) NewProvider(cfg ProviderConfig) Provider {
 	cfg = cfg.Clone()
 	return &cortexProvider{
-		ProviderBase: ProviderBase{
-			Def:    cloneAgentDef(f.def),
-			Caps:   cortexProviderCapabilities(),
-			Config: cfg,
-		},
+		Def:     cloneAgentDef(f.def),
+		Caps:    cortexProviderCapabilities(),
+		Config:  cfg,
 		sources: newCortexSourceSet(cfg.Roots),
 	}
 }
@@ -46,8 +47,18 @@ func (p *cortexProvider) Discover(ctx context.Context) ([]SourceRef, error) {
 	return p.sources.Discover(ctx)
 }
 
+func (p *cortexProvider) DiscoverEach(ctx context.Context, yield func(SourceRef) error) error {
+	return p.sources.DiscoverEach(ctx, yield)
+}
+
 func (p *cortexProvider) WatchPlan(ctx context.Context) (WatchPlan, error) {
 	return p.sources.WatchPlan(ctx)
+}
+
+func (p *cortexProvider) WatchRoots(
+	ctx context.Context,
+) ([]WatchRoot, error) {
+	return p.sources.WatchRoots(ctx)
 }
 
 func (p *cortexProvider) SourcesForChangedPath(
@@ -83,7 +94,7 @@ func (p *cortexProvider) Parse(
 		return ParseOutcome{}, err
 	}
 	if !ok {
-		return ParseOutcome{}, fmt.Errorf("cortex source path unavailable")
+		return ParseOutcome{}, errors.New("cortex source path unavailable")
 	}
 	machine := firstNonEmptyJSONLString(req.Machine, p.Config.Machine)
 	sess, msgs, err := p.parseSession(path, machine)
@@ -126,6 +137,10 @@ func newCortexSourceSet(roots []string) JSONLSourceSet {
 		WithCompanionFiles(func(transcriptPath string) []string {
 			return []string{cortexHistoryCompanionPath(transcriptPath)}
 		}),
+		WithCompanionTranscript(func(companionPath string) (string, bool) {
+			stem, ok := strings.CutSuffix(companionPath, ".history.jsonl")
+			return stem + ".json", ok
+		}),
 		WithContentHashing(),
 	)
 }
@@ -149,8 +164,11 @@ func cortexHistoryCompanionPath(path string) string {
 }
 
 func cortexProviderCapabilities() Capabilities {
+	source := jsonlFileProviderSourceCapabilities()
+	source.StreamingDiscovery = CapabilitySupported
+	source.WatchRoots = CapabilitySupported
 	return Capabilities{
-		Source: jsonlFileProviderSourceCapabilities(),
+		Source: source,
 		Content: ContentCapabilities{
 			FirstMessage: CapabilitySupported,
 			SessionName:  CapabilitySupported,

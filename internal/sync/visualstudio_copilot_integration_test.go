@@ -1,12 +1,13 @@
 package sync_test
 
 import (
-	"context"
-	"encoding/json"
+	"encoding/json/v2"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -42,6 +43,180 @@ func vsCopilotTraceLine(
 		`","endTimeUnixNano":"` + end +
 		`","attributes":[` + strings.Join(allAttrs, ",") +
 		`]}]}]}]}`
+}
+
+func TestReconcileWatchRootsPreservesVisualStudioCopilotSessionBehindSymlinkedVSRoot(
+	t *testing.T,
+) {
+	root := t.TempDir()
+	conversationID := "5bc5f6d7-9a6e-4f9c-8f3c-b7be2e7d9f20"
+	vsRoot := filepath.Join(root, ".vs")
+	sessionPath := filepath.Join(
+		vsRoot, "SampleApp", "copilot-chat", "thread", "sessions",
+		conversationID,
+	)
+	require.NoError(t, os.MkdirAll(filepath.Dir(sessionPath), 0o755))
+	require.NoError(t, os.WriteFile(sessionPath, []byte(vsCopilotTraceLine(
+		conversationID, "span", "chat gpt-5.5", "1781293600000000000",
+		"1781293610000000000", map[string]string{
+			"gen_ai.operation.name": "chat",
+			"gen_ai.input.messages": `[{"role":"user","parts":[{"type":"text","content":"Run the tests."}]}]`,
+		},
+	)+"\n"), 0o600))
+
+	database := dbtest.OpenTestDB(t)
+	engine := sync.NewEngine(t.Context(), database, sync.EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{parser.AgentVSCopilot: {root}},
+		Machine:   "local",
+	})
+	t.Cleanup(engine.Close)
+
+	stats := engine.SyncAll(t.Context(), nil)
+	require.False(t, stats.Aborted)
+	require.Equal(t, 1, stats.Synced)
+	sessionID := "visualstudio-copilot:" + conversationID
+	stored, err := database.GetSession(t.Context(), sessionID)
+	require.NoError(t, err)
+	require.NotNil(t, stored)
+
+	targetVSRoot := filepath.Join(t.TempDir(), "vs-data")
+	require.NoError(t, os.Rename(vsRoot, targetVSRoot))
+	if err := os.Symlink(targetVSRoot, vsRoot); err != nil {
+		t.Skipf("symlink not supported: %v", err)
+	}
+
+	require.NoError(t, engine.ReconcileWatchRoots(t.Context(), []string{root}, false))
+	active, err := database.GetSession(t.Context(), sessionID)
+	require.NoError(t, err)
+	assert.NotNil(t, active,
+		"authoritative reconciliation must preserve a session behind a directory symlink")
+}
+
+func TestReconcileWatchRootsVisualStudioCopilot300MembersUsesOneBoundedScan(t *testing.T) {
+	const members = 300
+	root := t.TempDir()
+	tracePath := filepath.Join(
+		root, "20260714T120000_00000000_VSGitHubCopilot_traces.jsonl",
+	)
+	var data strings.Builder
+	for i := range members {
+		id := fmt.Sprintf("00000000-0000-0000-0000-%012x", i)
+		data.WriteString(vsCopilotTraceLine(
+			id, fmt.Sprintf("span-%03d", i), "chat gpt-5.5", "1781293620000000000",
+			"1781293630000000000", map[string]string{
+				"gen_ai.operation.name": "chat",
+				"gen_ai.input.messages": strings.Repeat("bounded prompt ", 300),
+			},
+		))
+		data.WriteByte('\n')
+	}
+	require.NoError(t, os.WriteFile(tracePath, []byte(data.String()), 0o600))
+	database := dbtest.OpenTestDB(t)
+	engine := sync.NewEngine(t.Context(), database, sync.EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{parser.AgentVSCopilot: {root}},
+		Machine:   "local",
+	})
+	t.Cleanup(engine.Close)
+
+	// Production uses at least two workers and caps above this desired overlap,
+	// so this target cannot exceed the workers available on low-CPU hosts.
+	overlapTarget := min(4, max(runtime.NumCPU(), 2))
+	require.GreaterOrEqual(t, overlapTarget, 2)
+	probe := newVSRetainedOverlapProbe(parser.AgentVSCopilot, overlapTarget)
+	ctx := parser.WithReconciliationRetainedMemberObserver(t.Context(), probe.observe)
+	done := make(chan error, 1)
+	go func() {
+		done <- engine.ReconcileWatchRoots(ctx, []string{root}, false)
+	}()
+	probe.waitAndRelease(t)
+	require.NoError(t, <-done)
+
+	result := engine.LastReconciliationResult()
+	assert.True(t, result.Complete)
+	assert.Equal(t, 1, result.Metrics.SharedContainerScans)
+	assert.Equal(t, 256, result.Metrics.MaxSpoolPageRows)
+	assert.Positive(t, result.Metrics.MaxProviderRetainedBytes)
+	assert.GreaterOrEqual(t, probe.maxActive.Load(), int32(overlapTarget))
+	assert.GreaterOrEqual(t, result.Metrics.MaxProviderRetainedBytes, probe.maxBytes.Load(),
+		"aggregate metric must include every concurrently retained worker member")
+	assert.Less(t, result.Metrics.MaxProviderRetainedBytes, int64(data.Len())/2,
+		"concurrent provider retention must stay bounded by members, not the container")
+	lastID := fmt.Sprintf("visualstudio-copilot:00000000-0000-0000-0000-%012x", members-1)
+	stored, err := database.GetSession(t.Context(), lastID)
+	require.NoError(t, err)
+	require.NotNil(t, stored)
+}
+
+type vsRetainedOverlapProbe struct {
+	provider  parser.AgentType
+	target    int
+	arrived   chan struct{}
+	release   chan struct{}
+	active    atomic.Int32
+	liveBytes atomic.Int64
+	maxActive atomic.Int32
+	maxBytes  atomic.Int64
+}
+
+func newVSRetainedOverlapProbe(
+	provider parser.AgentType, target int,
+) *vsRetainedOverlapProbe {
+	return &vsRetainedOverlapProbe{
+		provider: provider, target: target,
+		arrived: make(chan struct{}, target), release: make(chan struct{}),
+	}
+}
+
+func (probe *vsRetainedOverlapProbe) observe(provider parser.AgentType, retained int64) {
+	if provider != probe.provider || retained <= 0 {
+		return
+	}
+	active := probe.active.Add(1)
+	liveBytes := probe.liveBytes.Add(retained)
+	vsAtomicMaxInt32(&probe.maxActive, active)
+	vsAtomicMaxInt64(&probe.maxBytes, liveBytes)
+	select {
+	case probe.arrived <- struct{}{}:
+	case <-probe.release:
+	}
+	<-probe.release
+	probe.liveBytes.Add(-retained)
+	probe.active.Add(-1)
+}
+
+func (probe *vsRetainedOverlapProbe) waitAndRelease(t *testing.T) {
+	t.Helper()
+	defer func() {
+		select {
+		case <-probe.release:
+		default:
+			close(probe.release)
+		}
+	}()
+	for range probe.target {
+		select {
+		case <-probe.arrived:
+		case <-time.After(30 * time.Second):
+			require.FailNow(t, "timed out waiting for concurrent retained members")
+		}
+	}
+	close(probe.release)
+}
+
+func vsAtomicMaxInt32(value *atomic.Int32, candidate int32) {
+	for current := value.Load(); candidate > current; current = value.Load() {
+		if value.CompareAndSwap(current, candidate) {
+			return
+		}
+	}
+}
+
+func vsAtomicMaxInt64(value *atomic.Int64, candidate int64) {
+	for current := value.Load(); candidate > current; current = value.Load() {
+		if value.CompareAndSwap(current, candidate) {
+			return
+		}
+	}
 }
 
 // TestSyncEngineVisualStudioCopilotMultipleConversationsPerFile verifies that a
@@ -83,14 +258,14 @@ func TestSyncEngineVisualStudioCopilotMultipleConversationsPerFile(t *testing.T)
 	require.NoError(t, os.WriteFile(tracePath, []byte(data), 0o644))
 
 	database := dbtest.OpenTestDB(t)
-	engine := sync.NewEngine(database, sync.EngineConfig{
+	engine := sync.NewEngine(t.Context(), database, sync.EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentVSCopilot: {tracesDir},
 		},
 		Machine: "local",
 	})
 
-	stats := engine.SyncAll(context.Background(), nil)
+	stats := engine.SyncAll(t.Context(), nil)
 	assert.Equal(t, 2, stats.Synced,
 		"both conversations in the file should sync")
 
@@ -102,7 +277,7 @@ func TestSyncEngineVisualStudioCopilotMultipleConversationsPerFile(t *testing.T)
 	// The stored file_path is a virtual sync key, but `session export`
 	// and other source consumers must still resolve it to an openable
 	// trace file.
-	stored := database.GetSessionFilePath("visualstudio-copilot:" + dominant)
+	stored := database.GetSessionFilePath(t.Context(), "visualstudio-copilot:"+dominant)
 	require.NotEmpty(t, stored)
 	resolved := parser.ResolveSourceFilePath(stored)
 	f, err := os.Open(resolved)
@@ -133,19 +308,19 @@ func TestSyncEngineVisualStudioCopilotReadErrorNotCachedAsSkip(t *testing.T) {
 	require.NoError(t, os.Symlink(target, tracePath))
 
 	database := dbtest.OpenTestDB(t)
-	engine := sync.NewEngine(database, sync.EngineConfig{
+	engine := sync.NewEngine(t.Context(), database, sync.EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentVSCopilot: {tracesDir},
 		},
 		Machine: "local",
 	})
 
-	first := engine.SyncAll(context.Background(), nil)
+	first := engine.SyncAll(t.Context(), nil)
 	require.NotZero(t, first.Failed, "read failure should be reported")
 
 	// The same engine syncs again with the file unchanged. The failure
 	// must surface again instead of being silently skipped from cache.
-	second := engine.SyncAll(context.Background(), nil)
+	second := engine.SyncAll(t.Context(), nil)
 	assert.NotZero(t, second.Failed,
 		"read failure must not be cached as a skip")
 	assert.Zero(t, second.Skipped,
@@ -177,18 +352,18 @@ func TestSyncEngineVisualStudioCopilotClearsStaleReadErrorSkip(t *testing.T) {
 	// skipped before the read error can surface.
 	info, err := os.Stat(tracePath)
 	require.NoError(t, err)
-	require.NoError(t, database.ReplaceSkippedFiles(map[string]int64{
+	require.NoError(t, database.ReplaceSkippedFiles(t.Context(), map[string]int64{
 		tracePath: info.ModTime().UnixNano(),
 	}))
 
-	engine := sync.NewEngine(database, sync.EngineConfig{
+	engine := sync.NewEngine(t.Context(), database, sync.EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentVSCopilot: {tracesDir},
 		},
 		Machine: "local",
 	})
 
-	stats := engine.SyncAll(context.Background(), nil)
+	stats := engine.SyncAll(t.Context(), nil)
 	assert.NotZero(t, stats.Failed,
 		"stale read-error skip must be cleared so the failure is retried")
 	assert.Zero(t, stats.Skipped,
@@ -230,22 +405,22 @@ func TestFindSourceFileVisualStudioCopilotReturnsVirtualPath(t *testing.T) {
 	)
 
 	database := dbtest.OpenTestDB(t)
-	engine := sync.NewEngine(database, sync.EngineConfig{
+	engine := sync.NewEngine(t.Context(), database, sync.EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentVSCopilot: {tracesDir},
 		},
 		Machine: "local",
 	})
-	require.NotZero(t, engine.SyncAll(context.Background(), nil).Synced)
+	require.NotZero(t, engine.SyncAll(t.Context(), nil).Synced)
 
 	want := parser.VisualStudioCopilotVirtualPath(tracePath, conversationID)
-	assert.Equal(t, want, engine.FindSourceFile(sessionID),
+	assert.Equal(t, want, engine.FindSourceFile(t.Context(), sessionID),
 		"source resolution must return the conversation virtual path")
-	assert.NotZero(t, engine.SourceMtime(sessionID),
+	assert.NotZero(t, engine.SourceMtime(t.Context(), sessionID),
 		"mtime must resolve the virtual path to the physical trace")
 }
 
-func TestSyncRootsSinceVisualStudioCopilotPollTombstonesDeletedVS2026Session(
+func TestSyncRootsSinceVisualStudioCopilotPollMarksDeletedVS2026SourceMissing(
 	t *testing.T,
 ) {
 	if testing.Short() {
@@ -268,22 +443,68 @@ func TestSyncRootsSinceVisualStudioCopilotPollTombstonesDeletedVS2026Session(
 			})+"\n"), 0o644))
 
 	database := dbtest.OpenTestDB(t)
-	engine := sync.NewEngine(database, sync.EngineConfig{
+	engine := sync.NewEngine(t.Context(), database, sync.EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentVSCopilot: {root},
 		},
 		Machine: "local",
 	})
-	require.NotZero(t, engine.SyncAll(context.Background(), nil).Synced)
+	require.NotZero(t, engine.SyncAll(t.Context(), nil).Synced)
 	assertSessionMessageCount(t, database, sessionID, 1)
 
 	require.NoError(t, os.Remove(sessionPath))
-	engine.SyncRootsSince(context.Background(), []string{root}, time.Time{}, nil)
+	engine.SyncRootsSince(t.Context(), []string{root}, time.Time{}, nil)
 
-	gone, err := database.GetSession(context.Background(), sessionID)
+	full, err := database.GetSessionFull(t.Context(), sessionID)
 	require.NoError(t, err)
-	assert.Nil(t, gone,
-		"unwatched polling must tombstone deleted VS 2026 session files")
+	assertSourceMissingState(t, full)
+	sess, err := database.GetSession(t.Context(), sessionID)
+	require.NoError(t, err)
+	require.NotNil(t, sess, "unwatched polling must preserve the archived session")
+	assertSessionMessageCount(t, database, sessionID, 1)
+}
+
+func TestSyncPathsVisualStudioCopilotMarksDeletedVS2026SourceMissing(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test")
+	}
+	root := t.TempDir()
+	conversationID := "4a8f63f6-7626-4416-a874-fc7bd2c3f005"
+	sessionID := "visualstudio-copilot:" + conversationID
+	sessionPath := filepath.Join(
+		root, ".vs", "SampleApp", "copilot-chat", "thread", "sessions",
+		conversationID,
+	)
+	require.NoError(t, os.MkdirAll(filepath.Dir(sessionPath), 0o755))
+	require.NoError(t, os.WriteFile(sessionPath, []byte(
+		vsCopilotTraceLine(conversationID, "d1", "chat gpt-5.5",
+			"1781293600000000000", "1781293610000000000",
+			map[string]string{
+				"gen_ai.operation.name": "chat",
+				"gen_ai.input.messages": `[{"role":"user","parts":[{"type":"text","content":"Hello."}]}]`,
+			})+"\n"), 0o644))
+
+	database := dbtest.OpenTestDB(t)
+	engine := sync.NewEngine(t.Context(), database, sync.EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentVSCopilot: {root},
+		},
+		Machine: "local",
+	})
+	require.NotZero(t, engine.SyncAll(t.Context(), nil).Synced)
+	assertSessionMessageCount(t, database, sessionID, 1)
+
+	require.NoError(t, os.Remove(sessionPath))
+	engine.SyncPathsContext(t.Context(), []string{sessionPath})
+
+	full, err := database.GetSessionFull(t.Context(), sessionID)
+	require.NoError(t, err)
+	assertSourceMissingState(t, full)
+	sess, err := database.GetSession(t.Context(), sessionID)
+	require.NoError(t, err)
+	require.NotNil(t, sess,
+		"an extensionless container event must preserve its archived virtual member")
+	assertSessionMessageCount(t, database, sessionID, 1)
 }
 
 func TestSyncRootsSinceVisualStudioCopilotPollPreservesVS2026SessionWhenRootMissing(
@@ -310,19 +531,19 @@ func TestSyncRootsSinceVisualStudioCopilotPollPreservesVS2026SessionWhenRootMiss
 			})+"\n"), 0o644))
 
 	database := dbtest.OpenTestDB(t)
-	engine := sync.NewEngine(database, sync.EngineConfig{
+	engine := sync.NewEngine(t.Context(), database, sync.EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentVSCopilot: {root},
 		},
 		Machine: "local",
 	})
-	require.NotZero(t, engine.SyncAll(context.Background(), nil).Synced)
+	require.NotZero(t, engine.SyncAll(t.Context(), nil).Synced)
 	assertSessionMessageCount(t, database, sessionID, 1)
 
 	require.NoError(t, os.RemoveAll(root))
-	engine.SyncRootsSince(context.Background(), []string{root}, time.Time{}, nil)
+	engine.SyncRootsSince(t.Context(), []string{root}, time.Time{}, nil)
 
-	preserved, err := database.GetSession(context.Background(), sessionID)
+	preserved, err := database.GetSession(t.Context(), sessionID)
 	require.NoError(t, err)
 	require.NotNil(t, preserved,
 		"polling must preserve archived VS 2026 sessions when the root is unavailable")
@@ -360,21 +581,21 @@ func TestSyncRootsSinceVisualStudioCopilotRecanonicalizesDeletedVS2026SessionToO
 	require.NoError(t, os.Chtimes(sessionPath, sessionMtime, sessionMtime))
 
 	database := dbtest.OpenTestDB(t)
-	engine := sync.NewEngine(database, sync.EngineConfig{
+	engine := sync.NewEngine(t.Context(), database, sync.EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentVSCopilot: {root},
 		},
 		Machine: "local",
 	})
-	require.NotZero(t, engine.SyncAll(context.Background(), nil).Synced)
+	require.NotZero(t, engine.SyncAll(t.Context(), nil).Synced)
 	vsVirtualPath := parser.VisualStudioCopilotVirtualPath(
 		sessionPath, conversationID,
 	)
-	require.Equal(t, vsVirtualPath, database.GetSessionFilePath(sessionID))
+	require.Equal(t, vsVirtualPath, database.GetSessionFilePath(t.Context(), sessionID))
 
 	require.NoError(t, os.Remove(sessionPath))
 	stats := engine.SyncRootsSince(
-		context.Background(), []string{root},
+		t.Context(), []string{root},
 		time.Date(2026, 6, 12, 0, 0, 0, 0, time.UTC), nil,
 	)
 	require.NotZero(t, stats.Synced)
@@ -382,7 +603,7 @@ func TestSyncRootsSinceVisualStudioCopilotRecanonicalizesDeletedVS2026SessionToO
 	legacyVirtualPath := parser.VisualStudioCopilotVirtualPath(
 		legacyPath, conversationID,
 	)
-	assert.Equal(t, legacyVirtualPath, database.GetSessionFilePath(sessionID))
+	assert.Equal(t, legacyVirtualPath, database.GetSessionFilePath(t.Context(), sessionID))
 	assertSessionMessageCount(t, database, sessionID, 1)
 }
 
@@ -400,26 +621,26 @@ func TestSyncSingleSessionContextVisualStudioCopilotPreservesProject(t *testing.
 	)
 
 	database := dbtest.OpenTestDB(t)
-	engine := sync.NewEngine(database, sync.EngineConfig{
+	engine := sync.NewEngine(t.Context(), database, sync.EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentVSCopilot: {tracesDir},
 		},
 		Machine: "local",
 	})
-	require.NotZero(t, engine.SyncAll(context.Background(), nil).Synced)
+	require.NotZero(t, engine.SyncAll(t.Context(), nil).Synced)
 
-	before, err := database.GetSession(context.Background(), sessionID)
+	before, err := database.GetSession(t.Context(), sessionID)
 	require.NoError(t, err)
 	require.NotNil(t, before)
 	require.Equal(t, "visualstudio", before.Project)
 	before.Project = "stored-solution"
-	require.NoError(t, database.UpsertSession(*before))
+	require.NoError(t, database.UpsertSession(t.Context(), *before))
 
 	require.NoError(t, engine.SyncSingleSessionContext(
-		context.Background(), sessionID,
+		t.Context(), sessionID,
 	))
 
-	after, err := database.GetSession(context.Background(), sessionID)
+	after, err := database.GetSession(t.Context(), sessionID)
 	require.NoError(t, err)
 	require.NotNil(t, after)
 	assert.Equal(t, "stored-solution", after.Project,
@@ -465,19 +686,19 @@ func TestSyncEngineVisualStudioCopilotUnreadableSiblingBlocksPartialSession(t *t
 	require.NoError(t, os.Symlink(target, sibling))
 
 	database := dbtest.OpenTestDB(t)
-	engine := sync.NewEngine(database, sync.EngineConfig{
+	engine := sync.NewEngine(t.Context(), database, sync.EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentVSCopilot: {tracesDir},
 		},
 		Machine: "local",
 	})
 
-	stats := engine.SyncAll(context.Background(), nil)
+	stats := engine.SyncAll(t.Context(), nil)
 	assert.NotZero(t, stats.Failed,
 		"an unreadable sibling must surface as a sync failure")
 
 	sess, err := database.GetSession(
-		context.Background(), "visualstudio-copilot:"+conversationID,
+		t.Context(), "visualstudio-copilot:"+conversationID,
 	)
 	require.NoError(t, err)
 	assert.Nil(t, sess,
@@ -510,13 +731,13 @@ func TestSyncSingleSessionVisualStudioCopilotReparsesWhenSiblingChanges(t *testi
 			})+"\n"), 0o644))
 
 	database := dbtest.OpenTestDB(t)
-	engine := sync.NewEngine(database, sync.EngineConfig{
+	engine := sync.NewEngine(t.Context(), database, sync.EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentVSCopilot: {tracesDir},
 		},
 		Machine: "local",
 	})
-	require.NotZero(t, engine.SyncAll(context.Background(), nil).Synced)
+	require.NotZero(t, engine.SyncAll(t.Context(), nil).Synced)
 	assertSessionMessageCount(t, database, sessionID, 1)
 
 	// A sibling trace file gains a second turn for the same conversation while
@@ -535,7 +756,7 @@ func TestSyncSingleSessionVisualStudioCopilotReparsesWhenSiblingChanges(t *testi
 			})+"\n"), 0o644))
 
 	require.NoError(t, engine.SyncSingleSessionContext(
-		context.Background(), sessionID,
+		t.Context(), sessionID,
 	))
 	assertSessionMessageCount(t, database, sessionID, 2)
 }
@@ -564,15 +785,15 @@ func TestSourceMtimeVisualStudioCopilotReflectsSiblingChanges(t *testing.T) {
 			})+"\n"), 0o644))
 
 	database := dbtest.OpenTestDB(t)
-	engine := sync.NewEngine(database, sync.EngineConfig{
+	engine := sync.NewEngine(t.Context(), database, sync.EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentVSCopilot: {tracesDir},
 		},
 		Machine: "local",
 	})
-	require.NotZero(t, engine.SyncAll(context.Background(), nil).Synced)
+	require.NotZero(t, engine.SyncAll(t.Context(), nil).Synced)
 
-	before := engine.SourceMtime(sessionID)
+	before := engine.SourceMtime(t.Context(), sessionID)
 	require.NotZero(t, before)
 
 	// A sibling trace file gains spans with a strictly newer mtime while the
@@ -590,7 +811,7 @@ func TestSourceMtimeVisualStudioCopilotReflectsSiblingChanges(t *testing.T) {
 	newer := time.Unix(0, before+int64(time.Hour))
 	require.NoError(t, os.Chtimes(sibling, newer, newer))
 
-	after := engine.SourceMtime(sessionID)
+	after := engine.SourceMtime(t.Context(), sessionID)
 	assert.Greater(t, after, before,
 		"SourceMtime must reflect a newer sibling trace file")
 	assert.Equal(t, newer.UnixNano(), after,
@@ -628,13 +849,13 @@ func TestSyncSingleSessionVisualStudioCopilotDirReadErrorSurfaces(t *testing.T) 
 			})+"\n"), 0o644))
 
 	database := dbtest.OpenTestDB(t)
-	engine := sync.NewEngine(database, sync.EngineConfig{
+	engine := sync.NewEngine(t.Context(), database, sync.EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentVSCopilot: {tracesDir},
 		},
 		Machine: "local",
 	})
-	require.NotZero(t, engine.SyncAll(context.Background(), nil).Synced)
+	require.NotZero(t, engine.SyncAll(t.Context(), nil).Synced)
 	assertSessionMessageCount(t, database, sessionID, 1)
 
 	// Make the directory traversable but not readable: the stored trace file can
@@ -642,7 +863,7 @@ func TestSyncSingleSessionVisualStudioCopilotDirReadErrorSurfaces(t *testing.T) 
 	require.NoError(t, os.Chmod(tracesDir, 0o100))
 	t.Cleanup(func() { _ = os.Chmod(tracesDir, 0o755) })
 
-	err := engine.SyncSingleSessionContext(context.Background(), sessionID)
+	err := engine.SyncSingleSessionContext(t.Context(), sessionID)
 	require.Error(t, err,
 		"a sibling directory read error must surface, not be cached as an "+
 			"unchanged skip")
@@ -683,15 +904,15 @@ func TestSyncEngineVisualStudioCopilotPreservesSessionWhenSiblingDeleted(t *test
 			})+"\n"), 0o644))
 
 	database := dbtest.OpenTestDB(t)
-	engine := sync.NewEngine(database, sync.EngineConfig{
+	engine := sync.NewEngine(t.Context(), database, sync.EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentVSCopilot: {tracesDir},
 		},
 		Machine: "local",
 	})
-	require.NotZero(t, engine.SyncAll(context.Background(), nil).Synced)
+	require.NotZero(t, engine.SyncAll(t.Context(), nil).Synced)
 	assertSessionMessageCount(t, database, sessionID, 2)
-	require.NoError(t, database.SetSessionDataVersion(
+	require.NoError(t, database.SetSessionDataVersion(t.Context(),
 		sessionID, db.CurrentDataVersion()-1,
 	))
 
@@ -704,10 +925,10 @@ func TestSyncEngineVisualStudioCopilotPreservesSessionWhenSiblingDeleted(t *test
 	)
 
 	require.NoError(t, engine.SyncSingleSessionContext(
-		context.Background(), sessionID,
+		t.Context(), sessionID,
 	))
 	assertSessionMessageCount(t, database, sessionID, 2)
-	sess, err := database.GetSessionFull(context.Background(), sessionID)
+	sess, err := database.GetSessionFull(t.Context(), sessionID)
 	require.NoError(t, err, "GetSessionFull")
 	require.NotNil(t, sess)
 	require.NotNil(t, sess.FileSize)
@@ -749,13 +970,13 @@ func TestSyncEngineVisualStudioCopilotPreservesToolResultsWhenTraceShrinks(t *te
 	), 0o644))
 
 	database := dbtest.OpenTestDB(t)
-	engine := sync.NewEngine(database, sync.EngineConfig{
+	engine := sync.NewEngine(t.Context(), database, sync.EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentVSCopilot: {tracesDir},
 		},
 		Machine: "local",
 	})
-	require.NotZero(t, engine.SyncAll(context.Background(), nil).Synced)
+	require.NotZero(t, engine.SyncAll(t.Context(), nil).Synced)
 	msgs := fetchMessages(t, database, sessionID)
 	require.Len(t, msgs, 1)
 	require.Len(t, msgs[0].ToolCalls, 1)
@@ -766,7 +987,7 @@ func TestSyncEngineVisualStudioCopilotPreservesToolResultsWhenTraceShrinks(t *te
 	require.NoError(t, os.Chtimes(tracePath, later, later))
 
 	require.NoError(t, engine.SyncSingleSessionContext(
-		context.Background(), sessionID,
+		t.Context(), sessionID,
 	))
 	msgs = fetchMessages(t, database, sessionID)
 	require.Len(t, msgs, 1)
@@ -826,13 +1047,13 @@ func TestSyncEngineVisualStudioCopilotMergesRicherMatchedMessageWhenTraceShrinks
 	}, "\n")+"\n"), 0o644))
 
 	database := dbtest.OpenTestDB(t)
-	engine := sync.NewEngine(database, sync.EngineConfig{
+	engine := sync.NewEngine(t.Context(), database, sync.EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentVSCopilot: {tracesDir},
 		},
 		Machine: "local",
 	})
-	require.NotZero(t, engine.SyncAll(context.Background(), nil).Synced)
+	require.NotZero(t, engine.SyncAll(t.Context(), nil).Synced)
 	msgs := fetchMessages(t, database, sessionID)
 	require.Len(t, msgs, 3)
 	require.Len(t, msgs[1].ToolCalls, 1)
@@ -849,7 +1070,7 @@ func TestSyncEngineVisualStudioCopilotMergesRicherMatchedMessageWhenTraceShrinks
 	)
 
 	require.NoError(t, engine.SyncSingleSessionContext(
-		context.Background(), sessionID,
+		t.Context(), sessionID,
 	))
 	msgs = fetchMessages(t, database, sessionID)
 	require.Len(t, msgs, 3,
@@ -872,7 +1093,7 @@ func TestSyncEngineVisualStudioCopilotMergesRicherMatchedMessageWhenTraceShrinks
 		assert.Equal(t, time.Unix(0, 1781293630000000000).UTC().
 			Format(time.RFC3339Nano), *sess.EndedAt)
 	})
-	sess, err := database.GetSessionFull(context.Background(), sessionID)
+	sess, err := database.GetSessionFull(t.Context(), sessionID)
 	require.NoError(t, err, "GetSessionFull")
 	require.NotNil(t, sess)
 	require.NotNil(t, sess.FileSize)
@@ -915,13 +1136,13 @@ func TestSyncEngineVisualStudioCopilotMergesUpdateAndPreservesIncompleteSameCoun
 	require.NoError(t, os.WriteFile(tracePath, []byte(initial), 0o644))
 
 	database := dbtest.OpenTestDB(t)
-	engine := sync.NewEngine(database, sync.EngineConfig{
+	engine := sync.NewEngine(t.Context(), database, sync.EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentVSCopilot: {tracesDir},
 		},
 		Machine: "local",
 	})
-	require.NotZero(t, engine.SyncAll(context.Background(), nil).Synced)
+	require.NotZero(t, engine.SyncAll(t.Context(), nil).Synced)
 	msgs := fetchMessages(t, database, sessionID)
 	require.Len(t, msgs, 2)
 	require.Empty(t, msgs[0].ToolCalls[0].ResultEvents)
@@ -939,7 +1160,7 @@ func TestSyncEngineVisualStudioCopilotMergesUpdateAndPreservesIncompleteSameCoun
 	require.NoError(t, os.Chtimes(tracePath, later, later))
 
 	require.NoError(t, engine.SyncSingleSessionContext(
-		context.Background(), sessionID,
+		t.Context(), sessionID,
 	))
 	msgs = fetchMessages(t, database, sessionID)
 	require.Len(t, msgs, 2)
@@ -989,13 +1210,13 @@ func TestSyncEngineVisualStudioCopilotMergeDerivesFirstMessageFromMergedRows(t *
 			})+"\n"), 0o644))
 
 	database := dbtest.OpenTestDB(t)
-	engine := sync.NewEngine(database, sync.EngineConfig{
+	engine := sync.NewEngine(t.Context(), database, sync.EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentVSCopilot: {tracesDir},
 		},
 		Machine: "local",
 	})
-	require.NotZero(t, engine.SyncAll(context.Background(), nil).Synced)
+	require.NotZero(t, engine.SyncAll(t.Context(), nil).Synced)
 	assertSessionState(t, database, sessionID, func(sess *db.Session) {
 		require.NotNil(t, sess.FirstMessage)
 		assert.Equal(t, "Run command: dotnet bui", *sess.FirstMessage)
@@ -1009,7 +1230,7 @@ func TestSyncEngineVisualStudioCopilotMergeDerivesFirstMessageFromMergedRows(t *
 	require.NoError(t, os.Chtimes(primary, later, later))
 
 	require.NoError(t, engine.SyncSingleSessionContext(
-		context.Background(), sessionID,
+		t.Context(), sessionID,
 	))
 	msgs := fetchMessages(t, database, sessionID)
 	require.Len(t, msgs, 2)
@@ -1019,8 +1240,7 @@ func TestSyncEngineVisualStudioCopilotMergeDerivesFirstMessageFromMergedRows(t *
 	assert.Equal(t, strings.TrimSpace(laterPrompt), msgs[1].Content)
 	assertSessionState(t, database, sessionID, func(sess *db.Session) {
 		require.NotNil(t, sess.FirstMessage)
-		assert.Equal(t,
-			"Run command: dotnet build --configuration Release",
+		assert.Equal(t, "Run command: dotnet build --configuration Release",
 			*sess.FirstMessage,
 		)
 	})
@@ -1070,13 +1290,13 @@ func TestSyncEngineVisualStudioCopilotMergesNewMessageWhenTraceShrinks(t *testin
 	}, "\n")+"\n"), 0o644))
 
 	database := dbtest.OpenTestDB(t)
-	engine := sync.NewEngine(database, sync.EngineConfig{
+	engine := sync.NewEngine(t.Context(), database, sync.EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentVSCopilot: {tracesDir},
 		},
 		Machine: "local",
 	})
-	require.NotZero(t, engine.SyncAll(context.Background(), nil).Synced)
+	require.NotZero(t, engine.SyncAll(t.Context(), nil).Synced)
 	assertSessionMessageCount(t, database, sessionID, 3)
 
 	require.NoError(t, os.Remove(rotatedSibling))
@@ -1094,7 +1314,7 @@ func TestSyncEngineVisualStudioCopilotMergesNewMessageWhenTraceShrinks(t *testin
 	require.NoError(t, os.Chtimes(newSibling, later, later))
 
 	require.NoError(t, engine.SyncSingleSessionContext(
-		context.Background(), sessionID,
+		t.Context(), sessionID,
 	))
 	msgs := fetchMessages(t, database, sessionID)
 	require.Len(t, msgs, 4)
@@ -1143,13 +1363,13 @@ func TestSyncEngineVisualStudioCopilotMergesNewMessageWhenCompositeGrows(t *test
 	storedSize, _ := parser.VisualStudioCopilotTraceFingerprint(primary)
 
 	database := dbtest.OpenTestDB(t)
-	engine := sync.NewEngine(database, sync.EngineConfig{
+	engine := sync.NewEngine(t.Context(), database, sync.EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentVSCopilot: {tracesDir},
 		},
 		Machine: "local",
 	})
-	require.NotZero(t, engine.SyncAll(context.Background(), nil).Synced)
+	require.NotZero(t, engine.SyncAll(t.Context(), nil).Synced)
 	assertSessionMessageCount(t, database, sessionID, 2)
 
 	require.NoError(t, os.Remove(rotatedSibling))
@@ -1171,7 +1391,7 @@ func TestSyncEngineVisualStudioCopilotMergesNewMessageWhenCompositeGrows(t *test
 	require.NoError(t, os.Chtimes(newSibling, later, later))
 
 	require.NoError(t, engine.SyncSingleSessionContext(
-		context.Background(), sessionID,
+		t.Context(), sessionID,
 	))
 	msgs := fetchMessages(t, database, sessionID)
 	require.Len(t, msgs, 3)
@@ -1220,13 +1440,13 @@ func TestSyncEngineVisualStudioCopilotDoesNotAppendRotatedDuplicateToolCall(t *t
 			})+"\n"), 0o644))
 
 	database := dbtest.OpenTestDB(t)
-	engine := sync.NewEngine(database, sync.EngineConfig{
+	engine := sync.NewEngine(t.Context(), database, sync.EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentVSCopilot: {tracesDir},
 		},
 		Machine: "local",
 	})
-	require.NotZero(t, engine.SyncAll(context.Background(), nil).Synced)
+	require.NotZero(t, engine.SyncAll(t.Context(), nil).Synced)
 	assertSessionMessageCount(t, database, sessionID, 2)
 
 	require.NoError(t, os.Remove(rotatedSibling))
@@ -1237,7 +1457,7 @@ func TestSyncEngineVisualStudioCopilotDoesNotAppendRotatedDuplicateToolCall(t *t
 	require.NoError(t, os.Chtimes(primary, later, later))
 
 	require.NoError(t, engine.SyncSingleSessionContext(
-		context.Background(), sessionID,
+		t.Context(), sessionID,
 	))
 	msgs := fetchMessages(t, database, sessionID)
 	require.Len(t, msgs, 2)
@@ -1280,24 +1500,23 @@ func TestSyncAllVisualStudioCopilotSkipCacheUsesCompositeFingerprint(t *testing.
 	require.NoError(t, os.Chtimes(primary, repTime, repTime))
 
 	database := dbtest.OpenTestDB(t)
-	engine := sync.NewEngine(database, sync.EngineConfig{
+	engine := sync.NewEngine(t.Context(), database, sync.EngineConfig{
 		AgentDirs: map[parser.AgentType][]string{
 			parser.AgentVSCopilot: {tracesDir},
 		},
 		Machine: "local",
 	})
-	require.NotZero(t, engine.SyncAll(context.Background(), nil).Synced)
+	require.NotZero(t, engine.SyncAll(t.Context(), nil).Synced)
 	assertSessionMessageCount(t, database, sessionID, 1)
 
 	// Trash the conversation and re-sync so its virtual path lands in the skip
 	// cache with the composite mtime (equal to the representative's mtime).
-	require.NoError(t, database.SoftDeleteSession(sessionID))
-	require.NoError(t, database.ResetAllMtimes())
-	engine.SyncAll(context.Background(), nil)
-	require.NotZero(t,
-		engine.SnapshotSkipCache()[parser.VisualStudioCopilotVirtualPath(
-			primary, conversationID,
-		)],
+	require.NoError(t, database.SoftDeleteSession(t.Context(), sessionID))
+	require.NoError(t, database.ResetAllMtimes(t.Context()))
+	engine.SyncAll(t.Context(), nil)
+	require.NotZero(t, engine.SnapshotSkipCache()[parser.VisualStudioCopilotVirtualPath(
+		primary, conversationID,
+	)],
 		"trashed conversation must be in the skip cache for this test to "+
 			"exercise the bypass",
 	)
@@ -1307,7 +1526,7 @@ func TestSyncAllVisualStudioCopilotSkipCacheUsesCompositeFingerprint(t *testing.
 	// conversation a second turn. The composite size grows but the
 	// representative mtime does not, so only the composite fingerprint can
 	// detect the change.
-	_, restoreErr := database.RestoreSession(sessionID)
+	_, restoreErr := database.RestoreSession(t.Context(), sessionID)
 	require.NoError(t, restoreErr)
 	sibling := filepath.Join(
 		tracesDir, "20260610T145205_bbbb2222_VSGitHubCopilot_traces.jsonl",
@@ -1322,6 +1541,6 @@ func TestSyncAllVisualStudioCopilotSkipCacheUsesCompositeFingerprint(t *testing.
 	olderTime := time.Unix(1781293600, 0)
 	require.NoError(t, os.Chtimes(sibling, olderTime, olderTime))
 
-	engine.SyncAll(context.Background(), nil)
+	engine.SyncAll(t.Context(), nil)
 	assertSessionMessageCount(t, database, sessionID, 2)
 }

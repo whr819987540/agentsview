@@ -8,11 +8,30 @@ export const KNOWN_AGENTS: readonly AgentMeta[] = [
   { name: "claude", color: "var(--accent-blue)" },
   { name: "cowork", color: "var(--accent-sky)", label: "Claude Cowork" },
   { name: "codex", color: "var(--accent-green)" },
+  { name: "traex", color: "var(--accent-coral)", label: "TraeX" },
+  { name: "augure-code", color: "var(--accent-lime)", label: "Augure Code" },
+  {
+    name: "augure-desktop",
+    color: "var(--accent-violet)",
+    label: "Augure Desktop",
+  },
   { name: "copilot", color: "var(--accent-amber)" },
+  { name: "devin", color: "var(--accent-red)", label: "Devin" },
+  { name: "evener", color: "var(--accent-teal)", label: "Evener" },
   { name: "gemini", color: "var(--accent-rose)" },
+  { name: "gemini-apps", color: "var(--accent-rose)", label: "Gemini Apps" },
   { name: "opencode", color: "var(--accent-purple)" },
+  {
+    name: "opencodereview",
+    color: "var(--accent-indigo)",
+    label: "Open Code Review",
+  },
+  { name: "kilo", color: "var(--accent-purple)", label: "Kilo" },
+  { name: "kilo-legacy", color: "var(--accent-purple)", label: "Kilo (legacy)" },
+  { name: "cline", color: "var(--accent-violet)", label: "Cline" },
   { name: "openhands", color: "var(--accent-teal)", label: "OpenHands" },
   { name: "cursor", color: "var(--accent-black)" },
+  { name: "cursor-ide", color: "var(--accent-black)", label: "Cursor IDE" },
   { name: "amp", color: "var(--accent-coral)", label: "Amp" },
   { name: "zencoder", color: "var(--accent-red)", label: "Zencoder" },
   { name: "zed", color: "var(--accent-green)", label: "Zed" },
@@ -27,12 +46,23 @@ export const KNOWN_AGENTS: readonly AgentMeta[] = [
     label: "Visual Studio Copilot",
   },
   { name: "pi", color: "var(--accent-indigo)", label: "Pi" },
+  { name: "tau", color: "var(--accent-amber)", label: "Tau" },
+  {
+    name: "prime-agent",
+    color: "var(--accent-indigo)",
+    label: "Prime Agent",
+  },
   { name: "qwen", color: "var(--accent-cyan)", label: "Qwen Code" },
   { name: "qwenpaw", color: "var(--accent-cyan)", label: "QwenPaw" },
   {
     name: "deepseek-tui",
     color: "var(--accent-cyan)",
     label: "DeepSeek TUI",
+  },
+  {
+    name: "deepseek-harness",
+    color: "var(--accent-cyan)",
+    label: "DeepSeek Harness",
   },
   {
     name: "openclaw",
@@ -46,12 +76,19 @@ export const KNOWN_AGENTS: readonly AgentMeta[] = [
   },
   { name: "iflow", color: "var(--accent-sky)", label: "iFlow" },
   { name: "kimi", color: "var(--accent-pink)", label: "Kimi" },
+  {
+    name: "kimi-work",
+    color: "var(--accent-pink)",
+    label: "Kimi Work",
+  },
   { name: "claude-ai", color: "var(--accent-violet)", label: "Claude.ai" },
   { name: "chatgpt", color: "var(--accent-lime)", label: "ChatGPT" },
   { name: "kiro", color: "var(--accent-lime)", label: "Kiro" },
   { name: "kiro-ide", color: "var(--accent-lime)", label: "Kiro IDE" },
   { name: "cortex", color: "var(--accent-cyan)", label: "Cortex Code" },
   { name: "workbuddy", color: "var(--accent-violet)", label: "WorkBuddy" },
+  { name: "codebuddy", color: "var(--accent-blue)", label: "CodeBuddy" },
+  { name: "qoder", color: "var(--accent-cyan)", label: "Qoder" },
   { name: "piebald", color: "var(--accent-orange)", label: "Piebald" },
   {
     name: "antigravity",
@@ -64,11 +101,24 @@ export const KNOWN_AGENTS: readonly AgentMeta[] = [
     label: "Antigravity CLI",
   },
   { name: "vibe", color: "var(--accent-orange)", label: "Mistral Vibe" },
+  {
+    name: "posit-assistant",
+    color: "var(--accent-indigo)",
+    label: "Posit Assistant",
+  },
+  { name: "roocode", color: "var(--accent-rose)", label: "RooCode" },
+  { name: "poolside", color: "var(--accent-cyan)", label: "Poolside" },
+  { name: "omnigent", color: "var(--accent-teal)", label: "Omnigent" },
+  { name: "codebuff", color: "var(--accent-amber)", label: "Codebuff" },
+  { name: "freebuff", color: "var(--accent-sky)", label: "Freebuff" },
+  {
+    name: "crush",
+    color: "var(--accent-coral)",
+    label: "Charm Crush",
+  },
 ];
 
-const agentColorMap = new Map(
-  KNOWN_AGENTS.map((a) => [a.name, a.color]),
-);
+const agentColorMap = new Map(KNOWN_AGENTS.map((a) => [a.name, a.color]));
 
 const defaultFillColor = "var(--accent-blue)";
 const accentForegroundMap = new Map([
@@ -94,7 +144,7 @@ export function agentColor(agent: string): string {
   return agentColorMap.get(agent) ?? defaultFillColor;
 }
 
-export function accentForeground(color: string): string {
+function accentForeground(color: string): string {
   return accentForegroundMap.get(color) ?? "var(--accent-blue-foreground)";
 }
 
@@ -102,8 +152,20 @@ export function agentForeground(agent: string): string {
   return accentForeground(agentColor(agent));
 }
 
-export function agentLabel(agent: string): string {
+export function agentLabel(agent: string, override?: string | null): string {
+  if (override?.trim()) return override;
   const meta = KNOWN_AGENTS.find((a) => a.name === agent);
   if (meta?.label) return meta.label;
   return agent.charAt(0).toUpperCase() + agent.slice(1);
+}
+
+// Ordinary Claude CLI transcripts record entrypoint "cli" on nearly every
+// session, so badging it would tag the whole sidebar with noise. Only
+// non-default entrypoints (sdk-cli, sdk-py, ...) are worth surfacing.
+const DEFAULT_ENTRYPOINT = "cli";
+
+export function entrypointBadge(entrypoint?: string | null): string | null {
+  const value = entrypoint?.trim();
+  if (!value || value === DEFAULT_ENTRYPOINT) return null;
+  return value;
 }

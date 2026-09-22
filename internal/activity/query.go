@@ -1,6 +1,7 @@
 package activity
 
 import (
+	"errors"
 	"fmt"
 	"time"
 )
@@ -70,10 +71,10 @@ func ResolveQuery(input QueryInput, now time.Time) (Query, error) {
 		return Query{}, err
 	}
 	if !start.Before(end) {
-		return Query{}, fmt.Errorf("from must be before to")
+		return Query{}, errors.New("from must be before to")
 	}
 	if end.Sub(start) > maxRange {
-		return Query{}, fmt.Errorf("range exceeds maximum of one year")
+		return Query{}, errors.New("range exceeds maximum of one year")
 	}
 	bucket, err := ResolveBucket(start, end, input.BucketOverride, loc)
 	if err != nil {
@@ -84,7 +85,7 @@ func ResolveQuery(input QueryInput, now time.Time) (Query, error) {
 		return Query{}, err
 	}
 	if len(windows) > maxBuckets {
-		return Query{}, fmt.Errorf("bucket configuration would produce too many buckets")
+		return Query{}, errors.New("bucket configuration would produce too many buckets")
 	}
 	nowUTC := now.UTC()
 	return Query{
@@ -97,6 +98,59 @@ func ResolveQuery(input QueryInput, now time.Time) (Query, error) {
 		Bucket:        bucket,
 		GapCapSeconds: defaultGapCap,
 	}, nil
+}
+
+// ValidateResolvedQuery applies the same bounded-query contract to a Query
+// reconstructed from a signed report token. Tokens are an optimization hint,
+// not authority to bypass the public request limits.
+func ValidateResolvedQuery(q Query) error {
+	if !q.RangeStart.Before(q.RangeEnd) {
+		return errors.New("from must be before to")
+	}
+	if q.RangeEnd.Sub(q.RangeStart) > maxRange {
+		return errors.New("range exceeds maximum of one year")
+	}
+	if !allowedBucketSpec(q.Bucket) {
+		return errors.New("invalid bucket specification")
+	}
+	if q.GapCapSeconds != defaultGapCap {
+		return errors.New("invalid gap cap")
+	}
+	if q.EffectiveEnd.Before(q.RangeStart) || q.EffectiveEnd.After(q.RangeEnd) {
+		return errors.New("effective end is outside report range")
+	}
+	if q.Partial {
+		if !q.EffectiveEnd.Before(q.RangeEnd) {
+			return errors.New("partial report must end before report range")
+		}
+	} else if !q.EffectiveEnd.Equal(q.RangeEnd) {
+		return errors.New("complete report must use the full report range")
+	}
+	loc, err := loadLocation(q.Timezone)
+	if err != nil {
+		return err
+	}
+	windows, err := BuildBuckets(q.RangeStart, q.RangeEnd, q.Bucket, loc)
+	if err != nil {
+		return err
+	}
+	if len(windows) > maxBuckets {
+		return errors.New("bucket configuration would produce too many buckets")
+	}
+	return nil
+}
+
+func allowedBucketSpec(spec BucketSpec) bool {
+	switch spec {
+	case BucketSpec{Unit: BucketMinute, NominalSeconds: 300},
+		BucketSpec{Unit: BucketMinute, NominalSeconds: 900},
+		BucketSpec{Unit: BucketHour, NominalSeconds: 3600},
+		BucketSpec{Unit: BucketDay, NominalSeconds: 86400},
+		BucketSpec{Unit: BucketWeek, NominalSeconds: 604800}:
+		return true
+	default:
+		return false
+	}
 }
 
 // loadLocation resolves an IANA timezone name; empty and "UTC" map to time.UTC.
@@ -135,7 +189,7 @@ func resolveRange(
 // parseCustomRange parses the RFC3339 From/To bounds; both are required.
 func parseCustomRange(input QueryInput) (time.Time, time.Time, error) {
 	if input.From == "" || input.To == "" {
-		return time.Time{}, time.Time{}, fmt.Errorf("custom range requires both from and to")
+		return time.Time{}, time.Time{}, errors.New("custom range requires both from and to")
 	}
 	from, err := time.Parse(time.RFC3339, input.From)
 	if err != nil {

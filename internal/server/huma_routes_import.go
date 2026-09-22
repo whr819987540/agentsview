@@ -2,29 +2,33 @@ package server
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
+	"errors"
 	"io"
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 
 	"github.com/danielgtaylor/huma/v2"
+	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/importer"
 )
 
 func (s *Server) registerImportRoutes() {
-	group := newRouteGroup(s.api, "/api/v1/import", "Import")
+	group := huma.NewGroup(s.api, "/api/v1/import")
+	configureRouteGroup(group, "Import")
+	s.api.OpenAPI().Components.Schemas.Schema(reflect.TypeFor[importer.ImportStats](), true, "")
 
-	stream(
-		s, group, http.MethodPost, "/claude-ai",
+	s.stream(group, http.MethodPost, "/claude-ai",
 		"Import Claude.ai archive", s.humaImportClaudeAI,
-		streamJSONResponse(),
+		streamJSONResponseSchema("ImporterImportStats"),
 	)
-	stream(
-		s, group, http.MethodPost, "/chatgpt",
+	s.stream(group, http.MethodPost, "/chatgpt",
 		"Import ChatGPT archive", s.humaImportChatGPT,
-		streamJSONResponse(),
+		streamJSONResponseSchema("ImporterImportStats"),
 	)
 }
 
@@ -45,6 +49,9 @@ func (s *Server) humaImportClaudeAI(
 		return nil, apiError(http.StatusNotImplemented,
 			"import not available in read-only mode")
 	}
+	if err := s.rejectWriterClosedWrite(); err != nil {
+		return nil, err
+	}
 	file := in.RawBody.Data().File
 	if !file.IsSet {
 		return nil, apiError(http.StatusBadRequest,
@@ -61,7 +68,7 @@ func (s *Server) humaImportClaudeAI(
 		stream, ok := newHumaSSEStream(hctx)
 		if !ok {
 			writeHumaJSON(hctx, http.StatusInternalServerError,
-				apiErrorResponse{Message: "streaming not supported"})
+				apiResponseError{Message: "streaming not supported"})
 			return
 		}
 		stats, err := s.importClaudeAIFromFileWithCallbacks(hctx.Context(), file, &importer.ImportCallbacks{
@@ -97,8 +104,16 @@ func (s *Server) importClaudeAIFromFileWithCallbacks(
 		return importer.ImportStats{}, err
 	}
 	defer cleanup()
-	stats, err := importer.ImportClaudeAI(ctx, s.db, reader, cb)
+	var stats importer.ImportStats
+	err = s.serializeArchiveWrite(ctx, func() error {
+		var importErr error
+		stats, importErr = importer.ImportClaudeAI(ctx, s.db, reader, cb)
+		return importErr
+	})
 	if err != nil {
+		if errors.Is(err, db.ErrWriterClosed) {
+			return importer.ImportStats{}, writerClosedError()
+		}
 		return importer.ImportStats{}, apiError(http.StatusInternalServerError,
 			"import failed: "+err.Error())
 	}
@@ -158,6 +173,9 @@ func (s *Server) humaImportChatGPT(
 		return nil, apiError(http.StatusNotImplemented,
 			"import not available in read-only mode")
 	}
+	if err := s.rejectWriterClosedWrite(); err != nil {
+		return nil, err
+	}
 	file := in.RawBody.Data().File
 	if !file.IsSet {
 		return nil, apiError(http.StatusBadRequest,
@@ -178,7 +196,7 @@ func (s *Server) humaImportChatGPT(
 		stream, ok := newHumaSSEStream(hctx)
 		if !ok {
 			writeHumaJSON(hctx, http.StatusInternalServerError,
-				apiErrorResponse{Message: "streaming not supported"})
+				apiResponseError{Message: "streaming not supported"})
 			return
 		}
 		stats, err := s.importChatGPTFromFile(hctx.Context(), file, &importer.ImportCallbacks{
@@ -221,9 +239,17 @@ func (s *Server) importChatGPTFromFile(
 			"failed to extract zip: "+err.Error())
 	}
 	defer cleanup()
-	stats, err := importer.ImportChatGPT(ctx, s.db, dir,
-		filepath.Join(s.cfg.DataDir, "assets"), cb)
+	var stats importer.ImportStats
+	err = s.serializeArchiveWrite(ctx, func() error {
+		var importErr error
+		stats, importErr = importer.ImportChatGPT(ctx, s.db, dir,
+			filepath.Join(s.cfg.DataDir, "assets"), cb)
+		return importErr
+	})
 	if err != nil {
+		if errors.Is(err, db.ErrWriterClosed) {
+			return importer.ImportStats{}, writerClosedError()
+		}
 		return importer.ImportStats{}, apiError(http.StatusInternalServerError,
 			"import failed: "+err.Error())
 	}
@@ -233,6 +259,6 @@ func (s *Server) importChatGPTFromFile(
 func jsonStreamResponse(value any) *huma.StreamResponse {
 	return &huma.StreamResponse{Body: func(hctx huma.Context) {
 		hctx.SetHeader("Content-Type", "application/json")
-		_ = json.NewEncoder(hctx.BodyWriter()).Encode(value)
+		_ = json.MarshalEncode(jsontext.NewEncoder(hctx.BodyWriter()), value)
 	}}
 }

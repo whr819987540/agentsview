@@ -1,6 +1,6 @@
 <script lang="ts">
   import { analytics } from "../../stores/analytics.svelte.js";
-  import type { ProjectAnalytics } from "../../api/types.js";
+  import type { DbProjectAnalytics as ProjectAnalytics } from "../../api/generated/index.js";
   import { m } from "../../i18n/index.js";
 
   const MAX_PROJECTS = 15;
@@ -151,7 +151,7 @@
         class="tooltip"
         style="left: {tooltip.x}px; top: {tooltip.y}px;"
       >
-        {tooltip.text}
+        <span>{tooltip.text}</span>
       </div>
     {/if}
   {:else}
@@ -186,7 +186,7 @@
   .bar-list {
     display: flex;
     flex-direction: column;
-    gap: 3px;
+    gap: var(--space-2);
   }
 
   .bar-row {
@@ -264,7 +264,7 @@
     border-radius: var(--radius-sm);
     white-space: nowrap;
     pointer-events: none;
-    z-index: 100;
+    z-index: var(--z-tooltip);
   }
 
   .empty {

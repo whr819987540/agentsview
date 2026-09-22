@@ -1,111 +1,100 @@
 <script lang="ts">
-  import { onDestroy, untrack } from "svelte";
+  import { onDestroy, tick, untrack } from "svelte";
+  import { Button, EmptyState } from "@kenn-io/kit-ui";
+  // kit-ui-check-ignore: MessageList uses the local TanStack wrapper for pinned-message scroll reconciliation and per-session measurement cache resets; kit-ui VirtualList does not expose those controls yet.
   import type { Virtualizer } from "@tanstack/virtual-core";
   import { messages } from "../../stores/messages.svelte.js";
   import { ui } from "../../stores/ui.svelte.js";
   import { sessions } from "../../stores/sessions.svelte.js";
-  import { MessageSquareIcon } from "../../icons.js";
+  import { settings } from "../../stores/settings.svelte.js";
+  import { readProgress } from "../../stores/read-progress.svelte.js";
+  import { CircleQuestionMarkIcon, MessageSquareIcon } from "../../icons.js";
   import { createVirtualizer } from "../../virtual/createVirtualizer.svelte.js";
   import MessageContent from "./MessageContent.svelte";
   import CompactBoundaryDivider from "./CompactBoundaryDivider.svelte";
   import ForkBoundaryDivider from "./ForkBoundaryDivider.svelte";
   import SystemBoundaryCard from "../system/SystemBoundaryCard.svelte";
   import ToolCallGroup from "./ToolCallGroup.svelte";
-  import type { Message } from "../../api/types.js";
+  import type { DbMessage as Message } from "../../api/generated/index.js";
+  import type { DisplayItem } from "../../utils/display-items.js";
   import {
-    buildDisplayItems,
-    type DisplayItem,
-  } from "../../utils/display-items.js";
-  import { filterDisplayItemsByTranscriptMode } from "../../utils/transcript-mode.js";
-  import {
-    hasVisibleSegments,
-  } from "../../utils/content-parser.js";
-  import { isSystemMessage } from "../../utils/messages.js";
+    isSystemBoundaryMessage,
+    isSystemMessage,
+  } from "../../utils/messages.js";
   import { resolveMessageLayout } from "../../utils/message-layout.js";
   import { inSessionSearch } from "../../stores/inSessionSearch.svelte.js";
   import { sessionActivity } from "../../stores/sessionActivity.svelte.js";
-  import SessionFindBar from "./SessionFindBar.svelte";
+  import SessionFindView from "./SessionFindView.svelte";
   import {
-    getAlignedOffsetScrollAlign,
     getLatestDisplayIndex,
     type ScrollAlign,
   } from "./message-scroll.js";
+  import { m } from "../../i18n/index.js";
+  import { settleVirtualScroll } from "./staged-scroll.js";
+  import { revealMatch } from "../../search/reveal.js";
+  import type { Match } from "../../search/session-index.js";
+  import {
+    keepsAnswerBeforeTrailingTools,
+    projectSessionScope,
+  } from "../../search/session-scope.js";
   import {
     findAnchorIndexAsc,
     findFirstVisibleVirtualItem,
     scrollMemory,
     type ScrollAnchor,
   } from "./scroll-memory.js";
-  import { m } from "../../i18n/index.js";
 
   let containerRef: HTMLDivElement | undefined = $state(undefined);
   let scrollRaf: number | null = null;
   let lastScrollRequest = 0;
+  let destroyed = false;
   let activeFollowScrollRequest: number | null = null;
-  let completedExactScrollRequest: number | null = null;
-  let followingScrollRaf: number | null = null;
-  let followSettleTimer:
-    | ReturnType<typeof setTimeout>
-    | null = null;
   let activeRestoreRequest: number | null = null;
   let restoreTarget:
     | { sessionId: string; anchor: ScrollAnchor }
     | null = null;
+  let followingScrollRaf: number | null = null;
+  let followSettleTimer:
+    | ReturnType<typeof setTimeout>
+    | null = null;
+  let visibleProgressSignature: string | null = $state(null);
+  let visibleProgressRaf: number | null = null;
+  let unreadTraversalKey: string | null = null;
+  let unreadBoundarySeen = false;
+  let unreadLatestSeen = false;
 
   let baseMessages: Message[] = $derived.by(() =>
     messages.messages.filter((m) => !isSystemMessage(m)),
   );
 
-  let baseDisplayItemsAsc = $derived(
-    buildDisplayItems(baseMessages),
-  );
-
-  let filteredDisplayItemsAsc = $derived(
-    buildDisplayItems(baseMessages, {
-      skipToolGrouping: !ui.isBlockVisible("tool"),
+  // Share transcript row visibility and searchable block filters with the index.
+  let sessionScope = $derived(
+    projectSessionScope({
+      messages: messages.messages,
+      transcriptMode: ui.transcriptMode,
+      visibleBlocks: ui.visibleBlocks,
+      hasBlockFilters: ui.hasBlockFilters,
+      keepAnswerBeforeTrailingTools: keepsAnswerBeforeTrailingTools(
+        settings.sessionProviders,
+        sessions.activeSession?.agent,
+      ),
     }),
   );
 
-  function isItemVisible(item: DisplayItem): boolean {
-    if (item.kind === "tool-group") {
-      return true;
-    }
-    return hasVisibleSegments(item.message, (type) =>
-      ui.isBlockVisible(type),
-    );
-  }
+  let displayItemsAsc = $derived(sessionScope.items);
 
-  let normalDisplayItemsAsc = $derived.by(() => {
-    if (!ui.hasBlockFilters) return baseDisplayItemsAsc;
-    return filteredDisplayItemsAsc.filter(isItemVisible);
-  });
+  let normalDisplayItemsAsc = $derived(sessionScope.normalItems);
 
-  let displayItemsAsc = $derived.by(() => {
-    if (ui.transcriptMode === "normal") {
-      return normalDisplayItemsAsc;
-    }
+  let displayedOrdinals = $derived.by(() =>
+    displayItemsAsc.flatMap((item) => item.ordinals),
+  );
 
-    if (!ui.hasBlockFilters) {
-      return filterDisplayItemsByTranscriptMode(
-        baseDisplayItemsAsc,
-        "focused",
-      );
-    }
+  let displayedOrdinalsSignature = $derived(
+    displayedOrdinals.join(","),
+  );
 
-    return filterDisplayItemsByTranscriptMode(
-      filteredDisplayItemsAsc,
-      "focused",
-      {
-        isMessageVisible: (message) =>
-          hasVisibleSegments(message, (type) =>
-            ui.isBlockVisible(type),
-          ),
-      },
-    ).filter(isItemVisible);
-  });
-
-  function itemAt(index: number) {
-    if (ui.sortNewestFirst) {
+  function itemAt(index: number, newestFirst = ui.sortNewestFirst) {
+    if (newestFirst) {
       const mapped = displayItemsAsc.length - 1 - index;
       return displayItemsAsc[mapped];
     }
@@ -116,6 +105,7 @@
     const count = displayItemsAsc.length;
     const el = containerRef ?? null;
     const sid = sessions.activeSessionId ?? "";
+    const newestFirst = ui.sortNewestFirst;
     return {
       count,
       getScrollElement: () => el,
@@ -124,7 +114,7 @@
       useAnimationFrameWithResizeObserver: true,
       measureCacheKey: sid,
       getItemKey: (index: number) => {
-        const item = itemAt(index);
+        const item = itemAt(index, newestFirst);
         if (!item) return `${sid}-${index}`;
         if (item.kind === "tool-group") {
           return `${sid}-tg-${item.ordinals[0]}`;
@@ -181,6 +171,134 @@
     sessionActivity.firstVisibleTimestamp = null;
   }
 
+  function recordVisibleProgress() {
+    const v = virtualizer.instance;
+    const sessionId = messages.sessionId;
+    const currentToken = messages.activeSessionToken;
+    const marker = sessionId
+      ? readProgress.get(sessionId)
+      : null;
+    if (
+      !v ||
+      !sessionId ||
+      !currentToken ||
+      !marker ||
+      marker.token === currentToken
+    ) {
+      return;
+    }
+
+    if (baseMessages.length === 0) {
+      readProgress.markRead(
+        sessionId,
+        currentToken,
+        latestRawLoadedOrdinal,
+      );
+      return;
+    }
+
+    const latestDisplayedOrdinal = displayedOrdinals.at(-1);
+    if (latestDisplayedOrdinal === undefined) {
+      readProgress.markRead(
+        sessionId,
+        currentToken,
+        latestLoadedOrdinal,
+      );
+      return;
+    }
+
+    const top = v.scrollOffset ?? containerRef?.scrollTop ?? 0;
+    const height = containerRef?.clientHeight || v.scrollRect?.height || 0;
+    const bottom = top + height;
+    let maxVisibleOrdinal: number | null = null;
+    const visibleOrdinals = new Set<number>();
+
+    for (const row of v.getVirtualItems()) {
+      if (row.end <= top || row.start >= bottom) continue;
+      const item = itemAt(row.index);
+      if (!item) continue;
+      if (item.kind === "message") {
+        visibleOrdinals.add(item.message.ordinal);
+        maxVisibleOrdinal = maxVisibleOrdinal === null
+          ? item.message.ordinal
+          : Math.max(maxVisibleOrdinal, item.message.ordinal);
+        continue;
+      }
+
+      for (const ordinal of visibleToolGroupOrdinals(row.index)) {
+        visibleOrdinals.add(ordinal);
+        maxVisibleOrdinal = maxVisibleOrdinal === null
+          ? ordinal
+          : Math.max(maxVisibleOrdinal, ordinal);
+      }
+    }
+
+    if (maxVisibleOrdinal === null || latestLoadedOrdinal === null) return;
+
+    const rawUnreadBoundary = unreadBoundaryOrdinal(
+      latestLoadedOrdinal,
+    );
+    const unreadBoundary = displayedOrdinals.find((ordinal) =>
+      ordinal >= rawUnreadBoundary
+    ) ?? latestDisplayedOrdinal;
+    const traversalKey =
+      `${sessionId}|${currentToken}|${unreadBoundary}|${latestDisplayedOrdinal}`;
+    if (unreadTraversalKey !== traversalKey) {
+      unreadTraversalKey = traversalKey;
+      unreadBoundarySeen = false;
+      unreadLatestSeen = false;
+    }
+    if (visibleOrdinals.has(unreadBoundary)) {
+      unreadBoundarySeen = true;
+    }
+    if (visibleOrdinals.has(latestDisplayedOrdinal)) {
+      unreadLatestSeen = true;
+    }
+
+    if (ui.sortNewestFirst) {
+      if (unreadBoundarySeen && unreadLatestSeen) {
+        readProgress.markRead(
+          sessionId,
+          currentToken,
+          latestLoadedOrdinal,
+        );
+      }
+      return;
+    }
+
+    if (
+      unreadBoundarySeen &&
+      maxVisibleOrdinal >= latestDisplayedOrdinal
+    ) {
+      readProgress.markRead(
+        sessionId,
+        currentToken,
+        latestLoadedOrdinal,
+      );
+      return;
+    }
+  }
+
+  function visibleToolGroupOrdinals(
+    rowIndex: number,
+  ): number[] {
+    if (!containerRef) return [];
+    const row = containerRef.querySelector<HTMLElement>(
+      `.virtual-row[data-index="${rowIndex}"]`,
+    );
+    if (!row) return [];
+    const rootRect = containerRef.getBoundingClientRect();
+    const ordinals: number[] = [];
+    for (const node of row.querySelectorAll<HTMLElement>("[data-message-ordinal]")) {
+      const ordinal = Number(node.dataset.messageOrdinal);
+      if (!Number.isInteger(ordinal) || ordinal < 0) continue;
+      const rect = node.getBoundingClientRect();
+      if (rect.bottom <= rootRect.top || rect.top >= rootRect.bottom) continue;
+      ordinals.push(ordinal);
+    }
+    return ordinals;
+  }
+
   // Recompute visible timestamp when minimap opens or
   // message content changes (e.g. SSE reload).
   $effect(() => {
@@ -191,6 +309,79 @@
       publishVisibleTimestamp();
     }
   });
+
+  let latestLoadedOrdinal = $derived(
+    baseMessages[baseMessages.length - 1]?.ordinal ?? null,
+  );
+
+  let latestRawLoadedOrdinal = $derived(
+    messages.messages[messages.messages.length - 1]?.ordinal ?? null,
+  );
+
+  function unreadBoundaryOrdinal(
+    latestOrdinal: number,
+  ): number {
+    const explicit = messages.activeSessionUnreadOrdinal;
+    const earliestOrdinal = baseMessages[0]?.ordinal ?? latestOrdinal;
+    const boundary = explicit ?? earliestOrdinal;
+    return baseMessages.find((message) =>
+      message.ordinal >= boundary
+    )?.ordinal ?? latestOrdinal;
+  }
+
+  $effect(() => {
+    const sessionId = messages.sessionId;
+    const currentToken = messages.activeSessionToken;
+    const loading = messages.loading;
+    const latestOrdinal =
+      latestLoadedOrdinal ?? latestRawLoadedOrdinal;
+    if (!sessionId || !currentToken || loading) return;
+    readProgress.baseline(sessionId, currentToken, latestOrdinal);
+  });
+
+  $effect(() => {
+    const sessionId = messages.sessionId;
+    const currentToken = messages.activeSessionToken;
+    const loading = messages.loading;
+    const count = messages.messageCount;
+    const latest = latestDisplaySignature();
+    const displayed = displayedOrdinalsSignature;
+    const unreadOrdinal = messages.activeSessionUnreadOrdinal;
+    if (!sessionId || !currentToken || loading || !containerRef) return;
+    const signature =
+      `${sessionId}|${currentToken}|${count}|${latest}|${unreadOrdinal}|${displayed}`;
+    if (
+      visibleProgressSignature === null ||
+      !visibleProgressSignature.startsWith(`${sessionId}|`)
+    ) {
+      visibleProgressSignature = signature;
+      scheduleVisibleProgress(sessionId, currentToken);
+      return;
+    }
+    if (visibleProgressSignature === signature) return;
+    visibleProgressSignature = signature;
+    scheduleVisibleProgress(sessionId, currentToken);
+  });
+
+  function scheduleVisibleProgress(
+    sessionId: string,
+    currentToken: string,
+  ) {
+    if (visibleProgressRaf !== null) {
+      cancelAnimationFrame(visibleProgressRaf);
+    }
+    visibleProgressRaf = requestAnimationFrame(() => {
+      visibleProgressRaf = null;
+      if (
+        messages.sessionId !== sessionId ||
+        messages.loading ||
+        messages.activeSessionToken !== currentToken
+      ) {
+        return;
+      }
+      recordVisibleProgress();
+    });
+  }
 
   function handleScroll() {
     if (!containerRef) return;
@@ -220,44 +411,14 @@
         publishVisibleTimestamp();
       }
 
+      recordVisibleProgress();
       recordScrollAnchor();
-    });
-  }
 
-  /** Remember the current viewport anchor so switching back to
-   *  this session can restore the reading position. */
-  function recordScrollAnchor() {
-    const sid = messages.sessionId;
-    const v = virtualizer.instance;
-    if (!sid || !v || messages.loading) return;
-    const scrollTop = v.scrollOffset ?? 0;
-    const vi = findFirstVisibleVirtualItem(
-      v.getVirtualItems(),
-      scrollTop,
-    );
-    if (!vi) return;
-    const item = itemAt(vi.index);
-    if (!item) return;
-    scrollMemory.remember(sid, {
-      ordinal: item.ordinals[0]!,
-      offsetPx: Math.max(0, scrollTop - vi.start),
     });
-  }
-
-  function cancelRestoreWork() {
-    restoreTarget = null;
-    if (
-      activeRestoreRequest !== null &&
-      activeRestoreRequest === lastScrollRequest
-    ) {
-      lastScrollRequest += 1;
-    }
-    activeRestoreRequest = null;
   }
 
   function handleManualScrollIntent() {
-    lastScrollRequest += 1;
-    completedExactScrollRequest = null;
+    lastScrollRequest++;
     cancelRestoreWork();
     if (ui.followLatest) {
       cancelFollowLatestWork();
@@ -309,8 +470,12 @@
   }
 
   onDestroy(() => {
-    lastScrollRequest += 1;
-    completedExactScrollRequest = null;
+    destroyed = true;
+    lastScrollRequest++;
+    if (visibleProgressRaf !== null) {
+      cancelAnimationFrame(visibleProgressRaf);
+      visibleProgressRaf = null;
+    }
     if (scrollRaf !== null) {
       cancelAnimationFrame(scrollRaf);
       scrollRaf = null;
@@ -324,6 +489,80 @@
       followSettleTimer = null;
     }
   });
+
+  /** Remember the current viewport anchor so switching back to
+   *  this session can restore the reading position. */
+  function recordScrollAnchor() {
+    const sid = messages.sessionId;
+    const v = virtualizer.instance;
+    if (!sid || !v || messages.loading) return;
+    const scrollTop = v.scrollOffset ?? 0;
+    const vi = findFirstVisibleVirtualItem(
+      v.getVirtualItems(),
+      scrollTop,
+    );
+    if (!vi) return;
+    const item = itemAt(vi.index);
+    if (!item) return;
+    scrollMemory.remember(sid, {
+      ordinal: item.ordinals[0]!,
+      offsetPx: Math.max(0, scrollTop - vi.start),
+    });
+  }
+
+  function cancelRestoreWork() {
+    restoreTarget = null;
+    if (
+      activeRestoreRequest !== null &&
+      activeRestoreRequest === lastScrollRequest
+    ) {
+      lastScrollRequest += 1;
+    }
+    activeRestoreRequest = null;
+  }
+
+  /** Scroll back to a remembered anchor, loading older pages first
+   *  when the anchor predates the currently loaded window. */
+  async function restoreScrollAnchor(anchor: ScrollAnchor) {
+    const reqId = ++lastScrollRequest;
+    activeFollowScrollRequest = null;
+    activeRestoreRequest = reqId;
+
+    let idxAsc = findAnchorIndexAsc(displayItemsAsc, anchor.ordinal);
+    const isExact =
+      displayItemsAsc[idxAsc]?.ordinals.includes(anchor.ordinal) ?? false;
+    if (!isExact && messages.hasOlder) {
+      await messages.ensureOrdinalLoaded(anchor.ordinal);
+      if (reqId !== lastScrollRequest) return;
+      // Let Svelte re-derive displayItemsAsc and the virtualizer
+      // update its count after loading.
+      await raf();
+      await raf();
+      if (reqId !== lastScrollRequest) return;
+      idxAsc = findAnchorIndexAsc(displayItemsAsc, anchor.ordinal);
+    }
+    if (idxAsc < 0) return;
+
+    const idx = ui.sortNewestFirst
+      ? displayItemsAsc.length - 1 - idxAsc
+      : idxAsc;
+    const settled = await scrollToDisplayIndex(idx, 0, 0, reqId, "start");
+    if (!settled || reqId !== lastScrollRequest) return;
+    // Re-apply the sub-row offset the anchor was taken at, so the
+    // restore lands on the same line rather than the row's top. The
+    // row's own offset is asked for explicitly rather than read back
+    // from scrollOffset, which can still be mid-animation here.
+    const v = virtualizer.instance;
+    if (v && anchor.offsetPx > 0) {
+      const resolved = v.getOffsetForIndex?.(idx, "start");
+      const rowOffset = Array.isArray(resolved)
+        ? resolved[0]
+        : (v.scrollOffset ?? 0);
+      v.scrollToOffset(Math.round(rowOffset + anchor.offsetPx), {
+        align: "start",
+      });
+    }
+  }
 
   function cancelFollowLatestWork() {
     if (
@@ -345,176 +584,26 @@
 
   function scrollToDisplayIndex(
     index: number,
-    waitFrames: number = 0,
-    scrollRetries: number = 0,
-    reqId: number = lastScrollRequest,
+    waitFrames = 0,
+    scrollRetries = 0,
+    reqId = lastScrollRequest,
     align: ScrollAlign = "start",
-    offsetPx: number = 0,
-  ) {
-    if (
-      reqId !== lastScrollRequest ||
-      completedExactScrollRequest === reqId
-    ) {
-      return;
-    }
-
-    const v = virtualizer.instance;
-    if (!v) return;
-
-    // Phase 1: wait up to 5 frames for virtualCount to sync.
-    const desiredCount = displayItemsAsc.length;
-    const virtualCount = v.options.count;
-    if (
-      waitFrames < 5 &&
-      (virtualCount !== desiredCount || index >= virtualCount)
-    ) {
-      requestAnimationFrame(() => {
-        scrollToDisplayIndex(
-          index, waitFrames + 1, 0, reqId,
-          align, offsetPx,
-        );
-      });
-      return;
-    }
-
-    // Phase 2a: item already rendered — use exact measured offset.
-    const virtualItems = v.getVirtualItems();
-    const isRendered = virtualItems.some(
-      (vi) => vi.index === index,
-    );
-    if (isRendered) {
-      const offsetAndAlign =
-        v.getOffsetForIndex(index, align);
-      if (offsetAndAlign) {
-        const [offset] = offsetAndAlign;
-        v.scrollToOffset(
-          Math.round(offset + offsetPx),
-          { align: getAlignedOffsetScrollAlign(align) },
-        );
-      }
-      return;
-    }
-
-    // Phase 2b: item not yet in render window. scrollToIndex
-    // scrolls to an estimated position, but TanStack's reconcile
-    // loop exits after 1 stable frame — before ResizeObserver
-    // measurements (delayed by bumpVersion's setTimeout(0)) have
-    // updated the offsets.
-    //
-    // Retry in 2 frames: by then ResizeObserver + bumpVersion have
-    // fired, measurements are updated, and the next attempt either
-    // finds the item rendered (for an exact offset scroll) or
-    // repeats with a more accurate estimate. Limit to 15 scroll
-    // retries (~480 ms) to avoid looping forever.
-    v.scrollToIndex(index, { align });
-    if (scrollRetries < 15) {
-      requestAnimationFrame(() => {
-        requestAnimationFrame(() => {
-          scrollToDisplayIndex(
-            index,
-            waitFrames,
-            scrollRetries + 1,
-            reqId,
-            align,
-            offsetPx,
-          );
-        });
-      });
-    }
+  ): Promise<boolean> {
+    return settleVirtualScroll({
+      index, align, waitFrames, scrollRetries,
+      getVirtualizer: () => virtualizer.instance,
+      getCount: () => displayItemsAsc.length,
+      isCurrent: () => !destroyed && reqId === lastScrollRequest,
+      nextFrame: raf,
+    });
   }
 
   function raf(): Promise<void> {
     return new Promise((r) => requestAnimationFrame(() => r()));
   }
 
-  function centerWithinNestedScrollers(
-    mark: HTMLElement,
-    scope: HTMLElement,
-  ) {
-    let ancestor = mark.parentElement;
-    while (
-      ancestor &&
-      ancestor !== containerRef &&
-      scope.contains(ancestor)
-    ) {
-      if (ancestor.scrollHeight > ancestor.clientHeight) {
-        const overflowY = getComputedStyle(ancestor).overflowY;
-        if (overflowY === "auto" || overflowY === "scroll") {
-          const ancestorRect = ancestor.getBoundingClientRect();
-          const markRect = mark.getBoundingClientRect();
-          const scale = ancestorRect.height / ancestor.clientHeight;
-          ancestor.scrollTop +=
-            ((markRect.top + markRect.bottom) / 2 -
-              (ancestorRect.top + ancestorRect.bottom) / 2) /
-            (scale || 1);
-        }
-      }
-      ancestor = ancestor.parentElement;
-    }
-  }
-
-  async function scrollToSearchHighlight(
-    ordinal: number,
-    query: string,
-    reqId: number,
-  ) {
-    for (let attempt = 0; attempt < 60; attempt++) {
-      await raf();
-      if (
-        reqId !== lastScrollRequest ||
-        inSessionSearch.currentOrdinal !== ordinal ||
-        inSessionSearch.query !== query
-      ) {
-        return;
-      }
-
-      const row = Array.from(
-        containerRef?.querySelectorAll<HTMLElement>(
-          ".virtual-row[data-message-ordinals]",
-        ) ?? [],
-      ).find((candidate) =>
-        candidate.dataset.messageOrdinals
-          ?.split(",")
-          .includes(String(ordinal)),
-      );
-      const scope = row?.querySelector<HTMLElement>(
-        `[data-message-ordinal="${ordinal}"]`,
-      ) ?? row;
-      const mark = scope?.querySelector<HTMLElement>(
-        "mark.search-highlight--current",
-      );
-      if (!containerRef || !mark || !scope) continue;
-
-      centerWithinNestedScrollers(mark, scope);
-      const containerRect = containerRef.getBoundingClientRect();
-      const markRect = mark.getBoundingClientRect();
-      const scale = containerRect.height / containerRef.clientHeight;
-      const markTop =
-        (markRect.top - containerRect.top) / (scale || 1) +
-        containerRef.scrollTop;
-      const centeredOffset =
-        markTop -
-        containerRef.clientHeight / 2 +
-        markRect.height / (2 * (scale || 1));
-      const maxOffset = Math.max(
-        0,
-        containerRef.scrollHeight - containerRef.clientHeight,
-      );
-      virtualizer.instance?.scrollToOffset(
-        Math.round(Math.min(maxOffset, Math.max(0, centeredOffset))),
-        { align: "start" },
-      );
-      completedExactScrollRequest = reqId;
-      return;
-    }
-  }
-
-  async function scrollToOrdinalInternal(
-    ordinal: number,
-    searchQuery: string | undefined = undefined,
-  ) {
+  async function scrollToOrdinalInternal(ordinal: number) {
     const reqId = ++lastScrollRequest;
-    completedExactScrollRequest = null;
     activeFollowScrollRequest = null;
 
     const idxAsc = displayItemsAsc.findIndex((item) =>
@@ -525,9 +614,6 @@
         ? displayItemsAsc.length - 1 - idxAsc
         : idxAsc;
       scrollToDisplayIndex(idx, 0, 0, reqId);
-      if (searchQuery) {
-        await scrollToSearchHighlight(ordinal, searchQuery, reqId);
-      }
       return;
     }
 
@@ -550,107 +636,11 @@
       ? displayItemsAsc.length - 1 - loadedIdxAsc
       : loadedIdxAsc;
     scrollToDisplayIndex(loadedIdx, 0, 0, reqId);
-    if (searchQuery) {
-      await scrollToSearchHighlight(ordinal, searchQuery, reqId);
-    }
   }
 
-  export function scrollToOrdinal(
-    ordinal: number,
-    searchQuery: string | undefined = undefined,
-  ) {
-    void scrollToOrdinalInternal(ordinal, searchQuery);
+  export function scrollToOrdinal(ordinal: number) {
+    void scrollToOrdinalInternal(ordinal);
   }
-
-  async function restoreScrollAnchor(anchor: ScrollAnchor) {
-    const reqId = ++lastScrollRequest;
-    activeFollowScrollRequest = null;
-    activeRestoreRequest = reqId;
-
-    let idxAsc = findAnchorIndexAsc(
-      displayItemsAsc,
-      anchor.ordinal,
-    );
-    const isExact =
-      displayItemsAsc[idxAsc]?.ordinals.includes(
-        anchor.ordinal,
-      ) ?? false;
-    if (!isExact && messages.hasOlder) {
-      await messages.ensureOrdinalLoaded(anchor.ordinal);
-      if (reqId !== lastScrollRequest) return;
-
-      // Let Svelte re-derive displayItemsAsc and the
-      // virtualizer update its count after loading.
-      await raf();
-      await raf();
-      if (reqId !== lastScrollRequest) return;
-
-      idxAsc = findAnchorIndexAsc(
-        displayItemsAsc,
-        anchor.ordinal,
-      );
-    }
-    if (idxAsc < 0) return;
-
-    const idx = ui.sortNewestFirst
-      ? displayItemsAsc.length - 1 - idxAsc
-      : idxAsc;
-    scrollToDisplayIndex(
-      idx,
-      0,
-      0,
-      reqId,
-      "start",
-      anchor.offsetPx,
-    );
-  }
-
-  // Arm position restore when entering a session that has a
-  // remembered anchor. Deep links and search navigation
-  // (pendingScrollOrdinal) and follow-latest win over restore.
-  $effect(() => {
-    const sid = messages.sessionId;
-    untrack(() => {
-      // Invalidate scroll work queued for the previous session
-      // so its retry loop cannot scroll the new session's list.
-      lastScrollRequest += 1;
-      activeRestoreRequest = null;
-      if (!sid) {
-        restoreTarget = null;
-        return;
-      }
-      if (restoreTarget?.sessionId === sid) return;
-      const anchor = scrollMemory.get(sid);
-      const pendingMatchesSession =
-        ui.pendingScrollOrdinal !== null &&
-        (ui.pendingScrollSession === null ||
-          ui.pendingScrollSession === sid);
-      restoreTarget =
-        anchor && !pendingMatchesSession && !ui.followLatest
-          ? { sessionId: sid, anchor }
-          : null;
-    });
-  });
-
-  // Restore the remembered position once messages have loaded.
-  $effect(() => {
-    const sid = messages.sessionId;
-    const loading = messages.loading;
-    const count = displayItemsAsc.length;
-    untrack(() => {
-      const target = restoreTarget;
-      if (!target || target.sessionId !== sid) return;
-      if (loading || count === 0) return;
-      restoreTarget = null;
-      if (
-        ui.followLatest ||
-        ui.pendingScrollOrdinal !== null
-      ) {
-        return;
-      }
-      void restoreScrollAnchor(target.anchor);
-    });
-  });
 
   function scrollToLatestInternal() {
     const reqId = ++lastScrollRequest;
@@ -724,6 +714,14 @@
     return `${m.ordinal}:${m.content_length}:${m.timestamp}`;
   }
 
+  function itemOrdinals(item: DisplayItem): number[] {
+    if (item.kind === "message") return [item.message.ordinal];
+    const source = ui.sortNewestFirst
+      ? [...item.messages].reverse()
+      : item.messages;
+    return source.map((message) => message.ordinal);
+  }
+
   $effect(() => {
     const follow = ui.followLatest;
     if (!follow) {
@@ -757,30 +755,197 @@
     return normalDisplayItemsAsc;
   }
 
-  let highlightQuery = $derived(
-    inSessionSearch.isOpen && inSessionSearch.query.trim().length > 0
-      ? inSessionSearch.query
-      : "",
-  );
+  let searchRevealKey = $derived.by(() => {
+    const match = inSessionSearch.resolvedCurrent;
+    return match ? `${match.ordinal}:${match.blockKey}:${match.occurrence}` : "";
+  });
+
+  async function revealSearchMatch(match: Match, sessionId: string, reqId: number): Promise<boolean> {
+    return revealMatch({
+      ordinal: match.ordinal,
+      blockKey: match.blockKey,
+      getContainer: () => containerRef,
+      isCurrent: () => !destroyed && reqId === lastScrollRequest &&
+        messages.sessionId === sessionId && sessions.activeSessionId === sessionId &&
+        inSessionSearch.isActive,
+      ensureLoaded: (ordinal) => messages.ensureOrdinalLoaded(ordinal),
+      mountMessage: () => {
+        const ascIndex = displayItemsAsc.findIndex((item) => item.ordinals.includes(match.ordinal));
+        if (ascIndex < 0) return Promise.resolve(false);
+        const index = ui.sortNewestFirst ? displayItemsAsc.length - 1 - ascIndex : ascIndex;
+        return scrollToDisplayIndex(index, 0, 0, reqId);
+      },
+      scrollToOffset: (offset) => virtualizer.instance?.scrollToOffset(
+        Math.round(offset), { align: "start" },
+      ),
+      afterUpdate: tick,
+      nextFrame: raf,
+    });
+  }
+
+  $effect(() => {
+    const request = inSessionSearch.navigationRevision;
+    const key = searchRevealKey;
+    const sessionId = messages.sessionId;
+    const count = displayItemsAsc.length;
+    const newestFirst = ui.sortNewestFirst;
+    if (!inSessionSearch.isActive || !sessionId || !containerRef) return;
+    if (!key) {
+      // Active query without a renderable occurrence: drop any pending reveal
+      // so a filtered-out block cannot be mounted or scrolled into view.
+      lastScrollRequest++;
+      return;
+    }
+    void request;
+    void count;
+    void newestFirst;
+    return untrack(() => {
+      const match = inSessionSearch.resolvedCurrent;
+      if (!match) return;
+      const reqId = ++lastScrollRequest;
+      activeFollowScrollRequest = null;
+      ui.selectOrdinal(match.ordinal);
+      ui.setFollowLatest(false);
+      void revealSearchMatch(match, sessionId, reqId).catch((error: unknown) => {
+        if (reqId === lastScrollRequest) console.warn("Could not reveal search occurrence", error);
+      });
+      return () => {
+        if (reqId === lastScrollRequest) lastScrollRequest++;
+      };
+    });
+  });
 
   let effectiveLayout = $derived(
-    resolveMessageLayout(ui.messageLayout, highlightQuery !== ""),
+    resolveMessageLayout(ui.messageLayout, inSessionSearch.isActive),
   );
+
+  let readProgressDivider = $derived.by(() => {
+    const sessionId = messages.sessionId;
+    const currentToken = messages.activeSessionToken;
+    const marker = sessionId
+      ? readProgress.get(sessionId)
+      : null;
+    const latestOrdinal = latestLoadedOrdinal;
+    if (
+      !sessionId ||
+      !currentToken ||
+      !marker ||
+      marker.token === currentToken ||
+      latestOrdinal === null
+    ) {
+      return null;
+    }
+
+    const unreadBoundary = unreadBoundaryOrdinal(latestOrdinal);
+
+    const items = ui.sortNewestFirst
+      ? [...displayItemsAsc].reverse()
+      : displayItemsAsc;
+
+    if (ui.sortNewestFirst) {
+      if (messages.activeSessionUnreadOrdinal === null) {
+        return null;
+      }
+      const dividerBoundary = marker.ordinal !== null &&
+          unreadBoundary === marker.ordinal + 1
+        ? marker.ordinal
+        : unreadBoundary;
+      for (const item of items) {
+        for (const ordinal of itemOrdinals(item)) {
+          if (ordinal <= dividerBoundary) {
+            return {
+              ordinal,
+              label: m.read_progress_earlier_messages(),
+            };
+          }
+        }
+      }
+      return null;
+    }
+
+    for (const item of items) {
+      for (const ordinal of itemOrdinals(item)) {
+        if (ordinal >= unreadBoundary) {
+          return {
+            ordinal,
+            label: m.read_progress_new_messages(),
+          };
+        }
+      }
+    }
+    return null;
+  });
+
+  // Arm position restore when entering a session that has a remembered
+  // anchor. Deep links and search navigation (pendingScrollOrdinal) and
+  // follow-latest win over restore.
+  $effect(() => {
+    const sid = messages.sessionId;
+    untrack(() => {
+      // Invalidate scroll work queued for the previous session so its
+      // retry loop cannot scroll the new session's list.
+      lastScrollRequest += 1;
+      activeRestoreRequest = null;
+      if (!sid) {
+        restoreTarget = null;
+        return;
+      }
+      if (restoreTarget?.sessionId === sid) return;
+      const anchor = scrollMemory.get(sid);
+      const pendingMatchesSession =
+        ui.pendingScrollOrdinal !== null &&
+        (ui.pendingScrollSession === null ||
+          ui.pendingScrollSession === sid);
+      restoreTarget =
+        anchor && !pendingMatchesSession && !ui.followLatest
+          ? { sessionId: sid, anchor }
+          : null;
+    });
+  });
+
+  // Restore the remembered position once messages have loaded.
+  $effect(() => {
+    const sid = messages.sessionId;
+    const loading = messages.loading;
+    const count = displayItemsAsc.length;
+    untrack(() => {
+      const target = restoreTarget;
+      if (!target || target.sessionId !== sid) return;
+      if (loading || count === 0) return;
+      restoreTarget = null;
+      if (ui.followLatest || ui.pendingScrollOrdinal !== null) return;
+      void restoreScrollAnchor(target.anchor);
+    });
+  });
 </script>
 
 {#if !sessions.activeSessionId}
-  <div class="empty-state">
-    <div class="empty-icon">
+  <EmptyState title={m.message_list_empty()}>
+    {#snippet icon()}
       <MessageSquareIcon size="36" strokeWidth="1.5" aria-hidden="true" />
-    </div>
-    <p class="empty-text">{m.message_list_empty()}</p>
-  </div>
+    {/snippet}
+  </EmptyState>
 {:else if messages.loading && messages.messages.length === 0}
-  <div class="empty-state">
-    <p class="empty-text">{m.message_list_loading()}</p>
-  </div>
+  <EmptyState title={m.message_list_loading()} />
+{:else if sessions.activeSessionNotFound && messages.messages.length === 0}
+  <EmptyState
+    title={m.message_list_session_not_found()}
+    description={m.message_list_session_not_found_hint()}
+  >
+    {#snippet icon()}
+      <CircleQuestionMarkIcon size="36" strokeWidth="1.5" aria-hidden="true" />
+    {/snippet}
+    <Button size="sm" onclick={() => void sessions.retryActiveSession()}>
+      {m.message_list_session_not_found_retry()}
+    </Button>
+  </EmptyState>
 {:else}
-  <SessionFindBar />
+  <SessionFindView
+    items={displayItemsAsc}
+    totalSize={virtualizer.instance?.getTotalSize() ?? 0}
+    newestFirst={ui.sortNewestFirst}
+    rowOffset={(index) => virtualizer.instance?.getOffsetForIndex(index, "start")?.[0] ?? index * 120}
+  >
   <div
     class="message-list-scroll layout-{effectiveLayout}"
     bind:this={containerRef}
@@ -803,7 +968,6 @@
             class:selected={ui.selectedOrdinal !== null &&
               item.ordinals.includes(ui.selectedOrdinal)}
             data-index={row.index}
-            data-message-ordinals={item.ordinals.join(",")}
             style="position: absolute; top: 0; left: 0; width: 100%; transform: translateY({row.start}px);"
             use:measureElement={virtualizer.instance}
             onclick={() => {
@@ -812,18 +976,27 @@
               ui.selectOrdinal(item.ordinals[0]!);
             }}
           >
+            {#if item.kind !== "tool-group" && readProgressDivider !== null && item.ordinals.includes(readProgressDivider.ordinal)}
+              <div class="read-progress-divider" role="separator" aria-label={m.read_progress_boundary()}>
+                {readProgressDivider.label}
+              </div>
+            {/if}
             {#if item.kind === "tool-group"}
               <ToolCallGroup
                 messages={item.messages}
                 timestamp={item.timestamp}
-                highlightQuery={highlightQuery}
-                currentHighlightOrdinal={inSessionSearch.currentOrdinal}
+                searchable={true}
+                sortNewestFirst={ui.sortNewestFirst}
+                divider={readProgressDivider !== null && item.ordinals.includes(readProgressDivider.ordinal)
+                  ? readProgressDivider
+                  : undefined}
               />
             {:else if item.message.is_compact_boundary}
               <CompactBoundaryDivider message={item.message} />
-            {:else if item.message.is_system && item.message.source_subtype === 'fork_boundary'}
+            {:else if item.message.is_system
+              && item.message.source_subtype === "fork_boundary"}
               <ForkBoundaryDivider message={item.message} />
-            {:else if item.message.is_system && item.message.source_subtype && item.message.source_subtype !== 'compact_boundary'}
+            {:else if isSystemBoundaryMessage(item.message)}
               <SystemBoundaryCard
                 subtype={item.message.source_subtype}
                 content={item.message.content}
@@ -832,8 +1005,7 @@
             {:else}
               <MessageContent
                 message={item.message}
-                highlightQuery={highlightQuery}
-                isCurrentHighlight={inSessionSearch.currentOrdinal === item.message.ordinal}
+                searchOrdinal={item.message.ordinal}
               />
             {/if}
           </div>
@@ -841,6 +1013,7 @@
       {/each}
     </div>
   </div>
+  </SessionFindView>
 {/if}
 
 <style>
@@ -863,23 +1036,26 @@
     border-radius: var(--radius-md, 6px);
   }
 
-  .empty-state {
-    flex: 1;
+  .read-progress-divider {
     display: flex;
-    flex-direction: column;
     align-items: center;
-    justify-content: center;
-    color: var(--text-muted);
-    gap: 12px;
+    gap: 8px;
+    margin-bottom: 8px;
+    color: var(--accent-blue);
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
   }
 
-  .empty-icon {
-    opacity: 0.25;
-  }
-
-  .empty-text {
-    font-size: 14px;
-    font-weight: 500;
+  .read-progress-divider::before,
+  .read-progress-divider::after {
+    content: "";
+    height: 1px;
+    flex: 1;
+    background: color-mix(
+      in srgb, var(--accent-blue) 35%, transparent
+    );
   }
 
   /* ── Compact layout ── */

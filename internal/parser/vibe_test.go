@@ -1,8 +1,8 @@
 package parser
 
 import (
-	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"os"
 	"path/filepath"
 	"testing"
@@ -38,7 +38,7 @@ func parseVibeTestSession(t *testing.T, path string, fileInfo FileInfo) (ParseRe
 func discoverVibeTestSessions(t *testing.T, root string) []DiscoveredFile {
 	t.Helper()
 	provider := newVibeTestProvider(t, root)
-	sources, err := provider.Discover(context.Background())
+	sources, err := provider.Discover(t.Context())
 	require.NoError(t, err)
 	if len(sources) == 0 {
 		return nil
@@ -72,11 +72,11 @@ func TestDiscoverVibeSessions(t *testing.T) {
 
 	// Create invalid directory (no messages.jsonl)
 	invalidDir := filepath.Join(tmpDir, "session_invalid")
-	require.NoError(t, os.MkdirAll(invalidDir, 0755))
+	require.NoError(t, os.MkdirAll(invalidDir, 0o755))
 
 	// Create directory without session prefix
 	otherDir := filepath.Join(tmpDir, "other_dir")
-	require.NoError(t, os.MkdirAll(otherDir, 0755))
+	require.NoError(t, os.MkdirAll(otherDir, 0o755))
 
 	// Run discovery
 	discovered := discoverVibeTestSessions(t, tmpDir)
@@ -100,7 +100,7 @@ func TestDiscoverVibeSessionsMultiple(t *testing.T) {
 
 	// Create a directory without messages.jsonl
 	invalidDir := filepath.Join(tmpDir, "session_20260613_130000_ddd")
-	require.NoError(t, os.MkdirAll(invalidDir, 0755))
+	require.NoError(t, os.MkdirAll(invalidDir, 0o755))
 
 	// Run discovery
 	discovered := discoverVibeTestSessions(t, tmpDir)
@@ -122,7 +122,7 @@ func TestDiscoverVibeSessionsEmptyDir(t *testing.T) {
 	files := discoverVibeTestSessions(t, tmpDir)
 
 	// Should return empty slice
-	assert.Len(t, files, 0)
+	assert.Empty(t, files)
 }
 
 func TestDiscoverVibeSessionsNonExistentDir(t *testing.T) {
@@ -130,7 +130,7 @@ func TestDiscoverVibeSessionsNonExistentDir(t *testing.T) {
 	files := discoverVibeTestSessions(t, "/nonexistent/path")
 
 	// Should return empty slice without error
-	assert.Len(t, files, 0)
+	assert.Empty(t, files)
 }
 
 func TestFindVibeSourceFile(t *testing.T) {
@@ -190,11 +190,11 @@ func TestParseVibeSession(t *testing.T) {
 	// Verify session metadata
 	assert.Equal(t, AgentVibe, result.Session.Agent)
 	assert.NotEmpty(t, result.Session.ID)
-	assert.True(t, len(result.Session.ID) > 0)
+	assert.NotEmpty(t, result.Session.ID)
 
 	// Verify messages
 	require.NotEmpty(t, result.Messages)
-	assert.Equal(t, 5, len(result.Messages))
+	assert.Len(t, result.Messages, 5)
 
 	// Verify first message is user
 	assert.Equal(t, RoleUser, result.Messages[0].Role)
@@ -229,9 +229,9 @@ func TestParseVibeSession(t *testing.T) {
 	assert.Equal(t, 0, usageEvent.CacheCreationInputTokens)
 	assert.Equal(t, 0, usageEvent.CacheReadInputTokens)
 	assert.Equal(t, 0, usageEvent.ReasoningTokens)
-	assert.Nil(t, usageEvent.CostUSD)
-	assert.Equal(t, "", usageEvent.CostStatus)
-	assert.Equal(t, "", usageEvent.CostSource)
+	assert.Nil(t, usageEvent.Cost)
+	assert.Empty(t, usageEvent.CostStatus)
+	assert.Empty(t, usageEvent.CostSource)
 	assert.Equal(t, "session:vibe:abc123def-0000-0000-0000-000000000000", usageEvent.DedupKey)
 }
 
@@ -247,14 +247,14 @@ func TestParseVibeSessionWithTools(t *testing.T) {
 
 	// Verify messages
 	require.NotEmpty(t, result.Messages)
-	assert.Equal(t, 4, len(result.Messages))
+	assert.Len(t, result.Messages, 4)
 
 	// Verify tool calls were parsed
 	hasToolCalls := false
 	for _, msg := range result.Messages {
 		if len(msg.ToolCalls) > 0 {
 			hasToolCalls = true
-			assert.Equal(t, 1, len(msg.ToolCalls))
+			assert.Len(t, msg.ToolCalls, 1)
 			assert.Equal(t, "call_001", msg.ToolCalls[0].ToolUseID)
 			assert.Equal(t, "read_file", msg.ToolCalls[0].ToolName)
 			assert.Equal(t, "Read", msg.ToolCalls[0].Category)
@@ -271,15 +271,15 @@ func TestParseVibeSessionWithTools(t *testing.T) {
 		if len(msg.ToolResults) > 0 {
 			hasToolResults = true
 			assert.Equal(t, RoleUser, msg.Role)
-			assert.Equal(t, "", msg.Content)
-			assert.Equal(t, 1, len(msg.ToolResults))
+			assert.Empty(t, msg.Content)
+			assert.Len(t, msg.ToolResults, 1)
 			assert.Equal(t, "call_001", msg.ToolResults[0].ToolUseID)
 
 			// ContentRaw must be valid JSON (a quoted string) so
 			// DecodeContent can surface the plain-text tool output.
 			var decoded string
-			require.NoError(
-				t, json.Unmarshal(
+			require.NoError(t,
+				json.Unmarshal(
 					[]byte(msg.ToolResults[0].ContentRaw), &decoded,
 				),
 			)
@@ -290,8 +290,8 @@ func TestParseVibeSessionWithTools(t *testing.T) {
 	assert.True(t, hasToolResults, "Expected tool results to be linked")
 
 	for _, msg := range result.Messages {
-		assert.NotEqual(
-			t, RoleType("tool"), msg.Role,
+		assert.NotEqual(t,
+			RoleType("tool"), msg.Role,
 			"raw tool-result records must not appear as standalone messages",
 		)
 	}
@@ -308,7 +308,7 @@ func TestParseVibeSessionEmpty(t *testing.T) {
 	require.NoError(t, err)
 
 	// Empty file should have no messages
-	assert.Len(t, result.Messages, 0)
+	assert.Empty(t, result.Messages)
 	assert.Equal(t, 0, result.Session.MessageCount)
 }
 
@@ -520,6 +520,55 @@ func TestParseVibeSessionModelFromConfig(t *testing.T) {
 	assert.Equal(t, 40, usageEvent.OutputTokens)
 }
 
+// TestParseVibeSessionCachedTokens verifies that the provider cache-hit count
+// recorded under stats.session_cached_tokens is split out into the cache-read
+// field and subtracted from input tokens, since Vibe reports it as a subset of
+// session_prompt_tokens (OpenAI/Mistral wire shape). Counting it in both places
+// would double-bill the cached prefix.
+func TestParseVibeSessionCachedTokens(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	content := `{"role": "user", "content": "test message", "message_id": "1"}
+{"role": "assistant", "content": "test response", "message_id": "2"}
+`
+	metaContent := `{
+		"session_id": "test-session-cached",
+		"start_time": "2026-06-13T10:00:00Z",
+		"end_time": "2026-06-13T10:05:00Z",
+		"title": "Test session with cached tokens",
+		"config": {"active_model": "mistral-medium-3.5"},
+		"stats": {
+			"session_prompt_tokens": 100,
+			"session_completion_tokens": 40,
+			"session_cached_tokens": 30,
+			"context_tokens": 140,
+			"last_turn_cached_tokens": 10,
+			"session_total_llm_tokens": 140
+		}
+	}
+`
+	files := map[string]string{
+		"session_test/messages.jsonl": content,
+		"session_test/meta.json":      metaContent,
+	}
+	setupFileSystem(t, tmpDir, files)
+
+	path := filepath.Join(tmpDir, "session_test", "messages.jsonl")
+	fileInfo := FileInfo{Path: path, Mtime: time.Now().UnixNano()}
+
+	result, err := parseVibeTestSession(t, path, fileInfo)
+	require.NoError(t, err)
+
+	require.Len(t, result.UsageEvents, 1)
+	usageEvent := result.UsageEvents[0]
+	assert.Equal(t, "mistral-medium-3.5", usageEvent.Model)
+	// Input is the fresh (non-cached) prefix: 100 - 30.
+	assert.Equal(t, 70, usageEvent.InputTokens)
+	assert.Equal(t, 40, usageEvent.OutputTokens)
+	assert.Equal(t, 30, usageEvent.CacheReadInputTokens)
+	assert.Equal(t, 0, usageEvent.CacheCreationInputTokens)
+}
+
 // TestParseVibeSessionInjectedUserExcluded verifies that an injected user
 // record (system context) is marked system and excluded from both the first
 // message and the user-message count, so it cannot masquerade as the user's
@@ -564,17 +613,19 @@ func TestParseVibeSessionToolResultNotCountedAsUser(t *testing.T) {
 	assert.Equal(t, "Read the README file", result.Session.FirstMessage)
 }
 
-// TestParseVibeSessionMalformedMetaRecoversID verifies that when meta.json has
-// a valid session_id but a malformed optional field (a bad timestamp here that
-// fails the full parse), the canonical ID is still recovered rather than
-// dropping to the directory-name fallback, which would abandon the canonical
-// session row.
-func TestParseVibeSessionMalformedMetaRecoversID(t *testing.T) {
+// TestParseVibeSessionMalformedMetaRecoversIdentity verifies that a malformed
+// optional field does not discard independent identity-bearing metadata.
+func TestParseVibeSessionMalformedMetaRecoversIdentity(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	content := `{"role": "user", "content": "hello", "message_id": "1"}
 `
-	metaContent := `{"session_id": "uuid-canonical-1", "start_time": "not-a-timestamp"}`
+	metaContent := `{
+		"session_id": "uuid-canonical-1",
+		"start_time": "not-a-timestamp",
+		"git_branch": "feature/fallback",
+		"environment": {"working_directory": "/workspace/sample-project"}
+	}`
 	setupFileSystem(t, tmpDir, map[string]string{
 		"session_dir/messages.jsonl": content,
 		"session_dir/meta.json":      metaContent,
@@ -588,6 +639,9 @@ func TestParseVibeSessionMalformedMetaRecoversID(t *testing.T) {
 
 	assert.Equal(t, "vibe:uuid-canonical-1", result.Session.ID)
 	assert.Equal(t, "uuid-canonical-1", result.Session.SourceSessionID)
+	assert.Equal(t, "/workspace/sample-project", result.Session.Cwd)
+	assert.Equal(t, "sample_project", result.Session.Project)
+	assert.Equal(t, "feature/fallback", result.Session.GitBranch)
 	// The malformed optional fields are skipped, so no usage event is emitted.
 	assert.Empty(t, result.UsageEvents)
 }
@@ -647,10 +701,10 @@ func TestConvertVibeMessageToolCalls(t *testing.T) {
 		Role: "assistant",
 		ToolCalls: []VibeToolCall{
 			{ID: "call_obj", Function: VibeToolCallFunction{
-				Name: "read_file", Arguments: json.RawMessage(`{"path":"a.txt"}`),
+				Name: "read_file", Arguments: jsontext.Value(`{"path":"a.txt"}`),
 			}},
 			{ID: "call_str", Function: VibeToolCallFunction{
-				Name: "run_shell_command", Arguments: json.RawMessage(`"{\"cmd\":\"ls\"}"`),
+				Name: "run_shell_command", Arguments: jsontext.Value(`"{\"cmd\":\"ls\"}"`),
 			}},
 		},
 	}
@@ -696,11 +750,11 @@ func TestParseRealVibeSession(t *testing.T) {
 	// Verify basic session metadata
 	assert.Equal(t, AgentVibe, result.Session.Agent)
 	assert.NotEmpty(t, result.Session.ID)
-	assert.True(t, len(result.Session.ID) > 0)
+	assert.NotEmpty(t, result.Session.ID)
 
 	// Should have parsed messages
 	require.NotEmpty(t, result.Messages)
-	assert.Greater(t, len(result.Messages), 0)
+	assert.NotEmpty(t, result.Messages)
 
 	// Verify timestamps from meta.json
 	assert.False(t, result.Session.StartedAt.IsZero())

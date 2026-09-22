@@ -4,7 +4,8 @@ package main
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"fmt"
 	"os"
 	"strings"
@@ -42,11 +43,11 @@ const (
 //     in SQL; suffix matches come back in most-recent order. If
 //     multiple suffix matches exist without an exact row, the
 //     most recent wins and an ambiguity warning is emitted.
-//  3. Canonical disk probe: when input begins with a registered
-//     agent prefix, strip the prefix and ask that agent's disk source
-//     lookup so a truly canonical-but-unsynced ID on disk still resolves.
-//  4. Raw disk probe: ask every file-based agent's disk source lookup
-//     with the raw input; the first hit yields "<prefix><input>".
+//  3. Canonical provider probe: when input begins with a registered
+//     agent prefix, strip the prefix and ask that agent's source lookup
+//     so a truly canonical-but-unsynced ID still resolves.
+//  4. Raw provider probe: ask every file-backed agent plus Devin for a
+//     raw-ID source lookup; the first hit yields "<prefix><input>".
 //  5. No match anywhere: returned unchanged with known=false.
 //
 // known reports whether resolution found evidence for the ID.
@@ -88,7 +89,7 @@ func resolveRawSessionID(
 	// before resolving the source (which rejects IDs with
 	// colons via IsValidSessionID).
 	for _, def := range parser.Registry {
-		if def.IDPrefix == "" || !def.FileBased ||
+		if def.IDPrefix == "" ||
 			!agentHasDiskSourceLookup(def) {
 			continue
 		}
@@ -109,7 +110,7 @@ func resolveRawSessionID(
 	// colon-bearing raw IDs (Kimi, OpenClaw, Kiro IDE) may
 	// match.
 	for _, def := range parser.Registry {
-		if !def.FileBased || !agentHasDiskSourceLookup(def) {
+		if !agentHasDiskSourceLookup(def) {
 			continue
 		}
 		for _, dir := range agentDirs[def.Type] {
@@ -122,16 +123,19 @@ func resolveRawSessionID(
 	return input, false
 }
 
-// agentHasDiskSourceLookup reports whether a session source can be located on
-// disk by raw ID for the agent, via its provider-authoritative provider's
-// FindSource.
+// agentHasDiskSourceLookup reports whether a provider-authoritative session
+// source can be located by raw ID through the provider facade's FindSource path.
 func agentHasDiskSourceLookup(def parser.AgentDef) bool {
 	if parser.ProviderMigrationModes()[def.Type] !=
 		parser.ProviderMigrationProviderAuthoritative {
 		return false
 	}
-	_, ok := parser.ProviderFactoryByType(def.Type)
-	return ok
+	factory, ok := parser.ProviderFactoryByType(def.Type)
+	if !ok {
+		return false
+	}
+	return factory.Capabilities().Source.FindSource ==
+		parser.CapabilitySupported
 }
 
 // findAgentSourceFile resolves a raw agent session ID to an on-disk source path
@@ -214,9 +218,8 @@ func runTokenUse(args []string) {
 		os.Exit(tokenUseExitErr)
 	}
 	if out != nil {
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		if encErr := enc.Encode(out); encErr != nil {
+		enc := jsontext.NewEncoder(os.Stdout, jsontext.WithIndent("  "))
+		if encErr := json.MarshalEncode(enc, out); encErr != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", encErr)
 			os.Exit(tokenUseExitErr)
 		}
@@ -241,7 +244,7 @@ func sessionUsageData(sessionID string) (*sessionUsageOutput, int, error) {
 		appCfg,
 		archiveQueryPolicy{
 			AutoStart:            true,
-			ReadOnlyDaemon:       archiveQueryRejectReadOnlyDaemon,
+			ReadOnlyDaemon:       archiveQueryUseReadOnlyDaemon,
 			DirectReadOnlyAction: "refresh session usage directly",
 		},
 	)
@@ -249,5 +252,5 @@ func sessionUsageData(sessionID string) (*sessionUsageOutput, int, error) {
 		return nil, tokenUseExitErr, err
 	}
 	defer closeArchiveQueryBackend(cleanup)
-	return backend.SessionUsage(ctx, sessionID)
+	return backend.SessionUsage(ctx, sessionUsageQuery{SessionID: sessionID})
 }

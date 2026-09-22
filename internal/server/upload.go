@@ -86,9 +86,7 @@ func commitUpload(upload stagedUpload) (committedUpload, error) {
 	switch {
 	case err == nil:
 		if !info.Mode().IsRegular() {
-			return state, fmt.Errorf(
-				"committing upload: destination is not a regular file",
-			)
+			return state, errors.New("committing upload: destination is not a regular file")
 		}
 		backupPath, err := createUploadBackupPath(upload.finalPath)
 		if err != nil {
@@ -112,7 +110,7 @@ func commitUpload(upload stagedUpload) (committedUpload, error) {
 		if state.hadPrevious {
 			if rbErr := os.Rename(state.backupPath, upload.finalPath); rbErr != nil {
 				return state, fmt.Errorf(
-					"committing upload: %w (restore previous upload failed: %v)",
+					"committing upload: %w (restore previous upload failed: %w)",
 					err, rbErr,
 				)
 			}
@@ -177,7 +175,6 @@ func sessionBatchWriteFromParsed(
 		ID:                   sess.ID,
 		Project:              sess.Project,
 		Machine:              sess.Machine,
-		Agent:                string(sess.Agent),
 		MessageCount:         sess.MessageCount,
 		UserMessageCount:     sess.UserMessageCount,
 		ParentSessionID:      strPtr(sess.ParentSessionID),
@@ -191,6 +188,7 @@ func sessionBatchWriteFromParsed(
 		FileMtime:            int64Ptr(sess.File.Mtime),
 		FileHash:             strPtr(sess.File.Hash),
 	}
+	db.ApplyParsedSessionIdentity(&dbSess, sess)
 	if sess.FirstMessage != "" {
 		dbSess.FirstMessage = &sess.FirstMessage
 	}
@@ -206,20 +204,29 @@ func sessionBatchWriteFromParsed(
 	for i, m := range msgs {
 		hasCtx, hasOut := m.TokenPresence()
 		dbMsgs[i] = db.Message{
-			SessionID:        sess.ID,
-			Ordinal:          m.Ordinal,
-			Role:             string(m.Role),
-			Content:          m.Content,
-			Timestamp:        timeutil.Format(m.Timestamp),
-			HasThinking:      m.HasThinking,
-			HasToolUse:       m.HasToolUse,
-			ContentLength:    m.ContentLength,
-			Model:            m.Model,
-			TokenUsage:       m.TokenUsage,
-			ContextTokens:    m.ContextTokens,
-			OutputTokens:     m.OutputTokens,
-			HasContextTokens: hasCtx,
-			HasOutputTokens:  hasOut,
+			SessionID:         sess.ID,
+			Ordinal:           m.Ordinal,
+			Role:              string(m.Role),
+			Content:           m.Content,
+			Timestamp:         timeutil.Format(m.Timestamp),
+			HasThinking:       m.HasThinking,
+			HasToolUse:        m.HasToolUse,
+			ContentLength:     m.ContentLength,
+			IsSystem:          m.IsSystem,
+			IsCompactBoundary: m.IsCompactBoundary,
+			Model:             m.Model,
+			ReasoningEffort:   m.ReasoningEffort,
+			TokenUsage:        m.TokenUsage,
+			PromptSource:      m.PromptSource,
+			SourceType:        m.SourceType,
+			SourceSubtype:     m.SourceSubtype,
+			SourceUUID:        m.SourceUUID,
+			SourceParentUUID:  m.SourceParentUUID,
+			IsSidechain:       m.IsSidechain,
+			ContextTokens:     m.ContextTokens,
+			OutputTokens:      m.OutputTokens,
+			HasContextTokens:  hasCtx,
+			HasOutputTokens:   hasOut,
 		}
 	}
 

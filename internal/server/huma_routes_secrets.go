@@ -10,10 +10,11 @@ import (
 )
 
 func (s *Server) registerSecretsRoutes() {
-	group := newRouteGroup(s.api, "/api/v1/secrets", "Secrets")
+	group := huma.NewGroup(s.api, "/api/v1/secrets")
+	configureRouteGroup(group, "Secrets")
 
-	get(s, group, "", "List secret findings", s.humaListSecrets)
-	stream(s, group, http.MethodPost, "/scan", "Scan secrets", s.humaScanSecrets)
+	s.get(group, "", "List secret findings", s.humaListSecrets)
+	s.stream(group, http.MethodPost, "/scan", "Scan secrets", s.humaScanSecrets)
 }
 
 type secretListInput struct {
@@ -86,7 +87,7 @@ func (s *Server) humaScanSecrets(
 		stream, ok := newHumaSSEStream(hctx)
 		if !ok {
 			writeHumaJSON(hctx, http.StatusInternalServerError,
-				apiErrorResponse{Message: "streaming not supported"})
+				apiResponseError{Message: "streaming not supported"})
 			return
 		}
 		summary, err := s.sessions.ScanSecrets(ctx, service.SecretScanInput{
@@ -99,9 +100,20 @@ func (s *Server) humaScanSecrets(
 			stream.SendJSON("progress", p)
 		})
 		if err != nil {
+			// The scan commits per-session results as it walks, so a
+			// failure or cancellation partway through has already
+			// changed eligibility for everything it scanned.
+			if summary != nil && summary.Scanned > 0 {
+				s.notifySessionMutation()
+			}
 			stream.SendJSON("error", map[string]string{"error": err.Error()})
 			return
 		}
+		// A completed scan changes extraction eligibility in both
+		// directions — new findings retract generated entries, fresh
+		// clean stamps make sessions extractable — and no sync activity
+		// follows a delegated scan to surface either.
+		s.notifySessionMutation()
 		stream.SendJSON("summary", summary)
 	}}, nil
 }

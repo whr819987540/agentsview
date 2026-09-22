@@ -1,12 +1,415 @@
-import { describe, expect, it } from "vite-plus/test";
+// @vitest-environment jsdom
+import { afterEach, describe, expect, it, vi } from "vite-plus/test";
+import { fireEvent, screen } from "@testing-library/svelte";
+import { mount, tick, unmount } from "svelte";
+vi.mock("../../feature-flags.js", () => ({
+  PROJECT_MAPPING_WORKSPACE_ENABLED: true,
+}));
+import { activity } from "../../stores/activity.svelte.js";
+import { sessions } from "../../stores/sessions.svelte.js";
+import { router } from "../../stores/router.svelte.js";
+import { yokedDates } from "../../stores/yokedDates.svelte.js";
 import source from "./ActivityPage.svelte?raw";
+// @ts-ignore
+import ActivityPage from "./ActivityPage.svelte";
+import type { Report } from "../../api/types.js";
+import { testMoney } from "../../test/money.js";
 
-describe("ActivityPage refresh control layout", () => {
-  it("keeps the shared refresh control inline with the toolbar filters", () => {
-    expect(source).toContain("<RefreshControl");
-    expect(source).toContain("activity.lastUpdatedAt");
-    expect(source).not.toContain("refresh-slot");
-    expect(source).not.toContain("margin-left: auto");
+async function flushEffects() {
+  await tick();
+  await Promise.resolve();
+  await tick();
+}
+
+function stubActivityPageCollaborators() {
+  vi.stubGlobal(
+    "ResizeObserver",
+    class {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    },
+  );
+  vi.spyOn(activity, "attach").mockReturnValue(() => {});
+  vi.spyOn(activity, "loadFilterOptions").mockResolvedValue(true);
+  vi.spyOn(activity, "load").mockResolvedValue(true);
+}
+
+async function openCalendar(triggerLabel: string) {
+  await fireEvent.click(screen.getByRole("button", { name: triggerLabel }));
+  await fireEvent.click(screen.getByRole("radio", { name: "Calendar" }));
+}
+
+function projectReport(): Report {
+  return {
+    timezone: "UTC",
+    range_start: "2026-07-01T00:00:00Z",
+    range_end: "2026-07-02T00:00:00Z",
+    bucket_unit: "hour",
+    bucket_seconds: 3600,
+    bucket_count: 24,
+    partial: false,
+    as_of: null,
+    effective_end: "2026-07-02T00:00:00Z",
+    elapsed_bucket_count: 24,
+    buckets: [],
+    peak: { agents: 0, at: null },
+    interactive_peak: { agents: 0, at: null },
+    subagent_peak: { agents: 0, at: null },
+    automated_peak: { agents: 0, at: null },
+    totals: {
+      active_minutes: 0,
+      idle_minutes: 0,
+      agent_minutes: 20,
+      sessions: 1,
+      untimed_sessions: 0,
+      distinct_projects: 1,
+      distinct_models: 0,
+      output_tokens: 0,
+      cost: testMoney(0),
+      subagent_agent_minutes: 0,
+      automated_agent_minutes: 0,
+      subagent_cost: testMoney(0),
+      automated_cost: testMoney(0),
+      automated_sessions: 0,
+      subagent_sessions: 0,
+      interactive_agent_minutes: 20,
+      interactive_cost: testMoney(0),
+      interactive_sessions: 1,
+    },
+    by_project: [
+      {
+        key: "wrong-project",
+        project_key: "pl1:sha256:wrong",
+        agent_minutes: 20,
+        cost: testMoney(0),
+        interactive_agent_minutes: 20,
+        subagent_agent_minutes: 0,
+        automated_agent_minutes: 0,
+        interactive_cost: testMoney(0),
+        subagent_cost: testMoney(0),
+        automated_cost: testMoney(0),
+      },
+    ],
+    by_model: [],
+    by_agent: [],
+    by_session: [],
+    sessions_total: 0,
+    projects: {},
+  } as Report;
+}
+
+function calendarDay(label: string): HTMLButtonElement {
+  return screen.getByRole("button", { name: label }) as HTMLButtonElement;
+}
+
+async function selectFirstActivityRange() {
+  const target = screen.getByRole("button", {
+    name: "Filter sessions active in this time range",
+  });
+  await fireEvent.pointerDown(target, { button: 0 });
+  await fireEvent.pointerUp(window);
+}
+
+it("shows machine labels without full IDs crowding the menu and filters by ID", async () => {
+  stubActivityPageCollaborators();
+  const machine = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+  activity.machines = [machine];
+  sessions.machineLabels = { [machine]: "Workstation" };
+  const component = mount(ActivityPage, { target: document.body });
+  try {
+    await flushEffects();
+    await fireEvent.click(screen.getByTitle("Filter by machine"));
+    const option = screen.getByRole("option", { name: "Workstation" });
+    await fireEvent.mouseDown(option);
+    expect(activity.machine).toBe(machine);
+  } finally {
+    unmount(component);
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    document.body.innerHTML = "";
+    activity.machines = [];
+    activity.setMachine("");
+    sessions.machineLabels = {};
+  }
+});
+
+it("distinguishes machines that share a label by a short ID and selects the right one", async () => {
+  stubActivityPageCollaborators();
+  const first = "aaaaaaaa111111111111111111111111";
+  const second = "bbbbbbbb222222222222222222222222";
+  const unique = "cccccccc333333333333333333333333";
+  activity.machines = [first, second, unique];
+  sessions.machineLabels = { [first]: "Workstation", [second]: "Workstation", [unique]: "Laptop" };
+  const component = mount(ActivityPage, { target: document.body });
+  try {
+    await flushEffects();
+    await fireEvent.click(screen.getByTitle("Filter by machine"));
+    expect(screen.getByRole("option", { name: "Workstation aaaaaaaa" })).toBeTruthy();
+    expect(screen.getByRole("option", { name: "Laptop" })).toBeTruthy();
+    await fireEvent.mouseDown(screen.getByRole("option", { name: "Workstation bbbbbbbb" }));
+    expect(activity.machine).toBe(second);
+    await flushEffects();
+    expect(screen.getByTitle("Filter by machine").textContent).toContain("Workstation (bbbbbbbb)");
+  } finally {
+    await unmount(component);
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    document.body.innerHTML = "";
+    activity.machines = [];
+    activity.setMachine("");
+    sessions.machineLabels = {};
+  }
+});
+
+it("falls back to the ID tail when same-label machines share an ID prefix", async () => {
+  stubActivityPageCollaborators();
+  const first = "host-prod-east-00000001";
+  const second = "host-prod-east-00000002";
+  activity.machines = [first, second];
+  sessions.machineLabels = { [first]: "Build box", [second]: "Build box" };
+  const component = mount(ActivityPage, { target: document.body });
+  try {
+    await flushEffects();
+    await fireEvent.click(screen.getByTitle("Filter by machine"));
+    expect(screen.getByRole("option", { name: "Build box …00000001" })).toBeTruthy();
+    await fireEvent.mouseDown(screen.getByRole("option", { name: "Build box …00000002" }));
+    expect(activity.machine).toBe(second);
+  } finally {
+    await unmount(component);
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    document.body.innerHTML = "";
+    activity.machines = [];
+    activity.setMachine("");
+    sessions.machineLabels = {};
+  }
+});
+
+describe("ActivityPage refresh control", () => {
+  it("shows report progress in the refresh status instead of the report body", async () => {
+    stubActivityPageCollaborators();
+    activity.report = projectReport();
+    activity.lastUpdatedAt = Date.now() - 3 * 60_000;
+    activity.loading = true;
+    activity.progress = { phase: "scanning_activity", rows_processed: 120 };
+
+    const component = mount(ActivityPage, { target: document.body });
+    await flushEffects();
+
+    const refresh = document.body.querySelector(".activity-refresh");
+    expect(refresh?.textContent).toContain("Processing activity… 120 rows");
+    expect(refresh?.textContent).not.toContain("Updated 3m ago");
+    expect(document.body.querySelector(".activity-content")?.textContent).not.toContain(
+      "Processing activity",
+    );
+
+    activity.progress = { phase: "loading_usage" };
+    await flushEffects();
+    expect(refresh?.textContent).toContain("Loading usage…");
+
+    activity.progress = { phase: "finalizing", sessions_processed: 2 };
+    await flushEffects();
+    expect(refresh?.textContent).toContain("Finalizing report…");
+
+    unmount(component);
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    document.body.innerHTML = "";
+    activity.report = null;
+    activity.loading = false;
+    activity.progress = null;
+    activity.lastUpdatedAt = null;
+  });
+});
+
+describe("ActivityPage breakdown links", () => {
+  let component: ReturnType<typeof mount> | undefined;
+
+  afterEach(() => {
+    if (component) unmount(component);
+    component = undefined;
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    document.body.innerHTML = "";
+    activity.report = null;
+  });
+
+  it("renders project rows as Data links with no reclassify controls", async () => {
+    stubActivityPageCollaborators();
+    activity.report = projectReport();
+
+    component = mount(ActivityPage, { target: document.body });
+    await flushEffects();
+
+    expect(document.body.querySelector('button[aria-label^="Reclassify"]')).toBeNull();
+    const link = document.body.querySelector("a.bar-label") as HTMLAnchorElement;
+    expect(link).toBeTruthy();
+    expect(link.getAttribute("href")).toBe("/data?project_key=pl1%3Asha256%3Awrong");
+    expect(link.getAttribute("title")).toBe("View wrong-project in Data");
+  });
+});
+
+describe("ActivityPage bucket drill-down", () => {
+  let component: ReturnType<typeof mount> | undefined;
+
+  afterEach(() => {
+    if (component) unmount(component);
+    component = undefined;
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    document.body.innerHTML = "";
+    activity.report = null;
+    activity.reportGeneration = 0;
+  });
+
+  it("clears a selected bucket after a same-ID report refresh", async () => {
+    stubActivityPageCollaborators();
+    vi.spyOn(activity, "loadSessionPage").mockResolvedValue(true);
+    activity.reportGeneration = 1;
+    activity.report = {
+      ...projectReport(),
+      report_id: "stable-report",
+      bucket_count: 1,
+      elapsed_bucket_count: 1,
+      buckets: [
+        {
+          start: "2026-07-01T00:00:00Z",
+          end: "2026-07-01T01:00:00Z",
+          max_agents: 1,
+          max_interactive_agents: 1,
+          max_subagent_agents: 0,
+          max_automated_agents: 0,
+          subagent_at_peak: 0,
+          interactive_at_peak: 1,
+          automated_at_peak: 0,
+          agent_minutes: 20,
+          output_tokens: 0,
+          cost: testMoney(0),
+        },
+      ],
+    } as Report;
+
+    component = mount(ActivityPage, { target: document.body });
+    await flushEffects();
+    await selectFirstActivityRange();
+    await flushEffects();
+    expect(activity.loadSessionPage).toHaveBeenCalledWith({
+      bucketRange: { start: 0, end: 1 },
+    });
+    expect(screen.getByTitle("Clear time filter")).toBeTruthy();
+
+    activity.reportGeneration = 2;
+    await flushEffects();
+    expect(screen.queryByTitle("Clear time filter")).toBeNull();
+  });
+
+  it("does not show a bucket selection when its page request fails", async () => {
+    stubActivityPageCollaborators();
+    vi.spyOn(activity, "loadSessionPage").mockResolvedValue(false);
+    activity.report = {
+      ...projectReport(),
+      report_id: "stable-report",
+      bucket_count: 1,
+      elapsed_bucket_count: 1,
+      buckets: [
+        {
+          start: "2026-07-01T00:00:00Z",
+          end: "2026-07-01T01:00:00Z",
+          max_agents: 1,
+          max_interactive_agents: 1,
+          max_subagent_agents: 0,
+          max_automated_agents: 0,
+          subagent_at_peak: 0,
+          interactive_at_peak: 1,
+          automated_at_peak: 0,
+          agent_minutes: 20,
+          output_tokens: 0,
+          cost: testMoney(0),
+        },
+      ],
+    } as Report;
+
+    component = mount(ActivityPage, { target: document.body });
+    await flushEffects();
+    await selectFirstActivityRange();
+    await flushEffects();
+
+    expect(screen.queryByTitle("Clear time filter")).toBeNull();
+  });
+
+  it("does not restore a bucket selection after a report-generation refresh", async () => {
+    stubActivityPageCollaborators();
+    vi.spyOn(activity, "loadSessionPage").mockImplementation(async () => {
+      activity.reportGeneration++;
+      return true;
+    });
+    activity.reportGeneration = 1;
+    activity.report = {
+      ...projectReport(),
+      report_id: "stable-report",
+      bucket_count: 1,
+      elapsed_bucket_count: 1,
+      buckets: [
+        {
+          start: "2026-07-01T00:00:00Z",
+          end: "2026-07-01T01:00:00Z",
+          max_agents: 1,
+          max_interactive_agents: 1,
+          max_subagent_agents: 0,
+          max_automated_agents: 0,
+          subagent_at_peak: 0,
+          interactive_at_peak: 1,
+          automated_at_peak: 0,
+          agent_minutes: 20,
+          output_tokens: 0,
+          cost: testMoney(0),
+        },
+      ],
+    } as Report;
+
+    component = mount(ActivityPage, { target: document.body });
+    await flushEffects();
+    await selectFirstActivityRange();
+    await flushEffects();
+
+    expect(screen.queryByTitle("Clear time filter")).toBeNull();
+  });
+
+  it("keeps the active badge when clearing its page request fails", async () => {
+    stubActivityPageCollaborators();
+    vi.spyOn(activity, "loadSessionPage").mockResolvedValueOnce(true).mockResolvedValueOnce(false);
+    activity.report = {
+      ...projectReport(),
+      report_id: "stable-report",
+      bucket_count: 1,
+      elapsed_bucket_count: 1,
+      buckets: [
+        {
+          start: "2026-07-01T00:00:00Z",
+          end: "2026-07-01T01:00:00Z",
+          max_agents: 1,
+          max_interactive_agents: 1,
+          max_subagent_agents: 0,
+          max_automated_agents: 0,
+          subagent_at_peak: 0,
+          interactive_at_peak: 1,
+          automated_at_peak: 0,
+          agent_minutes: 20,
+          output_tokens: 0,
+          cost: testMoney(0),
+        },
+      ],
+    } as Report;
+
+    component = mount(ActivityPage, { target: document.body });
+    await flushEffects();
+    await selectFirstActivityRange();
+    await flushEffects();
+    await fireEvent.click(screen.getByTitle("Clear time filter"));
+    await flushEffects();
+
+    expect(screen.getByTitle("Clear time filter")).toBeTruthy();
   });
 });
 
@@ -20,12 +423,8 @@ describe("ActivityPage date yoke controls", () => {
   it("yokes week and month selections using resolved period starts", () => {
     expect(source).toContain("startOfIsoWeek(activity.date)");
     expect(source).toContain("startOfMonth(activity.date)");
-    expect(source).not.toContain(
-      "panelDateState(activity.date, addDays(activity.date, 6)",
-    );
-    expect(source).not.toContain(
-      "panelDateState(activity.date, endOfMonth(activity.date)",
-    );
+    expect(source).not.toContain("panelDateState(activity.date, addDays(activity.date, 6)");
+    expect(source).not.toContain("panelDateState(activity.date, endOfMonth(activity.date)");
   });
 
   it("preserves relative range selections as rolling yoke state", () => {
@@ -45,5 +444,185 @@ describe("ActivityPage date yoke controls", () => {
     expect(source).toContain("activity.setCustomRange");
     expect(source).toContain("params.window_days");
     expect(source).toContain('mode: "relative", days: activity.rollingWindowDays');
+  });
+});
+
+describe("ActivityPage date yoke integration", () => {
+  let component: ReturnType<typeof mount> | undefined;
+
+  afterEach(() => {
+    if (component) {
+      unmount(component);
+      component = undefined;
+    }
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    document.body.innerHTML = "";
+    window.history.replaceState(null, "", "/");
+    router.route = "sessions";
+    router.params = {};
+    activity.preset = "day";
+    activity.from = "";
+    activity.to = "";
+    activity.rollingWindowDays = null;
+    yokedDates.setEnabled(false);
+    localStorage.clear();
+    vi.useRealTimers();
+  });
+
+  it("seeds bare Activity from an enabled representable fixed range", async () => {
+    const loadStates: Array<{
+      preset: string;
+      from: string;
+      to: string;
+    }> = [];
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        disconnect() {}
+      },
+    );
+    vi.spyOn(activity, "attach").mockReturnValue(() => {});
+    vi.spyOn(activity, "loadFilterOptions").mockResolvedValue(true);
+    vi.spyOn(activity, "load").mockImplementation(() => {
+      loadStates.push({
+        preset: activity.preset,
+        from: activity.from,
+        to: activity.to,
+      });
+      return Promise.resolve(true);
+    });
+    router.route = "activity";
+    router.params = {};
+    activity.preset = "day";
+    activity.from = "";
+    activity.to = "";
+    activity.rollingWindowDays = null;
+    yokedDates.setEnabled(true);
+    yokedDates.updateFromPanel({
+      from: "2026-06-01",
+      to: "2026-06-07",
+      mode: "fixed",
+    });
+
+    component = mount(ActivityPage, { target: document.body });
+    await flushEffects();
+
+    expect(activity.preset).toBe("custom");
+    expect(activity.from).toBe("2026-06-01");
+    expect(activity.to).toBe("2026-06-07");
+    expect(loadStates[0]).toEqual({
+      preset: "custom",
+      from: "2026-06-01",
+      to: "2026-06-07",
+    });
+  });
+});
+
+describe("ActivityPage calendar day rollover", () => {
+  let component: ReturnType<typeof mount> | undefined;
+
+  afterEach(() => {
+    if (component) {
+      unmount(component);
+      component = undefined;
+    }
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+    document.body.innerHTML = "";
+    window.history.replaceState(null, "", "/");
+    router.route = "sessions";
+    router.params = {};
+    activity.preset = "day";
+    activity.date = "";
+    activity.from = "";
+    activity.to = "";
+    activity.rollingWindowDays = null;
+    activity.report = null;
+    activity.loading = false;
+    activity.error = null;
+    yokedDates.setEnabled(false);
+    localStorage.clear();
+  });
+
+  it("synchronizes the current day when mounting crosses midnight", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 5, 17, 23, 59, 59, 999));
+    stubActivityPageCollaborators();
+    router.route = "activity";
+    activity.date = "2026-06-17";
+
+    component = mount(ActivityPage, { target: document.body });
+    vi.setSystemTime(new Date(2026, 5, 18, 0, 0, 0));
+    await flushEffects();
+    await openCalendar("Jun 17, 2026");
+
+    const june18 = calendarDay("Jun 18, 2026");
+    expect(june18.disabled).toBe(false);
+    await fireEvent.click(june18);
+    expect(activity.date).toBe("2026-06-18");
+  });
+
+  it("enables each new local day at midnight without remounting", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 5, 17, 23, 59, 59, 500));
+    stubActivityPageCollaborators();
+    router.route = "activity";
+    activity.date = "2026-06-17";
+
+    component = mount(ActivityPage, { target: document.body });
+    await flushEffects();
+    await openCalendar("Jun 17, 2026");
+
+    const june18 = calendarDay("Jun 18, 2026");
+    const june19 = calendarDay("Jun 19, 2026");
+    expect(june18.disabled).toBe(true);
+    expect(june19.disabled).toBe(true);
+
+    await vi.advanceTimersByTimeAsync(500);
+    await flushEffects();
+
+    expect(june18.disabled).toBe(false);
+    await fireEvent.click(june18);
+    expect(activity.date).toBe("2026-06-18");
+    expect(june19.disabled).toBe(true);
+
+    await vi.advanceTimersByTimeAsync(24 * 60 * 60 * 1000);
+    await flushEffects();
+
+    expect(june19.disabled).toBe(false);
+    await fireEvent.click(june19);
+    expect(activity.date).toBe("2026-06-19");
+
+    expect(vi.getTimerCount()).toBeGreaterThan(0);
+    await unmount(component);
+    component = undefined;
+    await vi.runOnlyPendingTimersAsync();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("catches up to the current local day after a delayed timeout", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date(2026, 4, 30, 23, 59, 59, 500));
+    stubActivityPageCollaborators();
+    router.route = "activity";
+    activity.date = "2026-05-30";
+
+    component = mount(ActivityPage, { target: document.body });
+    await flushEffects();
+    await openCalendar("May 30, 2026");
+
+    const june3 = calendarDay("Jun 3, 2026");
+    expect(june3.disabled).toBe(true);
+
+    vi.setSystemTime(new Date(2026, 5, 3, 12, 0, 0));
+    await vi.advanceTimersByTimeAsync(500);
+    await flushEffects();
+
+    expect(june3.disabled).toBe(false);
+    await fireEvent.click(june3);
+    expect(activity.date).toBe("2026-06-03");
   });
 });

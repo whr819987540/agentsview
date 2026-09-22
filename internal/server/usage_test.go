@@ -1,21 +1,24 @@
 package server_test
 
 import (
-	"encoding/json"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/money"
 	"go.kenn.io/agentsview/internal/server"
 	"go.kenn.io/agentsview/internal/service"
 )
 
 // tokenUsageJSON is a valid token_usage blob for test messages.
-var tokenUsageJSON = json.RawMessage(
+var tokenUsageJSON = jsontext.Value(
 	`{"input_tokens":100,"output_tokens":50,` +
 		`"cache_creation_input_tokens":10,` +
 		`"cache_read_input_tokens":20}`,
@@ -156,7 +159,7 @@ func seedUsagePairwiseEnv(t *testing.T, te *testEnv) {
 		project string
 		started string
 		model   string
-		usage   json.RawMessage
+		usage   jsontext.Value
 	}
 
 	entries := []entry{
@@ -165,7 +168,7 @@ func seedUsagePairwiseEnv(t *testing.T, te *testEnv) {
 			project: "alpha",
 			started: "2024-06-01T09:00:00Z",
 			model:   "claude-sonnet-4-20250514",
-			usage: json.RawMessage(
+			usage: jsontext.Value(
 				`{"input_tokens":100,"output_tokens":50,"cache_creation_input_tokens":10,"cache_read_input_tokens":20}`,
 			),
 		},
@@ -174,7 +177,7 @@ func seedUsagePairwiseEnv(t *testing.T, te *testEnv) {
 			project: "beta",
 			started: "2024-06-01T10:00:00Z",
 			model:   "gpt-4o",
-			usage: json.RawMessage(
+			usage: jsontext.Value(
 				`{"input_tokens":30,"output_tokens":15,"cache_creation_input_tokens":0,"cache_read_input_tokens":5}`,
 			),
 		},
@@ -210,7 +213,7 @@ func TestHandleUsageSummaryJSONShape(t *testing.T) {
 	assertStatus(t, w, http.StatusOK)
 
 	// Verify all expected top-level keys exist.
-	var raw map[string]json.RawMessage
+	var raw map[string]jsontext.Value
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &raw))
 
 	required := []string{
@@ -246,7 +249,7 @@ func TestHandleUsageSummaryIncludesUnsupportedCopilotSignal(t *testing.T) {
 	require.NotNil(t, resp.UnsupportedUsage)
 	assert.Equal(t, service.UnsupportedUsageKindCopilotNoTokenData, resp.UnsupportedUsage.Kind)
 	assert.Equal(t, 0, resp.SessionCounts.Total)
-	assert.Equal(t, 0.0, resp.Totals.TotalCost)
+	assert.Equal(t, money.Money{}, resp.Totals.TotalCost)
 }
 
 func TestHandleUsageSummarySkipsUnsupportedCopilotSignalForMixedFilters(t *testing.T) {
@@ -270,7 +273,7 @@ func TestHandleUsageSummarySkipsUnsupportedCopilotSignalForMixedFilters(t *testi
 func TestHandleUsageSummaryIncludesCursorUsageEvents(t *testing.T) {
 	te := setup(t)
 
-	require.NoError(t, te.db.InsertCursorUsageEvents([]db.CursorUsageEvent{{
+	require.NoError(t, te.db.InsertCursorUsageEvents(t.Context(), []db.CursorUsageEvent{{
 		OccurredAt:       "2026-05-14T10:05:00Z",
 		Model:            "claude-4.6-opus-high-thinking",
 		Kind:             "USAGE_EVENT_KIND_USAGE_BASED",
@@ -278,8 +281,8 @@ func TestHandleUsageSummaryIncludesCursorUsageEvents(t *testing.T) {
 		OutputTokens:     567,
 		CacheWriteTokens: 0,
 		CacheReadTokens:  8901,
-		ChargedCents:     15.66,
-		CursorTokenFee:   3.32,
+		Charged:          money.MustParseDollars("0.1566"),
+		CursorTokenFee:   money.MustParseDollars("0.0332"),
 		UserID:           "152683922",
 		UserEmail:        "member@example.com",
 		IsHeadless:       false,
@@ -295,7 +298,7 @@ func TestHandleUsageSummaryIncludesCursorUsageEvents(t *testing.T) {
 
 	resp := decode[server.UsageSummaryResponse](t, w)
 	require.Len(t, resp.Daily, 1)
-	assert.InDelta(t, 0.1566, resp.Totals.TotalCost, 1e-9)
+	assert.Equal(t, money.MustParseDollars("0.1566"), resp.Totals.TotalCost)
 	require.NotEmpty(t, resp.AgentTotals)
 	assert.Equal(t, "cursor", resp.AgentTotals[0].Agent)
 }
@@ -336,6 +339,71 @@ func TestHandleUsageTopSessionsLimit(t *testing.T) {
 	assert.LessOrEqual(t, len(entries), 1)
 }
 
+func TestHandleUsageTopSessionsRanksBySelectedTokenTypes(t *testing.T) {
+	te := setup(t)
+	require.NoError(t, te.db.SetSyncState(t.Context(), db.MachineAliasKeyPrefix+"old-owner", "test"))
+	for _, fixture := range []struct {
+		id        string
+		input     int
+		output    int
+		startedAt string
+	}{
+		{
+			id: "input-heavy", input: 1000, output: 1,
+			startedAt: "2024-06-01T09:00:00Z",
+		},
+		{
+			id: "output-heavy", input: 10, output: 50,
+			startedAt: "2024-06-01T10:00:00Z",
+		},
+	} {
+		te.seedSession(t, fixture.id, "demo", 1, func(sess *db.Session) {
+			sess.Agent = "codex"
+			sess.StartedAt = &fixture.startedAt
+		})
+		te.seedMessages(t, fixture.id, 1, func(_ int, msg *db.Message) {
+			msg.Role = "assistant"
+			msg.Timestamp = fixture.startedAt
+			msg.Model = "gpt-5.4"
+			msg.TokenUsage = jsontext.Value(
+				`{"input_tokens":` + strconv.Itoa(fixture.input) +
+					`,"output_tokens":` + strconv.Itoa(fixture.output) + `}`,
+			)
+		})
+	}
+
+	w := te.get(t, buildPathURL(
+		"/api/v1/usage/top-sessions",
+		map[string]string{
+			"from":        "2024-06-01",
+			"to":          "2024-06-01",
+			"timezone":    "UTC",
+			"sort":        "tokens",
+			"token_types": "output",
+			"machine":     "old-owner",
+			"limit":       "1",
+		}))
+	assertStatus(t, w, http.StatusOK)
+
+	var entries []db.TopSessionEntry
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &entries))
+	require.Len(t, entries, 1)
+	assert.Equal(t, "output-heavy", entries[0].SessionID)
+	assert.Equal(t, 10, entries[0].InputTokens)
+	assert.Equal(t, 50, entries[0].OutputTokens)
+	assert.Equal(t, 60, entries[0].TotalTokens)
+}
+
+func TestHandleUsageTopSessionsRejectsUnknownTokenType(t *testing.T) {
+	te := setup(t)
+
+	w := te.get(t, buildPathURL(
+		"/api/v1/usage/top-sessions",
+		map[string]string{"token_types": "output,unknown"},
+	))
+	assertStatus(t, w, http.StatusBadRequest)
+}
+
 func TestHandleUsagePairwiseComparisonJSONShape(t *testing.T) {
 	te := setup(t)
 	seedUsagePairwiseEnv(t, te)
@@ -354,7 +422,7 @@ func TestHandleUsagePairwiseComparisonJSONShape(t *testing.T) {
 	))
 	assertStatus(t, w, http.StatusOK)
 
-	var raw map[string]json.RawMessage
+	var raw map[string]jsontext.Value
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &raw))
 	assert.Contains(t, raw, "left")
 	assert.Contains(t, raw, "right")
@@ -427,7 +495,7 @@ func TestUsageRoutesRegistered(t *testing.T) {
 	}
 	for _, ep := range endpoints {
 		t.Run(ep, func(t *testing.T) {
-			req := httptest.NewRequest(
+			req := httptest.NewRequestWithContext(t.Context(),
 				http.MethodGet, ep, nil,
 			)
 			w := httptest.NewRecorder()

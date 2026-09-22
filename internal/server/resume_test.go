@@ -3,7 +3,7 @@ package server
 import (
 	"encoding/base64"
 	"encoding/binary"
-	"encoding/json"
+	"encoding/json/v2"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -58,6 +58,18 @@ func TestShellQuote(t *testing.T) {
 			assert.Equal(t, tt.want, got)
 		})
 	}
+}
+
+func TestResumeCommandAugureCode(t *testing.T) {
+	assert.True(t, resumeAgentNeedsModel("augure-code"))
+
+	// Model selection mirrors the frontend: codex-shaped -m flag,
+	// omitted when the session has no eligible model usage.
+	cmd := resumeCommand("augure-code", resumeAgents["augure-code"], "sess-1", "")
+	assert.Equal(t, "augure resume sess-1", cmd)
+
+	cmd = resumeCommand("augure-code", resumeAgents["augure-code"], "run-1", "ossington-5")
+	assert.Equal(t, "augure resume run-1 -m ossington-5", cmd)
 }
 
 func TestCommandWithCleanup(t *testing.T) {
@@ -157,9 +169,7 @@ func TestDetectTerminalLinux_EnvTerminal(t *testing.T) {
 	// Create a fake terminal binary on PATH.
 	binDir := t.TempDir()
 	fakeBin := filepath.Join(binDir, "myterm")
-	require.NoError(t,
-		os.WriteFile(fakeBin, []byte("#!/bin/sh\n"), 0o755),
-	)
+	require.NoError(t, os.WriteFile(fakeBin, []byte("#!/bin/sh\n"), 0o755))
 	t.Setenv("PATH", binDir)
 	t.Setenv("TERMINAL", "myterm")
 
@@ -176,9 +186,7 @@ func TestDetectTerminalLinux_EnvTerminalWithArgs(t *testing.T) {
 	}
 	binDir := t.TempDir()
 	fakeBin := filepath.Join(binDir, "kitty")
-	require.NoError(t,
-		os.WriteFile(fakeBin, []byte("#!/bin/sh\n"), 0o755),
-	)
+	require.NoError(t, os.WriteFile(fakeBin, []byte("#!/bin/sh\n"), 0o755))
 	t.Setenv("PATH", binDir)
 	t.Setenv("TERMINAL", "kitty --single-instance")
 
@@ -222,7 +230,7 @@ func TestLaunchClaudeDesktop(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cmd := launchClaudeDesktop(tt.sessionID, tt.cwd)
+			cmd := launchClaudeDesktop(t.Context(), tt.sessionID, tt.cwd)
 			require.NotEmpty(t, cmd.Path,
 				"expected non-empty command path")
 			// The command should be "open <url>".
@@ -283,7 +291,7 @@ func TestReadCursorLastWorkingDir(t *testing.T) {
 		`{"role":"assistant","message":{"content":[{"type":"tool_use","name":"ReadFile","input":{"path":"/tmp/file.txt"}}]}}` + "\n" +
 		`{"role":"assistant","message":{"content":[{"type":"tool_use","name":"Shell","input":{"command":"pwd","working_directory":` + string(firstJSON) + `}}]}}` + "\n" +
 		`{"role":"assistant","message":{"content":[{"type":"tool_use","name":"Shell","input":{"command":"pwd","working_directory":"relative/path"}}]}}` + "\n" +
-		`{"role":"assistant","message":{"content":[{"type":"tool_use","name":"Shell","input":{"command":"pwd","working_directory":` + string(lastJSON) + `}}]}}` + "\n"
+		`{"role":"assistant","message":{"content":[{"type":"tool_use","name":"Shell","parameters":{"command":"pwd","working_directory":` + string(lastJSON) + `}}]}}` + "\n"
 	require.NoError(t, os.WriteFile(sessionFile, []byte(content), 0o644))
 
 	got := readCursorLastWorkingDir(sessionFile)
@@ -758,12 +766,15 @@ func TestResolveCursorWorkspaceDirUsesLastWorkingDirHint(t *testing.T) {
 		cursorTranscript, []byte(lastDirContent), 0o644,
 	))
 
-	got := resolveCursorWorkspaceDir(&db.Session{
-		Agent:    "cursor",
-		Project:  cursorProject,
-		FilePath: &cursorTranscript,
-	})
-	assertSameDir(t, "resolveCursorWorkspaceDir()", got, cursorProject)
+	got := resolveCursorWorkspaceDirWithHint(
+		&db.Session{
+			Agent:    "cursor",
+			Project:  cursorProject,
+			FilePath: &cursorTranscript,
+		},
+		func() string { return cursorLastDir },
+	)
+	assertSameDir(t, "resolveCursorWorkspaceDirWithHint()", got, cursorProject)
 }
 
 func TestResolveCursorWorkspaceDirAmbiguousWithoutHintReturnsEmpty(
@@ -828,14 +839,46 @@ func TestResolveCursorWorkspaceDirStaleHintReturnsEmpty(
 		cursorTranscript, []byte(content), 0o644,
 	))
 
-	got := resolveCursorWorkspaceDir(&db.Session{
+	got := resolveCursorWorkspaceDirWithHint(
+		&db.Session{
+			Agent:    "cursor",
+			Project:  "li_tools",
+			FilePath: &cursorTranscript,
+		},
+		func() string { return staleDir },
+	)
+	assert.Empty(t, got,
+		"resolveCursorWorkspaceDirWithHint() with stale hint = %q, want empty",
+		got)
+}
+
+func TestResolveSessionDirDoesNotUseCursorLastWorkingDirHint(t *testing.T) {
+	tmpDir := t.TempDir()
+	pathA := filepath.Join(tmpDir, "li-tools")
+	pathB := filepath.Join(tmpDir, "li", "tools")
+	lastDir := filepath.Join(pathA, "frontend")
+	require.NoError(t, os.MkdirAll(lastDir, 0o755))
+	require.NoError(t, os.MkdirAll(pathB, 0o755))
+
+	encoded := encodeCursorProjectPathForTest(pathA)
+	lastDirJSON, _ := json.Marshal(lastDir)
+	cursorTranscript := filepath.Join(
+		tmpDir, ".cursor", "projects", encoded,
+		"agent-transcripts", "cursor-sess", "cursor-sess.jsonl",
+	)
+	require.NoError(t, os.MkdirAll(filepath.Dir(cursorTranscript), 0o755))
+	require.NoError(t, os.WriteFile(cursorTranscript, []byte(
+		`{"role":"assistant","message":{"content":[{"type":"tool_use","name":"Shell","input":{"command":"pwd","working_directory":`+
+			string(lastDirJSON)+`}}]}}`+"\n",
+	), 0o644))
+
+	got := resolveSessionDir(&db.Session{
 		Agent:    "cursor",
 		Project:  "li_tools",
 		FilePath: &cursorTranscript,
 	})
 	assert.Empty(t, got,
-		"resolveCursorWorkspaceDir() with stale hint = %q, want empty",
-		got)
+		"non-resume session directory lookup must keep passive ambiguity")
 }
 
 func TestResolveCursorWorkspaceDirWithoutTranscriptContents(
@@ -897,6 +940,22 @@ func TestResolveCursorResumePathsUsesProvidedLastWorkingDir(
 	assertSameDir(t, "workspaceDir", workspaceDir, cursorProject)
 }
 
+func TestResolveCursorResumePathsUsesStoredWorkspace(t *testing.T) {
+	workspaceDir := t.TempDir()
+	lastCwd := filepath.Join(workspaceDir, "frontend")
+	require.NoError(t, os.MkdirAll(lastCwd, 0o755))
+
+	launchDir, gotWorkspaceDir := resolveCursorResumePaths(
+		&db.Session{
+			Agent: "cursor",
+			Cwd:   workspaceDir,
+		},
+		lastCwd,
+	)
+	assertSameDir(t, "launchDir", launchDir, lastCwd)
+	assertSameDir(t, "workspaceDir", gotWorkspaceDir, workspaceDir)
+}
+
 func TestResolveCursorResumePathsFallbackWorkspaceToLastWorkingDir(
 	t *testing.T,
 ) {
@@ -912,7 +971,8 @@ func TestResolveCursorResumePathsFallbackWorkspaceToLastWorkingDir(
 		lastCwd,
 	)
 	assertSameDir(t, "launchDir", launchDir, lastCwd)
-	assertSameDir(t, "workspaceDir", workspaceDir, lastCwd)
+	assert.Empty(t, workspaceDir,
+		"a raw tool working directory is a launch hint, not workspace identity")
 }
 
 func TestResolveResumeDirCanonicalizesSymlink(t *testing.T) {
@@ -1043,7 +1103,9 @@ func encodeCursorProjectPathForTest(path string) string {
 		if part == "" {
 			continue
 		}
-		tokens = append(tokens, cursorComponentTokens(part)...)
+		tokens = append(tokens, strings.FieldsFunc(part, func(r rune) bool {
+			return r == '-' || r == '.' || r == '_'
+		})...)
 	}
 	return strings.Join(tokens, "-")
 }

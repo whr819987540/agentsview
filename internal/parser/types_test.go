@@ -223,13 +223,18 @@ func TestAgentByType(t *testing.T) {
 		{AgentGemini, true},
 		{AgentMiMoCode, true},
 		{AgentOpenCode, true},
+		{AgentOpenCodeReview, true},
 		{AgentOpenHands, true},
 		{AgentCursor, true},
 		{AgentAmp, true},
 		{AgentVSCodeCopilot, true},
 		{AgentPi, true},
+		{AgentPrimeAgent, true},
 		{AgentOMP, true},
+		{AgentDevin, true},
 		{AgentDeepSeekTUI, true},
+		{AgentDeepSeekHarness, true},
+		{AgentCline, true},
 		{"unknown", false},
 	}
 	for _, tt := range tests {
@@ -267,6 +272,18 @@ func TestAgentByPrefix(t *testing.T) {
 			true,
 		},
 		{
+			"traex prefix",
+			"traex:some-uuid",
+			AgentTraeX,
+			true,
+		},
+		{
+			"augure-code prefix",
+			"augure-code:some-uuid",
+			AgentAugureCode,
+			true,
+		},
+		{
 			"copilot prefix",
 			"copilot:sess-id",
 			AgentCopilot,
@@ -276,6 +293,12 @@ func TestAgentByPrefix(t *testing.T) {
 			"gemini prefix",
 			"gemini:sess-id",
 			AgentGemini,
+			true,
+		},
+		{
+			"gemini apps prefix",
+			"gemini-apps:sess-id",
+			AgentGeminiApps,
 			true,
 		},
 		{
@@ -327,9 +350,21 @@ func TestAgentByPrefix(t *testing.T) {
 			true,
 		},
 		{
+			"prime agent prefix",
+			"prime-agent:019c1234-session",
+			AgentPrimeAgent,
+			true,
+		},
+		{
 			"omp prefix",
 			"omp:omp-session-uuid",
 			AgentOMP,
+			true,
+		},
+		{
+			"devin prefix",
+			"devin:session-id",
+			AgentDevin,
 			true,
 		},
 		{
@@ -357,6 +392,24 @@ func TestAgentByPrefix(t *testing.T) {
 			"deepseek tui prefix",
 			"deepseek-tui:sess-id",
 			AgentDeepSeekTUI,
+			true,
+		},
+		{
+			"deepseek harness prefix",
+			"deepseek-harness:sess-id",
+			AgentDeepSeekHarness,
+			true,
+		},
+		{
+			"qoder prefix",
+			"qoder:sess-id",
+			AgentQoder,
+			true,
+		},
+		{
+			"cline prefix",
+			"cline:sess-id",
+			AgentCline,
 			true,
 		},
 		{
@@ -401,47 +454,74 @@ func TestRegistryCompleteness(t *testing.T) {
 		AgentOpenClaude,
 		AgentCowork,
 		AgentCodex,
+		AgentTraeX,
+		AgentAugureCode,
 		AgentCopilot,
 		AgentGemini,
+		AgentGeminiApps,
 		AgentMiMoCode,
 		AgentOpenCode,
+		AgentOpenCodeReview,
 		AgentKilo,
+		AgentKiloLegacy,
 		AgentOpenHands,
 		AgentCursor,
+		AgentCursorIDE,
 		AgentAmp,
 		AgentVSCodeCopilot,
+		AgentWindsurf,
+		AgentTrae,
 		AgentVSCopilot,
 		AgentPi,
+		AgentTau,
+		AgentPrimeAgent,
 		AgentOMP,
 		AgentQwen,
 		AgentCommandCode,
 		AgentDeepSeekTUI,
+		AgentDeepSeekHarness,
 		AgentOpenClaw,
 		AgentQClaw,
 		AgentKimi,
+		AgentKimiWork,
 		AgentClaudeAI,
 		AgentChatGPT,
 		AgentKiro,
 		AgentKiroIDE,
 		AgentCortex,
 		AgentHermes,
+		AgentAugureDesktop,
+		AgentGrok,
+		AgentGoose,
 		AgentForge,
+		AgentDevin,
 		AgentPiebald,
 		AgentWarp,
 		AgentPositron,
+		AgentPositAssistant,
+		AgentZCode,
 		AgentZed,
 		AgentAntigravity,
 		AgentAntigravityCLI,
 		AgentIflow,
 		AgentIcodemate,
 		AgentWorkBuddy,
+		AgentCodeBuddy,
 		AgentZencoder,
 		AgentGptme,
+		AgentQoder,
 		AgentQwenPaw,
 		AgentShelley,
 		AgentVibe,
 		AgentAider,
+		AgentEvener,
 		AgentReasonix,
+		AgentRooCode,
+		AgentCline,
+		AgentPoolside,
+		AgentOmnigent,
+		AgentCodebuff,
+		AgentCrush,
 	}
 
 	expected := make(map[AgentType]bool, len(allTypes))
@@ -474,13 +554,14 @@ func TestInferRelationshipTypes(t *testing.T) {
 		name   string
 		inputs []ParseResult
 		want   []RelationshipType
-	}{{
-		"no parent",
-		[]ParseResult{
-			{Session: ParsedSession{ID: "abc"}},
+	}{
+		{
+			"no parent",
+			[]ParseResult{
+				{Session: ParsedSession{ID: "abc"}},
+			},
+			[]RelationshipType{RelNone},
 		},
-		[]RelationshipType{RelNone},
-	},
 		{
 			"agent prefix gets subagent",
 			[]ParseResult{
@@ -558,17 +639,6 @@ func TestInferRelationshipTypes(t *testing.T) {
 	}
 }
 
-func TestFileBasedAgentsHaveConfigKey(t *testing.T) {
-	for _, def := range Registry {
-		if !def.FileBased {
-			continue
-		}
-		assert.NotEmptyf(t, def.ConfigKey,
-			"file-based agent %q (%s) has empty ConfigKey",
-			def.DisplayName, def.Type)
-	}
-}
-
 func TestZedRegistryEntry(t *testing.T) {
 	def, ok := AgentByType(AgentZed)
 	require.True(t, ok, "AgentZed missing from Registry")
@@ -578,6 +648,17 @@ func TestZedRegistryEntry(t *testing.T) {
 	assert.Equal(t, "zed:", def.IDPrefix)
 }
 
+func TestZCodeRegistryEntry(t *testing.T) {
+	def, ok := AgentByType(AgentZCode)
+	require.True(t, ok, "AgentZCode missing from Registry")
+	require.False(t, def.FileBased, "ZCode FileBased")
+	assert.Equal(t, "ZCODE_DIR", def.EnvVar)
+	assert.Equal(t, "zcode_dirs", def.ConfigKey)
+	assert.Equal(t, []string{".zcode/cli/db", ".zcode/cli"}, def.DefaultDirs)
+	assert.Equal(t, "zcode:", def.IDPrefix)
+	assert.True(t, def.Usage.NoPerMessageTokenData)
+}
+
 func TestShelleyRegistryEntry(t *testing.T) {
 	def, ok := AgentByType(AgentShelley)
 	require.True(t, ok, "AgentShelley missing from Registry")
@@ -585,6 +666,16 @@ func TestShelleyRegistryEntry(t *testing.T) {
 	assert.Equal(t, "SHELLEY_DIR", def.EnvVar)
 	assert.Equal(t, "shelley_dirs", def.ConfigKey)
 	assert.Equal(t, "shelley:", def.IDPrefix)
+}
+
+func TestOmnigentRegistryEntry(t *testing.T) {
+	def, ok := AgentByType(AgentOmnigent)
+	require.True(t, ok, "AgentOmnigent missing from Registry")
+	require.True(t, def.FileBased, "Omnigent FileBased")
+	assert.Equal(t, "OMNIGENT_DIR", def.EnvVar)
+	assert.Equal(t, "omnigent_dirs", def.ConfigKey)
+	assert.Equal(t, "omnigent:", def.IDPrefix)
+	require.Equal(t, []string{".omnigent"}, def.DefaultDirs)
 }
 
 func TestOpenCodeRegistryEntry(t *testing.T) {
@@ -598,6 +689,17 @@ func TestOpenCodeRegistryEntry(t *testing.T) {
 	}
 	require.Truef(t, slices.Equal(def.WatchSubdirs, want),
 		"OpenCode WatchSubdirs = %v, want %v", def.WatchSubdirs, want)
+}
+
+func TestOpenCodeReviewRegistryEntry(t *testing.T) {
+	def, ok := AgentByType(AgentOpenCodeReview)
+	require.True(t, ok, "AgentOpenCodeReview missing from Registry")
+	require.True(t, def.FileBased, "Open Code Review FileBased")
+	assert.Equal(t, "Open Code Review", def.DisplayName)
+	assert.Equal(t, "OPENCODEREVIEW_DIR", def.EnvVar)
+	assert.Equal(t, "opencodereview_dirs", def.ConfigKey)
+	assert.Equal(t, []string{".opencodereview/sessions"}, def.DefaultDirs)
+	assert.Equal(t, "opencodereview:", def.IDPrefix)
 }
 
 func TestOpenClaudeRegistryEntry(t *testing.T) {
@@ -620,6 +722,63 @@ func TestCoworkRegistryEntry(t *testing.T) {
 	assert.Equal(t, coworkDefaultDirs(), def.DefaultDirs)
 	assert.True(t, def.ShallowWatch,
 		"Cowork root contains large local_* working trees that discovery skips")
+}
+
+func TestPeriodicReconcileCapability(t *testing.T) {
+	optedIn := map[AgentType]bool{}
+	for _, def := range Registry {
+		optedIn[def.Type] = def.PeriodicReconcile
+	}
+	// Shallow-watched providers rely on scheduled reconciliation because
+	// subdirectory changes are invisible to their shallow watch coverage.
+	assert.True(t, optedIn[AgentOpenHands])
+	assert.True(t, optedIn[AgentAider])
+	// Omnigent's watcher scans only members at or past the stored
+	// updated_at floor, so metadata-only edits and deletions rely on the
+	// scheduled fingerprint-gated container reparse.
+	assert.True(t, optedIn[AgentOmnigent])
+	// Codebuff's recursive per-project watch covers existing projects;
+	// scheduled reconciliation picks up newly created project
+	// directories under the root (see codebuffWatchRoots).
+	assert.True(t, optedIn[AgentCodebuff])
+	// Cowork's provider WatchPlan registers its root recursively
+	// (coworkWatchRoots Recursive:true overrides legacy ShallowWatch), so
+	// scheduled reconciliation would redundantly rescan the whole archive.
+	assert.False(t, optedIn[AgentCowork])
+	// Recursive session roots must NOT opt in: their shallow roots are
+	// supplemental (codex_provider.go WatchPlan registers Recursive:true),
+	// so scheduled reconciliation would rescan the whole session tree.
+	assert.False(t, optedIn[AgentCodex])
+	assert.False(t, optedIn[AgentHermes])
+	assert.False(t, optedIn[AgentClaude])
+	assert.False(t, optedIn[AgentGemini])
+}
+
+func TestRemoteSyncExcludedCapability(t *testing.T) {
+	excluded := map[AgentType]bool{}
+	for _, def := range Registry {
+		excluded[def.Type] = def.RemoteSyncExcluded
+	}
+	// Trae's modern layout stores sessions as encrypted state that a remote
+	// machine cannot read, so it opts out of every remote sync artifact.
+	assert.True(t, excluded[AgentTrae])
+	// Omnigent's chat.db co-locates transcripts with authentication
+	// secrets, so its source tree never leaves the machine.
+	assert.True(t, excluded[AgentOmnigent])
+	// Augure Desktop's roots hold the raw state.db (plus WAL/journal)
+	// alongside non-transcript application state, so the store never
+	// leaves the machine either.
+	assert.True(t, excluded[AgentAugureDesktop])
+	assert.False(t, excluded[AgentClaude])
+	assert.False(t, excluded[AgentCodex])
+}
+
+func TestRemoteSyncExcludedAgent(t *testing.T) {
+	assert.True(t, RemoteSyncExcludedAgent(AgentTrae))
+	assert.True(t, RemoteSyncExcludedAgent(AgentOmnigent))
+	assert.True(t, RemoteSyncExcludedAgent(AgentAugureDesktop))
+	assert.False(t, RemoteSyncExcludedAgent(AgentClaude))
+	assert.False(t, RemoteSyncExcludedAgent(AgentType("unknown-agent")))
 }
 
 func TestAgentByPrefixCowork(t *testing.T) {
@@ -653,6 +812,20 @@ func TestCommandCodeRegistryEntry(t *testing.T) {
 	assert.Equal(t, "commandcode:", def.IDPrefix)
 }
 
+func TestDevinRegistryEntry(t *testing.T) {
+	def, ok := AgentByType(AgentDevin)
+	require.True(t, ok, "AgentDevin missing from Registry")
+	require.False(t, def.FileBased, "Devin FileBased")
+	assert.Equal(t, "Devin", def.DisplayName)
+	assert.Equal(t, "DEVIN_DIR", def.EnvVar)
+	assert.Equal(t, "devin_dirs", def.ConfigKey)
+	assert.Equal(t, []string{
+		"Library/Application Support/devin",
+		".local/share/devin",
+	}, def.DefaultDirs)
+	assert.Equal(t, "devin:", def.IDPrefix)
+}
+
 func TestDeepSeekTUIRegistryEntry(t *testing.T) {
 	def, ok := AgentByType(AgentDeepSeekTUI)
 	require.True(t, ok, "AgentDeepSeekTUI missing from Registry")
@@ -662,6 +835,18 @@ func TestDeepSeekTUIRegistryEntry(t *testing.T) {
 	assert.Equal(t, "deepseek_tui_sessions_dirs", def.ConfigKey)
 	assert.Equal(t, []string{".codewhale/sessions", ".deepseek/sessions"}, def.DefaultDirs)
 	assert.Equal(t, "deepseek-tui:", def.IDPrefix)
+}
+
+func TestDeepSeekHarnessRegistryEntry(t *testing.T) {
+	def, ok := AgentByType(AgentDeepSeekHarness)
+	require.True(t, ok, "AgentDeepSeekHarness missing from Registry")
+	require.True(t, def.FileBased, "DeepSeek Harness FileBased")
+	assert.Equal(t, "DeepSeek Harness", def.DisplayName)
+	assert.Equal(t, "DEEPSEEK_HARNESS_SESSIONS_DIR", def.EnvVar)
+	assert.Equal(t, "DSH_HOME", def.DefaultRootEnvVar)
+	assert.Equal(t, "deepseek_harness_sessions_dirs", def.ConfigKey)
+	assert.Equal(t, []string{".dsh/sessions"}, def.DefaultDirs)
+	assert.Equal(t, "deepseek-harness:", def.IDPrefix)
 }
 
 func TestResolveOpenCodeSourcePrefersStorage(t *testing.T) {
@@ -696,7 +881,7 @@ func TestResolveMiMoCodeSourcePrefersStorage(t *testing.T) {
 	require.Len(t, discovered, 1)
 	require.Equal(t, AgentMiMoCode, discovered[0].Agent)
 
-	require.Equal(t, path, findOpenCodeFormatSourceFile(mimoFmt, root, "ses_test"))
+	require.Equal(t, path, findOpenCodeFormatSourceFile(t.Context(), mimoFmt, root, "ses_test"))
 }
 
 func TestResolveOpenCodeSourceFallsBackToSQLiteOnBrokenStoragePath(
@@ -770,7 +955,7 @@ func TestFindOpenCodeSourceFilePrefersStorage(t *testing.T) {
 	require.NoError(t, os.WriteFile(path, []byte(`{"id":"ses_123"}`), 0o644), "write session")
 	require.NoError(t, os.WriteFile(filepath.Join(root, "opencode.db"), []byte("x"), 0o644), "write db marker")
 
-	got := findOpenCodeFormatSourceFile(openCodeFmt, root, "ses_123")
+	got := findOpenCodeFormatSourceFile(t.Context(), openCodeFmt, root, "ses_123")
 	require.Equal(t, path, got, "FindOpenCodeSourceFile()")
 }
 
@@ -783,7 +968,7 @@ func TestFindOpenCodeSourceFileFallsBackToSQLiteInHybridRoot(t *testing.T) {
 	dbPath := filepath.Join(root, "opencode.db")
 	seedHybridSQLiteDB(t, dbPath, "ses_456")
 
-	got := findOpenCodeFormatSourceFile(openCodeFmt, root, "ses_456")
+	got := findOpenCodeFormatSourceFile(t.Context(), openCodeFmt, root, "ses_456")
 	want := OpenCodeSQLiteVirtualPath(dbPath, "ses_456")
 	require.Equal(t, want, got, "FindOpenCodeSourceFile()")
 }
@@ -802,7 +987,7 @@ func TestFindOpenCodeSourceFileReturnsEmptyWhenSessionMissing(t *testing.T) {
 	dbPath := filepath.Join(root, "opencode.db")
 	seedHybridSQLiteDB(t, dbPath, "ses_unrelated")
 
-	got := findOpenCodeFormatSourceFile(openCodeFmt, root, "ses_missing")
+	got := findOpenCodeFormatSourceFile(t.Context(), openCodeFmt, root, "ses_missing")
 	assert.Empty(t, got, "FindOpenCodeSourceFile()")
 }
 
@@ -811,11 +996,11 @@ func TestFindOpenCodeSourceFilePureSQLiteOnlyForExistingSession(t *testing.T) {
 	dbPath := filepath.Join(root, "opencode.db")
 	seedHybridSQLiteDB(t, dbPath, "ses_present")
 
-	got := findOpenCodeFormatSourceFile(openCodeFmt, root, "ses_present")
+	got := findOpenCodeFormatSourceFile(t.Context(), openCodeFmt, root, "ses_present")
 	assert.Equal(t,
 		OpenCodeSQLiteVirtualPath(dbPath, "ses_present"),
 		got, "FindOpenCodeSourceFile(present)")
-	got = findOpenCodeFormatSourceFile(openCodeFmt, root, "ses_absent")
+	got = findOpenCodeFormatSourceFile(t.Context(), openCodeFmt, root, "ses_absent")
 	assert.Empty(t, got, "FindOpenCodeSourceFile(absent)")
 }
 
@@ -932,8 +1117,20 @@ func TestResolveOpenCodeWatchRootsSQLite(t *testing.T) {
 
 func TestResolveOpenCodeWatchRootsMissingRoot(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "missing")
-	got := ResolveOpenCodeWatchRoots(root)
-	assert.Nil(t, got, "ResolveOpenCodeWatchRoots()")
+	for _, tc := range []struct {
+		name    string
+		resolve func(string) []string
+	}{
+		{name: "opencode", resolve: ResolveOpenCodeWatchRoots},
+		{name: "kilo", resolve: ResolveKiloWatchRoots},
+		{name: "mimocode", resolve: ResolveMiMoCodeWatchRoots},
+		{name: "icodemate", resolve: ResolveIcodemateWatchRoots},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, []string{root}, tc.resolve(root),
+				"missing roots need a deterministic lifecycle watch plan")
+		})
+	}
 }
 
 func TestParseOpenCodeSQLiteVirtualPath(t *testing.T) {
@@ -1047,6 +1244,12 @@ func TestAgentByPrefixRemote(t *testing.T) {
 			true,
 		},
 		{
+			"remote devin",
+			"devbox1~devin:session-id",
+			AgentDevin,
+			true,
+		},
+		{
 			"remote gemini",
 			"myhost~gemini:sess-id",
 			AgentGemini,
@@ -1107,6 +1310,35 @@ func TestVSCodeCopilotDefaultDirs(t *testing.T) {
 	}
 }
 
+func TestWindsurfRegistryEntry(t *testing.T) {
+	def, ok := AgentByType(AgentWindsurf)
+	require.True(t, ok, "AgentWindsurf not in Registry")
+
+	assert.Equal(t, "Windsurf", def.DisplayName)
+	assert.Equal(t, "WINDSURF_DIR", def.EnvVar)
+	assert.Equal(t, "windsurf_dirs", def.ConfigKey)
+	assert.Equal(t, "windsurf:", def.IDPrefix)
+	assert.True(t, def.FileBased)
+	assert.Contains(t, def.WatchSubdirs, "workspaceStorage")
+
+	required := []string{
+		"AppData/Roaming/Windsurf/User",
+		"AppData/Roaming/Windsurf - Next/User",
+		"Library/Application Support/Windsurf/User",
+		"Library/Application Support/Windsurf - Next/User",
+		".config/Windsurf/User",
+		".config/Windsurf - Next/User",
+	}
+	for _, path := range required {
+		assert.Truef(t, slices.Contains(def.DefaultDirs, path),
+			"missing default dir: %s", path)
+	}
+
+	byPrefix, ok := AgentByPrefix("windsurf:session-a")
+	require.True(t, ok)
+	assert.Equal(t, AgentWindsurf, byPrefix.Type)
+}
+
 func TestApplyUsageEventTokenTotals(t *testing.T) {
 	// Verify that applyUsageEventTokenTotals computes PeakContextTokens
 	// correctly including cache-creation and cache-read tokens.
@@ -1162,7 +1394,7 @@ func TestReasonixRegistryEntry(t *testing.T) {
 	assert.Contains(t, reasonixDef.WatchSubdirs, "archive")
 
 	// Verify default dirs contain .reasonix and Windows path
-	assert.True(t, len(reasonixDef.DefaultDirs) > 0)
+	assert.NotEmpty(t, reasonixDef.DefaultDirs)
 	hasUnix := false
 	hasWindows := false
 	for _, dir := range reasonixDef.DefaultDirs {
@@ -1175,4 +1407,19 @@ func TestReasonixRegistryEntry(t *testing.T) {
 	}
 	assert.True(t, hasUnix, "DefaultDirs should contain .reasonix")
 	assert.True(t, hasWindows, "DefaultDirs should contain AppData/Roaming/reasonix")
+}
+
+func TestFreebuffNotRegistered(t *testing.T) {
+	// Freebuff intentionally shares the Codebuff provider and is NOT
+	// registered in Registry. Freebuff sessions do carry agent =
+	// AgentFreebuff with freebuff:-prefixed IDs (set by
+	// parseCodebuffSession when run-state.json agentType contains
+	// "free"), but there is no separate registry entry or factory:
+	// sync canonicalizes freebuff onto the Codebuff provider def
+	// (AgentByPrefix maps freebuff: IDs to the Codebuff def), so
+	// lifecycle operations over the shared roots run once.
+	for _, def := range Registry {
+		assert.NotEqualf(t, AgentFreebuff, def.Type,
+			"AgentFreebuff must not be registered — it shares the Codebuff provider")
+	}
 }

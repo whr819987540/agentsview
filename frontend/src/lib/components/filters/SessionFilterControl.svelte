@@ -59,10 +59,14 @@
   });
 
   const sortedMachines = $derived.by(() => {
-    const machines = [...sessions.machines].sort();
+    const machines = [...sessions.machines].sort((a, b) =>
+      sessions.machineLabel(a).localeCompare(sessions.machineLabel(b)),
+    );
     if (!machineSearch) return machines;
     const q = machineSearch.toLowerCase();
-    return machines.filter((m) => m.toLowerCase().includes(q));
+    return machines.filter((machine) =>
+      sessions.machineLabel(machine).toLowerCase().includes(q),
+    );
   });
 
   $effect(() => {
@@ -152,7 +156,7 @@
 
 {#if open}
   <div
-    class="filter-dropdown"
+    class="filter-dropdown kit-popover-card"
     class:left={align === "left"}
     bind:this={dropdownRef}
   >
@@ -354,6 +358,7 @@
               class:selected
               style:--agent-color={"var(--accent-blue)"}
               style:--agent-foreground={"var(--accent-blue-foreground)"}
+              title={machine}
               onclick={() =>
                 sessions.toggleMachineFilter(machine)}
             >
@@ -366,7 +371,7 @@
                 {/if}
               </span>
               <span class="agent-select-name">
-                {machine}
+                {sessions.machineLabel(machine)}
               </span>
             </button>
           {:else}
@@ -445,12 +450,9 @@
     overflow-x: hidden;
     overscroll-behavior: contain;
     scrollbar-gutter: stable;
-    background: var(--bg-surface);
-    border: 1px solid var(--border-default);
-    border-radius: var(--radius-md);
-    box-shadow: var(--shadow-lg);
+    /* card chrome comes from the shared kit-popover-card class */
     padding: 8px;
-    z-index: 100;
+    z-index: var(--z-popover);
     text-transform: none;
     letter-spacing: normal;
     animation: dropdown-in 0.12s ease-out;

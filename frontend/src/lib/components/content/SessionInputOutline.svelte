@@ -1,6 +1,6 @@
 <script lang="ts">
   import { fetchSessionInputOutline } from "../../api/inputOutline.js";
-  import type { InputOutlineItem } from "../../api/types/core.js";
+  import type { ServiceInputOutlineItem as InputOutlineItem } from "../../api/generated/index.js";
   import { m } from "../../i18n/index.js";
   import { MessageSquareTextIcon, SquareTerminalIcon } from "../../icons.js";
   import { ui } from "../../stores/ui.svelte.js";

@@ -1,10 +1,10 @@
 <script lang="ts">
   import { fetchSessionTree } from "../../api/sessionTree.js";
+  import type { Session } from "../../api/types/core.js";
   import type {
-    Session,
     SessionTreeNode,
     SessionTreeResponse,
-  } from "../../api/types/core.js";
+  } from "../../api/generated/index.js";
   import { m } from "../../i18n/index.js";
   import { router } from "../../stores/router.svelte.js";
   import { formatNumber } from "../../utils/format.js";

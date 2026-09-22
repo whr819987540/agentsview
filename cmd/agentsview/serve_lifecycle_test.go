@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+	"encoding/json/v2"
 	"fmt"
 	"net"
 	"net/http/httptest"
@@ -94,8 +96,8 @@ func TestRunServeStatusReportsIncompatibleWritableDaemon(t *testing.T) {
 	assert.Contains(t, out, "API version")
 	assert.Contains(t, out, "data version")
 	assert.Contains(t, out, "compatibility")
-	assert.Contains(t, out, "serve --replace")
-	assert.Contains(t, out, "serve stop")
+	assert.Contains(t, out, "agentsview daemon restart")
+	assert.Contains(t, out, "agentsview daemon stop")
 	assert.NotContains(t, out, "not responding")
 }
 
@@ -123,7 +125,7 @@ func TestRunServeStatusPrefersIncompatibleWritableOverReadOnly(t *testing.T) {
 
 	assert.Contains(t, out, "incompatible")
 	assert.Contains(t, out, strconv.Itoa(writablePID))
-	assert.Contains(t, out, "serve --replace")
+	assert.Contains(t, out, "agentsview daemon restart")
 	assert.NotContains(t, out, "mode:    read-only")
 }
 
@@ -143,6 +145,116 @@ func TestRunServeStatusPrefersStartingOverReadOnly(t *testing.T) {
 
 	assert.Contains(t, out, "agentsview is starting up.")
 	assert.NotContains(t, out, "mode:    read-only")
+}
+
+func TestRunServeStatusReportsStartupProgress(t *testing.T) {
+	dir := runtimeTestDir(t)
+	MarkDaemonStarting(dir)
+	t.Cleanup(func() { UnmarkDaemonStarting(dir) })
+
+	// Backdated started_at keeps the elapsed assertion stable.
+	state, err := json.Marshal(startupState{
+		PID:       os.Getpid(),
+		StartedAt: time.Now().Add(-90 * time.Second),
+		Phase:     "full resync",
+		Detail:    "claude: 12/38 sessions (32%)",
+		LogPath:   serveLogPath(dir),
+		UpdatedAt: time.Now(),
+	})
+	require.NoError(t, err, "marshal startup state")
+	require.NoError(t, os.WriteFile(startupStatePath(dir), state, 0o600),
+		"write startup state")
+
+	out := captureStdout(t, func() {
+		runServeStatus(config.Config{DataDir: dir})
+	})
+
+	assert.Contains(t, out, "agentsview is starting up.")
+	assert.Contains(t, out, fmt.Sprintf("pid:     %d", os.Getpid()))
+	// runServeStatus computes elapsed from a live clock, so allow a
+	// few seconds of scheduler slack; exact rendering is covered by
+	// the fixed-clock serveStartingStatusLines unit test.
+	assert.Regexp(t, `elapsed: 1m3[0-5]s`, out)
+	assert.Contains(t, out,
+		"phase:   full resync: claude: 12/38 sessions (32%)")
+	assert.Contains(t, out, "log:     "+serveLogPath(dir))
+}
+
+func TestRunServeStatusStartingWithoutStateFallsBack(t *testing.T) {
+	dir := runtimeTestDir(t)
+	MarkDaemonStarting(dir)
+	t.Cleanup(func() { UnmarkDaemonStarting(dir) })
+	require.NoError(t, os.WriteFile(
+		startupStatePath(dir), []byte("{corrupt"), 0o600,
+	), "plant corrupt state file")
+
+	out := captureStdout(t, func() {
+		runServeStatus(config.Config{DataDir: dir})
+	})
+
+	assert.Contains(t, out, "agentsview is starting up.")
+	assert.NotContains(t, out, "phase:")
+}
+
+func TestRunServeStatus_StartupStateFallbackWithoutRuntimeRecord(t *testing.T) {
+	dir := runtimeTestDir(t)
+	host, port := testPingServer(t)
+	createTime, ok := processCreateTimeMillis(os.Getpid())
+	require.True(t, ok)
+	writeStartupFallbackFixture(t, dir, host, port, os.Getpid(), strconv.FormatInt(createTime, 10))
+
+	out := captureStdout(t, func() {
+		runServeStatus(config.Config{DataDir: dir})
+	})
+
+	assert.Contains(t, out, "agentsview running at")
+	assert.Contains(t, out, fmt.Sprintf("http://%s:%d", host, port))
+	assert.Contains(t, out, "runtime record unwritten")
+}
+
+func TestRunServeStatus_StartupStateFallbackStaleStateDoesNotClaimRunning(t *testing.T) {
+	dir := runtimeTestDir(t)
+	host, port := testPingServer(t)
+	writeStartupFallbackFixture(t, dir, host, port, os.Getpid(), "1")
+
+	out := captureStdout(t, func() {
+		runServeStatus(config.Config{DataDir: dir})
+	})
+
+	assert.NotContains(t, out, "agentsview running at")
+	assert.Contains(t, out, "agentsview is starting up.")
+	assert.Contains(t, out, "stale fallback")
+}
+
+func TestRunServeStop_StartupStateFallbackWithoutRuntimeRecord(t *testing.T) {
+	dir := runtimeTestDir(t)
+	host, port := testPingServer(t)
+	createTime, ok := processCreateTimeMillis(os.Getpid())
+	require.True(t, ok)
+	writeStartupFallbackFixture(t, dir, host, port, os.Getpid(), strconv.FormatInt(createTime, 10))
+
+	rt := FindWritableDaemonRuntime(dir)
+	require.NotNil(t, rt)
+	assert.True(t, stopTargetConfirmed(rt.Record, ""))
+}
+
+func TestRunServeStop_StartupStateFallbackRequiresIdentity(t *testing.T) {
+	dir := runtimeTestDir(t)
+	host, port := testPingServer(t)
+	writeStartupFallbackFixture(t, dir, host, port, os.Getpid(), "1")
+
+	assert.Nil(t, FindWritableDaemonRuntime(dir), "stale fallback must not authorize stop")
+}
+
+func TestUnmarkDaemonStartingRemovesStartupState(t *testing.T) {
+	dir := runtimeTestDir(t)
+	MarkDaemonStarting(dir)
+	newStartupStateWriter(dir, time.Now).SetPhase("opening database")
+	require.NotNil(t, readStartupState(dir), "state written during startup")
+
+	UnmarkDaemonStarting(dir)
+	assert.Nil(t, readStartupState(dir),
+		"state must not outlive the start lock")
 }
 
 func newPingDaemonWithPID(t *testing.T, pid int) testDaemonEndpoint {
@@ -180,6 +292,17 @@ func TestServeCommandHasLifecycleSubcommands(t *testing.T) {
 	}
 	assert.True(t, names["status"], "serve must expose a status subcommand")
 	assert.True(t, names["stop"], "serve must expose a stop subcommand")
+	assert.True(t, names["restart"], "serve must expose a restart subcommand")
+}
+
+func TestServeRestartHelpExplainsWriterOnlyAsymmetry(t *testing.T) {
+	out, err := executeCommand(newRootCommand(), "serve", "restart", "--help")
+	require.NoError(t, err)
+	assert.Contains(t, out, "writable SQLite background daemon")
+	assert.Contains(t, out, "config.toml")
+	assert.Contains(t, out,
+		"Unlike `agentsview serve stop`, this command intentionally leaves "+
+			"read-only PostgreSQL and DuckDB servers running.")
 }
 
 func TestStopWritableDaemonsForUpdateStopsAllAndRestartsOne(t *testing.T) {
@@ -222,7 +345,7 @@ func TestStopWritableDaemonsForUpdateStopsAllAndRestartsOne(t *testing.T) {
 
 	oldStop := stopDaemonRuntimeForUpgrade
 	var stopped []int
-	stopDaemonRuntimeForUpgrade = func(
+	stopDaemonRuntimeForUpgrade = func(ctx context.Context,
 		_ config.Config, rt *DaemonRuntime,
 	) error {
 		stopped = append(stopped, rt.Record.PID)
@@ -230,7 +353,7 @@ func TestStopWritableDaemonsForUpdateStopsAllAndRestartsOne(t *testing.T) {
 	}
 	t.Cleanup(func() { stopDaemonRuntimeForUpgrade = oldStop })
 
-	result, err := stopWritableDaemonsForUpdate(config.Config{DataDir: dir})
+	result, err := stopWritableDaemonsForUpdate(t.Context(), config.Config{DataDir: dir})
 	require.NoError(t, err)
 	assert.True(t, result.Stopped)
 	assert.Equal(t, "127.0.0.1", result.Host)
@@ -239,6 +362,30 @@ func TestStopWritableDaemonsForUpdateStopsAllAndRestartsOne(t *testing.T) {
 	assert.True(t, result.RequireAuthKnown)
 	assert.True(t, result.NoSync)
 	assert.ElementsMatch(t, []int{os.Getpid(), secondPID}, stopped)
+}
+
+func TestStopWritableDaemonsForUpdateUsesStartupStateFallback(t *testing.T) {
+	dir := runtimeTestDir(t)
+	host, port := testPingServer(t)
+	createTime, ok := processCreateTimeMillis(os.Getpid())
+	require.True(t, ok)
+	writeStartupFallbackFixture(t, dir, host, port, os.Getpid(), strconv.FormatInt(createTime, 10))
+
+	oldStop := stopDaemonRuntimeForUpgrade
+	var stopped *DaemonRuntime
+	stopDaemonRuntimeForUpgrade = func(ctx context.Context, _ config.Config, rt *DaemonRuntime) error {
+		stopped = rt
+		return nil
+	}
+	t.Cleanup(func() { stopDaemonRuntimeForUpgrade = oldStop })
+
+	result, err := stopWritableDaemonsForUpdate(t.Context(), config.Config{DataDir: dir})
+	require.NoError(t, err)
+	assert.True(t, result.Stopped)
+	assert.Equal(t, host, result.Host)
+	assert.Equal(t, port, result.Port)
+	require.NotNil(t, stopped)
+	assert.Equal(t, os.Getpid(), stopped.Record.PID)
 }
 
 func TestStopDaemonProcessTerminatesAndCleansRecord(t *testing.T) {
@@ -259,6 +406,70 @@ func TestStopDaemonProcessTerminatesAndCleansRecord(t *testing.T) {
 	assert.False(t, daemon.ProcessAlive(pid))
 	assert.Empty(t, liveDaemonRecords(dir),
 		"runtime record must be removed after stop")
+}
+
+func TestStopDaemonRuntimeForUpgradeChecksExplicitPortBeforeStop(t *testing.T) {
+	requirePOSIXSignals(t, "uses a child process to observe replacement signals")
+	for _, tt := range []struct {
+		name        string
+		explicit    bool
+		ownEndpoint bool
+		wildcard    bool
+		host        string
+		otherHost   string
+		ephemeral   bool
+		wantError   bool
+	}{
+		{name: "occupied explicit port preserves incumbent", explicit: true, wantError: true},
+		{name: "incumbent endpoint can be replaced", explicit: true, ownEndpoint: true},
+		{name: "incumbent wildcard can narrow to loopback", explicit: true, ownEndpoint: true, wildcard: true},
+		{name: "same endpoint through localhost", explicit: true, ownEndpoint: true, host: "localhost"},
+		{name: "widening preserves incumbent on shared port", explicit: true, ownEndpoint: true, host: "0.0.0.0", otherHost: "127.0.0.2", wantError: true},
+		{name: "implicit port retains fallback"},
+		{name: "explicit zero retains automatic selection", explicit: true, ephemeral: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := runtimeTestDir(t)
+			pid, _ := startReapedSleepProcess(t)
+			endpoint := newPingDaemonWithPID(t, pid)
+			writeRuntimeRecordFixture(t, dir, runtimeRecordForEndpoint(
+				endpoint, withRuntimePID(pid),
+			))
+			rt := FindDaemonRuntime(dir)
+			require.NotNil(t, rt)
+			if tt.wildcard {
+				rt.Host = "0.0.0.0"
+			}
+			listener, port := heldLoopbackPort(t)
+			t.Cleanup(func() { listener.Close() })
+			if tt.ownEndpoint {
+				port = endpoint.Port
+			} else if tt.ephemeral {
+				port = 0
+			}
+			if tt.otherHost != "" {
+				other, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", net.JoinHostPort(tt.otherHost, strconv.Itoa(port)))
+				if err != nil {
+					t.Skipf("second loopback address unavailable: %v", err)
+				}
+				t.Cleanup(func() { other.Close() })
+			}
+			cfg := config.Config{DataDir: dir, Host: endpoint.Host, Port: port, PortExplicit: tt.explicit}
+			if tt.host != "" {
+				cfg.Host = tt.host
+			}
+			err := stopDaemonRuntimeForUpgradeImpl(t.Context(), cfg, rt)
+			if tt.wantError {
+				require.ErrorContains(t, err, "requested port")
+				assert.True(t, daemon.ProcessAlive(pid), "failed preflight must leave the incumbent running")
+				assert.FileExists(t, rt.Record.SourcePath)
+				return
+			}
+			require.NoError(t, err)
+			assert.False(t, daemon.ProcessAlive(pid))
+			assert.NoFileExists(t, rt.Record.SourcePath)
+		})
+	}
 }
 
 func TestStopDaemonProcessKeepsRecordWhenProcessSurvives(t *testing.T) {
@@ -283,25 +494,145 @@ func TestStopDaemonProcessKeepsRecordWhenProcessSurvives(t *testing.T) {
 		"runtime record must be kept when the daemon is still alive")
 }
 
-func TestRecordedDaemonStillPresent(t *testing.T) {
-	live, ok := processCreateTimeMillis(os.Getpid())
+func TestStopDaemonProcessDoesNotForceKillUnknownIdentity(t *testing.T) {
+	requirePOSIXSignals(t, "SIGTERM-ignore and SIGKILL behavior is POSIX-specific")
+	setStartProbeTickForTest(t, 10*time.Millisecond)
+
+	tests := []struct {
+		name       string
+		createTime string
+	}{
+		{name: "missing"},
+		{name: "malformed", createTime: "not-a-time"},
+		{name: "zero", createTime: "0"},
+		{name: "negative", createTime: "-1"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := runtimeTestDir(t)
+			pid, reaped := startReapedTERMIgnoringProcess(t)
+			path, err := writeRuntimeRecordForTest(dir, daemon.RuntimeRecord{
+				PID:      pid,
+				Network:  daemon.NetworkTCP,
+				Address:  "127.0.0.1:1",
+				Metadata: map[string]string{runtimeCreateTime: tt.createTime},
+			})
+			require.NoError(t, err)
+
+			err = stopDaemonProcess(onlyLiveRuntimeRecord(t, dir), 50*time.Millisecond)
+			require.Error(t, err)
+			require.ErrorContains(t, err, "identity")
+			assert.True(t, daemon.ProcessAlive(pid),
+				"unknown identity must not authorize SIGKILL")
+			select {
+			case <-reaped:
+				assert.Fail(t, "unknown identity process was killed")
+			default:
+			}
+			assert.FileExists(t, path,
+				"unknown identity record must remain for manual recovery")
+		})
+	}
+}
+
+func TestStopDaemonProcessForceKillsMatchedIdentity(t *testing.T) {
+	requirePOSIXSignals(t, "SIGTERM-ignore and SIGKILL behavior is POSIX-specific")
+	setStartProbeTickForTest(t, 10*time.Millisecond)
+	dir := runtimeTestDir(t)
+	pid, reaped := startReapedTERMIgnoringProcess(t)
+	createTime, ok := processCreateTimeMillis(pid)
 	require.True(t, ok)
-
-	assert.True(t, recordedDaemonStillPresent(daemon.RuntimeRecord{
-		PID: os.Getpid(),
+	path, err := writeRuntimeRecordForTest(dir, daemon.RuntimeRecord{
+		PID:     pid,
+		Network: daemon.NetworkTCP,
+		Address: "127.0.0.1:1",
 		Metadata: map[string]string{
-			runtimeCreateTime: strconv.FormatInt(live, 10),
+			runtimeCreateTime: strconv.FormatInt(createTime, 10),
 		},
-	}), "exact create-time match means the daemon is still present")
+	})
+	require.NoError(t, err)
 
-	assert.False(t, recordedDaemonStillPresent(daemon.RuntimeRecord{
-		PID:      os.Getpid(),
-		Metadata: map[string]string{runtimeCreateTime: "1"},
-	}), "mismatched create time means the PID was reused, daemon is gone")
+	require.NoError(t, stopDaemonProcess(
+		onlyLiveRuntimeRecord(t, dir), 50*time.Millisecond,
+	))
+	<-reaped
+	assert.False(t, daemon.ProcessAlive(pid))
+	assertPathRemoved(t, path,
+		"matched identity record should be removed after force kill")
+}
 
-	assert.True(t, recordedDaemonStillPresent(daemon.RuntimeRecord{
-		PID: os.Getpid(),
-	}), "legacy record without a create time conservatively assumes presence")
+func TestStopDaemonProcessKeepsRecordWhenIdentityBecomesUnknownAfterForceKill(
+	t *testing.T,
+) {
+	requirePOSIXSignals(t, "relies on POSIX zombie semantics for ProcessAlive")
+	setStartProbeTickForTest(t, 10*time.Millisecond)
+	dir := runtimeTestDir(t)
+	pid := startTERMIgnoringProcess(t)
+	path, err := writeRuntimeRecordForTest(dir, daemon.RuntimeRecord{
+		PID:      pid,
+		Network:  daemon.NetworkTCP,
+		Address:  "127.0.0.1:1",
+		Metadata: map[string]string{runtimeCreateTime: "1234"},
+	})
+	require.NoError(t, err)
+	rec := onlyLiveRuntimeRecord(t, dir)
+
+	identityCalls := 0
+	identityState := func(gotPID int, recorded string) processCreateTimeState {
+		assert.Equal(t, pid, gotPID)
+		assert.Equal(t, "1234", recorded)
+		identityCalls++
+		if identityCalls == 1 {
+			return processCreateTimeMatch
+		}
+		return processCreateTimeUnknown
+	}
+
+	err = stopDaemonProcessWithIdentity(
+		rec, 50*time.Millisecond, identityState,
+	)
+	require.Error(t, err)
+	require.ErrorContains(t, err, "identity")
+	require.ErrorContains(t, err, "after force kill")
+	assert.Equal(t, 2, identityCalls)
+	assert.FileExists(t, path,
+		"unknown post-kill identity must preserve the runtime record")
+}
+
+func TestStopDaemonProcessKeepsRecordWhenMatchedProcessSurvivesForceKill(
+	t *testing.T,
+) {
+	requirePOSIXSignals(t, "relies on POSIX zombie semantics for ProcessAlive")
+	setStartProbeTickForTest(t, 10*time.Millisecond)
+	dir := runtimeTestDir(t)
+	pid := startTERMIgnoringProcess(t)
+	path, err := writeRuntimeRecordForTest(dir, daemon.RuntimeRecord{
+		PID:      pid,
+		Network:  daemon.NetworkTCP,
+		Address:  "127.0.0.1:1",
+		Metadata: map[string]string{runtimeCreateTime: "1234"},
+	})
+	require.NoError(t, err)
+	rec := onlyLiveRuntimeRecord(t, dir)
+
+	identityCalls := 0
+	identityState := func(gotPID int, recorded string) processCreateTimeState {
+		assert.Equal(t, pid, gotPID)
+		assert.Equal(t, "1234", recorded)
+		identityCalls++
+		return processCreateTimeMatch
+	}
+
+	err = stopDaemonProcessWithIdentity(
+		rec, 50*time.Millisecond, identityState,
+	)
+	require.Error(t, err)
+	require.ErrorContains(t, err, "still running after force kill")
+	assert.Equal(t, 2, identityCalls,
+		"identity must be confirmed before and after force kill")
+	assert.FileExists(t, path,
+		"surviving matched process must retain its ownership record")
 }
 
 func TestStopDaemonProcessRemovesRecordWhenPIDReused(t *testing.T) {
@@ -367,8 +698,7 @@ func TestWriteDaemonRuntimePersistsCaddyMetadata(t *testing.T) {
 	assert.Equal(t, strconv.Itoa(os.Getpid()), rec.Metadata[runtimeCaddyPID])
 	ct, ok := processCreateTimeMillis(os.Getpid())
 	require.True(t, ok)
-	assert.Equal(t,
-		strconv.FormatInt(ct, 10), rec.Metadata[runtimeCaddyCreateTime])
+	assert.Equal(t, strconv.FormatInt(ct, 10), rec.Metadata[runtimeCaddyCreateTime])
 }
 
 func TestWriteDaemonRuntimeOmitsCaddyMetadataWhenAbsent(t *testing.T) {

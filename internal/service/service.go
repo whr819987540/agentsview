@@ -5,7 +5,7 @@ package service
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/v2"
 	"errors"
 	"io"
 
@@ -18,6 +18,47 @@ import (
 // regardless of transport (the REST handler maps it back to HTTP 501).
 var ErrSearchUnavailable = errors.New("search not available")
 
+// RecallQueryCapability is implemented by services whose backing store can
+// query Recall entries. Callers should treat services without this capability
+// as unsupported so retrieval surfaces are not advertised optimistically.
+type RecallQueryCapability interface {
+	SupportsRecallQueries() bool
+}
+
+// SupportsRecallQueries reports whether svc can query Recall entries.
+func SupportsRecallQueries(svc SessionService) bool {
+	capability, ok := svc.(RecallQueryCapability)
+	return ok && capability.SupportsRecallQueries()
+}
+
+// ErrAroundMutuallyExclusive is returned by Messages when Around is combined
+// with From or a non-default Direction: the two retrieval modes (symmetric
+// window vs. linear pagination) cannot both be requested. The HTTP handler
+// maps it to a 400 response.
+var ErrAroundMutuallyExclusive = errors.New(
+	"around is mutually exclusive with from/direction",
+)
+
+// ErrBeforeAfterRequireAround is returned by Messages when Before or After
+// is set without Around. The HTTP handler maps it to a 400 response.
+var ErrBeforeAfterRequireAround = errors.New("before/after require around")
+
+// ErrSemanticUnavailable is returned by SearchContent for modes
+// "semantic"/"hybrid" when the backing store has no VectorSearcher wired in.
+// It is the same sentinel as db.ErrSemanticUnavailable so direct callers can
+// errors.Is it without transport-specific handling; the HTTP backend maps a
+// 501 response back to it for daemon-backed callers.
+var ErrSemanticUnavailable = db.ErrSemanticUnavailable
+
+const (
+	// SemanticSearchIntentHeader is required on HTTP GET semantic/hybrid
+	// content searches. It forces browser callers to use an explicit fetch with
+	// a non-simple header, preventing blind no-CORS cross-origin GETs from
+	// spending embeddings quota through the local daemon.
+	SemanticSearchIntentHeader = "X-AgentsView-Search-Intent"
+	SemanticSearchIntentValue  = "semantic"
+)
+
 // SessionService is the canonical per-session operation interface.
 // Two implementations: directBackend (wraps *db.DB) and httpBackend
 // (proxies to a running daemon).
@@ -27,6 +68,9 @@ type SessionService interface {
 	// case-sensitive substring, ordered by most recent activity and capped by
 	// limit.
 	FindSessionIDsByPartial(ctx context.Context, partial string, limit int) ([]string, error)
+	// FindSessionIDsByRawSuffix matches an exact stored ID or a literal
+	// colon/tilde-delimited suffix before applying limit.
+	FindSessionIDsByRawSuffix(ctx context.Context, raw string, limit int) ([]string, error)
 	List(ctx context.Context, f ListFilter) (*SessionList, error)
 	Messages(ctx context.Context, id string, f MessageFilter) (*MessageList, error)
 	InputOutline(ctx context.Context, id string, includeForkContext bool) (*InputOutline, error)
@@ -40,6 +84,12 @@ type SessionService interface {
 	UsagePairwiseComparison(
 		ctx context.Context, req UsagePairwiseComparisonRequest,
 	) (*UsagePairwiseComparisonResponse, error)
+	ListRecallEntries(ctx context.Context, f RecallFilter) (*RecallList, error)
+	GetRecallEntry(ctx context.Context, id string) (*db.RecallEntry, error)
+	QueryRecallEntries(ctx context.Context, req RecallQuery) (*RecallQueryResult, error)
+	ImportRecallEntries(
+		ctx context.Context, r io.Reader, opts db.RecallImportOptions,
+	) (*db.RecallImportResult, error)
 	ListSecrets(ctx context.Context, f SecretListFilter) (*SecretFindingList, error)
 	ScanSecrets(ctx context.Context, in SecretScanInput,
 		progress func(SecretScanProgress)) (*SecretScanSummary, error)
@@ -94,11 +144,13 @@ type SecretFindingList struct {
 // It mirrors the GET /api/v1/search query parameters so both transports
 // produce identical results.
 type SearchRequest struct {
-	Query   string `json:"query"`
-	Project string `json:"project,omitempty"`
-	Sort    string `json:"sort,omitempty"` // "relevance" (default) or "recency"
-	Cursor  int    `json:"cursor,omitempty"`
-	Limit   int    `json:"limit,omitempty"`
+	DateFrom string `json:"date_from,omitempty"`
+	DateTo   string `json:"date_to,omitempty"`
+	Query    string `json:"query"`
+	Project  string `json:"project,omitempty"`
+	Sort     string `json:"sort,omitempty"` // "relevance" (default) or "recency"
+	Cursor   int    `json:"cursor,omitempty"`
+	Limit    int    `json:"limit,omitempty"`
 }
 
 // SessionSearchResult mirrors db.SearchPage for transport: ranked
@@ -111,16 +163,26 @@ type SessionSearchResult struct {
 // ContentSearchRequest is the transport-neutral content-search input.
 type ContentSearchRequest struct {
 	Pattern       string   `json:"pattern"`
-	Mode          string   `json:"mode,omitempty"` // substring|regex|fts
+	Mode          string   `json:"mode,omitempty"` // substring|regex|fts|terms|semantic|hybrid
 	Sources       []string `json:"sources,omitempty"`
 	ExcludeSystem bool     `json:"exclude_system,omitempty"`
 	Reveal        bool     `json:"reveal,omitempty"`
+	// Context requests N messages of inline context before and after each
+	// match (0 = off, max 10). See directBackend.SearchContent.
+	Context int `json:"context,omitempty"`
 
 	Project, ExcludeProject, Machine, Agent           string
-	Date, DateFrom, DateTo, ActiveSince               string
+	SessionID, GitBranchExact                         string
+	Date, DateFrom, DateTo, Timezone, ActiveSince     string
 	IncludeChildren, IncludeAutomated, IncludeOneShot bool
+	ExcludeSessionIDs                                 []string
 	// GitBranch is a branchListSep-joined list of opaque (project, branch) tokens (EncodeBranchFilterToken).
 	GitBranch string
+
+	// Scope governs semantic/hybrid unit visibility ("top", "all", or
+	// "subordinate"; "" means "all") and supersedes IncludeChildren in
+	// those modes. See db.ContentSearchFilter.Scope.
+	Scope string `json:"scope,omitempty"`
 
 	Limit  int `json:"limit,omitempty"`
 	Cursor int `json:"cursor,omitempty"`
@@ -130,6 +192,117 @@ type ContentSearchRequest struct {
 type ContentSearchResult struct {
 	Matches    []db.ContentMatch `json:"matches"`
 	NextCursor int               `json:"next_cursor,omitempty"`
+}
+
+// RecallFilter mirrors GET /api/v1/recall/entries query parameters.
+type RecallFilter struct {
+	Query               string `json:"q,omitempty"`
+	Project             string `json:"project,omitempty"`
+	CWD                 string `json:"cwd,omitempty"`
+	GitBranch           string `json:"git_branch,omitempty"`
+	Agent               string `json:"agent,omitempty"`
+	Type                string `json:"type,omitempty"`
+	Scope               string `json:"scope,omitempty"`
+	Status              string `json:"status,omitempty"`
+	ExtractorMethod     string `json:"extractor_method,omitempty"`
+	SourceSessionID     string `json:"source_session_id,omitempty"`
+	SourceEpisodeID     string `json:"source_episode_id,omitempty"`
+	SourceRunID         string `json:"source_run_id,omitempty"`
+	SupersedesEntryID   string `json:"supersedes_entry_id,omitempty"`
+	SupersededByEntryID string `json:"superseded_by_entry_id,omitempty"`
+	TrustedOnly         bool   `json:"trusted_only,omitempty"`
+	Limit               int    `json:"limit,omitempty"`
+}
+
+// RecallList mirrors GET /api/v1/recall/entries.
+type RecallList struct {
+	RecallEntries []db.RecallResult `json:"entries"`
+	TrustedOnly   bool              `json:"trusted_only"`
+}
+
+// RecallQuery mirrors POST /api/v1/recall/query.
+type RecallQuery struct {
+	Query               string `json:"query"`
+	Mode                string `json:"mode,omitempty"`
+	Surface             string `json:"surface,omitempty"`
+	Project             string `json:"project,omitempty"`
+	CWD                 string `json:"cwd,omitempty"`
+	GitBranch           string `json:"git_branch,omitempty"`
+	Agent               string `json:"agent,omitempty"`
+	Type                string `json:"type,omitempty"`
+	Scope               string `json:"scope,omitempty"`
+	Status              string `json:"status,omitempty"`
+	ExtractorMethod     string `json:"extractor_method,omitempty"`
+	SourceSessionID     string `json:"source_session_id,omitempty"`
+	SourceEpisodeID     string `json:"source_episode_id,omitempty"`
+	SourceRunID         string `json:"source_run_id,omitempty"`
+	SupersedesEntryID   string `json:"supersedes_entry_id,omitempty"`
+	SupersededByEntryID string `json:"superseded_by_entry_id,omitempty"`
+	TrustedOnly         bool   `json:"trusted_only,omitempty"`
+	Limit               int    `json:"limit,omitempty"`
+	IncludeContext      bool   `json:"include_context,omitempty"`
+	ContextMaxBytes     int    `json:"context_max_bytes,omitempty"`
+	// SkipRecording keeps retrieval read-only by omitting the query event and
+	// exposure snapshot. MCP sets it because query_recall is declared read-only.
+	SkipRecording bool `json:"skip_recording,omitempty"`
+	// StrictRecording is reserved for local calibration workflows. It is not
+	// transported over JSON; ordinary query paths keep measurement best-effort.
+	StrictRecording bool `json:"-"`
+}
+
+// RecallQueryResult mirrors POST /api/v1/recall/query response.
+type RecallQueryResult struct {
+	Mode           string              `json:"mode"`
+	QueryID        string              `json:"query_id"`
+	MissReason     string              `json:"miss_reason"`
+	RecallEntries  []db.RecallResult   `json:"entries"`
+	TrustedOnly    bool                `json:"trusted_only"`
+	Summary        *RecallQuerySummary `json:"summary,omitempty"`
+	Context        string              `json:"context,omitempty"`
+	ContextMeta    *RecallContextMeta  `json:"context_meta,omitempty"`
+	ContextEntries []db.RecallResult   `json:"context_entries,omitempty"`
+	ContextSummary *RecallQuerySummary `json:"context_summary,omitempty"`
+}
+
+// RecallQuerySummary is aggregate metadata for auditing one recall query result.
+type RecallQuerySummary struct {
+	Count             int            `json:"count"`
+	ByType            map[string]int `json:"by_type"`
+	ByScope           map[string]int `json:"by_scope"`
+	ByStatus          map[string]int `json:"by_status"`
+	ByProject         map[string]int `json:"by_project"`
+	ByAgent           map[string]int `json:"by_agent"`
+	ByCWD             map[string]int `json:"by_cwd"`
+	ByGitBranch       map[string]int `json:"by_git_branch"`
+	ByMatchReason     map[string]int `json:"by_match_reason"`
+	ByExtractorMethod map[string]int `json:"by_extractor"`
+	ByModel           map[string]int `json:"by_model"`
+	BySourceRun       map[string]int `json:"by_source_run"`
+	BySourceSession   map[string]int `json:"by_source_session"`
+	BySourceEpisode   map[string]int `json:"by_source_episode"`
+	ByTransferability map[string]int `json:"by_transferability"`
+	ByProvenanceAudit map[string]int `json:"by_provenance_audit"`
+	ByEvidence        map[string]int `json:"by_evidence"`
+	ByLifecycle       map[string]int `json:"by_lifecycle"`
+}
+
+// RecallContextMeta describes the assembled recall context without exposing it
+// as additional model-visible evidence.
+type RecallContextMeta struct {
+	EntryCount                        int                 `json:"entry_count"`
+	Truncated                         bool                `json:"truncated"`
+	IncludedIDs                       []string            `json:"included_ids,omitempty"`
+	IncludedTypesByID                 map[string]string   `json:"included_types_by_id,omitempty"`
+	IncludedMatchReasonsByID          map[string][]string `json:"included_match_reasons_by_id,omitempty"`
+	SourceSessionIDs                  []string            `json:"source_session_ids,omitempty"`
+	SourceEpisodeIDs                  []string            `json:"source_episode_ids,omitempty"`
+	SourceRunIDs                      []string            `json:"source_run_ids,omitempty"`
+	TruncatedFrom                     int                 `json:"truncated_from,omitempty"`
+	OmittedCount                      int                 `json:"omitted_count,omitempty"`
+	PromptInjectionContext            bool                `json:"prompt_injection_context,omitempty"`
+	PromptInjectionContextIDs         []string            `json:"prompt_injection_context_ids,omitempty"`
+	PromptInjectionContextReasons     []string            `json:"prompt_injection_context_reasons,omitempty"`
+	PromptInjectionContextReasonsByID map[string][]string `json:"prompt_injection_context_reasons_by_id,omitempty"`
 }
 
 // SessionDetail mirrors the HTTP GetSession response shape: a
@@ -159,7 +332,7 @@ type SessionDetail struct {
 func (d SessionDetail) MarshalJSON() ([]byte, error) {
 	type sessionAlias db.Session
 	return json.Marshal(struct {
-		sessionAlias
+		sessionAlias     `json:",inline"`
 		QualitySignals   *db.QualitySignals `json:"quality_signals,omitempty"`
 		HealthScoreBasis []string           `json:"health_score_basis,omitempty"`
 		HealthPenalties  map[string]int     `json:"health_penalties,omitempty"`
@@ -179,7 +352,7 @@ func (d SessionDetail) MarshalJSON() ([]byte, error) {
 func (d *SessionDetail) UnmarshalJSON(data []byte) error {
 	type sessionAlias db.Session
 	var v struct {
-		sessionAlias
+		sessionAlias     `json:",inline"`
 		QualitySignals   *db.QualitySignals `json:"quality_signals"`
 		HealthScoreBasis []string           `json:"health_score_basis"`
 		HealthPenalties  map[string]int     `json:"health_penalties"`
@@ -214,6 +387,7 @@ type ListFilter struct {
 	Date             string `json:"date,omitempty"`
 	DateFrom         string `json:"date_from,omitempty"`
 	DateTo           string `json:"date_to,omitempty"`
+	Timezone         string `json:"timezone,omitempty"`
 	ActiveSince      string `json:"active_since,omitempty"`
 	MinMessages      int    `json:"min_messages,omitempty"`
 	MaxMessages      int    `json:"max_messages,omitempty"`
@@ -221,6 +395,7 @@ type ListFilter struct {
 	IncludeOneShot   bool   `json:"include_one_shot,omitempty"`
 	IncludeAutomated bool   `json:"include_automated,omitempty"`
 	IncludeChildren  bool   `json:"include_children,omitempty"`
+	IncludeSource    bool   `json:"include_source,omitempty"`
 	Outcome          string `json:"outcome,omitempty"`      // comma-separated
 	HealthGrade      string `json:"health_grade,omitempty"` // comma-separated
 	Termination      string `json:"termination,omitempty"`  // comma-separated
@@ -239,17 +414,33 @@ type ListFilter struct {
 // From is a pointer so callers can distinguish "omitted" from "0". An
 // omitted From in descending mode means "start from the newest message";
 // an explicit 0 means "start at ordinal 0".
+//
+// Around/Before/After select a symmetric window centered on an ordinal
+// instead of linear pagination; they are mutually exclusive with
+// From/Direction (see directBackend.Messages). Roles filters the result to
+// the given roles (empty = all roles) in either mode.
 type MessageFilter struct {
-	From               *int   `json:"from,omitempty"`
-	Limit              int    `json:"limit,omitempty"`
-	Direction          string `json:"direction,omitempty"` // "asc" (default) or "desc"
-	IncludeForkContext bool   `json:"include_fork_context,omitempty"`
+	From      *int     `json:"from,omitempty"`
+	Limit     int      `json:"limit,omitempty"`
+	Direction string   `json:"direction,omitempty"` // "asc" (default) or "desc"
+	Around    *int     `json:"around,omitempty"`
+	Before    *int     `json:"before,omitempty"` // default 5 when Around set
+	After     *int     `json:"after,omitempty"`  // default 5 when Around set
+	Roles     []string `json:"roles,omitempty"`
+	// IncludeForkContext prepends the parent session's inherited prefix to a
+	// forked session's transcript so the fork boundary is visible in place.
+	// Mutually exclusive with Around (see directBackend.Messages).
+	IncludeForkContext bool `json:"include_fork_context,omitempty"`
 }
 
-// MessageList mirrors {messages, count}.
+// MessageList mirrors {messages, count}. FirstOrdinal/LastOrdinal report the
+// returned window's bounds (nil when Messages is empty) so callers can page
+// on with from = last_ordinal + 1.
 type MessageList struct {
-	Messages []db.Message `json:"messages"`
-	Count    int          `json:"count"`
+	Messages     []db.Message `json:"messages"`
+	Count        int          `json:"count"`
+	FirstOrdinal *int         `json:"first_ordinal,omitempty"`
+	LastOrdinal  *int         `json:"last_ordinal,omitempty"`
 }
 
 // InputOutline is a deterministic outline of user-authored inputs in a
@@ -290,8 +481,9 @@ type ToolCallList struct {
 // SyncInput carries the payload for a per-session sync.
 // Exactly one of Path or ID must be set.
 type SyncInput struct {
-	Path string `json:"path,omitempty"`
-	ID   string `json:"id,omitempty"`
+	Path      string `json:"path,omitempty"`
+	ID        string `json:"id,omitempty"`
+	Subagents bool   `json:"subagents,omitempty"`
 }
 
 // Event is the CLI-side NDJSON wrapper for SSE events from
