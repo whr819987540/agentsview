@@ -64,8 +64,12 @@ jobs:
           GOOS: linux
           GOARCH: amd64
           CGO_ENABLED: "1"
-          CGO_CFLAGS: -O2 -g -I${{ github.workspace }}/.sqlite-include
         run: |
+          # This job runs in a container, where the github.workspace
+          # expression resolves to the runner host path rather than the
+          # in-container mount. GITHUB_WORKSPACE is correct inside it.
+          export CGO_CFLAGS="-O2 -g -I${GITHUB_WORKSPACE}/.sqlite-include"
+
           VERSION=$(git describe --tags --always)
           COMMIT=${GITHUB_SHA::8}
           BUILD_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
