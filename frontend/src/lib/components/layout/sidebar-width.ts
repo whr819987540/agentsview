@@ -13,11 +13,12 @@ export const VITALS_WIDTH_STORAGE_MAX = 560;
 // logic agrees with the (max-width: 760px) CSS rules and ui.isMobileViewport.
 export const SIDEBAR_DESKTOP_BREAKPOINT = BREAKPOINTS.medium + 1;
 
-function clampStoredPaneWidth(
+/** Clamps a stored pane size, falling back when it is missing or not a number. */
+export function clampStoredPaneSize(
   value: unknown,
   fallback: number,
-  minWidth: number,
-  maxWidth: number,
+  minSize: number,
+  maxSize: number,
 ): number {
   const numericValue = typeof value === "string" && value.trim() !== "" ? Number(value) : value;
 
@@ -25,11 +26,11 @@ function clampStoredPaneWidth(
     return fallback;
   }
 
-  return Math.min(maxWidth, Math.max(minWidth, numericValue));
+  return Math.min(maxSize, Math.max(minSize, numericValue));
 }
 
 export function clampStoredSidebarWidth(value: unknown): number {
-  return clampStoredPaneWidth(
+  return clampStoredPaneSize(
     value,
     SIDEBAR_WIDTH_DEFAULT,
     SIDEBAR_WIDTH_MIN,
@@ -38,7 +39,7 @@ export function clampStoredSidebarWidth(value: unknown): number {
 }
 
 export function clampStoredVitalsWidth(value: unknown): number {
-  return clampStoredPaneWidth(
+  return clampStoredPaneSize(
     value,
     VITALS_WIDTH_DEFAULT,
     VITALS_WIDTH_MIN,

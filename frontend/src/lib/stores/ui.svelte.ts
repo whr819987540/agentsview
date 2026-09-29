@@ -15,6 +15,11 @@ import {
   clampStoredSidebarWidth,
   clampStoredVitalsWidth,
 } from "../components/layout/sidebar-width.js";
+import {
+  SESSION_TREE_HEIGHT_DEFAULT,
+  SESSION_TREE_HEIGHT_KEY,
+  clampStoredSessionTreeHeight,
+} from "../components/content/session-tree-height.js";
 
 type Theme = "light" | "dark";
 export type MessageLayout = "default" | "compact" | "stream" | "skim";
@@ -234,6 +239,14 @@ function readStoredVitalsWidth(): number {
   }
 }
 
+function readStoredSessionTreeHeight(): number {
+  try {
+    return clampStoredSessionTreeHeight(localStorage?.getItem(SESSION_TREE_HEIGHT_KEY));
+  } catch {
+    return SESSION_TREE_HEIGHT_DEFAULT;
+  }
+}
+
 function readStoredBool(key: string, fallback: boolean): boolean {
   try {
     const raw = localStorage?.getItem(key);
@@ -268,6 +281,8 @@ class UIStore {
   transcriptMode: TranscriptMode = $state(readStoredTranscriptMode());
   sidebarWidth: number = $state(readStoredSidebarWidth());
   vitalsWidth: number = $state(readStoredVitalsWidth());
+  /** Height limit for the session tree above the session vitals. */
+  sessionTreeHeight: number = $state(readStoredSessionTreeHeight());
   activeModal: ModalType = $state(null);
   /** Whether the next gist publish should be secret instead of public. */
   publishSecret: boolean = $state(false);
@@ -327,6 +342,14 @@ class UIStore {
       $effect(() => {
         try {
           localStorage?.setItem(VITALS_WIDTH_KEY, String(this.vitalsWidth));
+        } catch {
+          // ignore
+        }
+      });
+
+      $effect(() => {
+        try {
+          localStorage?.setItem(SESSION_TREE_HEIGHT_KEY, String(this.sessionTreeHeight));
         } catch {
           // ignore
         }
@@ -547,6 +570,10 @@ class UIStore {
 
   setVitalsWidth(width: number) {
     this.vitalsWidth = clampStoredVitalsWidth(width);
+  }
+
+  setSessionTreeHeight(height: number) {
+    this.sessionTreeHeight = clampStoredSessionTreeHeight(height);
   }
 
   setPublishTarget(target: Exclude<PublishTarget, null>) {

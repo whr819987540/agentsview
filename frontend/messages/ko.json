@@ -1773,6 +1773,7 @@
   "session_vitals_now": "지금",
   "session_tree_title": "Session tree",
   "session_tree_truncated": "Partial tree",
+  "session_tree_resize": "세션 트리 크기 조정",
   "session_tree_untitled": "Untitled session",
   "session_tree_relationship_root": "root",
   "session_tree_relationship_fork": "fork",

@@ -1820,6 +1820,7 @@
   "session_vitals_now": "İndi",
   "session_tree_title": "Session tree",
   "session_tree_truncated": "Partial tree",
+  "session_tree_resize": "Sessiya ağacının ölçüsünü dəyişdir",
   "session_tree_untitled": "Untitled session",
   "session_tree_relationship_root": "root",
   "session_tree_relationship_fork": "fork",

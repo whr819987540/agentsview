@@ -1569,6 +1569,7 @@
   "session_vitals_now": "現在",
   "session_tree_title": "會話樹",
   "session_tree_truncated": "部分樹",
+  "session_tree_resize": "調整會話樹高度",
   "session_tree_untitled": "未命名會話",
   "session_tree_relationship_root": "根節點",
   "session_tree_relationship_fork": "分叉",

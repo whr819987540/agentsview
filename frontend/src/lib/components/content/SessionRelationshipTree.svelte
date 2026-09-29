@@ -1,4 +1,8 @@
 <script lang="ts">
+  import {
+    SplitResizeHandle,
+    type SplitResizeEvent,
+  } from "@kenn-io/kit-ui";
   import { fetchSessionTree } from "../../api/sessionTree.js";
   import type { Session } from "../../api/types/core.js";
   import type {
@@ -7,7 +11,13 @@
   } from "../../api/generated/index.js";
   import { m } from "../../i18n/index.js";
   import { router } from "../../stores/router.svelte.js";
+  import { ui } from "../../stores/ui.svelte.js";
   import { formatNumber } from "../../utils/format.js";
+  import {
+    SESSION_TREE_HEIGHT_MIN,
+    SESSION_TREE_HEIGHT_STORAGE_MAX,
+    clampSessionTreeHeightForLayout,
+  } from "./session-tree-height.js";
 
   interface Props {
     sessionId: string;
@@ -47,6 +57,69 @@
 
   let rows = $derived(tree ? flattenTree(tree.root) : []);
   let visible = $derived(rows.length > 1);
+
+  let treeElement = $state<HTMLElement | null>(null);
+  // Height of the column the tree shares with the session vitals, or null
+  // until it has been laid out.
+  let columnHeight = $state<number | null>(null);
+  let resizeStartHeight = 0;
+
+  const columnLimit = $derived(
+    columnHeight ?? Number.POSITIVE_INFINITY,
+  );
+  // The stored height is a limit: shorter trees keep their natural height
+  // and taller ones scroll inside it.
+  const maxHeight = $derived(
+    clampSessionTreeHeightForLayout(ui.sessionTreeHeight, columnLimit),
+  );
+  const layoutMaxHeight = $derived(
+    clampSessionTreeHeightForLayout(
+      SESSION_TREE_HEIGHT_STORAGE_MAX,
+      columnLimit,
+    ),
+  );
+
+  function measureColumnHeight(): number | null {
+    const height =
+      treeElement?.parentElement?.getBoundingClientRect().height ?? 0;
+    columnHeight = height > 0 ? height : null;
+    return columnHeight;
+  }
+
+  $effect(() => {
+    const column = treeElement?.parentElement;
+    if (!column) return;
+    measureColumnHeight();
+    const observer = new ResizeObserver(() => {
+      measureColumnHeight();
+    });
+    observer.observe(column);
+    return () => observer.disconnect();
+  });
+
+  function handleResizeStart() {
+    // Start from the rendered height so a tree shorter than its limit
+    // follows the handle right away.
+    const renderedHeight = Math.round(
+      treeElement?.getBoundingClientRect().height ?? 0,
+    );
+    resizeStartHeight =
+      renderedHeight > 0 ? Math.min(renderedHeight, maxHeight) : maxHeight;
+  }
+
+  function handleResize(event: SplitResizeEvent) {
+    // The handle sits below the tree, so moving it down (positive delta)
+    // makes the tree taller.
+    const nextHeight = clampSessionTreeHeightForLayout(
+      resizeStartHeight + event.delta,
+      measureColumnHeight() ?? Number.POSITIVE_INFINITY,
+    );
+
+    // Skip persisting when the clamp lands on the rendered limit so a taller
+    // stored preference survives drags in a short window.
+    if (nextHeight === maxHeight) return;
+    ui.setSessionTreeHeight(nextHeight);
+  }
 
   function sessionTitle(session: Session): string {
     const title = (
@@ -102,7 +175,12 @@
 </script>
 
 {#if visible}
-  <section class="session-tree" aria-label={m.session_tree_title()}>
+  <section
+    class="session-tree"
+    aria-label={m.session_tree_title()}
+    bind:this={treeElement}
+    style:max-height={`${maxHeight}px`}
+  >
     <header class="tree-header">
       <span>{m.session_tree_title()}</span>
       {#if tree?.truncated}
@@ -143,16 +221,29 @@
       {/each}
     </div>
   </section>
+  <SplitResizeHandle
+    orientation="vertical"
+    ariaLabel={m.session_tree_resize()}
+    ariaValueMin={SESSION_TREE_HEIGHT_MIN}
+    ariaValueMax={layoutMaxHeight}
+    ariaValueNow={maxHeight}
+    onResizeStart={handleResizeStart}
+    onResize={handleResize}
+    onResizeEnd={handleResize}
+  />
 {/if}
 
 <style>
   .session-tree {
     flex-shrink: 0;
+    display: flex;
+    flex-direction: column;
     border-bottom: 1px solid var(--border-default);
     background: var(--bg-surface);
   }
 
   .tree-header {
+    flex-shrink: 0;
     min-height: 34px;
     padding: 9px 14px 7px;
     display: flex;
@@ -177,6 +268,8 @@
   }
 
   .tree-list {
+    min-height: 0;
+    overflow-y: auto;
     padding: 0 8px 10px;
     display: grid;
     gap: 2px;

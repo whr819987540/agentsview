@@ -36,6 +36,17 @@
 - 在 `frontend/src/App.svelte` 的右侧 vitals slot 中，将 `SessionRelationshipTree`
   渲染在 `SessionVitals` 上方。
 - 树只在节点数超过 1 时显示；单 session 不占用空间。
+- 树的高度有上限，默认 280px。节点超出上限时在树内部滚动，不会把下方的
+  Analysis 面板挤出视野。
+- 树下方有一条分隔条（kit-ui `SplitResizeHandle`，`orientation="vertical"`）。
+  用户可以拖动它，或聚焦后按上下方向键，调整树的高度上限：
+  - 上限范围是 96px 到 1600px，并且始终给下方的 Analysis 面板留出 160px。
+  - 树内容比上限矮时保持自然高度；拖动从树当前的实际高度开始计算。
+  - 上限保存在 localStorage 的 `agentsview-session-tree-height`，刷新后保留。
+  - 窗口变矮时树临时收缩，但不会覆盖已保存的上限。
+- 高度常量和限制逻辑在
+  `frontend/src/lib/components/content/session-tree-height.ts`；状态是
+  `ui.sessionTreeHeight`，通过 `ui.setSessionTreeHeight()` 修改。
 - 每个节点是可点击 anchor：
   - `href` 使用 `router.buildSessionHref(session.id)`
   - 普通左键点击使用 `router.navigateToSession(session.id)`
@@ -55,10 +66,9 @@
   - `session_tree_relationship_subagent`
   - `session_tree_relationship_continuation`
   - `session_tree_message_count`
-- 本地化文件已同步：
-  - `frontend/messages/en.json`
-  - `frontend/messages/zh-CN.json`
-  - `frontend/messages/zh-TW.json`
+  - `session_tree_resize`（分隔条的无障碍标签）
+- `frontend/messages/*.json` 的 8 个 locale key 集合一致。`ko`、`fr`、`ja`、
+  `az`、`es` 中除 `session_tree_resize` 外的树文案仍是英文。
 
 ## Tests Added
 
@@ -78,6 +88,13 @@
   - branch-start class
   - truncated/localized labels
   - click navigation via router
+  - height limit from the stored value
+  - dragging grows a short tree from its rendered height
+  - arrow keys and the 96px minimum
+  - the 160px Analysis reserve in a short column
+  - a short window keeps a taller stored limit
+- `session-tree-height.test.ts` covers stored-value parsing and layout clamping.
+- `ui.test.ts` covers reading and persisting `agentsview-session-tree-height`.
 
 ## Validation
 
@@ -86,7 +103,7 @@ Frontend validation:
 ```bash
 cd frontend
 npm run i18n:compile
-npm test -- SessionRelationshipTree.test.ts
+npm test -- SessionRelationshipTree.test.ts session-tree-height.test.ts ui.test.ts
 npm run check
 ```
 
@@ -111,6 +128,8 @@ node -e "for (const f of ['frontend/messages/en.json','frontend/messages/zh-CN.j
 - UI 入口在 session 详情页右上角的 Analysis/Vitals 图标；打开右侧栏后，
   `Session tree` 显示在 `Analysis` 面板上方。
 - 如果当前 session 所在树只有一个节点，树不会显示。
+- 拖动 `Session tree` 下方的分隔条可以调整树的高度，给 Analysis 面板留出
+  更多或更少空间。
 - Codex 原生 fork 关系需要 data version `58` 后重新 sync/resync 才会补齐到 DB。
 - 本机 `/tmp/.git` 会污染 parser 测试的项目名推断；运行 Go 测试时建议设置
   `TMPDIR="$HOME/tmp"`。

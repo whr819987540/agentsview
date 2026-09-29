@@ -542,6 +542,70 @@ describe("UIStore", () => {
     });
   });
 
+  describe("session tree height", () => {
+    const SESSION_TREE_HEIGHT_KEY = "agentsview-session-tree-height";
+
+    async function importWithStoredHeight(stored: string | null, cacheKey: string) {
+      const setItem = vi.fn();
+      Object.defineProperty(globalThis, "localStorage", {
+        value: {
+          getItem: vi.fn((key: string) => (key === SESSION_TREE_HEIGHT_KEY ? stored : null)),
+          setItem,
+        },
+        writable: true,
+        configurable: true,
+      });
+      const mod = await import(/* @vite-ignore */ `./ui.svelte.js?${cacheKey}`);
+      return { ui: mod.ui as typeof ui, setItem };
+    }
+
+    it("reads and clamps the stored height", async () => {
+      const original = globalThis.localStorage;
+
+      try {
+        const stored = await importWithStoredHeight("420", "sessionTreeHeightStored");
+        const tooSmall = await importWithStoredHeight("20", "sessionTreeHeightTooSmall");
+        const invalid = await importWithStoredHeight("tall", "sessionTreeHeightInvalid");
+        const missing = await importWithStoredHeight(null, "sessionTreeHeightMissing");
+
+        expect(stored.ui.sessionTreeHeight).toBe(420);
+        expect(tooSmall.ui.sessionTreeHeight).toBe(96);
+        expect(invalid.ui.sessionTreeHeight).toBe(280);
+        expect(missing.ui.sessionTreeHeight).toBe(280);
+      } finally {
+        Object.defineProperty(globalThis, "localStorage", {
+          value: original,
+          writable: true,
+          configurable: true,
+        });
+      }
+    });
+
+    it("persists clamped heights through setSessionTreeHeight", async () => {
+      const original = globalThis.localStorage;
+
+      try {
+        const { ui: store, setItem } = await importWithStoredHeight(
+          null,
+          "sessionTreeHeightPersist",
+        );
+        setItem.mockClear();
+
+        store.setSessionTreeHeight(5000);
+        await tick();
+
+        expect(store.sessionTreeHeight).toBe(1600);
+        expect(setItem).toHaveBeenCalledWith(SESSION_TREE_HEIGHT_KEY, "1600");
+      } finally {
+        Object.defineProperty(globalThis, "localStorage", {
+          value: original,
+          writable: true,
+          configurable: true,
+        });
+      }
+    });
+  });
+
   describe("Calls detail preference", () => {
     it("defaults the Calls detail to expanded", async () => {
       const original = globalThis.localStorage;

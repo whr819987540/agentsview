@@ -21,6 +21,7 @@ vi.mock("../../api/sessionTree.js", () => ({
 
 import { m } from "../../i18n/index.js";
 import { router } from "../../stores/router.svelte.js";
+import { ui } from "../../stores/ui.svelte.js";
 // @ts-ignore
 import SessionRelationshipTree from "./SessionRelationshipTree.svelte";
 
@@ -107,6 +108,61 @@ async function flush() {
   await tick();
 }
 
+function mockHeight(element: Element, height: number) {
+  Object.defineProperty(element, "getBoundingClientRect", {
+    configurable: true,
+    value: () => ({
+      width: 320,
+      height,
+      top: 0,
+      right: 320,
+      bottom: height,
+      left: 0,
+      x: 0,
+      y: 0,
+      toJSON: () => ({}),
+    }),
+  });
+}
+
+function getTree() {
+  const tree = document.querySelector<HTMLElement>(".session-tree");
+  expect(tree).not.toBeNull();
+  return tree!;
+}
+
+function getResizeHandle() {
+  return document.querySelector<HTMLElement>(
+    `[aria-label="${m.session_tree_resize()}"]`,
+  );
+}
+
+function pointerEvent(type: string, clientY: number) {
+  return new PointerEvent(type, {
+    bubbles: true,
+    clientY,
+    pointerId: 1,
+  });
+}
+
+async function dragHandle(startY: number, endY: number) {
+  const handle = getResizeHandle();
+  expect(handle).not.toBeNull();
+
+  handle!.dispatchEvent(pointerEvent("pointerdown", startY));
+  handle!.dispatchEvent(pointerEvent("pointermove", endY));
+  await tick();
+  handle!.dispatchEvent(pointerEvent("pointerup", endY));
+  await tick();
+}
+
+async function pressKey(key: string) {
+  getResizeHandle()!.dispatchEvent(
+    new KeyboardEvent("keydown", { bubbles: true, key }),
+  );
+  await tick();
+}
+
 describe("SessionRelationshipTree", () => {
   let component: ReturnType<typeof mount> | undefined;
 
@@ -123,6 +179,7 @@ describe("SessionRelationshipTree", () => {
       unmount(component);
       component = undefined;
     }
+    ui.setSessionTreeHeight(280);
     vi.restoreAllMocks();
     document.body.innerHTML = "";
   });
@@ -150,6 +207,7 @@ describe("SessionRelationshipTree", () => {
     expect(
       document.querySelector(".session-tree"),
     ).toBeNull();
+    expect(getResizeHandle()).toBeNull();
   });
 
   it("renders active, leaf, branch, and localized labels", async () => {
@@ -208,5 +266,86 @@ describe("SessionRelationshipTree", () => {
       .click();
 
     expect(navigate).toHaveBeenCalledWith("sibling");
+  });
+
+  describe("height", () => {
+    // Stands in for the vitals column the tree renders into.
+    let column: HTMLElement;
+
+    beforeEach(() => {
+      mocks.fetchSessionTree.mockResolvedValue(makeTree());
+      column = document.createElement("div");
+      document.body.appendChild(column);
+    });
+
+    async function mountInColumn() {
+      component = mount(SessionRelationshipTree, {
+        target: column,
+        props: { sessionId: "child" },
+      });
+      await flush();
+    }
+
+    it("limits the tree to the stored height", async () => {
+      ui.setSessionTreeHeight(360);
+
+      await mountInColumn();
+
+      expect(getTree().style.maxHeight).toBe("360px");
+      expect(getResizeHandle()?.getAttribute("aria-valuenow")).toBe(
+        "360",
+      );
+    });
+
+    it("grows a short tree from its rendered height when dragged down", async () => {
+      await mountInColumn();
+      mockHeight(getTree(), 150);
+
+      await dragHandle(400, 460);
+
+      expect(ui.sessionTreeHeight).toBe(210);
+      expect(getTree().style.maxHeight).toBe("210px");
+    });
+
+    it("shrinks from arrow keys and stops at the minimum", async () => {
+      await mountInColumn();
+      mockHeight(getTree(), 280);
+
+      await pressKey("ArrowUp");
+      expect(ui.sessionTreeHeight).toBe(256);
+
+      await dragHandle(400, 0);
+      expect(ui.sessionTreeHeight).toBe(96);
+      expect(getTree().style.maxHeight).toBe("96px");
+    });
+
+    it("keeps room for the session vitals below the tree", async () => {
+      mockHeight(column, 500);
+      await mountInColumn();
+      mockHeight(getTree(), 280);
+
+      await dragHandle(400, 700);
+
+      // A 500px column keeps 160px for the handle and vitals.
+      expect(ui.sessionTreeHeight).toBe(340);
+      expect(getTree().style.maxHeight).toBe("340px");
+      expect(getResizeHandle()?.getAttribute("aria-valuemax")).toBe(
+        "340",
+      );
+    });
+
+    it("fits a taller stored height to a short column without forgetting it", async () => {
+      ui.setSessionTreeHeight(600);
+      mockHeight(column, 500);
+
+      await mountInColumn();
+      expect(getTree().style.maxHeight).toBe("340px");
+
+      mockHeight(getTree(), 340);
+      await dragHandle(400, 480);
+
+      expect(getTree().style.maxHeight).toBe("340px");
+      expect(ui.sessionTreeHeight).toBe(600);
+    });
   });
 });

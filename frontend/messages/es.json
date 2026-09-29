@@ -1820,6 +1820,7 @@
   "session_vitals_now": "ahora",
   "session_tree_title": "Session tree",
   "session_tree_truncated": "Partial tree",
+  "session_tree_resize": "Redimensionar el árbol de sesiones",
   "session_tree_untitled": "Untitled session",
   "session_tree_relationship_root": "root",
   "session_tree_relationship_fork": "fork",
