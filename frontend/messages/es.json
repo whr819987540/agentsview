@@ -1767,6 +1767,7 @@
   "session_input_outline_empty": "No user inputs",
   "session_input_outline_error": "Failed to load inputs",
   "session_input_outline_jump_to": "Jump to input: {preview}",
+  "session_input_outline_resize": "Redimensionar las entradas del usuario",
   "session_vitals_resize": "Redimensionar el panel de análisis de la sesión",
   "session_vitals_session": "Sesión",
   "session_vitals_repository": "Repositorio",

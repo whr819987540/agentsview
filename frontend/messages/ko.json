@@ -1722,6 +1722,7 @@
   "session_input_outline_empty": "No user inputs",
   "session_input_outline_error": "Failed to load inputs",
   "session_input_outline_jump_to": "Jump to input: {preview}",
+  "session_input_outline_resize": "사용자 입력 크기 조정",
   "session_vitals_resize": "세션 분석 패널 크기 조정",
   "session_vitals_session": "세션",
   "session_vitals_repository": "저장소",

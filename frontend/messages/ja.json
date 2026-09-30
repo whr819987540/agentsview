@@ -1763,6 +1763,7 @@
   "session_input_outline_empty": "No user inputs",
   "session_input_outline_error": "Failed to load inputs",
   "session_input_outline_jump_to": "Jump to input: {preview}",
+  "session_input_outline_resize": "ユーザー入力のサイズを変更する",
   "session_vitals_resize": "セッション分析パネルのサイズを変更する",
   "session_vitals_session": "セッション",
   "session_vitals_repository": "リポジトリ",

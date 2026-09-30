@@ -606,6 +606,72 @@ describe("UIStore", () => {
     });
   });
 
+  describe("session input outline height", () => {
+    const SESSION_INPUT_OUTLINE_HEIGHT_KEY = "agentsview-session-input-outline-height";
+
+    async function importWithStoredHeight(stored: string | null, cacheKey: string) {
+      const setItem = vi.fn();
+      Object.defineProperty(globalThis, "localStorage", {
+        value: {
+          getItem: vi.fn((key: string) =>
+            key === SESSION_INPUT_OUTLINE_HEIGHT_KEY ? stored : null,
+          ),
+          setItem,
+        },
+        writable: true,
+        configurable: true,
+      });
+      const mod = await import(/* @vite-ignore */ `./ui.svelte.js?${cacheKey}`);
+      return { ui: mod.ui as typeof ui, setItem };
+    }
+
+    it("reads and clamps the stored height", async () => {
+      const original = globalThis.localStorage;
+
+      try {
+        const stored = await importWithStoredHeight("420", "inputOutlineHeightStored");
+        const tooSmall = await importWithStoredHeight("20", "inputOutlineHeightTooSmall");
+        const invalid = await importWithStoredHeight("tall", "inputOutlineHeightInvalid");
+        const missing = await importWithStoredHeight(null, "inputOutlineHeightMissing");
+
+        expect(stored.ui.sessionInputOutlineHeight).toBe(420);
+        expect(tooSmall.ui.sessionInputOutlineHeight).toBe(96);
+        expect(invalid.ui.sessionInputOutlineHeight).toBe(240);
+        expect(missing.ui.sessionInputOutlineHeight).toBe(240);
+      } finally {
+        Object.defineProperty(globalThis, "localStorage", {
+          value: original,
+          writable: true,
+          configurable: true,
+        });
+      }
+    });
+
+    it("persists clamped heights through setSessionInputOutlineHeight", async () => {
+      const original = globalThis.localStorage;
+
+      try {
+        const { ui: store, setItem } = await importWithStoredHeight(
+          null,
+          "inputOutlineHeightPersist",
+        );
+        setItem.mockClear();
+
+        store.setSessionInputOutlineHeight(5000);
+        await tick();
+
+        expect(store.sessionInputOutlineHeight).toBe(1600);
+        expect(setItem).toHaveBeenCalledWith(SESSION_INPUT_OUTLINE_HEIGHT_KEY, "1600");
+      } finally {
+        Object.defineProperty(globalThis, "localStorage", {
+          value: original,
+          writable: true,
+          configurable: true,
+        });
+      }
+    });
+  });
+
   describe("Calls detail preference", () => {
     it("defaults the Calls detail to expanded", async () => {
       const original = globalThis.localStorage;

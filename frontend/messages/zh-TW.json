@@ -1516,6 +1516,7 @@
   "session_input_outline_empty": "沒有用戶輸入",
   "session_input_outline_error": "輸入載入失敗",
   "session_input_outline_jump_to": "跳轉到輸入：{preview}",
+  "session_input_outline_resize": "調整使用者輸入高度",
   "session_vitals_session": "會話",
   "session_vitals_running": "運行中",
   "session_vitals_running_duration": "運行中 {duration}+",

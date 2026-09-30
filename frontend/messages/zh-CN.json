@@ -1505,6 +1505,7 @@
   "session_input_outline_empty": "没有用户输入",
   "session_input_outline_error": "输入加载失败",
   "session_input_outline_jump_to": "跳转到输入：{preview}",
+  "session_input_outline_resize": "调整用户输入高度",
   "session_vitals_resize": "调整会话分析面板大小",
   "session_vitals_session": "会话",
   "session_vitals_repository": "存储库",

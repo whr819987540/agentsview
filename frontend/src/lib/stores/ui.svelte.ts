@@ -20,6 +20,11 @@ import {
   SESSION_TREE_HEIGHT_KEY,
   clampStoredSessionTreeHeight,
 } from "../components/content/session-tree-height.js";
+import {
+  SESSION_INPUT_OUTLINE_HEIGHT_DEFAULT,
+  SESSION_INPUT_OUTLINE_HEIGHT_KEY,
+  clampStoredSessionInputOutlineHeight,
+} from "../components/content/session-input-outline-height.js";
 
 type Theme = "light" | "dark";
 export type MessageLayout = "default" | "compact" | "stream" | "skim";
@@ -247,6 +252,16 @@ function readStoredSessionTreeHeight(): number {
   }
 }
 
+function readStoredSessionInputOutlineHeight(): number {
+  try {
+    return clampStoredSessionInputOutlineHeight(
+      localStorage?.getItem(SESSION_INPUT_OUTLINE_HEIGHT_KEY),
+    );
+  } catch {
+    return SESSION_INPUT_OUTLINE_HEIGHT_DEFAULT;
+  }
+}
+
 function readStoredBool(key: string, fallback: boolean): boolean {
   try {
     const raw = localStorage?.getItem(key);
@@ -283,6 +298,8 @@ class UIStore {
   vitalsWidth: number = $state(readStoredVitalsWidth());
   /** Height limit for the session tree above the session vitals. */
   sessionTreeHeight: number = $state(readStoredSessionTreeHeight());
+  /** Height limit for the user input outline in the session vitals. */
+  sessionInputOutlineHeight: number = $state(readStoredSessionInputOutlineHeight());
   activeModal: ModalType = $state(null);
   /** Whether the next gist publish should be secret instead of public. */
   publishSecret: boolean = $state(false);
@@ -350,6 +367,17 @@ class UIStore {
       $effect(() => {
         try {
           localStorage?.setItem(SESSION_TREE_HEIGHT_KEY, String(this.sessionTreeHeight));
+        } catch {
+          // ignore
+        }
+      });
+
+      $effect(() => {
+        try {
+          localStorage?.setItem(
+            SESSION_INPUT_OUTLINE_HEIGHT_KEY,
+            String(this.sessionInputOutlineHeight),
+          );
         } catch {
           // ignore
         }
@@ -574,6 +602,10 @@ class UIStore {
 
   setSessionTreeHeight(height: number) {
     this.sessionTreeHeight = clampStoredSessionTreeHeight(height);
+  }
+
+  setSessionInputOutlineHeight(height: number) {
+    this.sessionInputOutlineHeight = clampStoredSessionInputOutlineHeight(height);
   }
 
   setPublishTarget(target: Exclude<PublishTarget, null>) {

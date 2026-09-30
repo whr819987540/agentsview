@@ -1767,6 +1767,7 @@
   "session_input_outline_empty": "No user inputs",
   "session_input_outline_error": "Failed to load inputs",
   "session_input_outline_jump_to": "Jump to input: {preview}",
+  "session_input_outline_resize": "İstifadəçi girişlərinin ölçüsünü dəyişdir",
   "session_vitals_resize": "Sessiya təhlili panelinin ölçüsünü dəyişdir",
   "session_vitals_session": "Sessiya",
   "session_vitals_repository": "Repozitoriya",
