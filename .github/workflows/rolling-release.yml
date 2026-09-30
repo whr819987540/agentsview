@@ -1,8 +1,9 @@
 name: Rolling Release
 
 # Build directly-usable Linux and Windows binaries on every push to main
-# and publish them to a rolling "latest" prerelease. Tagged releases
-# (release.yml) remain the stable distribution channel.
+# and publish them to a rolling "latest" prerelease. Each build is also
+# kept as a permanent "build-YYYYMMDD-<sha>" prerelease so earlier
+# versions remain downloadable.
 
 on:
   push:
@@ -200,6 +201,20 @@ jobs:
             --target "$GITHUB_SHA" \
             --title "Rolling build ($SHORT_SHA)" \
             --notes "$NOTES" \
+            artifacts/agentsview-linux-amd64 \
+            artifacts/agentsview-windows-amd64.exe \
+            artifacts/SHA256SUMS
+
+          # Also keep a permanent snapshot of this build so earlier
+          # versions stay downloadable after "latest" moves on.
+          BUILD_TAG="build-$(date -u +%Y%m%d)-${SHORT_SHA}"
+          BUILD_NOTES=$(printf 'Snapshot build of `%s`.\n\n> %s\n' \
+            "$GITHUB_SHA" "$SUBJECT")
+          gh release create "$BUILD_TAG" \
+            --prerelease \
+            --target "$GITHUB_SHA" \
+            --title "Build $BUILD_TAG" \
+            --notes "$BUILD_NOTES" \
             artifacts/agentsview-linux-amd64 \
             artifacts/agentsview-windows-amd64.exe \
             artifacts/SHA256SUMS
