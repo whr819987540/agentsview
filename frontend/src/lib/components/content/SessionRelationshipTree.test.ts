@@ -346,4 +346,92 @@ describe("SessionRelationshipTree", () => {
       expect(ui.sessionTreeHeight).toBe(600);
     });
   });
+
+  describe("active node scrolling", () => {
+    const ROW_HEIGHT = 50;
+    const LIST_HEIGHT = 200;
+
+    // A root with `count - 1` subagent children; the child at
+    // `activeIndex` (1-based row) is the active session.
+    function makeWideTree(count: number, activeIndex: number) {
+      const children = Array.from({ length: count - 1 }, (_, i) => ({
+        session: makeSession(`node-${i + 1}`, {
+          relationship_type: "subagent",
+        }),
+        depth: 1,
+        is_active: i + 1 === activeIndex,
+        is_leaf: true,
+        is_branch_start: false,
+        children: [],
+      }));
+      return {
+        active_session_id: `node-${activeIndex}`,
+        truncated: false,
+        root: {
+          session: makeSession("root"),
+          depth: 0,
+          is_active: false,
+          is_leaf: false,
+          is_branch_start: true,
+          children,
+        },
+      } satisfies SessionTreeResponse;
+    }
+
+    // Lays rows out top to bottom at ROW_HEIGHT each inside a list that
+    // shows LIST_HEIGHT pixels.
+    beforeEach(() => {
+      vi.spyOn(HTMLElement.prototype, "offsetTop", "get").mockImplementation(
+        function (this: HTMLElement) {
+          if (!this.classList.contains("tree-node")) return 0;
+          const rows = Array.from(this.parentElement?.children ?? []);
+          return rows.indexOf(this) * ROW_HEIGHT;
+        },
+      );
+      vi.spyOn(HTMLElement.prototype, "offsetHeight", "get").mockImplementation(
+        function (this: HTMLElement) {
+          return this.classList.contains("tree-node") ? ROW_HEIGHT : 0;
+        },
+      );
+      vi.spyOn(HTMLElement.prototype, "clientHeight", "get").mockImplementation(
+        function (this: HTMLElement) {
+          return this.classList.contains("tree-list") ? LIST_HEIGHT : 0;
+        },
+      );
+    });
+
+    function getList() {
+      const list = document.querySelector<HTMLElement>(".tree-list");
+      expect(list).not.toBeNull();
+      return list!;
+    }
+
+    it("centers an active node that loads below the visible rows", async () => {
+      mocks.fetchSessionTree.mockResolvedValue(makeWideTree(12, 9));
+
+      component = mount(SessionRelationshipTree, {
+        target: document.body,
+        props: { sessionId: "node-9" },
+      });
+      await flush();
+      await tick();
+
+      // Row 9 spans 450-500px; centering it in a 200px list puts the top
+      // of the view at 450 - (200 - 50) / 2.
+      expect(getList().scrollTop).toBe(375);
+    });
+
+    it("leaves the list at the top when the active node is already visible", async () => {
+      mocks.fetchSessionTree.mockResolvedValue(makeWideTree(12, 2));
+
+      component = mount(SessionRelationshipTree, {
+        target: document.body,
+        props: { sessionId: "node-2" },
+      });
+      await flush();
+      await tick();
+
+      expect(getList().scrollTop).toBe(0);
+    });
+  });
 });

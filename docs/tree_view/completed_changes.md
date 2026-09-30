@@ -44,6 +44,8 @@
   - 树内容比上限矮时保持自然高度；拖动从树当前的实际高度开始计算。
   - 上限保存在 localStorage 的 `agentsview-session-tree-height`，刷新后保留。
   - 窗口变矮时树临时收缩，但不会覆盖已保存的上限。
+- 每次树加载后，如果当前会话的节点在可视区域之外，树列表会自动滚动，把它
+  放到中间；节点已经可见时不滚动。只滚动树列表本身，不会带动右侧栏或页面。
 - 高度常量和限制逻辑在
   `frontend/src/lib/components/content/session-tree-height.ts`；状态是
   `ui.sessionTreeHeight`，通过 `ui.setSessionTreeHeight()` 修改。
@@ -93,6 +95,8 @@
   - arrow keys and the 96px minimum
   - the 160px Analysis reserve in a short column
   - a short window keeps a taller stored limit
+  - an active node below the visible rows is scrolled to the middle
+  - an active node that is already visible leaves the list at the top
 - `session-tree-height.test.ts` covers stored-value parsing and layout clamping.
 - `ui.test.ts` covers reading and persisting `agentsview-session-tree-height`.
 
@@ -130,6 +134,7 @@ node -e "for (const f of ['frontend/messages/en.json','frontend/messages/zh-CN.j
 - 如果当前 session 所在树只有一个节点，树不会显示。
 - 拖动 `Session tree` 下方的分隔条可以调整树的高度，给 Analysis 面板留出
   更多或更少空间。
+- 打开一个位于大树深处的会话时，树会自动滚动到当前会话的节点。
 - Codex 原生 fork 关系需要 data version `58` 后重新 sync/resync 才会补齐到 DB。
 - 本机 `/tmp/.git` 会污染 parser 测试的项目名推断；运行 Go 测试时建议设置
   `TMPDIR="$HOME/tmp"`。

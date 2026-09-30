@@ -3,6 +3,7 @@
     SplitResizeHandle,
     type SplitResizeEvent,
   } from "@kenn-io/kit-ui";
+  import { tick } from "svelte";
   import { fetchSessionTree } from "../../api/sessionTree.js";
   import type { Session } from "../../api/types/core.js";
   import type {
@@ -61,6 +62,7 @@
   // Sizes below are CSS pixels (clientHeight/offsetHeight), not
   // getBoundingClientRect, which includes interface zoom.
   let treeElement = $state<HTMLElement | null>(null);
+  let listElement = $state<HTMLElement | null>(null);
   // Height of the column the tree shares with the session vitals, or null
   // until it has been laid out.
   let columnHeight = $state<number | null>(null);
@@ -97,6 +99,34 @@
     observer.observe(column);
     return () => observer.disconnect();
   });
+
+  // Each loaded tree starts scrolled to the top, so bring the active
+  // session's node into view when it is below the height limit.
+  $effect(() => {
+    const list = listElement;
+    const loaded = tree;
+    if (!list || !loaded) return;
+    // Let the height limit settle against the measured column first.
+    void tick().then(() => {
+      if (listElement === list && tree === loaded) {
+        scrollActiveNodeIntoView(list);
+      }
+    });
+  });
+
+  function scrollActiveNodeIntoView(list: HTMLElement) {
+    const node = list.querySelector<HTMLElement>(".tree-node.active");
+    if (!node) return;
+    // Scroll the list directly: scrollIntoView would also scroll the
+    // vitals column and the page layout around it.
+    const top = node.offsetTop;
+    const bottom = top + node.offsetHeight;
+    const viewTop = list.scrollTop;
+    const viewBottom = viewTop + list.clientHeight;
+    if (top >= viewTop && bottom <= viewBottom) return;
+    // Center the node so its parent and siblings stay visible around it.
+    list.scrollTop = top - (list.clientHeight - node.offsetHeight) / 2;
+  }
 
   function handleResizeStart() {
     // Start from the rendered height so a tree shorter than its limit
@@ -187,7 +217,7 @@
       {/if}
     </header>
 
-    <div class="tree-list">
+    <div class="tree-list" bind:this={listElement}>
       {#each rows as node (node.session.id)}
         {@const session = node.session}
         <a
@@ -267,6 +297,8 @@
   }
 
   .tree-list {
+    /* Offset parent for the rows, so their offsetTop is in scroll space. */
+    position: relative;
     min-height: 0;
     overflow-y: auto;
     padding: 0 8px 10px;
