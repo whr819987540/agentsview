@@ -171,10 +171,28 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
     steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts
+          path: src
+
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
         with:
           path: artifacts
           merge-multiple: true
+
+      - name: Prepare installers
+        run: |
+          # Point the installers at the repository that publishes this
+          # release so they work straight from the release download URL.
+          mkdir -p installers
+          sed "s|@AGENTSVIEW_REPO@|$GH_REPO|" src/scripts/install-rolling.sh > installers/install.sh
+          sed "s|@AGENTSVIEW_REPO@|$GH_REPO|" src/scripts/install-rolling.ps1 > installers/install.ps1
+          if grep -l '@AGENTSVIEW_REPO@' installers/*; then
+            echo "Installer placeholder was not replaced" >&2
+            exit 1
+          fi
 
       - name: Generate checksums
         run: |
@@ -191,8 +209,9 @@ jobs:
           SHORT_SHA=${GITHUB_SHA::8}
           SUBJECT=$(printf '%s\n' "$HEAD_COMMIT_MESSAGE" | head -1)
 
-          NOTES=$(printf 'Automated rolling build of `%s`.\n\n> %s\n\nStable download URLs:\n- https://github.com/%s/releases/download/latest/agentsview-linux-amd64\n- https://github.com/%s/releases/download/latest/agentsview-windows-amd64.exe\n' \
-            "$GITHUB_SHA" "$SUBJECT" "$GH_REPO" "$GH_REPO")
+          BASE="https://github.com/$GH_REPO/releases/download/latest"
+          NOTES=$(printf 'Automated rolling build of `%s`.\n\n> %s\n\nInstall on Linux:\n```sh\ncurl -fsSL %s/install.sh | bash\n```\n\nInstall on Windows:\n```powershell\npowershell -ExecutionPolicy ByPass -c "irm %s/install.ps1 | iex"\n```\n\nStable download URLs:\n- %s/agentsview-linux-amd64\n- %s/agentsview-windows-amd64.exe\n' \
+            "$GITHUB_SHA" "$SUBJECT" "$BASE" "$BASE" "$BASE" "$BASE")
 
           # Recreate the release so the "latest" tag moves to this commit.
           gh release delete latest --yes --cleanup-tag || true
@@ -203,7 +222,9 @@ jobs:
             --notes "$NOTES" \
             artifacts/agentsview-linux-amd64 \
             artifacts/agentsview-windows-amd64.exe \
-            artifacts/SHA256SUMS
+            artifacts/SHA256SUMS \
+            installers/install.sh \
+            installers/install.ps1
 
           # Also keep a permanent snapshot of this build so earlier
           # versions stay downloadable after "latest" moves on.

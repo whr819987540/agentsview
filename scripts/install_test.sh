@@ -73,3 +73,5 @@ echo "Results: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
 
 bash "$SCRIPT_DIR/make_install_test.sh"
+
+bash "$SCRIPT_DIR/install_rolling_test.sh"

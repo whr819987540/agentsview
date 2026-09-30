@@ -233,6 +233,11 @@ jobs:
       - name: Restore pricing snapshot
         run: go run ./internal/pricing/cmd/litellm-snapshot -restore
 
+      - name: Run installer tests (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/install_rolling_test.ps1
+
       - name: Run Go tests (Linux)
         if: runner.os == 'Linux'
         run: go test -tags "fts5" -coverprofile=coverage.out ./... -v -count=1 -timeout=20m
