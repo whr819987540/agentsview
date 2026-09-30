@@ -13,7 +13,7 @@ mkdir -p internal/web/dist
     'keep embed dir for generated frontend assets' \
     > internal/web/dist/.keep
 
-VERSION="$(git describe --tags --always --dirty 2>/dev/null || echo dev)"
+VERSION="$(git describe --tags --always --dirty --match 'v*' 2>/dev/null || echo dev)"
 COMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 

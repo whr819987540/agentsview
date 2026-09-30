@@ -54,7 +54,7 @@ echo "Assembling build context..."
 
 # Resolve version info from git before copying (we exclude .git).
 # Sanitize to alphanumeric + ._+- to prevent Make injection.
-AV_VERSION=$(cd "$AGENTSVIEW_SRC" && git describe --tags --always --dirty 2>/dev/null || echo "dev")
+AV_VERSION=$(cd "$AGENTSVIEW_SRC" && git describe --tags --always --dirty --match 'v*' 2>/dev/null || echo "dev")
 AV_VERSION=$(printf '%s' "$AV_VERSION" | tr -cd 'A-Za-z0-9._+-')
 AV_COMMIT=$(cd "$AGENTSVIEW_SRC" && git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 AV_COMMIT=$(printf '%s' "$AV_COMMIT" | tr -cd 'A-Za-z0-9._+-')
