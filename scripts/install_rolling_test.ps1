@@ -101,6 +101,13 @@ try {
     Assert-Eq 'reinstall succeeds' 0 $r.Status
     Assert-Eq 'reinstall replaces binary' 'build-2' (Get-Content $dest -Raw)
 
+    # Without an override the binary lands in %USERPROFILE%\.local\bin.
+    $profileDir = Join-Path $work 'profile'
+    $r = Invoke-Installer @{ USERPROFILE = $profileDir }
+    Assert-Eq 'default dir install succeeds' 0 $r.Status
+    $defaultDest = Join-Path (Join-Path (Join-Path $profileDir '.local') 'bin') 'agentsview.exe'
+    Assert-Eq 'default dir is USERPROFILE\.local\bin' 'build-2' (Get-Content $defaultDest -Raw)
+
     # A corrupted download is rejected before anything is installed.
     $badDir = Join-Path $work 'bad'
     Set-Content -Path $asset -Value 'tampered' -NoNewline

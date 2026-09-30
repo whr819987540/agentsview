@@ -9,7 +9,7 @@
 #
 # Environment overrides:
 #   AGENTSVIEW_REPO            owner/repo that publishes the rolling release
-#   AGENTSVIEW_INSTALL_DIR     install directory (default: %USERPROFILE%\.agentsview\bin)
+#   AGENTSVIEW_INSTALL_DIR     install directory (default: %USERPROFILE%\.local\bin)
 #   AGENTSVIEW_NO_MODIFY_PATH  set to 1 to leave the user PATH alone
 #   AGENTSVIEW_SKIP_CHECKSUM   set to 1 to skip SHA256SUMS verification
 
@@ -57,7 +57,8 @@ function Get-InstallDir {
     if ($env:AGENTSVIEW_INSTALL_DIR) {
         return $env:AGENTSVIEW_INSTALL_DIR
     }
-    return Join-Path $env:USERPROFILE '.agentsview\bin'
+    # Same place as ~/.local/bin on Linux.
+    return Join-Path (Join-Path $env:USERPROFILE '.local') 'bin'
 }
 
 function Invoke-Download {

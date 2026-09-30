@@ -32,8 +32,9 @@ reload.
 powershell -ExecutionPolicy ByPass -c "irm https://github.com/whr819987540/agentsview/releases/download/latest/install.ps1 | iex"
 ```
 
-The installer puts `agentsview.exe` in `%USERPROFILE%\.agentsview\bin` and adds
-that directory to your user `PATH`. Open a new terminal afterwards.
+The installer puts `agentsview.exe` in `%USERPROFILE%\.local\bin`, the same
+place as `~/.local/bin` on Linux. If that directory is not in your user `PATH`,
+it adds it and asks you to open a new terminal.
 
 Run `agentsview update` to move to the newest rolling build. Earlier builds
 stay available as `build-YYYYMMDD-<commit>` entries on the
