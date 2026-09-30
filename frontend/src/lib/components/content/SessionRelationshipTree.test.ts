@@ -108,20 +108,18 @@ async function flush() {
   await tick();
 }
 
-function mockHeight(element: Element, height: number) {
-  Object.defineProperty(element, "getBoundingClientRect", {
+// jsdom has no layout, so tests supply the sizes the component reads.
+function mockRenderedHeight(tree: HTMLElement, height: number) {
+  Object.defineProperty(tree, "offsetHeight", {
     configurable: true,
-    value: () => ({
-      width: 320,
-      height,
-      top: 0,
-      right: 320,
-      bottom: height,
-      left: 0,
-      x: 0,
-      y: 0,
-      toJSON: () => ({}),
-    }),
+    value: height,
+  });
+}
+
+function mockColumnHeight(column: HTMLElement, height: number) {
+  Object.defineProperty(column, "clientHeight", {
+    configurable: true,
+    value: height,
   });
 }
 
@@ -299,7 +297,7 @@ describe("SessionRelationshipTree", () => {
 
     it("grows a short tree from its rendered height when dragged down", async () => {
       await mountInColumn();
-      mockHeight(getTree(), 150);
+      mockRenderedHeight(getTree(), 150);
 
       await dragHandle(400, 460);
 
@@ -309,7 +307,7 @@ describe("SessionRelationshipTree", () => {
 
     it("shrinks from arrow keys and stops at the minimum", async () => {
       await mountInColumn();
-      mockHeight(getTree(), 280);
+      mockRenderedHeight(getTree(), 280);
 
       await pressKey("ArrowUp");
       expect(ui.sessionTreeHeight).toBe(256);
@@ -320,9 +318,9 @@ describe("SessionRelationshipTree", () => {
     });
 
     it("keeps room for the session vitals below the tree", async () => {
-      mockHeight(column, 500);
+      mockColumnHeight(column, 500);
       await mountInColumn();
-      mockHeight(getTree(), 280);
+      mockRenderedHeight(getTree(), 280);
 
       await dragHandle(400, 700);
 
@@ -336,12 +334,12 @@ describe("SessionRelationshipTree", () => {
 
     it("fits a taller stored height to a short column without forgetting it", async () => {
       ui.setSessionTreeHeight(600);
-      mockHeight(column, 500);
+      mockColumnHeight(column, 500);
 
       await mountInColumn();
       expect(getTree().style.maxHeight).toBe("340px");
 
-      mockHeight(getTree(), 340);
+      mockRenderedHeight(getTree(), 340);
       await dragHandle(400, 480);
 
       expect(getTree().style.maxHeight).toBe("340px");

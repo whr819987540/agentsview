@@ -58,6 +58,8 @@
   let rows = $derived(tree ? flattenTree(tree.root) : []);
   let visible = $derived(rows.length > 1);
 
+  // Sizes below are CSS pixels (clientHeight/offsetHeight), not
+  // getBoundingClientRect, which includes interface zoom.
   let treeElement = $state<HTMLElement | null>(null);
   // Height of the column the tree shares with the session vitals, or null
   // until it has been laid out.
@@ -80,8 +82,7 @@
   );
 
   function measureColumnHeight(): number | null {
-    const height =
-      treeElement?.parentElement?.getBoundingClientRect().height ?? 0;
+    const height = treeElement?.parentElement?.clientHeight ?? 0;
     columnHeight = height > 0 ? height : null;
     return columnHeight;
   }
@@ -100,9 +101,7 @@
   function handleResizeStart() {
     // Start from the rendered height so a tree shorter than its limit
     // follows the handle right away.
-    const renderedHeight = Math.round(
-      treeElement?.getBoundingClientRect().height ?? 0,
-    );
+    const renderedHeight = treeElement?.offsetHeight ?? 0;
     resizeStartHeight =
       renderedHeight > 0 ? Math.min(renderedHeight, maxHeight) : maxHeight;
   }
