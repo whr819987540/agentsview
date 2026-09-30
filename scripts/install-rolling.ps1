@@ -240,8 +240,8 @@ function Install-AgentsviewRolling {
         Write-Host "Get started:"
         Write-Host "  agentsview serve    # Start the server and open browser"
         Write-Host ""
-        Write-Host "To update, run this installer again. 'agentsview update' installs"
-        Write-Host "the upstream stable release instead of this rolling build."
+        Write-Host "To update to the newest rolling build later:"
+        Write-Host "  agentsview update"
     } finally {
         if (Test-Path $tmpDir) {
             Remove-Item $tmpDir -Recurse -Force -ErrorAction SilentlyContinue

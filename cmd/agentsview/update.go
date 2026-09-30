@@ -36,6 +36,10 @@ func runUpdate(ctx context.Context, cfg UpdateConfig) {
 		log.Fatalf("resolving data dir: %v", err)
 	}
 
+	if repo := update.RollingRepo(); repo != "" {
+		fmt.Printf("Checking rolling builds from %s...\n", repo)
+	}
+
 	info, err := update.CheckForUpdate(ctx,
 		version, cfg.Force, dataDir,
 	)

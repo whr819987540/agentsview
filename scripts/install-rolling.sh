@@ -243,8 +243,8 @@ main() {
     echo "Get started:"
     echo "  agentsview serve    # Start the server and open browser"
     echo
-    echo "To update, run this installer again. 'agentsview update' installs"
-    echo "the upstream stable release instead of this rolling build."
+    echo "To update to the newest rolling build later:"
+    echo "  agentsview update"
 }
 
 # Guard: only run main when executed directly, not when sourced.

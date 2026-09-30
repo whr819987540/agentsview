@@ -43,6 +43,9 @@ type UpdateInfo struct {
 	Size           int64
 	Checksum       string
 	IsDevBuild     bool
+	// rawBinary is set for rolling builds, which publish the bare
+	// executable instead of an archive.
+	rawBinary bool
 	// cacheOnly is set when the info came from cache and lacks
 	// download metadata. The caller must re-fetch for installs.
 	cacheOnly bool
@@ -61,11 +64,19 @@ type cachedCheck struct {
 
 // CheckForUpdate checks if a newer version is available.
 // Uses a 1-hour cache to avoid hitting the GitHub API often.
+// Rolling builds check their own repository's rolling release.
 func CheckForUpdate(ctx context.Context,
 	currentVersion string,
 	forceCheck bool,
 	cacheDir string,
 ) (*UpdateInfo, error) {
+	if rollingRepo != "" {
+		return checkRollingUpdate(ctx,
+			rollingDownloadBase(rollingRepo),
+			currentVersion, forceCheck, cacheDir,
+		)
+	}
+
 	cleanVersion := strings.TrimPrefix(currentVersion, "v")
 	isDevBuild := IsDevBuildVersion(cleanVersion)
 
@@ -160,7 +171,17 @@ func PerformUpdate(ctx context.Context,
 		fmt.Println()
 	}
 	fmt.Println("Verifying and installing...")
-	if err := installFromArchive(
+	if info.rawBinary {
+		dstPath, err := installedBinaryPath()
+		if err != nil {
+			return err
+		}
+		if err := installRawBinaryTo(
+			archivePath, info.Checksum, dstPath, downloadChecksum,
+		); err != nil {
+			return err
+		}
+	} else if err := installFromArchive(
 		archivePath, info.Checksum, downloadChecksum,
 	); err != nil {
 		return err
@@ -186,30 +207,38 @@ func hashFile(path string) (string, error) {
 func installFromArchive(
 	archivePath, expectedChecksum, precomputedChecksum string,
 ) error {
-	currentExe, err := os.Executable()
+	dstPath, err := installedBinaryPath()
 	if err != nil {
-		return fmt.Errorf("find current executable: %w", err)
+		return err
 	}
-	currentExe, err = filepath.EvalSymlinks(currentExe)
-	if err != nil {
-		return fmt.Errorf("resolve symlinks: %w", err)
-	}
-	binDir := filepath.Dir(currentExe)
-	binaryName := "agentsview"
-	if runtime.GOOS == "windows" {
-		binaryName = "agentsview.exe"
-	}
-	dstPath := filepath.Join(binDir, binaryName)
-
 	return installFromArchiveTo(
 		archivePath, expectedChecksum, dstPath,
 		precomputedChecksum,
 	)
 }
 
-func installFromArchiveTo(
-	archivePath, expectedChecksum, dstPath string,
-	precomputedChecksum string,
+// installedBinaryPath returns where the update is installed: the
+// agentsview binary beside the running executable.
+func installedBinaryPath() (string, error) {
+	currentExe, err := os.Executable()
+	if err != nil {
+		return "", fmt.Errorf("find current executable: %w", err)
+	}
+	currentExe, err = filepath.EvalSymlinks(currentExe)
+	if err != nil {
+		return "", fmt.Errorf("resolve symlinks: %w", err)
+	}
+	binaryName := "agentsview"
+	if runtime.GOOS == "windows" {
+		binaryName = "agentsview.exe"
+	}
+	return filepath.Join(filepath.Dir(currentExe), binaryName), nil
+}
+
+// verifyChecksum checks path against expectedChecksum. A non-empty
+// precomputedChecksum is trusted instead of rehashing the file.
+func verifyChecksum(
+	path, expectedChecksum, precomputedChecksum string,
 ) error {
 	if expectedChecksum == "" {
 		return errors.New("empty checksum - refusing unverified binary")
@@ -218,9 +247,9 @@ func installFromArchiveTo(
 	checksum := precomputedChecksum
 	if checksum == "" {
 		var err error
-		checksum, err = hashFile(archivePath)
+		checksum, err = hashFile(path)
 		if err != nil {
-			return fmt.Errorf("hash archive: %w", err)
+			return fmt.Errorf("hash download: %w", err)
 		}
 	}
 
@@ -229,6 +258,18 @@ func installFromArchiveTo(
 			"checksum mismatch: expected %s, got %s",
 			expectedChecksum, checksum,
 		)
+	}
+	return nil
+}
+
+func installFromArchiveTo(
+	archivePath, expectedChecksum, dstPath string,
+	precomputedChecksum string,
+) error {
+	if err := verifyChecksum(
+		archivePath, expectedChecksum, precomputedChecksum,
+	); err != nil {
+		return err
 	}
 
 	extractDir, err := os.MkdirTemp("", "agentsview-extract-*")
@@ -705,8 +746,11 @@ func extractChecksum(releaseBody, assetName string) string {
 }
 
 func loadCache(cacheDir string) (*cachedCheck, error) {
-	cachePath := filepath.Join(cacheDir, cacheFileName)
-	data, err := os.ReadFile(cachePath)
+	return loadCacheFile(cacheDir, cacheFileName)
+}
+
+func loadCacheFile(cacheDir, name string) (*cachedCheck, error) {
+	data, err := os.ReadFile(filepath.Join(cacheDir, name))
 	if err != nil {
 		return nil, err
 	}
@@ -759,6 +803,10 @@ func checkCache(
 }
 
 func saveCache(version, cacheDir string) {
+	saveCacheFile(version, cacheDir, cacheFileName)
+}
+
+func saveCacheFile(version, cacheDir, name string) {
 	cached := cachedCheck{
 		CheckedAt: time.Now(),
 		Version:   version,
@@ -767,7 +815,7 @@ func saveCache(version, cacheDir string) {
 	if err != nil {
 		return
 	}
-	cachePath := filepath.Join(cacheDir, cacheFileName)
+	cachePath := filepath.Join(cacheDir, name)
 	_ = os.MkdirAll(filepath.Dir(cachePath), 0o755)
 	_ = os.WriteFile(cachePath, data, 0o600)
 }

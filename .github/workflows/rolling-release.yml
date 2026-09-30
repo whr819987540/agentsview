@@ -71,14 +71,20 @@ jobs:
           # in-container mount. GITHUB_WORKSPACE is correct inside it.
           export CGO_CFLAGS="-O2 -g -I${GITHUB_WORKSPACE}/.sqlite-include"
 
-          VERSION=$(git describe --tags --always)
+          # Match only v* tags; the rolling "latest" and "build-*" tags
+          # would otherwise become the version base.
+          VERSION=$(git describe --tags --always --match 'v*')
           COMMIT=${GITHUB_SHA::8}
           BUILD_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
           mkdir -p dist
-          LDFLAGS="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.buildDate=${BUILD_DATE}"
+          # rollingRepo makes `agentsview update` follow this repository's
+          # rolling release instead of the upstream stable releases.
+          LDFLAGS="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.buildDate=${BUILD_DATE} -X go.kenn.io/agentsview/internal/update.rollingRepo=${GITHUB_REPOSITORY}"
           go build -tags fts5 -buildvcs=false -ldflags="$LDFLAGS" -trimpath \
             -o dist/agentsview-linux-amd64 ./cmd/agentsview
+          # `agentsview update` compares this with the running version.
+          echo "$VERSION" > dist/VERSION
 
           # Smoke test (native build)
           ./dist/agentsview-linux-amd64 --version
@@ -95,7 +101,9 @@ jobs:
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: rolling-linux-amd64
-          path: dist/agentsview-linux-amd64
+          path: |
+            dist/agentsview-linux-amd64
+            dist/VERSION
 
   build-windows:
     runs-on: windows-latest
@@ -145,12 +153,16 @@ jobs:
           CGO_ENABLED: "1"
           CGO_CFLAGS: -O2 -g -I${{ github.workspace }}/.sqlite-include
         run: |
-          VERSION=$(git describe --tags --always)
+          # Match only v* tags; the rolling "latest" and "build-*" tags
+          # would otherwise become the version base.
+          VERSION=$(git describe --tags --always --match 'v*')
           COMMIT=${GITHUB_SHA::8}
           BUILD_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
           mkdir -p dist
-          LDFLAGS="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.buildDate=${BUILD_DATE}"
+          # rollingRepo makes `agentsview update` follow this repository's
+          # rolling release instead of the upstream stable releases.
+          LDFLAGS="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.buildDate=${BUILD_DATE} -X go.kenn.io/agentsview/internal/update.rollingRepo=${GITHUB_REPOSITORY}"
           go build -tags fts5 -ldflags="$LDFLAGS" -trimpath \
             -o dist/agentsview-windows-amd64.exe ./cmd/agentsview
 
@@ -223,6 +235,7 @@ jobs:
             artifacts/agentsview-linux-amd64 \
             artifacts/agentsview-windows-amd64.exe \
             artifacts/SHA256SUMS \
+            artifacts/VERSION \
             installers/install.sh \
             installers/install.ps1
 
@@ -238,4 +251,5 @@ jobs:
             --notes "$BUILD_NOTES" \
             artifacts/agentsview-linux-amd64 \
             artifacts/agentsview-windows-amd64.exe \
-            artifacts/SHA256SUMS
+            artifacts/SHA256SUMS \
+            artifacts/VERSION

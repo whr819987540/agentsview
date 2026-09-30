@@ -13,17 +13,44 @@ The latest release is **v0.44.0**. Check the
 
 ## Install
 
-**macOS and Linux:**
+These commands install the newest rolling build of this fork. A new rolling
+build is published on every push to `main`.
+
+**Linux (x86_64):**
+
+```bash
+curl -fsSL https://github.com/whr819987540/agentsview/releases/download/latest/install.sh | bash
+```
+
+The installer puts `agentsview` in `~/.local/bin`. If that directory is not in
+your `PATH`, it adds it to your shell startup file and tells you which file to
+reload.
+
+**Windows (PowerShell, x64):**
+
+```powershell
+powershell -ExecutionPolicy ByPass -c "irm https://github.com/whr819987540/agentsview/releases/download/latest/install.ps1 | iex"
+```
+
+The installer puts `agentsview.exe` in `%USERPROFILE%\.agentsview\bin` and adds
+that directory to your user `PATH`. Open a new terminal afterwards.
+
+Run `agentsview update` to move to the newest rolling build. Earlier builds
+stay available as `build-YYYYMMDD-<commit>` entries on the
+[releases page](https://github.com/whr819987540/agentsview/releases).
+
+**Upstream stable release (macOS, Linux, Windows):**
 
 ```bash
 curl -fsSL https://agentsview.io/install.sh | bash
 ```
 
-**Windows (PowerShell):**
-
 ```powershell
 powershell -ExecutionPolicy ByPass -c "irm https://agentsview.io/install.ps1 | iex"
 ```
+
+Rolling builds are not published for macOS. Installs from `agentsview.io`
+follow the upstream stable releases, and `agentsview update` keeps them there.
 
 Or download the **desktop app** (macOS / Windows) from
 [GitHub Releases](https://github.com/kenn-io/agentsview/releases) or via
