@@ -1,12 +1,17 @@
 #!/bin/bash
 # agentsview rolling-build installer for Linux
 #
-# Installs the newest build from the rolling "latest" prerelease that
-# .github/workflows/rolling-release.yml publishes on every push to main.
-# The workflow attaches this script to that release as install.sh with
-# the repository filled in:
+# Installs the newest build that .github/workflows/rolling-release.yml
+# publishes on every push to main. The workflow attaches this script to
+# the rolling "latest" prerelease as install.sh with the repository
+# filled in:
 #
 #   curl -fsSL https://github.com/<owner>/<repo>/releases/download/latest/install.sh | bash
+#
+# "latest" is updated in place on every push, so the installer reads
+# only its BUILD_TAG file there. SHA256SUMS and the binary come from the
+# immutable build-YYYYMMDD-<sha> release that BUILD_TAG names, so a push
+# during the install cannot mix files from two builds.
 #
 # Environment overrides:
 #   AGENTSVIEW_REPO            owner/repo that publishes the rolling release
@@ -19,7 +24,10 @@ set -euo pipefail
 # The release workflow replaces the placeholder when it publishes this
 # script. Running the unpublished copy requires AGENTSVIEW_REPO.
 DEFAULT_REPO="@AGENTSVIEW_REPO@"
-RELEASE_TAG="latest"
+LATEST_TAG="latest"
+# Snapshot tags look like build-20260102-0123abcd. Explicit character
+# lists keep locale collation from widening the ranges.
+BUILD_TAG_PATTERN='^build-[0123456789]{8}-[0123456789abcdef]{7,40}$'
 BINARY_NAME="agentsview"
 ASSET_NAME="agentsview-linux-amd64"
 
@@ -60,6 +68,31 @@ download() {
     else
         error "Neither curl nor wget found"
     fi
+}
+
+# Prints the snapshot tag named by the rolling release's BUILD_TAG file.
+# Exits when the file is missing or invalid, which can happen while the
+# workflow is republishing "latest". There is deliberately no fallback
+# to the assets on "latest".
+resolve_build_tag() {
+    local repo="$1"
+    local tmpdir="$2"
+    local url="https://github.com/${repo}/releases/download/${LATEST_TAG}/BUILD_TAG"
+    local retry="The rolling release may be mid-publish; try again in a few minutes."
+
+    if ! download "$url" "$tmpdir/BUILD_TAG"; then
+        error "Could not read the current build from $url\n$retry"
+    fi
+
+    local tag
+    tag=$(cat "$tmpdir/BUILD_TAG")
+    # Trim leading and trailing whitespace, including CRLF line endings.
+    tag="${tag#"${tag%%[![:space:]]*}"}"
+    tag="${tag%"${tag##*[![:space:]]}"}"
+    if ! [[ "$tag" =~ $BUILD_TAG_PATTERN ]]; then
+        error "BUILD_TAG on the rolling release does not name a build.\n$retry"
+    fi
+    echo "$tag"
 }
 
 verify_checksum() {
@@ -194,20 +227,23 @@ main() {
     local repo
     repo=$(resolve_repo)
     local install_dir="${AGENTSVIEW_INSTALL_DIR:-$HOME/.local/bin}"
-    local base_url="https://github.com/${repo}/releases/download/${RELEASE_TAG}"
-
-    info "Release: ${repo} (${RELEASE_TAG})"
-    info "Install directory: ${install_dir}"
-    echo
 
     local tmpdir
     tmpdir=$(mktemp -d)
     # shellcheck disable=SC2064
     trap "rm -rf '$tmpdir'" EXIT
 
+    info "Release: ${repo} (${LATEST_TAG})"
+    local build_tag
+    build_tag=$(resolve_build_tag "$repo" "$tmpdir")
+    local base_url="https://github.com/${repo}/releases/download/${build_tag}"
+    info "Build: ${build_tag}"
+    info "Install directory: ${install_dir}"
+    echo
+
     info "Downloading ${ASSET_NAME}..."
     if ! download "${base_url}/${ASSET_NAME}" "$tmpdir/$ASSET_NAME"; then
-        error "Download failed. Check https://github.com/${repo}/releases/tag/${RELEASE_TAG}"
+        error "Download failed. Check https://github.com/${repo}/releases/tag/${build_tag}"
     fi
 
     if [ "${AGENTSVIEW_SKIP_CHECKSUM:-0}" = "1" ]; then
@@ -220,7 +256,7 @@ main() {
     fi
 
     install_binary "$tmpdir/$ASSET_NAME" "$install_dir"
-    info "Installed ${install_dir}/${BINARY_NAME}"
+    info "Installed ${install_dir}/${BINARY_NAME} (${build_tag})"
     echo
 
     RC_TO_RELOAD=""

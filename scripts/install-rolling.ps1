@@ -1,11 +1,16 @@
 # agentsview rolling-build installer for Windows
 #
-# Installs the newest build from the rolling "latest" prerelease that
-# .github/workflows/rolling-release.yml publishes on every push to main.
-# The workflow attaches this script to that release as install.ps1 with
-# the repository filled in:
+# Installs the newest build that .github/workflows/rolling-release.yml
+# publishes on every push to main. The workflow attaches this script to
+# the rolling "latest" prerelease as install.ps1 with the repository
+# filled in:
 #
 #   powershell -ExecutionPolicy ByPass -c "irm https://github.com/<owner>/<repo>/releases/download/latest/install.ps1 | iex"
+#
+# "latest" is updated in place on every push, so the installer reads
+# only its BUILD_TAG file there. SHA256SUMS and the binary come from the
+# immutable build-YYYYMMDD-<sha> release that BUILD_TAG names, so a push
+# during the install cannot mix files from two builds.
 #
 # Environment overrides:
 #   AGENTSVIEW_REPO            owner/repo that publishes the rolling release
@@ -20,7 +25,10 @@ $ProgressPreference = 'SilentlyContinue'
 # The release workflow replaces the placeholder when it publishes this
 # script. Running the unpublished copy requires AGENTSVIEW_REPO.
 $defaultRepo = '@AGENTSVIEW_REPO@'
-$releaseTag = 'latest'
+$latestTag = 'latest'
+# Snapshot tags look like build-20260102-0123abcd. Used with -cmatch so
+# uppercase hex is rejected; \z also rejects a trailing newline.
+$buildTagPattern = '^build-[0-9]{8}-[0-9a-f]{7,40}\z'
 $binaryName = 'agentsview.exe'
 $assetName = 'agentsview-windows-amd64.exe'
 
@@ -70,6 +78,34 @@ function Invoke-Download {
         $params.UseBasicParsing = $true
     }
     Invoke-WebRequest @params
+}
+
+# Returns the snapshot tag named by the rolling release's BUILD_TAG file.
+# Exits when the file is missing or invalid, which can happen while the
+# workflow is republishing "latest". There is deliberately no fallback
+# to the assets on "latest".
+function Resolve-BuildTag {
+    param([string]$Repo, [string]$TmpDir)
+
+    $uri = "https://github.com/$Repo/releases/download/$latestTag/BUILD_TAG"
+    $retry = 'The rolling release may be mid-publish; try again in a few minutes.'
+    $file = Join-Path $TmpDir 'BUILD_TAG'
+    try {
+        Invoke-Download -Uri $uri -OutFile $file | Out-Null
+    } catch {
+        Write-Err "Error: Could not read the current build from ${uri}: $_"
+        Write-Err $retry
+        exit 1
+    }
+
+    $tag = [string](Get-Content -LiteralPath $file -Raw)
+    $tag = $tag.Trim()
+    if ($tag -cnotmatch $buildTagPattern) {
+        Write-Err "Error: BUILD_TAG on the rolling release does not name a build."
+        Write-Err $retry
+        exit 1
+    }
+    return $tag
 }
 
 function Test-ChecksumMatch {
@@ -181,17 +217,19 @@ function Install-AgentsviewRolling {
 
     $repo = Resolve-Repo
     $installDir = Get-InstallDir
-    $baseUrl = "https://github.com/$repo/releases/download/$releaseTag"
     $destPath = Join-Path $installDir $binaryName
-
-    Write-Info "Release: $repo ($releaseTag)"
-    Write-Info "Install directory: $installDir"
-    Write-Host ""
 
     $tmpDir = Join-Path ([System.IO.Path]::GetTempPath()) "agentsview-install-$(Get-Random)"
     New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
 
     try {
+        Write-Info "Release: $repo ($latestTag)"
+        $buildTag = Resolve-BuildTag -Repo $repo -TmpDir $tmpDir
+        $baseUrl = "https://github.com/$repo/releases/download/$buildTag"
+        Write-Info "Build: $buildTag"
+        Write-Info "Install directory: $installDir"
+        Write-Host ""
+
         $assetPath = Join-Path $tmpDir $assetName
 
         Write-Info "Downloading $assetName..."
@@ -199,7 +237,7 @@ function Install-AgentsviewRolling {
             Invoke-Download -Uri "$baseUrl/$assetName" -OutFile $assetPath
         } catch {
             Write-Err "Error: Download failed: $_"
-            Write-Err "Check https://github.com/$repo/releases/tag/$releaseTag"
+            Write-Err "Check https://github.com/$repo/releases/tag/$buildTag"
             exit 1
         }
 
@@ -221,7 +259,7 @@ function Install-AgentsviewRolling {
             New-Item -ItemType Directory -Path $installDir -Force | Out-Null
         }
         Install-Binary -Source $assetPath -Dest $destPath
-        Write-Info "Installed $destPath"
+        Write-Info "Installed $destPath ($buildTag)"
         Write-Host ""
 
         $needsRestart = Update-UserPath -Dir $installDir
