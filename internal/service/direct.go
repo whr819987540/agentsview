@@ -424,8 +424,8 @@ func findMessagePageStart(
 		}
 		return len(msgs)
 	}
-	for i := len(msgs) - 1; i >= 0; i-- {
-		if msgs[i].Ordinal <= from {
+	for i, m := range slices.Backward(msgs) {
+		if m.Ordinal <= from {
 			return i
 		}
 	}

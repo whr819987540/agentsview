@@ -76,7 +76,7 @@ func normalizeInputOutlinePreview(content string) (string, bool) {
 		}
 	}
 
-	for _, line := range strings.Split(text, "\n") {
+	for line := range strings.SplitSeq(text, "\n") {
 		line = strings.Join(strings.Fields(line), " ")
 		if line == "" {
 			continue
@@ -94,13 +94,13 @@ func hasBashWrapper(content string) bool {
 
 func firstWrappedContent(content, tag string) (string, bool) {
 	open := "<" + tag + ">"
-	close := "</" + tag + ">"
+	closing := "</" + tag + ">"
 	start := strings.Index(content, open)
 	if start < 0 {
 		return "", false
 	}
 	start += len(open)
-	end := strings.Index(content[start:], close)
+	end := strings.Index(content[start:], closing)
 	if end < 0 {
 		return content[start:], true
 	}
