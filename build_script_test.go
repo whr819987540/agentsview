@@ -1,6 +1,7 @@
 package agentsview_test
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -8,6 +9,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"unicode"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -158,6 +160,256 @@ func TestDesktopDevPowerShellStopsWhenPricingSnapshotRestoreFails(t *testing.T) 
 	assertEventContains(t, events,
 		"go run ./internal/pricing/cmd/litellm-snapshot -restore")
 	assertNoEventContains(t, events, "go build")
+}
+
+// rollingBuildTag mirrors the permanent per-build tag the rolling release
+// workflow creates next to the moving "latest" tag.
+const rollingBuildTag = "build-20260101-abcdef12"
+
+func TestMakefileVersionIgnoresRollingReleaseTags(t *testing.T) {
+	requireUnixShell(t)
+	requireCommand(t, "make")
+
+	root := t.TempDir()
+	want := initRollingTaggedRepo(t, root)
+	installRepoFile(t, root, "Makefile", 0o644)
+
+	// A dry run prints the build recipe with VERSION expanded.
+	out, err := runInWorkspace(
+		t,
+		root,
+		isolatedGitEnv(t, os.Environ()),
+		"make",
+		"-n",
+		"build",
+	)
+	require.NoError(t, err, "%s", out)
+
+	assert.Equal(t, want, tokenAfter(string(out), "-X main.version="))
+}
+
+func TestDevBackendBuildVersionIgnoresRollingReleaseTags(t *testing.T) {
+	requireUnixShell(t)
+
+	root := t.TempDir()
+	want := initRollingTaggedRepo(t, root)
+	installRepoFile(t, root, "scripts/dev-backend-build.sh", 0o755)
+	stubs := installUnixBuildStubs(t, root)
+	removeGitStubs(t, stubs)
+
+	out, err := runInWorkspace(
+		t,
+		root,
+		isolatedGitEnv(t, stubs.env()),
+		"bash",
+		"scripts/dev-backend-build.sh",
+	)
+	require.NoError(t, err, "%s", out)
+
+	assert.Equal(t, want, tokenAfter(
+		strings.Join(stubs.events(t), "\n"), "-X main.version="))
+}
+
+func TestPrepareSidecarVersionIgnoresRollingReleaseTags(t *testing.T) {
+	requireUnixShell(t)
+
+	root := t.TempDir()
+	want := initRollingTaggedRepo(t, root)
+	installRepoFile(t, root, "desktop/scripts/prepare-sidecar.sh", 0o755)
+	writeDesktopDevWorkspace(t, root)
+	stubs := installUnixBuildStubs(t, root)
+	removeGitStubs(t, stubs)
+
+	// Empty overrides send the script to git for the version and to the
+	// rustc stub for the target triple.
+	env := isolatedGitEnv(t, stubs.env(
+		"AGENTSVIEW_VERSION=",
+		"TAURI_ENV_TARGET_TRIPLE=",
+		"CARGO_BUILD_TARGET=",
+	))
+	out, err := runInWorkspace(
+		t,
+		root,
+		env,
+		"bash",
+		"desktop/scripts/prepare-sidecar.sh",
+	)
+	require.NoError(t, err, "%s", out)
+
+	assert.Equal(t, want, tokenAfter(
+		strings.Join(stubs.events(t), "\n"), "-X main.version="))
+	conf, err := os.ReadFile(
+		filepath.Join(root, "desktop", "src-tauri", "tauri.conf.json"))
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"version": "1.0.0-dev.1"}`, string(conf))
+}
+
+func TestScreenshotsVersionIgnoresRollingReleaseTags(t *testing.T) {
+	requireUnixShell(t)
+
+	src := t.TempDir()
+	want := initRollingTaggedRepo(t, src)
+
+	root := t.TempDir()
+	installRepoFile(t, root, "docs/screenshots/run.sh", 0o755)
+	screenshotsDir := filepath.Join(root, "docs", "screenshots")
+	require.NoError(t, os.WriteFile(
+		filepath.Join(screenshotsDir, "Dockerfile"),
+		[]byte("FROM scratch\n"),
+		0o644,
+	))
+	writeExecutable(t, filepath.Join(screenshotsDir, "extract-db.sh"),
+		"#!/bin/sh\nexit 0\n")
+	sourceDB := filepath.Join(root, "sessions.db")
+	require.NoError(t, os.WriteFile(sourceDB, nil, 0o644))
+
+	stubs := newBuildStubs(t, root)
+	writeExecutable(t, filepath.Join(stubs.binDir, "docker"), `#!/bin/sh
+printf 'docker %s\n' "$*" >> "$CALL_LOG"
+exit 0
+`)
+	for _, name := range []string{"rsync", "sqlite3"} {
+		writeExecutable(t, filepath.Join(stubs.binDir, name), "#!/bin/sh\nexit 0\n")
+	}
+
+	out, err := runInWorkspace(
+		t,
+		root,
+		isolatedGitEnv(t, stubs.env(
+			"AGENTSVIEW_SRC="+src,
+			"SOURCE_DB="+sourceDB,
+		)),
+		"bash",
+		"docs/screenshots/run.sh",
+	)
+	require.NoError(t, err, "%s", out)
+
+	assert.Equal(t, want, tokenAfter(
+		strings.Join(stubs.events(t), "\n"), "--build-arg AV_VERSION="))
+}
+
+func TestDesktopDevPowerShellVersionIgnoresRollingReleaseTags(t *testing.T) {
+	requireCommand(t, "pwsh")
+
+	root := t.TempDir()
+	want := initRollingTaggedRepo(t, root)
+	installRepoFile(t, root, "scripts/desktop-dev.ps1", 0o755)
+	writeDesktopDevWorkspace(t, root)
+	stubs := installWindowsBuildStubs(t, root)
+	removeGitStubs(t, stubs)
+
+	out, err := runInWorkspace(
+		t,
+		root,
+		isolatedGitEnv(t, stubs.env()),
+		"pwsh",
+		"-NoProfile",
+		"-ExecutionPolicy",
+		"Bypass",
+		"-File",
+		filepath.Join(root, "scripts", "desktop-dev.ps1"),
+	)
+	require.NoError(t, err, "%s", out)
+
+	assert.Equal(t, want, tokenAfter(
+		strings.Join(stubs.events(t), "\n"), "-X main.version="))
+	// The script restores tauri.conf.json after cargo exits, so its
+	// report is the remaining evidence of the version it patched in.
+	assert.Contains(t, string(out),
+		"Patched tauri.conf.json version to 1.0.0-dev.1")
+}
+
+// initRollingTaggedRepo makes root a git checkout shaped like this fork
+// after a rolling release: release tag v1.0.0 sits one commit behind
+// HEAD, HEAD carries the "latest" and build-* tags, and a tracked file
+// has an uncommitted edit. It returns the version that git describe
+// limited to v* tags reports for that checkout.
+func initRollingTaggedRepo(t *testing.T, root string) string {
+	t.Helper()
+	requireCommand(t, "git")
+
+	env := append(isolatedGitEnv(t, os.Environ()),
+		"GIT_AUTHOR_NAME=Test User",
+		"GIT_AUTHOR_EMAIL=test@example.invalid",
+		"GIT_COMMITTER_NAME=Test User",
+		"GIT_COMMITTER_EMAIL=test@example.invalid",
+	)
+	notes := filepath.Join(root, "notes.txt")
+	writeNotes := func(text string) {
+		require.NoError(t, os.WriteFile(notes, []byte(text+"\n"), 0o644))
+	}
+
+	runGit(t, root, env, "init", "-q")
+	writeNotes("release")
+	runGit(t, root, env, "add", "notes.txt")
+	runGit(t, root, env, "commit", "-q", "-m", "release")
+	runGit(t, root, env, "tag", "v1.0.0")
+	writeNotes("main")
+	runGit(t, root, env, "commit", "-q", "-a", "-m", "main")
+	runGit(t, root, env, "tag", "latest")
+	runGit(t, root, env, "tag", rollingBuildTag)
+	writeNotes("local edit")
+
+	head := runGit(t, root, env, "rev-parse", "--short", "HEAD")
+	return "v1.0.0-1-g" + head + "-dirty"
+}
+
+// isolatedGitEnv drops inherited GIT_* variables, such as the GIT_DIR a
+// git hook exports, and points git at empty config so the developer's
+// hooks, signing, and abbreviation settings do not apply.
+func isolatedGitEnv(t *testing.T, env []string) []string {
+	t.Helper()
+
+	globalConfig := filepath.Join(t.TempDir(), "gitconfig")
+	require.NoError(t, os.WriteFile(globalConfig, nil, 0o644))
+	isolated := make([]string, 0, len(env)+2)
+	for _, entry := range env {
+		if !strings.HasPrefix(entry, "GIT_") {
+			isolated = append(isolated, entry)
+		}
+	}
+	return append(isolated,
+		"GIT_CONFIG_GLOBAL="+globalConfig,
+		"GIT_CONFIG_NOSYSTEM=1",
+	)
+}
+
+func runGit(t *testing.T, dir string, env []string, args ...string) string {
+	t.Helper()
+
+	cmd := exec.CommandContext(t.Context(), "git", args...)
+	cmd.Dir = dir
+	cmd.Env = env
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	require.NoError(t, err, "git %s: %s", strings.Join(args, " "), stderr.String())
+	return strings.TrimSpace(string(out))
+}
+
+// removeGitStubs lets scripts run the real git against a scratch repo.
+func removeGitStubs(t *testing.T, stubs buildStubs) {
+	t.Helper()
+
+	for _, name := range []string{"git", "git.ps1", "git.cmd"} {
+		err := os.Remove(filepath.Join(stubs.binDir, name))
+		if !errors.Is(err, os.ErrNotExist) {
+			require.NoError(t, err)
+		}
+	}
+}
+
+// tokenAfter returns the whitespace-delimited word that follows the first
+// marker in text, or "" when the marker is absent.
+func tokenAfter(text, marker string) string {
+	_, rest, found := strings.Cut(text, marker)
+	if !found {
+		return ""
+	}
+	if end := strings.IndexFunc(rest, unicode.IsSpace); end >= 0 {
+		return rest[:end]
+	}
+	return rest
 }
 
 type buildStubs struct {
