@@ -46,13 +46,14 @@ type UpdateInfo struct {
 	// rawBinary is set for rolling builds, which publish the bare
 	// executable instead of an archive.
 	rawBinary bool
-	// cacheOnly is set when the info came from cache and lacks
-	// download metadata. The caller must re-fetch for installs.
+	// cacheOnly is set when the info lacks download metadata because
+	// it came from cache or a display-only rolling check. The caller
+	// must re-fetch for installs.
 	cacheOnly bool
 }
 
-// NeedsRefetch returns true when the info came from cache
-// and lacks the download URL/checksum needed for an install.
+// NeedsRefetch returns true when the info is display-only and
+// lacks the download URL/checksum needed for an install.
 func (u *UpdateInfo) NeedsRefetch() bool {
 	return u.cacheOnly
 }
@@ -64,7 +65,8 @@ type cachedCheck struct {
 
 // CheckForUpdate checks if a newer version is available.
 // Uses a 1-hour cache to avoid hitting the GitHub API often.
-// Rolling builds check their own repository's rolling release.
+// Rolling builds check their own repository's rolling release and
+// cache for 15 minutes; see checkRollingUpdate.
 func CheckForUpdate(ctx context.Context,
 	currentVersion string,
 	forceCheck bool,
@@ -72,7 +74,7 @@ func CheckForUpdate(ctx context.Context,
 ) (*UpdateInfo, error) {
 	if rollingRepo != "" {
 		return checkRollingUpdate(ctx,
-			rollingDownloadBase(rollingRepo),
+			rollingDownloadRoot(rollingRepo),
 			currentVersion, forceCheck, cacheDir,
 		)
 	}
