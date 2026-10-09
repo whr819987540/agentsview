@@ -293,6 +293,57 @@ assert_missing "no bashrc written when already in PATH" "$home/.bashrc"
 assert_contains "reports install dir already in PATH" "already in PATH" "$OUTPUT"
 assert_not_contains "no reload prompt when already in PATH" "Refresh your shell" "$OUTPUT"
 
+# Another agentsview, as in /usr/local/bin, judged against the PATH that
+# new shells will see.
+other_dir="$WORK/other/bin"
+mkdir -p "$other_dir"
+printf '#!/bin/sh\n' > "$other_dir/agentsview"
+chmod 755 "$other_dir/agentsview"
+
+# The installer just put its directory first in the startup file.
+home=$(new_home other-prepended)
+run_install "$home" SHELL=/bin/bash PATH="$other_dir:/usr/bin:/bin"
+assert_eq "install beside another copy succeeds" 0 "$STATUS"
+assert_not_contains "no warning when the new PATH line comes first" "Another agentsview" "$OUTPUT"
+assert_contains "unqualified success when the new PATH line comes first" "Installation complete!" "$OUTPUT"
+
+# The directory is already in PATH, after the other copy.
+home=$(new_home other-first)
+run_install "$home" SHELL=/bin/bash PATH="$other_dir:$home/.local/bin:/usr/bin:/bin"
+assert_eq "shadowed install still succeeds" 0 "$STATUS"
+assert_contains "warns that the other copy runs first" \
+    "Another agentsview at $other_dir/agentsview comes first in PATH and will run instead." "$OUTPUT"
+assert_contains "says how to fix the order" "put $home/.local/bin before $other_dir in PATH" "$OUTPUT"
+assert_not_contains "no unqualified success when shadowed" "Installation complete!" "$OUTPUT"
+
+# The directory is already in PATH, before the other copy.
+home=$(new_home other-later)
+run_install "$home" SHELL=/bin/bash PATH="$home/.local/bin:$other_dir:/usr/bin:/bin"
+assert_not_contains "no warning when the install dir comes first" "Another agentsview" "$OUTPUT"
+assert_contains "unqualified success when the install dir comes first" "Installation complete!" "$OUTPUT"
+
+# A symlink to the new binary earlier in PATH is not another copy.
+home=$(new_home other-symlink)
+mkdir -p "$home/.local/bin" "$home/links"
+ln -s "$home/.local/bin/agentsview" "$home/links/agentsview"
+run_install "$home" SHELL=/bin/bash PATH="$home/links:$home/.local/bin:/usr/bin:/bin"
+assert_not_contains "no warning for a symlink to the new binary" "Another agentsview" "$OUTPUT"
+
+# The startup file adds the directory but is not loaded, so the order in
+# new shells is unknown and the warning is conditional.
+home=$(new_home other-unloaded)
+printf 'export PATH="$PATH:$HOME/.local/bin"\n' > "$home/.bashrc"
+run_install "$home" SHELL=/bin/bash PATH="$other_dir:/usr/bin:/bin"
+assert_contains "conditional warning when the order is unknown" \
+    "Another agentsview is at $other_dir/agentsview. If $other_dir comes before $home/.local/bin in PATH, that copy will run instead." "$OUTPUT"
+assert_not_contains "no certain warning when the order is unknown" "comes first in PATH" "$OUTPUT"
+
+home=$(new_home other-no-modify)
+run_install "$home" SHELL=/bin/bash PATH="$other_dir:/usr/bin:/bin" AGENTSVIEW_NO_MODIFY_PATH=1
+assert_contains "conditional warning when PATH is left alone" \
+    "If $other_dir comes before $home/.local/bin in PATH" "$OUTPUT"
+assert_not_contains "no certain warning when PATH is left alone" "comes first in PATH" "$OUTPUT"
+
 # fish uses its own syntax and config file.
 home=$(new_home fish)
 run_install "$home" SHELL=/usr/bin/fish

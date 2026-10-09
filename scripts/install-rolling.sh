@@ -205,15 +205,37 @@ rc_mentions_dir() {
     return 1
 }
 
+# Prints the first executable file named $2 in the colon-separated
+# directory list $1.
+first_in_path() {
+    local list="$1"
+    local name="$2"
+    local entries=()
+    local entry
+    IFS=: read -r -a entries <<< "$list"
+    for entry in "${entries[@]}"; do
+        [ -n "$entry" ] || continue
+        if [ -f "$entry/$name" ] && [ -x "$entry/$name" ]; then
+            echo "$entry/$name"
+            return 0
+        fi
+    done
+    return 1
+}
+
 # Makes sure new shells find the install directory. Sets RC_TO_RELOAD
-# when the user must reload a startup file to pick up the change.
+# when the user must reload a startup file to pick up the change. Sets
+# NEW_SHELL_PATH to the PATH new shells will see, or leaves it empty
+# when the installer cannot tell where the directory will sit in it.
 ensure_path() {
     local dir="$1"
     local rc
     rc=$(shell_rc_file)
+    NEW_SHELL_PATH=""
 
     if path_contains "$dir"; then
         info "$dir is already in PATH"
+        NEW_SHELL_PATH="$PATH"
         return 0
     fi
 
@@ -240,6 +262,34 @@ ensure_path() {
     printf '\n# Added by the agentsview installer\n%s\n' "$line" >> "$rc"
     info "Added $dir to PATH in $rc"
     RC_TO_RELOAD="$rc"
+    # The new line runs last in the startup file and puts dir first.
+    NEW_SHELL_PATH="$dir:$PATH"
+}
+
+# Warns when another agentsview may run instead of $1, the binary just
+# installed. Returns 1 when that is certain.
+check_other_copy() {
+    local dest="$1"
+    local dir
+    dir=$(dirname "$dest")
+    local found
+
+    if [ -n "$NEW_SHELL_PATH" ]; then
+        found=$(first_in_path "$NEW_SHELL_PATH" "$BINARY_NAME") || return 0
+        # -ef also accepts a symlink to the new binary.
+        [ "$found" -ef "$dest" ] && return 0
+        warn "Another agentsview at $found comes first in PATH and will run instead."
+        warn "Remove it, or put $dir before $(dirname "$found") in PATH."
+        return 1
+    fi
+
+    # Where dir will sit in new shells is unknown, so only the current
+    # PATH, which lacks dir, can be searched.
+    found=$(first_in_path "$PATH" "$BINARY_NAME") || return 0
+    [ "$found" -ef "$dest" ] && return 0
+    warn "Another agentsview is at $found. If $(dirname "$found") comes before $dir in PATH, that copy will run instead."
+    warn "Check with 'command -v agentsview' in a new terminal."
+    return 0
 }
 
 install_binary() {
@@ -300,14 +350,15 @@ main() {
     RC_TO_RELOAD=""
     ensure_path "$install_dir"
 
-    local found
-    found=$(command -v "$BINARY_NAME" 2>/dev/null || true)
-    if [ -n "$found" ] && [ "$found" != "$install_dir/$BINARY_NAME" ]; then
-        warn "Another agentsview at $found comes first in PATH and will run instead."
-    fi
+    local shadowed=0
+    check_other_copy "$install_dir/$BINARY_NAME" || shadowed=1
 
     echo
-    info "Installation complete!"
+    if [ "$shadowed" = "1" ]; then
+        warn "Installed, but another agentsview runs first in PATH (see above)."
+    else
+        info "Installation complete!"
+    fi
     if [ -n "$RC_TO_RELOAD" ]; then
         echo
         warn "Refresh your shell to use agentsview:"
