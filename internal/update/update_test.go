@@ -187,6 +187,94 @@ func TestFetchContentLength(t *testing.T) {
 	}
 }
 
+func TestFetchSmallAsset(t *testing.T) {
+	const limit = 8
+	tests := []struct {
+		name       string
+		status     int
+		body       string
+		want       string
+		wantErrSub string
+	}{
+		{name: "body under limit", status: http.StatusOK, body: "v1\n", want: "v1\n"},
+		{name: "body at limit", status: http.StatusOK, body: "12345678", want: "12345678"},
+		{
+			name:       "body over limit",
+			status:     http.StatusOK,
+			body:       "123456789",
+			wantErrSub: "body exceeds 8 bytes",
+		},
+		{name: "not found", status: http.StatusNotFound, wantErrSub: "404"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var method, userAgent string
+			srv := httptest.NewServer(http.HandlerFunc(
+				func(w http.ResponseWriter, r *http.Request) {
+					method, userAgent = r.Method, r.UserAgent()
+					w.WriteHeader(tt.status)
+					_, _ = w.Write([]byte(tt.body))
+				},
+			))
+			t.Cleanup(srv.Close)
+
+			got, err := fetchSmallAsset(t.Context(), srv.URL+"/VERSION", limit)
+			assert.Equal(t, http.MethodGet, method)
+			assert.Equal(t, updateUserAgent, userAgent)
+			if tt.wantErrSub != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantErrSub)
+				assert.Contains(t, err.Error(), srv.URL+"/VERSION")
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestFetchChecksumFromFile(t *testing.T) {
+	sum := sha256Hex("binary")
+	tests := []struct {
+		name       string
+		status     int
+		want       string
+		wantErrSub string
+	}{
+		{name: "listed asset", status: http.StatusOK, want: sum},
+		{
+			name:       "missing checksums file",
+			status:     http.StatusNotFound,
+			wantErrSub: "failed to fetch checksums",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var userAgent string
+			srv := httptest.NewServer(http.HandlerFunc(
+				func(w http.ResponseWriter, r *http.Request) {
+					userAgent = r.UserAgent()
+					w.WriteHeader(tt.status)
+					_, _ = fmt.Fprintf(w, "%s  agentsview-linux-amd64\n", sum)
+				},
+			))
+			t.Cleanup(srv.Close)
+
+			got, err := fetchChecksumFromFile(t.Context(),
+				srv.URL+"/SHA256SUMS", "agentsview-linux-amd64",
+			)
+			assert.Equal(t, updateUserAgent, userAgent)
+			if tt.wantErrSub != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantErrSub)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
 func TestSanitizePath(t *testing.T) {
 	destDir := t.TempDir()
 

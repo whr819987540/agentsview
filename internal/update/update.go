@@ -694,14 +694,32 @@ func copyFile(src, dst string) error {
 	return out.Close()
 }
 
+// maxChecksumsSize bounds a SHA256SUMS download.
+const maxChecksumsSize = 1 << 20
+
 func fetchChecksumFromFile(ctx context.Context,
 	url, assetName string,
+) (string, error) {
+	body, err := fetchSmallAsset(ctx, url, maxChecksumsSize)
+	if err != nil {
+		return "", fmt.Errorf("failed to fetch checksums: %w", err)
+	}
+	return extractChecksum(body, assetName), nil
+}
+
+// fetchSmallAsset GETs a small text release asset, such as VERSION,
+// BUILD_TAG, or SHA256SUMS. It fails on any status other than 200 and
+// on bodies longer than limit bytes.
+func fetchSmallAsset(ctx context.Context,
+	url string, limit int64,
 ) (string, error) {
 	client := &http.Client{Timeout: 30 * time.Second}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return "", err
 	}
+	req.Header.Set("User-Agent", updateUserAgent)
+
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
@@ -709,16 +727,16 @@ func fetchChecksumFromFile(ctx context.Context,
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf(
-			"failed to fetch checksums: %s", resp.Status,
-		)
+		return "", fmt.Errorf("GET %s: %s", url, resp.Status)
 	}
-
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("GET %s: %w", url, err)
 	}
-	return extractChecksum(string(body), assetName), nil
+	if int64(len(body)) > limit {
+		return "", fmt.Errorf("GET %s: body exceeds %d bytes", url, limit)
+	}
+	return string(body), nil
 }
 
 func extractChecksum(releaseBody, assetName string) string {

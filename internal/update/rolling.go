@@ -3,8 +3,6 @@ package update
 import (
 	"context"
 	"fmt"
-	"io"
-	"net/http"
 	"runtime"
 	"strings"
 	"time"
@@ -105,30 +103,11 @@ func checkRollingUpdate(ctx context.Context,
 // fetchRollingVersion reads the one-line VERSION asset that names the
 // build in the rolling release.
 func fetchRollingVersion(ctx context.Context, url string) (string, error) {
-	client := &http.Client{Timeout: 30 * time.Second}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	body, err := fetchSmallAsset(ctx, url, maxRollingVersionSize)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("fetch rolling version: %w", err)
 	}
-	req.Header.Set("User-Agent", updateUserAgent)
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("fetch rolling version: %s", resp.Status)
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxRollingVersionSize+1))
-	if err != nil {
-		return "", err
-	}
-	if len(body) > maxRollingVersionSize {
-		return "", fmt.Errorf("rolling version exceeds %d bytes", maxRollingVersionSize)
-	}
-	version := strings.TrimSpace(string(body))
+	version := strings.TrimSpace(body)
 	if version == "" || strings.ContainsAny(version, " \t\r\n") {
 		return "", fmt.Errorf("invalid rolling version %q", version)
 	}
