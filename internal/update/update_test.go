@@ -666,7 +666,7 @@ func TestPerformUpdateInstallTarget(t *testing.T) {
 		{
 			name:      "archive update installs agentsview beside it",
 			assetName: "agentsview_0.45.0_test.tar.gz",
-			asset:     func(t *testing.T) string { return archiveBytes(t, "new") },
+			asset:     func(t *testing.T) string { t.Helper(); return archiveBytes(t, "new") },
 			wantFiles: map[string]string{rolling: "old", binaryName(): "new"},
 		},
 	}

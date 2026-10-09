@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -48,7 +49,7 @@ func (r *rollingRelease) serve(t *testing.T) string {
 				http.NotFound(w, req)
 				return
 			}
-			w.Header().Set("Content-Length", fmt.Sprint(len(body)))
+			w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 			if req.Method != http.MethodHead {
 				_, _ = w.Write([]byte(body))
 			}
