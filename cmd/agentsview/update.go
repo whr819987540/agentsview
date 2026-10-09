@@ -36,12 +36,13 @@ func runUpdate(ctx context.Context, cfg UpdateConfig) {
 		log.Fatalf("resolving data dir: %v", err)
 	}
 
-	if repo := update.RollingRepo(); repo != "" {
-		fmt.Printf("Checking rolling builds from %s...\n", repo)
+	rollingRepo := update.RollingRepo()
+	if rollingRepo != "" {
+		fmt.Printf("Checking rolling builds from %s...\n", rollingRepo)
 	}
 
 	info, err := update.CheckForUpdate(ctx,
-		version, cfg.Force, dataDir,
+		version, forceUpdateCheck(cfg, rollingRepo), dataDir,
 	)
 	if err != nil {
 		log.Fatalf("checking for updates: %v", err)
@@ -63,19 +64,6 @@ func runUpdate(ctx context.Context, cfg UpdateConfig) {
 		if cfg.Check {
 			return
 		}
-		// Cache-only results lack download metadata; re-fetch.
-		if info.NeedsRefetch() {
-			info, err = update.CheckForUpdate(ctx,
-				version, true, dataDir,
-			)
-			if err != nil {
-				log.Fatalf("checking for updates: %v", err)
-			}
-			if info == nil {
-				fmt.Println("Up to date.")
-				return
-			}
-		}
 	} else {
 		fmt.Printf(
 			"Update available: %s -> %s",
@@ -90,6 +78,19 @@ func runUpdate(ctx context.Context, cfg UpdateConfig) {
 		if cfg.Check {
 			return
 		}
+	}
+
+	info, err = installableUpdate(ctx, info,
+		func(ctx context.Context) (*update.UpdateInfo, error) {
+			return update.CheckForUpdate(ctx, version, true, dataDir)
+		},
+	)
+	if err != nil {
+		log.Fatalf("checking for updates: %v", err)
+	}
+	if info == nil {
+		fmt.Println("Up to date.")
+		return
 	}
 
 	if !cfg.Yes {
@@ -126,6 +127,26 @@ func runUpdate(ctx context.Context, cfg UpdateConfig) {
 		fmt.Println()
 		log.Fatal(err)
 	}
+}
+
+// forceUpdateCheck reports whether an explicit update command skips the
+// update cache. Rolling builds always check fresh, because the rolling
+// channel publishes on every push and a cached answer can be stale.
+func forceUpdateCheck(cfg UpdateConfig, rollingRepo string) bool {
+	return cfg.Force || rollingRepo != ""
+}
+
+// installableUpdate returns info with the download details an install
+// needs. Display-only results, such as cached checks, are re-fetched
+// with recheck, which returns nil when no update remains.
+func installableUpdate(ctx context.Context,
+	info *update.UpdateInfo,
+	recheck func(context.Context) (*update.UpdateInfo, error),
+) (*update.UpdateInfo, error) {
+	if !info.NeedsRefetch() {
+		return info, nil
+	}
+	return recheck(ctx)
 }
 
 func performUpdateWithDaemonLifecycle(ctx context.Context,
