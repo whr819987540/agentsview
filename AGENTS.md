@@ -21,6 +21,7 @@
 | S3 ingest, `S3Provider`, or `Source.S3Discovery`                                        | `docs/agents/s3-providers.md`        |
 | Any frontend file                                                                       | `frontend/AGENTS.md`                 |
 | Frontend controls, styling, or reusable components                                      | `frontend/AGENTS.md` and `DESIGN.md` |
+| Merging upstream into this fork                                                         | `docs/fork/upstream-merge.md`        |
 
 The `README.md` and `Makefile` are the sources for project facts, setup, and
 commands. Do not copy their catalogues into this file.
