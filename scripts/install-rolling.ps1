@@ -261,27 +261,73 @@ function Test-OtherCopyFirst {
     return $false
 }
 
-# Replaces the installed binary. Windows cannot delete a running .exe but
-# can rename it, so a running copy is moved aside first.
+# Replaces the installed binary. The new file is first copied beside
+# Dest. Windows cannot delete a running .exe but can rename it, so the
+# current file is renamed to a backup before the new one takes its
+# place. Backups use an installer-only name with a random part, so they
+# never collide with the agentsview.exe.old and agentsview.exe.new files
+# that `agentsview update` uses. If the new file cannot be put in place,
+# the backup is moved back.
 function Install-Binary {
     param([string]$Source, [string]$Dest)
 
-    if (Test-Path $Dest) {
+    $dir = Split-Path -Parent $Dest
+    $prefix = (Split-Path -Leaf $Dest) + '.installer-'
+
+    # Remove leftovers from earlier runs. A backup of a copy that is still
+    # running stays locked and is retried on the next run.
+    Get-ChildItem -LiteralPath $dir -Force -ErrorAction SilentlyContinue |
+        Where-Object { -not $_.PSIsContainer -and $_.Name.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) } |
+        ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
+
+    $id = [guid]::NewGuid().ToString('N').Substring(0, 12)
+    $staged = Join-Path $dir "$prefix$id.new"
+    $backup = Join-Path $dir "$prefix$id.old"
+
+    try {
+        Copy-Item -LiteralPath $Source -Destination $staged -Force -ErrorAction Stop
+    } catch {
+        Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue
+        Write-Err "Error: Could not write the new build to ${dir}: $_"
+        exit 1
+    }
+
+    $movedAside = $false
+    if (Test-Path -LiteralPath $Dest) {
         try {
-            Remove-Item $Dest -Force
+            Move-Item -LiteralPath $Dest -Destination $backup -Force -ErrorAction Stop
+            $movedAside = $true
         } catch {
-            $old = "$Dest.old"
-            Remove-Item $old -Force -ErrorAction SilentlyContinue
-            try {
-                Move-Item $Dest $old -Force
-            } catch {
-                Write-Err "Error: Could not replace $Dest. Stop agentsview and try again."
-                exit 1
-            }
-            Write-Warn "The running agentsview was moved to $old; restart it to use the new build."
+            Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue
+            Write-Err "Error: Could not replace $Dest. Stop agentsview and try again."
+            exit 1
         }
     }
-    Move-Item $Source $Dest -Force
+
+    try {
+        Move-Item -LiteralPath $staged -Destination $Dest -Force -ErrorAction Stop
+    } catch {
+        $installError = $_
+        Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue
+        Write-Err "Error: Could not install ${Dest}: $installError"
+        if ($movedAside) {
+            try {
+                Move-Item -LiteralPath $backup -Destination $Dest -Force -ErrorAction Stop
+                Write-Err "The previous build was restored."
+            } catch {
+                Write-Err "The previous build could not be restored. Rename $backup to $(Split-Path -Leaf $Dest) to get it back."
+            }
+        }
+        exit 1
+    }
+
+    if ($movedAside) {
+        try {
+            Remove-Item -LiteralPath $backup -Force -ErrorAction Stop
+        } catch {
+            Write-Warn "The running agentsview was moved to $backup; restart it to use the new build."
+        }
+    }
 }
 
 function Install-AgentsviewRolling {

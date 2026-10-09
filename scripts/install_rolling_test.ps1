@@ -84,6 +84,18 @@ if ($env:TEST_MACHINE_PATH -or $env:TEST_USER_PATH) {
         return @{ Machine = $env:TEST_MACHINE_PATH; User = $env:TEST_USER_PATH }
     }
 }
+# TEST_FAIL_INSTALL_MOVE makes moving the staged build into place fail;
+# 'restore' also makes moving the backup back fail.
+if ($env:TEST_FAIL_INSTALL_MOVE) {
+    function Move-Item {
+        [CmdletBinding()]
+        param([string]$LiteralPath, [string]$Destination, [switch]$Force)
+        $fail = $LiteralPath -like '*.installer-*.new'
+        if ($env:TEST_FAIL_INSTALL_MOVE -eq 'restore' -and $LiteralPath -like '*.installer-*.old') { $fail = $true }
+        if ($fail) { throw "injected failure moving $LiteralPath" }
+        Microsoft.PowerShell.Management\Move-Item -LiteralPath $LiteralPath -Destination $Destination -Force:$Force -ErrorAction Stop
+    }
+}
 Install-AgentsviewRolling
 '@
 
@@ -101,6 +113,7 @@ function Invoke-Installer {
         AGENTSVIEW_SKIP_CHECKSUM = $null
         TEST_MACHINE_PATH = $null
         TEST_USER_PATH = $null
+        TEST_FAIL_INSTALL_MOVE = $null
     }
     foreach ($key in $Vars.Keys) { $childEnv[$key] = $Vars[$key] }
 
@@ -200,6 +213,47 @@ try {
     Assert-Eq 'padded BUILD_TAG installs its snapshot' 'build-1' (Read-Text (Join-Path $paddedDir 'agentsview.exe'))
     Assert-Contains 'padded BUILD_TAG is trimmed in the download URL' "$baseUrl/$longTag/$assetName" (Get-RequestedUrls)
     Publish-Build $build2 'build-2'
+
+    # Installer backups from earlier runs are cleaned up; the backup
+    # names `agentsview update` uses are left alone.
+    $backupDir = Join-Path $work 'backups'
+    New-Item -ItemType Directory -Path $backupDir -Force | Out-Null
+    Set-Content -Path (Join-Path $backupDir 'agentsview.exe') -Value 'build-1' -NoNewline
+    Set-Content -Path (Join-Path $backupDir 'agentsview.exe.installer-0123456789ab.old') -Value 'stale' -NoNewline
+    Set-Content -Path (Join-Path $backupDir 'agentsview.exe.installer-ba9876543210.new') -Value 'stale' -NoNewline
+    Set-Content -Path (Join-Path $backupDir 'agentsview.exe.old') -Value 'updater-backup' -NoNewline
+    Set-Content -Path (Join-Path $backupDir 'agentsview.exe.new') -Value 'updater-staged' -NoNewline
+    $r = Invoke-Installer @{ AGENTSVIEW_INSTALL_DIR = $backupDir }
+    Assert-Eq 'install beside old backups succeeds' 0 $r.Status
+    Assert-Eq 'install beside old backups replaces binary' 'build-2' (Read-Text (Join-Path $backupDir 'agentsview.exe'))
+    Assert-Eq 'installer backups and staged files removed' 0 `
+        @(Get-ChildItem -LiteralPath $backupDir -Filter 'agentsview.exe.installer-*').Count
+    Assert-Eq 'updater backup left alone' 'updater-backup' (Read-Text (Join-Path $backupDir 'agentsview.exe.old'))
+    Assert-Eq 'updater staged file left alone' 'updater-staged' (Read-Text (Join-Path $backupDir 'agentsview.exe.new'))
+
+    # When the new build cannot be put in place, the old one is restored.
+    $failDir = Join-Path $work 'install-fails'
+    $failDest = Join-Path $failDir 'agentsview.exe'
+    New-Item -ItemType Directory -Path $failDir -Force | Out-Null
+    Set-Content -Path $failDest -Value 'build-1' -NoNewline
+    $r = Invoke-Installer @{ AGENTSVIEW_INSTALL_DIR = $failDir; TEST_FAIL_INSTALL_MOVE = '1' }
+    Assert-Eq 'failed install exits non-zero' 1 $r.Status
+    Assert-Contains 'failed install reports the error' "Could not install ${failDest}: injected failure" $r.Output
+    Assert-Contains 'failed install says the old build is back' 'The previous build was restored.' $r.Output
+    Assert-NotContains 'failed install does not claim success' 'Installation complete!' $r.Output
+    Assert-Eq 'failed install keeps the old build' 'build-1' (Read-Text $failDest)
+    Assert-Eq 'failed install leaves no installer files' 0 `
+        @(Get-ChildItem -LiteralPath $failDir -Filter 'agentsview.exe.installer-*').Count
+
+    # If the restore fails too, the backup stays and the message names it.
+    $r = Invoke-Installer @{ AGENTSVIEW_INSTALL_DIR = $failDir; TEST_FAIL_INSTALL_MOVE = 'restore' }
+    Assert-Eq 'failed restore exits non-zero' 1 $r.Status
+    $kept = @(Get-ChildItem -LiteralPath $failDir -Filter 'agentsview.exe.installer-*.old')
+    Assert-Eq 'failed restore keeps one backup' 1 $kept.Count
+    if ($kept.Count -eq 1) {
+        Assert-Eq 'failed restore backup holds the old build' 'build-1' (Read-Text $kept[0].FullName)
+        Assert-Contains 'failed restore names the backup' "Rename $($kept[0].FullName) to agentsview.exe" $r.Output
+    }
 
     # Without an override the binary lands in %USERPROFILE%\.local\bin.
     $profileDir = Join-Path $work 'profile'
@@ -380,10 +434,24 @@ try {
             $r = Invoke-Installer @{ AGENTSVIEW_INSTALL_DIR = $runDir }
             Assert-Eq 'install over running binary succeeds' 0 $r.Status
             Assert-Eq 'running binary replaced' 'build-2' (Read-Text $runDest)
-            Assert-Eq 'running binary moved aside' $true (Test-Path "$runDest.old")
+            # The updater's agentsview.exe.old name stays free, so a later
+            # `agentsview update` is not blocked by the locked backup.
+            $backups = @(Get-ChildItem -LiteralPath $runDir -Filter 'agentsview.exe.installer-*.old')
+            Assert-Eq 'running binary moved to an installer backup' 1 $backups.Count
+            Assert-Missing 'updater backup name left free' "$runDest.old"
+            if ($backups.Count -eq 1) {
+                Assert-Contains 'says where the running copy went' $backups[0].FullName $r.Output
+            }
         } finally {
             Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+            $proc.WaitForExit(10000) | Out-Null
         }
+
+        # Once that copy has stopped, the next run removes its backup.
+        $r = Invoke-Installer @{ AGENTSVIEW_INSTALL_DIR = $runDir }
+        Assert-Eq 'install after stop succeeds' 0 $r.Status
+        Assert-Eq 'stale installer backup removed' 0 `
+            @(Get-ChildItem -LiteralPath $runDir -Filter 'agentsview.exe.installer-*').Count
     } else {
         Write-Host "  SKIP: user PATH and running-binary cases need Windows"
     }
