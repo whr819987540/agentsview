@@ -14,31 +14,46 @@ The latest release is **v0.44.0**. Check the
 ## Install
 
 These commands install the newest rolling build of this fork. A new rolling
-build is published on every push to `main`.
+build is published on every push to `main`. Replace `<owner>/<repo>` with this
+repository, or copy the filled-in commands from the
+[rolling release notes](../../releases/tag/latest).
 
 **Linux (x86_64):**
 
 ```bash
-curl -fsSL https://github.com/whr819987540/agentsview/releases/download/latest/install.sh | bash
+curl -fsSL https://github.com/<owner>/<repo>/releases/download/latest/install.sh | bash
 ```
 
 The installer puts `agentsview` in `~/.local/bin`. If that directory is not in
-your `PATH`, it adds it to your shell startup file and tells you which file to
-reload.
+your `PATH`, it adds it to the front of `PATH` in your shell startup file and
+tells you which file to reload. If another `agentsview` would still run first,
+the installer names it and explains how to fix that.
 
 **Windows (PowerShell, x64):**
 
 ```powershell
-powershell -ExecutionPolicy ByPass -c "irm https://github.com/whr819987540/agentsview/releases/download/latest/install.ps1 | iex"
+powershell -ExecutionPolicy ByPass -c "irm https://github.com/<owner>/<repo>/releases/download/latest/install.ps1 | iex"
 ```
 
 The installer puts `agentsview.exe` in `%USERPROFILE%\.local\bin`, the same
-place as `~/.local/bin` on Linux. If that directory is not in your user `PATH`,
-it adds it and asks you to open a new terminal.
+place as `~/.local/bin` on Linux. If you already have an install in
+`%USERPROFILE%\.agentsview\bin` and none in `.local\bin`, it updates that
+install in place instead. If the install directory is not in your user `PATH`,
+it adds it to the front and asks you to open a new terminal. If another
+`agentsview.exe` would still run first, the installer names it and explains how
+to fix that.
 
-Run `agentsview update` to move to the newest rolling build. Earlier builds
-stay available as `build-YYYYMMDD-<commit>` entries on the
-[releases page](https://github.com/whr819987540/agentsview/releases).
+Run `agentsview update` to move to the newest rolling build. It checks for a new
+build every time you run it and replaces the program you ran, even when the
+file has another name such as `agentsview-linux-amd64`. Running
+`agentsview serve` from a newer rolling build replaces an older daemon that is
+still running.
+
+Every build stays available as a `build-YYYYMMDD-<commit>` entry on the
+[releases page](../../releases), dated by its commit. The installers and
+`agentsview update` read the newest build's entry name from the rolling release
+and download everything from that entry, so a push in the middle of an install
+cannot mix two builds.
 
 **Upstream stable release (macOS, Linux, Windows):**
 
