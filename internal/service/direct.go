@@ -528,7 +528,7 @@ func truncateForkContextToReplay(
 	contextMsgs []db.Message,
 	replay []parser.ParsedMessage,
 ) []db.Message {
-	if len(replay) > len(contextMsgs) {
+	if len(contextMsgs) == 0 || len(replay) > len(contextMsgs) {
 		return contextMsgs
 	}
 	for i, replayMsg := range replay {
