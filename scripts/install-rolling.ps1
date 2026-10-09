@@ -14,7 +14,9 @@
 #
 # Environment overrides:
 #   AGENTSVIEW_REPO            owner/repo that publishes the rolling release
-#   AGENTSVIEW_INSTALL_DIR     install directory (default: %USERPROFILE%\.local\bin)
+#   AGENTSVIEW_INSTALL_DIR     install directory (default: %USERPROFILE%\.local\bin,
+#                              or %USERPROFILE%\.agentsview\bin when an earlier
+#                              install is there and none is in .local\bin)
 #   AGENTSVIEW_NO_MODIFY_PATH  set to 1 to leave the user PATH alone
 #   AGENTSVIEW_SKIP_CHECKSUM   set to 1 to skip SHA256SUMS verification
 
@@ -66,7 +68,17 @@ function Get-InstallDir {
         return $env:AGENTSVIEW_INSTALL_DIR
     }
     # Same place as ~/.local/bin on Linux.
-    return Join-Path (Join-Path $env:USERPROFILE '.local') 'bin'
+    $dir = Join-Path (Join-Path $env:USERPROFILE '.local') 'bin'
+    # The stable installer and earlier rolling installers used
+    # %USERPROFILE%\.agentsview\bin. Update such an install where it is,
+    # so the old copy there does not keep running.
+    $legacyDir = Join-Path (Join-Path $env:USERPROFILE '.agentsview') 'bin'
+    if ((Test-Path -LiteralPath (Join-Path $legacyDir $binaryName) -PathType Leaf) -and
+        -not (Test-Path -LiteralPath (Join-Path $dir $binaryName))) {
+        Write-Info "Found an existing install in $legacyDir; updating it in place."
+        return $legacyDir
+    }
+    return $dir
 }
 
 function Invoke-Download {
@@ -147,8 +159,9 @@ function Test-PathListContains {
     return $false
 }
 
-# Adds the directory to the user PATH. Returns $true when the change
-# only reaches terminals opened afterwards.
+# Adds the directory to the front of the user PATH, so it wins over
+# other copies listed there. Returns $true when the change only reaches
+# terminals opened afterwards.
 function Update-UserPath {
     param([string]$Dir)
 
@@ -159,7 +172,7 @@ function Update-UserPath {
             return $false
         }
         Write-Warn "$Dir is in your user PATH, but this terminal has not loaded it yet."
-        $env:Path = "$env:Path;$Dir"
+        $env:Path = "$Dir;$env:Path"
         return $true
     }
 
@@ -169,14 +182,83 @@ function Update-UserPath {
     }
 
     if ($userPath) {
-        $newPath = "$($userPath.TrimEnd(';'));$Dir"
+        $newPath = "$Dir;$($userPath.TrimStart(';'))"
     } else {
         $newPath = $Dir
     }
     [Environment]::SetEnvironmentVariable('Path', $newPath, 'User')
-    $env:Path = "$env:Path;$Dir"
-    Write-Info "Added $Dir to your user PATH"
+    $env:Path = "$Dir;$env:Path"
+    Write-Info "Added $Dir to the front of your user PATH"
     return $true
+}
+
+# Returns the system (Machine) and user PATH values. New terminals use
+# the system PATH followed by the user PATH.
+function Get-PersistedPath {
+    return @{
+        Machine = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+        User = [Environment]::GetEnvironmentVariable('Path', 'User')
+    }
+}
+
+# Returns the first agentsview command in a ;-separated PATH list,
+# trying each PATHEXT extension in every folder the way Windows does.
+function Find-AgentsviewOnPath {
+    param([string]$PathList)
+
+    if (-not $PathList) { return $null }
+    $exts = $env:PATHEXT
+    if (-not $exts) { $exts = '.COM;.EXE;.BAT;.CMD' }
+    foreach ($entry in $PathList -split ';') {
+        $folder = [Environment]::ExpandEnvironmentVariables($entry.Trim().Trim('"'))
+        if (-not $folder) { continue }
+        foreach ($ext in $exts -split ';') {
+            if (-not $ext) { continue }
+            try {
+                $candidate = [System.IO.Path]::Combine($folder, 'agentsview' + $ext.ToLowerInvariant())
+            } catch {
+                # Invalid characters in a PATH entry; Windows skips it too.
+                continue
+            }
+            if ([System.IO.File]::Exists($candidate)) { return $candidate }
+        }
+    }
+    return $null
+}
+
+function Test-SamePath {
+    param([string]$A, [string]$B)
+    try {
+        return ([System.IO.Path]::GetFullPath($A) -ieq [System.IO.Path]::GetFullPath($B))
+    } catch {
+        return ($A -ieq $B)
+    }
+}
+
+# Warns when new terminals will run another agentsview instead of Dest,
+# and says how to fix it. Returns $true in that case.
+function Test-OtherCopyFirst {
+    param([string]$Dest, [string]$InstallDir)
+
+    $persisted = Get-PersistedPath
+    $winner = Find-AgentsviewOnPath "$($persisted.Machine);$($persisted.User)"
+    if ($winner -and -not (Test-SamePath $winner $Dest)) {
+        $winnerDir = Split-Path -Parent $winner
+        Write-Warn "Another agentsview at $winner comes first in PATH, so new terminals will run it instead of $Dest."
+        if (Test-PathListContains $persisted.Machine $winnerDir) {
+            Write-Warn "To fix it, delete or rename $winner, or remove $winnerDir from the system PATH. Both may need an administrator; the system PATH is searched before your user PATH."
+        } else {
+            Write-Warn "To fix it, delete or rename $winner, or move $InstallDir above $winnerDir in your user PATH (System Properties > Environment Variables)."
+        }
+        return $true
+    }
+
+    # New terminals will find Dest, but this one may still find another.
+    $current = Find-AgentsviewOnPath $env:Path
+    if ($winner -and $current -and -not (Test-SamePath $current $Dest)) {
+        Write-Warn "This terminal still finds $current first; open a new terminal to use the new build."
+    }
+    return $false
 }
 
 # Replaces the installed binary. Windows cannot delete a running .exe but
@@ -263,14 +345,14 @@ function Install-AgentsviewRolling {
         Write-Host ""
 
         $needsRestart = Update-UserPath -Dir $installDir
-
-        $found = Get-Command 'agentsview' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($found -and ($found.Source -ne $destPath)) {
-            Write-Warn "Another agentsview at $($found.Source) comes first in PATH and will run instead."
-        }
+        $shadowed = Test-OtherCopyFirst -Dest $destPath -InstallDir $installDir
 
         Write-Host ""
-        Write-Info "Installation complete!"
+        if ($shadowed) {
+            Write-Warn "Installed $destPath, but new terminals will run the other agentsview until you fix PATH (see above)."
+        } else {
+            Write-Info "Installation complete!"
+        }
         if ($needsRestart) {
             Write-Host ""
             Write-Warn "Open a new terminal so other windows pick up the PATH change."

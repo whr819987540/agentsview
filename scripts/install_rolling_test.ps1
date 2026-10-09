@@ -66,7 +66,9 @@ function Get-RequestedUrls {
 }
 
 # The child dot-sources the installer, swaps in a fixture-backed
-# download, and runs the real install function.
+# download, and runs the real install function. TEST_MACHINE_PATH and
+# TEST_USER_PATH stand in for the registry PATH values, which only
+# exist on Windows.
 $runner = @'
 . $env:TEST_INSTALLER
 function Invoke-Download {
@@ -76,6 +78,11 @@ function Invoke-Download {
     $src = Join-Path $env:TEST_RELEASES $Uri.Substring($Uri.IndexOf($marker) + $marker.Length)
     if (-not (Test-Path $src)) { throw "404 Not Found: $Uri" }
     Copy-Item $src $OutFile
+}
+if ($env:TEST_MACHINE_PATH -or $env:TEST_USER_PATH) {
+    function Get-PersistedPath {
+        return @{ Machine = $env:TEST_MACHINE_PATH; User = $env:TEST_USER_PATH }
+    }
 }
 Install-AgentsviewRolling
 '@
@@ -92,6 +99,8 @@ function Invoke-Installer {
         AGENTSVIEW_INSTALL_DIR = $null
         AGENTSVIEW_NO_MODIFY_PATH = '1'
         AGENTSVIEW_SKIP_CHECKSUM = $null
+        TEST_MACHINE_PATH = $null
+        TEST_USER_PATH = $null
     }
     foreach ($key in $Vars.Keys) { $childEnv[$key] = $Vars[$key] }
 
@@ -199,6 +208,82 @@ try {
     $defaultDest = Join-Path (Join-Path (Join-Path $profileDir '.local') 'bin') 'agentsview.exe'
     Assert-Eq 'default dir is USERPROFILE\.local\bin' 'build-2' (Read-Text $defaultDest)
 
+    # An install in the older %USERPROFILE%\.agentsview\bin is updated in
+    # place, so the old copy does not keep running from there.
+    $legacyProfile = Join-Path $work 'legacy-profile'
+    $legacyDest = Join-Path (Join-Path (Join-Path $legacyProfile '.agentsview') 'bin') 'agentsview.exe'
+    $legacyNewDest = Join-Path (Join-Path (Join-Path $legacyProfile '.local') 'bin') 'agentsview.exe'
+    New-Item -ItemType Directory -Path (Split-Path -Parent $legacyDest) -Force | Out-Null
+    Set-Content -Path $legacyDest -Value 'old-build' -NoNewline
+    $r = Invoke-Installer @{ USERPROFILE = $legacyProfile }
+    Assert-Eq 'legacy install update succeeds' 0 $r.Status
+    Assert-Eq 'legacy install updated in place' 'build-2' (Read-Text $legacyDest)
+    Assert-Missing 'no second copy in .local\bin' $legacyNewDest
+    Assert-Contains 'says the legacy install is updated in place' `
+        "Found an existing install in $(Split-Path -Parent $legacyDest); updating it in place." $r.Output
+
+    # Once .local\bin has a copy it is the install to update.
+    $bothProfile = Join-Path $work 'both-profile'
+    $bothLegacy = Join-Path (Join-Path (Join-Path $bothProfile '.agentsview') 'bin') 'agentsview.exe'
+    $bothNew = Join-Path (Join-Path (Join-Path $bothProfile '.local') 'bin') 'agentsview.exe'
+    New-Item -ItemType Directory -Path (Split-Path -Parent $bothLegacy) -Force | Out-Null
+    New-Item -ItemType Directory -Path (Split-Path -Parent $bothNew) -Force | Out-Null
+    Set-Content -Path $bothLegacy -Value 'old-build' -NoNewline
+    Set-Content -Path $bothNew -Value 'old-build' -NoNewline
+    $r = Invoke-Installer @{ USERPROFILE = $bothProfile }
+    Assert-Eq 'install with both folders succeeds' 0 $r.Status
+    Assert-Eq 'both folders: .local\bin updated' 'build-2' (Read-Text $bothNew)
+    Assert-Eq 'both folders: legacy copy untouched' 'old-build' (Read-Text $bothLegacy)
+
+    # An explicit folder wins over a legacy install.
+    $overrideDir = Join-Path $work 'override'
+    Set-Content -Path $legacyDest -Value 'old-build' -NoNewline
+    $r = Invoke-Installer @{ USERPROFILE = $legacyProfile; AGENTSVIEW_INSTALL_DIR = $overrideDir }
+    Assert-Eq 'override with legacy install succeeds' 0 $r.Status
+    Assert-Eq 'override folder gets the build' 'build-2' (Read-Text (Join-Path $overrideDir 'agentsview.exe'))
+    Assert-Eq 'override leaves legacy copy alone' 'old-build' (Read-Text $legacyDest)
+
+    # Another agentsview that new terminals find first is reported with
+    # its location and a fix, instead of an unqualified success.
+    $otherMachine = Join-Path $work 'other-machine'
+    New-Item -ItemType Directory -Path $otherMachine -Force | Out-Null
+    $otherMachineExe = Join-Path $otherMachine 'agentsview.exe'
+    Set-Content -Path $otherMachineExe -Value 'other' -NoNewline
+    $shadowDir = Join-Path $work 'shadow'
+    $shadowDest = Join-Path $shadowDir 'agentsview.exe'
+    $env:TEST_OTHER_MACHINE = $otherMachine
+    $r = Invoke-Installer @{ AGENTSVIEW_INSTALL_DIR = $shadowDir; TEST_MACHINE_PATH = '%TEST_OTHER_MACHINE%'; TEST_USER_PATH = $shadowDir }
+    Remove-Item Env:TEST_OTHER_MACHINE
+    Assert-Eq 'install shadowed by the system PATH still succeeds' 0 $r.Status
+    Assert-Contains 'names the copy on the system PATH' `
+        "Another agentsview at $otherMachineExe comes first in PATH, so new terminals will run it instead of $shadowDest." $r.Output
+    Assert-Contains 'system PATH fix' "remove $otherMachine from the system PATH" $r.Output
+    Assert-NotContains 'no unqualified success when the system PATH wins' 'Installation complete!' $r.Output
+    Assert-Contains 'qualified success when the system PATH wins' "Installed $shadowDest, but new terminals will run the other agentsview" $r.Output
+
+    # A .cmd shim earlier in the user PATH also counts.
+    $otherUser = Join-Path $work 'other-user'
+    New-Item -ItemType Directory -Path $otherUser -Force | Out-Null
+    $otherUserCmd = Join-Path $otherUser 'agentsview.cmd'
+    Set-Content -Path $otherUserCmd -Value '@echo other'
+    $r = Invoke-Installer @{ AGENTSVIEW_INSTALL_DIR = $shadowDir; TEST_MACHINE_PATH = (Join-Path $work 'empty'); TEST_USER_PATH = "$otherUser;$shadowDir" }
+    Assert-Contains 'names the shim on the user PATH' "Another agentsview at $otherUserCmd comes first in PATH" $r.Output
+    Assert-Contains 'user PATH fix' "move $shadowDir above $otherUser in your user PATH" $r.Output
+    Assert-NotContains 'no unqualified success when the user PATH wins' 'Installation complete!' $r.Output
+
+    # No warning when the install folder comes first.
+    $r = Invoke-Installer @{ AGENTSVIEW_INSTALL_DIR = $shadowDir; TEST_MACHINE_PATH = (Join-Path $work 'empty'); TEST_USER_PATH = "$shadowDir;$otherUser" }
+    Assert-NotContains 'no warning when the install folder comes first' 'Another agentsview' $r.Output
+    Assert-Contains 'unqualified success when the install folder comes first' 'Installation complete!' $r.Output
+
+    # Lookup order follows the PATH list and skips folders without a copy.
+    . $installer
+    Assert-Eq 'lookup finds the first folder with a copy' $otherUserCmd `
+        (Find-AgentsviewOnPath "$(Join-Path $work 'empty');$otherUser;$otherMachine")
+    Assert-Eq 'lookup accepts quoted folders' $otherMachineExe `
+        (Find-AgentsviewOnPath "`"$otherMachine`";$otherUser")
+    Assert-Eq 'lookup returns nothing without a copy' $null (Find-AgentsviewOnPath (Join-Path $work 'empty'))
+
     # A corrupted download is rejected before anything is installed.
     $badDir = Join-Path $work 'bad'
     $snapshotAsset = Join-Path (Join-Path $releases $build2) $assetName
@@ -257,10 +342,24 @@ try {
         $savedUserPath = [Environment]::GetEnvironmentVariable('Path', 'User')
         $pathDir = Join-Path $work 'path-bin'
         try {
+            # Another copy already in the user PATH, as an older install
+            # in %USERPROFILE%\.agentsview\bin would be.
+            $olderDir = Join-Path $work 'older-bin'
+            New-Item -ItemType Directory -Path $olderDir -Force | Out-Null
+            Set-Content -Path (Join-Path $olderDir 'agentsview.exe') -Value 'older' -NoNewline
+            if ($savedUserPath) {
+                [Environment]::SetEnvironmentVariable('Path', "$olderDir;$savedUserPath", 'User')
+            } else {
+                [Environment]::SetEnvironmentVariable('Path', $olderDir, 'User')
+            }
+
             $r = Invoke-Installer @{ AGENTSVIEW_INSTALL_DIR = $pathDir; AGENTSVIEW_NO_MODIFY_PATH = $null }
             Assert-Eq 'PATH install succeeds' 0 $r.Status
-            $entries = @(([Environment]::GetEnvironmentVariable('Path', 'User') -split ';') | Where-Object { $_ -ieq $pathDir })
+            $userEntries = @([Environment]::GetEnvironmentVariable('Path', 'User') -split ';')
+            $entries = @($userEntries | Where-Object { $_ -ieq $pathDir })
             Assert-Eq 'user PATH gains install dir' 1 $entries.Count
+            Assert-Eq 'install dir goes first in the user PATH' $pathDir $userEntries[0]
+            Assert-NotContains 'prepended install dir wins over the older copy' 'Another agentsview' $r.Output
             Assert-Contains 'asks for a new terminal' 'Open a new terminal' $r.Output
 
             $r = Invoke-Installer @{ AGENTSVIEW_INSTALL_DIR = $pathDir; AGENTSVIEW_NO_MODIFY_PATH = $null }
