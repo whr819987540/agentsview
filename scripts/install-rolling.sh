@@ -151,19 +151,57 @@ path_contains() {
     esac
 }
 
+# Prints the ways a startup file might spell the directory, one per line.
+dir_spellings() {
+    local dir="$1"
+    [ "$dir" = "/" ] || dir="${dir%/}"
+    echo "$dir"
+    case "$dir" in
+        "$HOME"/*)
+            local rel="${dir#"$HOME"/}"
+            echo "\$HOME/$rel"
+            echo "\${HOME}/$rel"
+            echo "~/$rel"
+            ;;
+    esac
+}
+
+# Reports whether a startup file line uses the spelling as a whole PATH
+# element: after a start of line, whitespace, quote, ":" or "=", and
+# before an optional "/" and then an end of line, whitespace, quote or
+# ":". Comments do not count, and neither do longer paths that start
+# with the spelling, such as ~/.local/binaries.
+line_names_dir() {
+    local line="$1"
+    local spelling="$2"
+    # Skip comment lines, then drop any trailing comment.
+    line="${line#"${line%%[![:space:]]*}"}"
+    case "$line" in
+        "#"*) return 1 ;;
+    esac
+    line="${line%%[[:space:]]#*}"
+    # Pad so the start and end of the line count as separators.
+    line=" $line "
+    [[ "$line" == *[[:space:]:=\"\']"$spelling"[[:space:]:\"\']* ]] && return 0
+    [[ "$line" == *[[:space:]:=\"\']"$spelling"/[[:space:]:\"\']* ]] && return 0
+    return 1
+}
+
 rc_mentions_dir() {
     local rc="$1"
     local dir="$2"
     [ -f "$rc" ] || return 1
-    grep -qF "$dir" "$rc" && return 0
-    case "$dir" in
-        "$HOME"/*)
-            local rel="${dir#"$HOME"/}"
-            grep -qF "\$HOME/$rel" "$rc" && return 0
-            grep -qF "\${HOME}/$rel" "$rc" && return 0
-            grep -qF "~/$rel" "$rc" && return 0
-            ;;
-    esac
+    local spellings=()
+    local spelling
+    while IFS= read -r spelling; do
+        spellings+=("$spelling")
+    done < <(dir_spellings "$dir")
+    local line
+    while IFS= read -r line || [ -n "$line" ]; do
+        for spelling in "${spellings[@]}"; do
+            line_names_dir "$line" "$spelling" && return 0
+        done
+    done < "$rc"
     return 1
 }
 

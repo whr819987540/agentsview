@@ -224,6 +224,67 @@ assert_eq "configured bash install succeeds" 0 "$STATUS"
 assert_eq "existing bashrc left unchanged" 1 "$(wc -l < "$home/.bashrc" | tr -d ' ')"
 assert_contains "configured bash asks for reload" "source $home/.bashrc" "$OUTPUT"
 
+# Only a real PATH element counts as configured. Each case writes one
+# startup file line; @HOME@ stands for the test HOME.
+rc_case() {
+    local expected="$1" line="$2"
+    local home="$WORK/rc-home"
+    mkdir -p "$home"
+    printf '%s\n' "${line//@HOME@/$home}" > "$home/rc"
+    local got=no
+    if (HOME="$home"; rc_mentions_dir "$home/rc" "$home/.local/bin"); then
+        got=yes
+    fi
+    assert_eq "startup line counts as configured=$expected: $line" "$expected" "$got"
+}
+rc_case yes 'export PATH="$HOME/.local/bin:$PATH"'
+rc_case yes 'export PATH="${HOME}/.local/bin:$PATH"'
+rc_case yes 'export PATH=~/.local/bin:$PATH'
+rc_case yes 'PATH="$PATH:$HOME/.local/bin"'
+rc_case yes 'PATH=$PATH:$HOME/.local/bin'
+rc_case yes 'export PATH="$HOME/.local/bin/:$PATH"'
+rc_case yes '  export PATH="$HOME/.local/bin:$PATH"  # my tools'
+rc_case yes 'export PATH="@HOME@/.local/bin:$PATH"'
+rc_case yes 'fish_add_path "$HOME/.local/bin"'
+rc_case yes 'fish_add_path ~/.local/bin'
+rc_case yes 'fish_add_path -g ~/.local/bin/'
+rc_case yes 'set -gx PATH $HOME/.local/bin $PATH'
+rc_case no '# old: ~/.local/bin'
+rc_case no '    # export PATH="$HOME/.local/bin:$PATH"'
+rc_case no 'export EDITOR=vim # see ~/.local/bin'
+rc_case no 'export PATH="$HOME/.local/binaries:$PATH"'
+rc_case no 'export PATH="$HOME/.local/bin-old:$PATH"'
+rc_case no 'export PATH="/srv@HOME@/.local/bin:$PATH"'
+rc_case no 'export PATH="$HOME/.local/bin/extra:$PATH"'
+rc_case no '# fish_add_path ~/.local/bin'
+rc_case no 'fish_add_path ~/.local/binaries'
+rc_case no 'set -gx PATH $HOME/.local/bin_old $PATH'
+
+# A final line without a newline still counts.
+home="$WORK/rc-home"
+printf 'export PATH="$HOME/.local/bin:$PATH"' > "$home/rc"
+got=no
+if (HOME="$home"; rc_mentions_dir "$home/rc" "$home/.local/bin"); then got=yes; fi
+assert_eq "unterminated last startup line counts as configured" yes "$got"
+
+# A startup file that only mentions the directory in a comment still
+# gets a PATH line.
+home=$(new_home bash-comment)
+printf '# old: ~/.local/bin\n' > "$home/.bashrc"
+run_install "$home" SHELL=/bin/bash
+assert_eq "commented bashrc install succeeds" 0 "$STATUS"
+assert_eq "commented bashrc gains PATH line" \
+    'export PATH="$HOME/.local/bin:$PATH"' "$(tail -1 "$home/.bashrc")"
+
+# A fish config that adds a longer path still gets a PATH line.
+home=$(new_home fish-longer)
+mkdir -p "$home/.config/fish"
+printf 'fish_add_path ~/.local/binaries\n' > "$home/.config/fish/config.fish"
+run_install "$home" SHELL=/usr/bin/fish
+assert_eq "fish longer-path install succeeds" 0 "$STATUS"
+assert_eq "fish config with a longer path gains PATH line" \
+    'fish_add_path "$HOME/.local/bin"' "$(tail -1 "$home/.config/fish/config.fish")"
+
 # Directory already in the running PATH: nothing to change or reload.
 home=$(new_home in-path)
 run_install "$home" SHELL=/bin/bash PATH="$home/.local/bin:/usr/bin:/bin"
