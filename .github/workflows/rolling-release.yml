@@ -18,7 +18,53 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  metadata:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      build_tag: ${{ steps.meta.outputs.build_tag }}
+      build_date: ${{ steps.meta.outputs.build_date }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          # git describe needs the full history and tags.
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Computed once here so both binaries embed the same version and the
+      # VERSION asset matches them exactly. A Windows binary that embedded a
+      # different string would see an update on every check.
+      - name: Compute version and snapshot tag
+        id: meta
+        run: |
+          # Match only v* tags; the rolling "latest" and "build-*" tags
+          # would otherwise become the version base.
+          VERSION=$(git describe --tags --always --match 'v*')
+          # Name the snapshot after the commit's committer date, not the run
+          # date, so re-runs of this commit reuse the same tag.
+          COMMIT_TIME=$(git show -s --format=%ct "$GITHUB_SHA")
+          BUILD_TAG="build-$(date -u -d "@$COMMIT_TIME" +%Y%m%d)-${GITHUB_SHA::8}"
+          BUILD_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          if [[ ! "$VERSION" =~ ^[^[:space:]]+$ ]]; then
+            echo "Unexpected version string: '$VERSION'" >&2
+            exit 1
+          fi
+          # Clients validate BUILD_TAG with this same pattern.
+          if [[ ! "$BUILD_TAG" =~ ^build-[0-9]{8}-[0-9a-f]{7,40}$ ]]; then
+            echo "Unexpected snapshot tag: '$BUILD_TAG'" >&2
+            exit 1
+          fi
+
+          echo "VERSION=$VERSION BUILD_TAG=$BUILD_TAG BUILD_DATE=$BUILD_DATE"
+          {
+            echo "version=$VERSION"
+            echo "build_tag=$BUILD_TAG"
+            echo "build_date=$BUILD_DATE"
+          } >> "$GITHUB_OUTPUT"
+
   build-linux:
+    needs: metadata
     runs-on: ubuntu-latest
     # manylinux_2_28 keeps the glibc requirement low so the binary runs on
     # older distributions, matching the tagged release builds.
@@ -65,17 +111,15 @@ jobs:
           GOOS: linux
           GOARCH: amd64
           CGO_ENABLED: "1"
+          VERSION: ${{ needs.metadata.outputs.version }}
+          BUILD_DATE: ${{ needs.metadata.outputs.build_date }}
         run: |
           # This job runs in a container, where the github.workspace
           # expression resolves to the runner host path rather than the
           # in-container mount. GITHUB_WORKSPACE is correct inside it.
           export CGO_CFLAGS="-O2 -g -I${GITHUB_WORKSPACE}/.sqlite-include"
 
-          # Match only v* tags; the rolling "latest" and "build-*" tags
-          # would otherwise become the version base.
-          VERSION=$(git describe --tags --always --match 'v*')
           COMMIT=${GITHUB_SHA::8}
-          BUILD_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
           mkdir -p dist
           # rollingRepo makes `agentsview update` follow this repository's
@@ -83,11 +127,18 @@ jobs:
           LDFLAGS="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.buildDate=${BUILD_DATE} -X go.kenn.io/agentsview/internal/update.rollingRepo=${GITHUB_REPOSITORY}"
           go build -tags fts5 -buildvcs=false -ldflags="$LDFLAGS" -trimpath \
             -o dist/agentsview-linux-amd64 ./cmd/agentsview
-          # `agentsview update` compares this with the running version.
-          echo "$VERSION" > dist/VERSION
 
-          # Smoke test (native build)
-          ./dist/agentsview-linux-amd64 --version
+          # Smoke test (native build). The binary must report exactly the
+          # version the VERSION asset publishes, or `agentsview update`
+          # would offer this build forever.
+          EXPECTED="agentsview ${VERSION} (commit ${COMMIT}, built ${BUILD_DATE})"
+          ACTUAL=$(./dist/agentsview-linux-amd64 --version)
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "ERROR: --version printed: $ACTUAL" >&2
+            echo "ERROR: expected:          $EXPECTED" >&2
+            exit 1
+          fi
+          echo "$ACTUAL"
 
           # Verify glibc compatibility
           MAX_GLIBC="GLIBC_2.28"
@@ -101,11 +152,10 @@ jobs:
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: rolling-linux-amd64
-          path: |
-            dist/agentsview-linux-amd64
-            dist/VERSION
+          path: dist/agentsview-linux-amd64
 
   build-windows:
+    needs: metadata
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
@@ -152,12 +202,10 @@ jobs:
           GOARCH: amd64
           CGO_ENABLED: "1"
           CGO_CFLAGS: -O2 -g -I${{ github.workspace }}/.sqlite-include
+          VERSION: ${{ needs.metadata.outputs.version }}
+          BUILD_DATE: ${{ needs.metadata.outputs.build_date }}
         run: |
-          # Match only v* tags; the rolling "latest" and "build-*" tags
-          # would otherwise become the version base.
-          VERSION=$(git describe --tags --always --match 'v*')
           COMMIT=${GITHUB_SHA::8}
-          BUILD_DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
           mkdir -p dist
           # rollingRepo makes `agentsview update` follow this repository's
@@ -166,8 +214,17 @@ jobs:
           go build -tags fts5 -ldflags="$LDFLAGS" -trimpath \
             -o dist/agentsview-windows-amd64.exe ./cmd/agentsview
 
-          # Smoke test (native build)
-          ./dist/agentsview-windows-amd64.exe --version
+          # Smoke test (native build). The binary must report exactly the
+          # version the VERSION asset publishes, or `agentsview update`
+          # would offer this build forever.
+          EXPECTED="agentsview ${VERSION} (commit ${COMMIT}, built ${BUILD_DATE})"
+          ACTUAL=$(./dist/agentsview-windows-amd64.exe --version)
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "ERROR: --version printed: $ACTUAL" >&2
+            echo "ERROR: expected:          $EXPECTED" >&2
+            exit 1
+          fi
+          echo "$ACTUAL"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
@@ -175,13 +232,14 @@ jobs:
           path: dist/agentsview-windows-amd64.exe
 
   release:
-    needs: [build-linux, build-windows]
+    needs: [metadata, build-linux, build-windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
+      BUILD_TAG: ${{ needs.metadata.outputs.build_tag }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
@@ -206,9 +264,16 @@ jobs:
             exit 1
           fi
 
-      - name: Generate checksums
+      # The only place the VERSION and BUILD_TAG assets are written.
+      - name: Write VERSION, BUILD_TAG, and checksums
+        env:
+          VERSION: ${{ needs.metadata.outputs.version }}
         run: |
           cd artifacts
+          # Older clients compare this with the running version.
+          printf '%s\n' "$VERSION" > VERSION
+          # Newer clients read this from "latest" to find the snapshot.
+          printf '%s\n' "$BUILD_TAG" > BUILD_TAG
           sha256sum agentsview-linux-amd64 agentsview-windows-amd64.exe > SHA256SUMS
           cat SHA256SUMS
 
@@ -236,12 +301,12 @@ jobs:
             artifacts/agentsview-windows-amd64.exe \
             artifacts/SHA256SUMS \
             artifacts/VERSION \
+            artifacts/BUILD_TAG \
             installers/install.sh \
             installers/install.ps1
 
           # Also keep a permanent snapshot of this build so earlier
           # versions stay downloadable after "latest" moves on.
-          BUILD_TAG="build-$(date -u +%Y%m%d)-${SHORT_SHA}"
           BUILD_NOTES=$(printf 'Snapshot build of `%s`.\n\n> %s\n' \
             "$GITHUB_SHA" "$SUBJECT")
           gh release create "$BUILD_TAG" \
@@ -252,4 +317,5 @@ jobs:
             artifacts/agentsview-linux-amd64 \
             artifacts/agentsview-windows-amd64.exe \
             artifacts/SHA256SUMS \
-            artifacts/VERSION
+            artifacts/VERSION \
+            artifacts/BUILD_TAG
