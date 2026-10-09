@@ -171,18 +171,16 @@ func PerformUpdate(ctx context.Context,
 		fmt.Println()
 	}
 	fmt.Println("Verifying and installing...")
+	dstPath, err := installTarget(info.rawBinary)
+	if err != nil {
+		return err
+	}
+	install := installFromArchiveTo
 	if info.rawBinary {
-		dstPath, err := installedBinaryPath()
-		if err != nil {
-			return err
-		}
-		if err := installRawBinaryTo(
-			archivePath, info.Checksum, dstPath, downloadChecksum,
-		); err != nil {
-			return err
-		}
-	} else if err := installFromArchive(
-		archivePath, info.Checksum, downloadChecksum,
+		install = installRawBinaryTo
+	}
+	if err := install(
+		archivePath, info.Checksum, dstPath, downloadChecksum,
 	); err != nil {
 		return err
 	}
@@ -204,23 +202,24 @@ func hashFile(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-func installFromArchive(
-	archivePath, expectedChecksum, precomputedChecksum string,
-) error {
-	dstPath, err := installedBinaryPath()
-	if err != nil {
-		return err
+// executablePath locates the running program. Tests replace it.
+var executablePath = os.Executable
+
+// binaryName is the file name of the agentsview executable that
+// release archives contain and archive updates install.
+func binaryName() string {
+	if runtime.GOOS == "windows" {
+		return "agentsview.exe"
 	}
-	return installFromArchiveTo(
-		archivePath, expectedChecksum, dstPath,
-		precomputedChecksum,
-	)
+	return "agentsview"
 }
 
-// installedBinaryPath returns where the update is installed: the
-// agentsview binary beside the running executable.
-func installedBinaryPath() (string, error) {
-	currentExe, err := os.Executable()
+// installTarget returns the file an update replaces. Archive updates
+// install the agentsview binary beside the running executable. Raw
+// binary updates replace the running executable itself, whatever its
+// name, so the next run and a restarted daemon use the new build.
+func installTarget(rawBinary bool) (string, error) {
+	currentExe, err := executablePath()
 	if err != nil {
 		return "", fmt.Errorf("find current executable: %w", err)
 	}
@@ -228,11 +227,10 @@ func installedBinaryPath() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("resolve symlinks: %w", err)
 	}
-	binaryName := "agentsview"
-	if runtime.GOOS == "windows" {
-		binaryName = "agentsview.exe"
+	if rawBinary {
+		return currentExe, nil
 	}
-	return filepath.Join(filepath.Dir(currentExe), binaryName), nil
+	return filepath.Join(filepath.Dir(currentExe), binaryName()), nil
 }
 
 // verifyChecksum checks path against expectedChecksum. A non-empty
@@ -288,14 +286,10 @@ func installFromArchiveTo(
 		}
 	}
 
-	binaryName := "agentsview"
-	if runtime.GOOS == "windows" {
-		binaryName = "agentsview.exe"
-	}
-	srcPath := filepath.Join(extractDir, binaryName)
+	srcPath := filepath.Join(extractDir, binaryName())
 	if _, err := os.Stat(srcPath); os.IsNotExist(err) {
 		return fmt.Errorf(
-			"binary %s not found in archive", binaryName,
+			"binary %s not found in archive", binaryName(),
 		)
 	}
 

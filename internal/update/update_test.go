@@ -474,3 +474,145 @@ func createTestTarGz(
 	_, err = tw.Write(data)
 	require.NoError(t, err)
 }
+
+// fakeExecutable makes executablePath report path for the test.
+func fakeExecutable(t *testing.T, path string, err error) {
+	t.Helper()
+	old := executablePath
+	executablePath = func() (string, error) { return path, err }
+	t.Cleanup(func() { executablePath = old })
+}
+
+func TestInstallTarget(t *testing.T) {
+	rolling := rollingAssetName(runtime.GOOS, runtime.GOARCH)
+	tests := []struct {
+		name      string
+		exeName   string
+		symlink   bool
+		rawBinary bool
+		want      string
+	}{
+		{
+			name:      "raw update replaces renamed executable",
+			exeName:   rolling,
+			rawBinary: true,
+			want:      rolling,
+		},
+		{
+			name:      "raw update replaces symlink target",
+			exeName:   rolling,
+			symlink:   true,
+			rawBinary: true,
+			want:      rolling,
+		},
+		{
+			name:    "archive update installs agentsview beside executable",
+			exeName: rolling,
+			want:    binaryName(),
+		},
+		{
+			name:    "archive update resolves symlink directory",
+			exeName: binaryName(),
+			symlink: true,
+			want:    binaryName(),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.symlink && runtime.GOOS == "windows" {
+				t.Skip("symlinks need extra privileges on Windows")
+			}
+			// Resolve the temp dir itself, which may sit behind a symlink.
+			realDir, err := filepath.EvalSymlinks(t.TempDir())
+			require.NoError(t, err)
+			exe := filepath.Join(realDir, tt.exeName)
+			require.NoError(t, os.WriteFile(exe, []byte("old"), 0o755))
+			if tt.symlink {
+				link := filepath.Join(t.TempDir(), "agentsview-link")
+				require.NoError(t, os.Symlink(exe, link))
+				exe = link
+			}
+			fakeExecutable(t, exe, nil)
+
+			got, err := installTarget(tt.rawBinary)
+			require.NoError(t, err)
+			assert.Equal(t, filepath.Join(realDir, tt.want), got)
+		})
+	}
+}
+
+func TestInstallTargetExecutableError(t *testing.T) {
+	fakeExecutable(t, "", os.ErrNotExist)
+
+	_, err := installTarget(true)
+	require.ErrorIs(t, err, os.ErrNotExist)
+	assert.Contains(t, err.Error(), "find current executable")
+}
+
+// archiveBytes returns a release archive holding the agentsview binary.
+func archiveBytes(t *testing.T, content string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "release.tar.gz")
+	createTestTarGz(t, path, binaryName(), content)
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	return string(data)
+}
+
+func TestPerformUpdateInstallTarget(t *testing.T) {
+	rolling := rollingAssetName(runtime.GOOS, runtime.GOARCH)
+	tests := []struct {
+		name      string
+		rawBinary bool
+		assetName string
+		asset     func(t *testing.T) string
+		wantFiles map[string]string
+	}{
+		{
+			name:      "raw update replaces the running executable in place",
+			rawBinary: true,
+			assetName: rolling,
+			asset:     func(*testing.T) string { return "new" },
+			wantFiles: map[string]string{rolling: "new"},
+		},
+		{
+			name:      "archive update installs agentsview beside it",
+			assetName: "agentsview_0.45.0_test.tar.gz",
+			asset:     func(t *testing.T) string { return archiveBytes(t, "new") },
+			wantFiles: map[string]string{rolling: "old", binaryName(): "new"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			asset := tt.asset(t)
+			srv := httptest.NewServer(http.HandlerFunc(
+				func(w http.ResponseWriter, _ *http.Request) {
+					_, _ = w.Write([]byte(asset))
+				},
+			))
+			t.Cleanup(srv.Close)
+
+			dir := t.TempDir()
+			exe := filepath.Join(dir, rolling)
+			require.NoError(t, os.WriteFile(exe, []byte("old"), 0o755))
+			fakeExecutable(t, exe, nil)
+
+			require.NoError(t, PerformUpdate(t.Context(), &UpdateInfo{
+				DownloadURL: srv.URL + "/" + tt.assetName,
+				AssetName:   tt.assetName,
+				Checksum:    sha256Hex(asset),
+				rawBinary:   tt.rawBinary,
+			}, nil))
+
+			entries, err := os.ReadDir(dir)
+			require.NoError(t, err)
+			got := map[string]string{}
+			for _, e := range entries {
+				data, err := os.ReadFile(filepath.Join(dir, e.Name()))
+				require.NoError(t, err)
+				got[e.Name()] = string(data)
+			}
+			assert.Equal(t, tt.wantFiles, got)
+		})
+	}
+}
