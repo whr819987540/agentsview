@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -421,6 +422,134 @@ func TestServeDaemonReplacementDecisionRefusesGitDescribeDevBuild(
 	assert.Contains(t, decision.Reason, "dev build")
 	assert.Contains(t, strings.Join(serveDaemonConflictLines(decision), "\n"),
 		"--replace")
+}
+
+func TestServeDaemonReplacementDecisionAutoReplacesOlderRollingBuild(
+	t *testing.T,
+) {
+	dir := runtimeTestDir(t)
+	host, port := testPingServer(t)
+	writeRuntimeRecordFixture(t, dir, daemonRuntimeRecord(
+		host, port, withRuntimeVersion("v0.44.0-39-g0f0f0f0f"),
+	))
+	stubRollingBuildRepo(t, "example/agentsview")
+	setTestVersion(t, "v0.44.0-40-g1a2b3c4d")
+
+	decision := decideServeDaemonReplacement(
+		config.Config{DataDir: dir}, serveReplacementOptions{},
+	)
+
+	require.NotNil(t, decision.Runtime)
+	assert.Equal(t, serveReplacementAuto, decision.Action)
+	assert.Equal(t,
+		"daemon version v0.44.0-39-g0f0f0f0f is older than current binary "+
+			"version v0.44.0-40-g1a2b3c4d",
+		decision.Reason)
+}
+
+func TestServeDaemonReplacementDecisionRollingBuilds(t *testing.T) {
+	const current = "v0.44.0-40-g1a2b3c4d"
+	compatErr := errors.New("daemon API version is older")
+	tests := []struct {
+		name          string
+		daemonVersion string
+		compatErr     error
+		wantAction    serveReplacementAction
+		wantReason    string
+	}{
+		{
+			name:          "older rolling daemon",
+			daemonVersion: "v0.44.0-39-g0f0f0f0f",
+			wantAction:    serveReplacementAuto,
+			wantReason: "daemon version v0.44.0-39-g0f0f0f0f is older than " +
+				"current binary version " + current,
+		},
+		{
+			name:          "same rolling daemon",
+			daemonVersion: current,
+			wantAction:    serveReplacementUseExisting,
+			wantReason:    "compatible writable daemon is already running",
+		},
+		{
+			name:          "newer rolling daemon",
+			daemonVersion: "v0.44.0-41-g0f0f0f0f",
+			wantAction:    serveReplacementRefuse,
+			wantReason: "daemon version v0.44.0-41-g0f0f0f0f is newer than " +
+				"current binary version " + current,
+		},
+		{
+			name:          "newer stable daemon",
+			daemonVersion: "v0.45.0",
+			wantAction:    serveReplacementRefuse,
+			wantReason: "daemon version v0.45.0 is newer than current binary " +
+				"version " + current,
+		},
+		{
+			name:          "unordered daemon version",
+			daemonVersion: "local-build",
+			wantAction:    serveReplacementRefuse,
+			wantReason: "current binary version " + current + " is not newer " +
+				"than daemon version local-build",
+		},
+		{
+			name:          "older incompatible rolling daemon",
+			daemonVersion: "v0.44.0-39-g0f0f0f0f",
+			compatErr:     compatErr,
+			wantAction:    serveReplacementAuto,
+			wantReason: "daemon version v0.44.0-39-g0f0f0f0f is older than " +
+				"current binary version " + current,
+		},
+		{
+			name:          "unordered incompatible daemon",
+			daemonVersion: "local-build",
+			compatErr:     compatErr,
+			wantAction:    serveReplacementRefuse,
+			wantReason: "current binary version " + current + " is not newer " +
+				"than daemon version local-build and cannot automatically " +
+				"replace the incompatible daemon: " + compatErr.Error(),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stubRollingBuildRepo(t, "example/agentsview")
+			setTestVersion(t, current)
+			rt := &DaemonRuntime{
+				API:  daemonAPIVersion,
+				Data: db.CurrentDataVersion(),
+			}
+			rt.Record.Version = tt.daemonVersion
+
+			var decision serveReplacementDecision
+			if tt.compatErr != nil {
+				decision = decideIncompatibleServeDaemonReplacement(
+					rt, tt.compatErr, serveReplacementOptions{},
+				)
+			} else {
+				decision = decideCompatibleServeDaemonReplacement(
+					rt, serveReplacementOptions{},
+				)
+			}
+
+			assert.Equal(t, tt.wantAction, decision.Action)
+			assert.Equal(t, tt.wantReason, decision.Reason)
+		})
+	}
+}
+
+func TestServeDaemonReplacementDecisionRefusesDirtyRollingBuild(
+	t *testing.T,
+) {
+	stubRollingBuildRepo(t, "example/agentsview")
+	setTestVersion(t, "v0.44.0-41-g1a2b3c4d-dirty")
+	rt := &DaemonRuntime{API: daemonAPIVersion, Data: db.CurrentDataVersion()}
+	rt.Record.Version = "v0.44.0-40-g0f0f0f0f"
+
+	decision := decideCompatibleServeDaemonReplacement(
+		rt, serveReplacementOptions{},
+	)
+
+	assert.Equal(t, serveReplacementRefuse, decision.Action)
+	assert.Contains(t, decision.Reason, "dev builds do not replace")
 }
 
 func TestServeDaemonReplacementDecisionRefusesCompatibleNonSemver(t *testing.T) {
