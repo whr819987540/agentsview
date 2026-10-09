@@ -1,9 +1,24 @@
 name: Rolling Release
 
-# Build directly-usable Linux and Windows binaries on every push to main
-# and publish them to a rolling "latest" prerelease. Each build is also
-# kept as a permanent "build-YYYYMMDD-<sha>" prerelease so earlier
-# versions remain downloadable.
+# Build directly-usable Linux and Windows binaries on every push to main.
+#
+# Each build is published as a permanent snapshot prerelease tagged
+# "build-YYYYMMDD-<sha8>", where the date is the commit's committer date in
+# UTC, so re-runs of a commit reuse its tag. A complete snapshot is never
+# modified. The rolling "latest" prerelease is then updated in place with
+# byte-identical copies of the snapshot's assets plus the installers.
+#
+# Assets on both releases:
+#   agentsview-linux-amd64, agentsview-windows-amd64.exe, SHA256SUMS
+#   VERSION    the exact string both binaries embed as main.version
+#   BUILD_TAG  the snapshot tag name
+# "latest" also carries install.sh and install.ps1.
+#
+# New clients read latest/BUILD_TAG once and fetch everything else from that
+# snapshot. Older clients read latest/VERSION, latest/SHA256SUMS, and
+# latest/<binary>.
+#
+# Job graph: metadata -> build-linux + build-windows -> snapshot -> latest
 
 on:
   push:
@@ -13,9 +28,11 @@ on:
 permissions:
   contents: read
 
-concurrency:
-  group: rolling-release
-  cancel-in-progress: true
+# There is deliberately no workflow-level concurrency group. Every push to
+# main must build and get its own snapshot, even when newer pushes follow
+# quickly, so superseded runs are not cancelled. This spends more CI minutes
+# than cancelling them did. Only the update of "latest" is serialized; see
+# the latest job.
 
 jobs:
   metadata:
@@ -231,38 +248,26 @@ jobs:
           name: rolling-windows-amd64
           path: dist/agentsview-windows-amd64.exe
 
-  release:
+  snapshot:
     needs: [metadata, build-linux, build-windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    # Runs for the same commit (for example, the same commit pushed to main
+    # twice) take turns, so they never race to create one snapshot. Never
+    # cancel: the snapshot is the permanent record of this build.
+    concurrency:
+      group: rolling-release-snapshot-${{ github.sha }}
+      cancel-in-progress: false
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
       BUILD_TAG: ${{ needs.metadata.outputs.build_tag }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
-        with:
-          persist-credentials: false
-          sparse-checkout: scripts
-          path: src
-
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
         with:
           path: artifacts
           merge-multiple: true
-
-      - name: Prepare installers
-        run: |
-          # Point the installers at the repository that publishes this
-          # release so they work straight from the release download URL.
-          mkdir -p installers
-          sed "s|@AGENTSVIEW_REPO@|$GH_REPO|" src/scripts/install-rolling.sh > installers/install.sh
-          sed "s|@AGENTSVIEW_REPO@|$GH_REPO|" src/scripts/install-rolling.ps1 > installers/install.ps1
-          if grep -l '@AGENTSVIEW_REPO@' installers/*; then
-            echo "Installer placeholder was not replaced" >&2
-            exit 1
-          fi
 
       # The only place the VERSION and BUILD_TAG assets are written.
       - name: Write VERSION, BUILD_TAG, and checksums
@@ -277,45 +282,280 @@ jobs:
           sha256sum agentsview-linux-amd64 agentsview-windows-amd64.exe > SHA256SUMS
           cat SHA256SUMS
 
-      - name: Publish rolling release
+      - name: Publish snapshot release
         env:
           # Passed through the environment so the commit message cannot
           # inject shell syntax into the run script.
           HEAD_COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
         run: |
+          ASSETS=(agentsview-linux-amd64 agentsview-windows-amd64.exe SHA256SUMS VERSION BUILD_TAG)
+          FILES=("${ASSETS[@]/#/artifacts/}")
+
+          # Prints absent, incomplete (an asset is missing or not fully
+          # uploaded), unpublished (a draft with every asset), or complete.
+          # shellcheck disable=SC2016 # $ARGS and $have are jq variables.
+          snapshot_state() {
+            local json
+            if ! json=$(gh release view "$BUILD_TAG" --json isDraft,assets 2>"$RUNNER_TEMP/release-view.err"); then
+              if grep -q 'release not found' "$RUNNER_TEMP/release-view.err"; then
+                echo absent
+                return 0
+              fi
+              cat "$RUNNER_TEMP/release-view.err" >&2
+              return 1
+            fi
+            jq -r '
+              [.assets[] | select(.state == "uploaded") | .name] as $have
+              | if (($ARGS.positional - $have) | length) > 0 then "incomplete"
+                elif .isDraft then "unpublished"
+                else "complete" end
+            ' --args "${ASSETS[@]}" <<<"$json"
+          }
+
+          STATE=$(snapshot_state)
+          echo "Snapshot $BUILD_TAG is $STATE."
+
+          case "$STATE" in
+            complete)
+              # A complete snapshot is immutable. A re-run leaves it as it
+              # is, and the latest job copies its assets.
+              exit 0
+              ;;
+            absent)
+              SUBJECT=$(printf '%s\n' "$HEAD_COMMIT_MESSAGE" | head -1)
+              # shellcheck disable=SC2016 # Backticks are Markdown.
+              NOTES=$(printf 'Snapshot build of `%s`.\n\n> %s\n' "$GITHUB_SHA" "$SUBJECT")
+              # gh keeps the release as a draft until every asset has
+              # uploaded, so the snapshot never appears half-filled.
+              gh release create "$BUILD_TAG" \
+                --prerelease \
+                --target "$GITHUB_SHA" \
+                --title "Build $BUILD_TAG" \
+                --notes "$NOTES" \
+                "${FILES[@]}"
+              ;;
+            incomplete | unpublished)
+              # An earlier attempt stopped part way. Nothing points at an
+              # unfinished snapshot yet, so replace every asset, not only
+              # the missing ones: SHA256SUMS must describe these binaries,
+              # and the binaries must embed this VERSION.
+              if [ "$STATE" = incomplete ]; then
+                gh release upload "$BUILD_TAG" --clobber "${FILES[@]}"
+                STATE=$(snapshot_state)
+              fi
+              if [ "$STATE" = unpublished ]; then
+                gh release edit "$BUILD_TAG" \
+                  --draft=false \
+                  --prerelease \
+                  --target "$GITHUB_SHA"
+              fi
+              ;;
+            *)
+              echo "Unexpected snapshot state: $STATE" >&2
+              exit 1
+              ;;
+          esac
+
+          STATE=$(snapshot_state)
+          if [ "$STATE" != complete ]; then
+            echo "Snapshot $BUILD_TAG is $STATE after publishing." >&2
+            exit 1
+          fi
+
+  latest:
+    needs: [metadata, snapshot]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    # Only one update of "latest" runs at a time, and none is cancelled
+    # once started. GitHub keeps at most one pending job per group and
+    # cancels an older pending one when another arrives, and runs can reach
+    # this job out of order, so the guard step below refuses to move
+    # "latest" backwards. If an older commit's job replaces a newer one
+    # while pending, "latest" stays one build behind until the next push.
+    concurrency:
+      group: rolling-release-latest
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      BUILD_TAG: ${{ needs.metadata.outputs.build_tag }}
+    steps:
+      - name: Check that latest is not ahead of this commit
+        id: guard
+        run: |
+          # The commit the latest tag points at, if the tag exists.
+          REF=$(gh api "repos/$GH_REPO/git/matching-refs/tags/latest" \
+            --jq '.[] | select(.ref == "refs/tags/latest") | "\(.object.type) \(.object.sha)"')
+          if [ -z "$REF" ]; then
+            echo "No latest tag yet; publishing $GITHUB_SHA."
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          TYPE=${REF%% *}
+          CURRENT=${REF#* }
+          # Peel an annotated tag down to the commit it marks.
+          while [ "$TYPE" = tag ]; do
+            REF=$(gh api "repos/$GH_REPO/git/tags/$CURRENT" --jq '"\(.object.type) \(.object.sha)"')
+            TYPE=${REF%% *}
+            CURRENT=${REF#* }
+          done
+          if [ "$TYPE" != commit ]; then
+            echo "The latest tag points at a $TYPE, not a commit." >&2
+            exit 1
+          fi
+          echo "current=$CURRENT" >> "$GITHUB_OUTPUT"
+
+          # "behind" means this commit is an ancestor of the published one.
+          # Re-runs of the same commit ("identical") and rewritten history
+          # ("diverged") still publish.
+          STATUS=$(gh api "repos/$GH_REPO/compare/${CURRENT}...${GITHUB_SHA}?per_page=1" --jq .status)
+          echo "latest is at $CURRENT; this commit is $STATUS relative to it."
+          case "$STATUS" in
+            behind)
+              echo "::notice::latest already holds a newer build ($CURRENT); leaving it unchanged."
+              echo "publish=false" >> "$GITHUB_OUTPUT"
+              ;;
+            ahead | identical | diverged)
+              echo "publish=true" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "Unexpected compare status: $STATUS" >&2
+              exit 1
+              ;;
+          esac
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        if: steps.guard.outputs.publish == 'true'
+        with:
+          persist-credentials: false
+          sparse-checkout: scripts
+          path: src
+
+      # Copy the snapshot's assets rather than this run's artifacts, so
+      # "latest" stays byte-identical to the snapshot even when a re-run
+      # found the snapshot already complete.
+      - name: Download snapshot assets
+        if: steps.guard.outputs.publish == 'true'
+        run: |
+          mkdir -p assets
+          gh release download "$BUILD_TAG" --dir assets \
+            --pattern agentsview-linux-amd64 \
+            --pattern agentsview-windows-amd64.exe \
+            --pattern SHA256SUMS \
+            --pattern VERSION \
+            --pattern BUILD_TAG
+          cd assets
+          sha256sum -c SHA256SUMS
+          if [ "$(cat BUILD_TAG)" != "$BUILD_TAG" ]; then
+            echo "Snapshot BUILD_TAG asset does not name $BUILD_TAG" >&2
+            exit 1
+          fi
+          if [ "$(wc -l < VERSION)" -ne 1 ] || [ -z "$(cat VERSION)" ]; then
+            echo "Snapshot VERSION asset is not a single line" >&2
+            exit 1
+          fi
+          echo "VERSION: $(cat VERSION)"
+
+      - name: Prepare installers
+        if: steps.guard.outputs.publish == 'true'
+        run: |
+          # Point the installers at the repository that publishes this
+          # release so they work straight from the release download URL.
+          mkdir -p installers
+          sed "s|@AGENTSVIEW_REPO@|$GH_REPO|" src/scripts/install-rolling.sh > installers/install.sh
+          sed "s|@AGENTSVIEW_REPO@|$GH_REPO|" src/scripts/install-rolling.ps1 > installers/install.ps1
+          if grep -l '@AGENTSVIEW_REPO@' installers/*; then
+            echo "Installer placeholder was not replaced" >&2
+            exit 1
+          fi
+
+      - name: Publish rolling release
+        if: steps.guard.outputs.publish == 'true'
+        env:
+          # Passed through the environment so the commit message cannot
+          # inject shell syntax into the run script.
+          HEAD_COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+          CURRENT_LATEST: ${{ steps.guard.outputs.current }}
+        run: |
           SHORT_SHA=${GITHUB_SHA::8}
           SUBJECT=$(printf '%s\n' "$HEAD_COMMIT_MESSAGE" | head -1)
+          TITLE="Rolling build ($SHORT_SHA)"
 
           BASE="https://github.com/$GH_REPO/releases/download/latest"
-          NOTES=$(printf 'Automated rolling build of `%s`.\n\n> %s\n\nInstall on Linux:\n```sh\ncurl -fsSL %s/install.sh | bash\n```\n\nInstall on Windows:\n```powershell\npowershell -ExecutionPolicy ByPass -c "irm %s/install.ps1 | iex"\n```\n\nStable download URLs:\n- %s/agentsview-linux-amd64\n- %s/agentsview-windows-amd64.exe\n' \
-            "$GITHUB_SHA" "$SUBJECT" "$BASE" "$BASE" "$BASE" "$BASE")
+          SNAPSHOT_URL="https://github.com/$GH_REPO/releases/tag/$BUILD_TAG"
+          # shellcheck disable=SC2016 # Backticks are Markdown.
+          NOTES=$(
+            printf 'Automated rolling build of `%s`.\n\n' "$GITHUB_SHA"
+            printf '> %s\n\n' "$SUBJECT"
+            printf 'The install commands and download URLs below always point at the newest build.\n\n'
+            printf 'Install on Linux:\n```sh\ncurl -fsSL %s/install.sh | bash\n```\n\n' "$BASE"
+            printf 'Install on Windows:\n```powershell\npowershell -ExecutionPolicy ByPass -c "irm %s/install.ps1 | iex"\n```\n\n' "$BASE"
+            printf 'Download URLs:\n- %s/agentsview-linux-amd64\n- %s/agentsview-windows-amd64.exe\n\n' "$BASE" "$BASE"
+            printf 'This build stays available as snapshot `%s`:\n%s\n' "$BUILD_TAG" "$SNAPSHOT_URL"
+          )
 
-          # Recreate the release so the "latest" tag moves to this commit.
-          gh release delete latest --yes --cleanup-tag || true
-          gh release create latest \
-            --prerelease \
-            --target "$GITHUB_SHA" \
-            --title "Rolling build ($SHORT_SHA)" \
-            --notes "$NOTES" \
-            artifacts/agentsview-linux-amd64 \
-            artifacts/agentsview-windows-amd64.exe \
-            artifacts/SHA256SUMS \
-            artifacts/VERSION \
-            artifacts/BUILD_TAG \
+          if STATE=$(gh release view latest --json isDraft \
+              --jq 'if .isDraft then "draft" else "published" end' \
+              2>"$RUNNER_TEMP/release-view.err"); then
+            :
+          elif grep -q 'release not found' "$RUNNER_TEMP/release-view.err"; then
+            STATE=absent
+          else
+            cat "$RUNNER_TEMP/release-view.err" >&2
+            exit 1
+          fi
+          echo "latest release is $STATE."
+
+          # Move the existing tag first. The guard reads it, so a later job
+          # for an older commit skips even if this upload fails part way.
+          # Creating or publishing a release creates the tag when absent.
+          if [ -n "$CURRENT_LATEST" ]; then
+            gh api -X PATCH "repos/$GH_REPO/git/refs/tags/latest" \
+              -f sha="$GITHUB_SHA" -F force=true --silent
+          fi
+
+          if [ "$STATE" = absent ]; then
+            # gh keeps the release as a draft until every asset has
+            # uploaded, so it never appears without its assets.
+            gh release create latest \
+              --prerelease \
+              --target "$GITHUB_SHA" \
+              --title "$TITLE" \
+              --notes "$NOTES" \
+              assets/agentsview-linux-amd64 \
+              assets/agentsview-windows-amd64.exe \
+              installers/install.sh \
+              installers/install.ps1 \
+              assets/SHA256SUMS \
+              assets/VERSION \
+              assets/BUILD_TAG
+            exit 0
+          fi
+
+          # Update the release in place so its download URLs keep working.
+          # --clobber deletes each asset and then uploads its replacement,
+          # so each asset is briefly missing. The order keeps clients safe:
+          #   1. Binaries and installers. An older client that fetches a
+          #      new binary with the old SHA256SUMS fails verification.
+          #   2. SHA256SUMS, now matching the new binaries.
+          #   3. VERSION. Older clients only start an update once it
+          #      changes, and by then the binaries and checksums match.
+          #   4. BUILD_TAG last. Newer clients keep using the previous
+          #      complete snapshot until it changes.
+          gh release upload latest --clobber \
+            assets/agentsview-linux-amd64 \
+            assets/agentsview-windows-amd64.exe \
             installers/install.sh \
             installers/install.ps1
+          gh release upload latest --clobber assets/SHA256SUMS
+          gh release upload latest --clobber assets/VERSION
+          gh release upload latest --clobber assets/BUILD_TAG
 
-          # Also keep a permanent snapshot of this build so earlier
-          # versions stay downloadable after "latest" moves on.
-          BUILD_NOTES=$(printf 'Snapshot build of `%s`.\n\n> %s\n' \
-            "$GITHUB_SHA" "$SUBJECT")
-          gh release create "$BUILD_TAG" \
-            --prerelease \
-            --target "$GITHUB_SHA" \
-            --title "Build $BUILD_TAG" \
-            --notes "$BUILD_NOTES" \
-            artifacts/agentsview-linux-amd64 \
-            artifacts/agentsview-windows-amd64.exe \
-            artifacts/SHA256SUMS \
-            artifacts/VERSION \
-            artifacts/BUILD_TAG
+          EDIT_ARGS=(--prerelease --title "$TITLE" --notes "$NOTES")
+          if [ "$STATE" = draft ]; then
+            # A draft left by an interrupted first publish. Publishing it
+            # creates the tag at --target if the tag does not exist yet.
+            EDIT_ARGS+=(--draft=false --target "$GITHUB_SHA")
+          fi
+          gh release edit latest "${EDIT_ARGS[@]}"
