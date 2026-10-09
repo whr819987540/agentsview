@@ -204,7 +204,20 @@ jobs:
       - name: Restore pricing snapshot and stage the sqlite header
         run: make pricing-snapshot
 
+      # MSYS2 mirrors sometimes stall mid-download. Retry once, as ci.yml
+      # does, so a slow mirror does not fail the whole release.
       - name: Setup MinGW
+        id: setup_mingw
+        continue-on-error: true
+        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884  # v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: mingw-w64-x86_64-gcc
+          path-type: inherit
+
+      - name: Setup MinGW (retry on transient failure)
+        if: steps.setup_mingw.outcome == 'failure'
         uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884  # v2
         with:
           msystem: MINGW64
