@@ -1249,7 +1249,7 @@ func TestDirectBackend_Messages_DescExplicitZeroFrom(t *testing.T) {
 func TestDirectBackend_Messages_IncludesForkContext(t *testing.T) {
 	t.Parallel()
 	svc, env := newDirectTestSvc(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	parentID := "parent-session"
 	childID := "child-session"
 	childStarted := "2026-07-01T10:05:00Z"
@@ -1335,7 +1335,7 @@ func TestDirectBackend_Messages_CodexForkContextUsesReplayRollback(
 ) {
 	t.Parallel()
 	svc, env := newDirectTestSvc(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	parentID := "codex:019f328a-9b2b-7592-bba5-49045a177ca9"
 	childID := "codex:019f329b-a65a-7a61-ae6d-9eea81fc4e18"
 	childStarted := "2026-07-05T14:08:36Z"
@@ -1453,7 +1453,7 @@ func TestDirectBackend_Messages_CodexForkContextUsesReplayRollback(
 func TestDirectBackend_InputOutlineNormalizesPreviews(t *testing.T) {
 	t.Parallel()
 	svc, env := newDirectTestSvc(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	const sessionID = "outline-normal"
 
 	dbtest.SeedSession(t, env.db, sessionID, "p1",
@@ -1526,7 +1526,7 @@ func TestDirectBackend_InputOutlineUsesForkContextSyntheticOrdinals(
 ) {
 	t.Parallel()
 	svc, env := newDirectTestSvc(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	parentID := "outline-parent"
 	childID := "outline-child"
 	childStarted := "2026-07-01T10:05:00Z"
@@ -1596,7 +1596,7 @@ func TestDirectBackend_Messages_ForkContextPaginatesBySyntheticOrdinal(
 ) {
 	t.Parallel()
 	svc, env := newDirectTestSvc(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	parentID := "page-parent"
 	childID := "page-child"
 

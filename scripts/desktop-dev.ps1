@@ -112,7 +112,7 @@ if (-not $SkipBuild) {
     # --- Build Go sidecar ---
     Write-Host "Building Go sidecar..." -ForegroundColor Cyan
 
-    $version = git -C $RepoRoot describe --tags --always --dirty 2>$null
+    $version = git -C $RepoRoot describe --tags --always --dirty --match 'v*' 2>$null
     if (-not $version) { $version = "dev" }
     $commit = git -C $RepoRoot rev-parse --short HEAD 2>$null
     if (-not $commit) { $commit = "unknown" }

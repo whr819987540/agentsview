@@ -3,8 +3,7 @@ package update
 import (
 	"context"
 	"fmt"
-	"io"
-	"net/http"
+	"regexp"
 	"runtime"
 	"strings"
 	"time"
@@ -18,9 +17,17 @@ var rollingRepo string
 
 const (
 	rollingReleaseTag     = "latest"
+	rollingBuildTagAsset  = "BUILD_TAG"
 	rollingVersionAsset   = "VERSION"
+	rollingChecksumsAsset = "SHA256SUMS"
 	rollingCacheFileName  = "update_check_rolling.json"
-	maxRollingVersionSize = 256
+	maxRollingTextSize    = 256
+)
+
+// rollingBuildTagPattern matches the immutable snapshot release that
+// every main build is published to, such as build-20261008-1a2b3c4d.
+var rollingBuildTagPattern = regexp.MustCompile(
+	`^build-[0-9]{8}-[0-9a-f]{7,40}$`,
 )
 
 // RollingRepo returns the repository this binary updates from when it
@@ -29,10 +36,10 @@ func RollingRepo() string {
 	return rollingRepo
 }
 
-func rollingDownloadBase(repo string) string {
-	return fmt.Sprintf(
-		"https://github.com/%s/releases/download/%s", repo, rollingReleaseTag,
-	)
+// rollingDownloadRoot is the release download root of repo. Release
+// assets live at <root>/<tag>/<asset>.
+func rollingDownloadRoot(repo string) string {
+	return fmt.Sprintf("https://github.com/%s/releases/download", repo)
 }
 
 // rollingAssetName is the raw binary the rolling release publishes for
@@ -45,34 +52,82 @@ func rollingAssetName(goos, goarch string) string {
 	return name
 }
 
-// checkRollingUpdate compares the running version with the VERSION
-// asset of the rolling release at baseURL. Any difference counts as an
-// update because the rolling release always holds the newest main build.
+// checkRollingUpdate compares the running version with the newest
+// rolling build published under downloadRoot. Any difference counts as
+// an update because the rolling release always holds the newest main
+// build.
+//
+// The mutable "latest" release is read only for its BUILD_TAG asset,
+// which names the immutable build-YYYYMMDD-<sha> snapshot of that
+// build. VERSION, SHA256SUMS, and the binary all come from that
+// snapshot, so a push that republishes "latest" in between cannot mix
+// files from two builds.
+//
+// A non-forced check reads only BUILD_TAG and VERSION and caches the
+// result for devCacheDuration, because the channel publishes on every
+// push. When an update exists it returns display-only info whose
+// NeedsRefetch is true. A forced check, which installs use, also reads
+// the checksum and size of this platform's binary.
 func checkRollingUpdate(ctx context.Context,
-	baseURL, currentVersion string,
+	downloadRoot, currentVersion string,
 	forceCheck bool,
 	cacheDir string,
 ) (*UpdateInfo, error) {
 	if !forceCheck {
 		if cached, err := loadCacheFile(cacheDir, rollingCacheFileName); err == nil &&
-			time.Since(cached.CheckedAt) < cacheDuration &&
-			cached.Version == currentVersion {
-			return nil, nil
+			cached.Version != "" &&
+			time.Since(cached.CheckedAt) < devCacheDuration {
+			return rollingDisplayInfo(currentVersion, cached.Version), nil
 		}
 	}
 
-	latestVersion, err := fetchRollingVersion(ctx, baseURL+"/"+rollingVersionAsset)
+	buildTag, err := fetchRollingBuildTag(ctx,
+		downloadRoot+"/"+rollingReleaseTag+"/"+rollingBuildTagAsset,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("check for updates: %w", err)
+	}
+	snapshotBase := downloadRoot + "/" + buildTag
+
+	latestVersion, err := fetchRollingVersion(ctx,
+		snapshotBase+"/"+rollingVersionAsset,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("check for updates: %w", err)
 	}
 	saveCacheFile(latestVersion, cacheDir, rollingCacheFileName)
 
-	if latestVersion == currentVersion {
-		return nil, nil
+	info := rollingDisplayInfo(currentVersion, latestVersion)
+	if info == nil || !forceCheck {
+		return info, nil
 	}
+	return withRollingDownload(ctx, info, snapshotBase)
+}
 
+// rollingDisplayInfo describes an update to latestVersion without the
+// download details an install needs, or returns nil when latestVersion
+// is the running build.
+func rollingDisplayInfo(currentVersion, latestVersion string) *UpdateInfo {
+	if latestVersion == currentVersion {
+		return nil
+	}
+	return &UpdateInfo{
+		CurrentVersion: currentVersion,
+		LatestVersion:  latestVersion,
+		rawBinary:      true,
+		cacheOnly:      true,
+	}
+}
+
+// withRollingDownload completes display-only info with the checksum and
+// size of this platform's binary in the snapshot at snapshotBase.
+func withRollingDownload(ctx context.Context,
+	info *UpdateInfo, snapshotBase string,
+) (*UpdateInfo, error) {
 	assetName := rollingAssetName(runtime.GOOS, runtime.GOARCH)
-	checksum, err := fetchChecksumFromFile(ctx, baseURL+"/SHA256SUMS", assetName)
+	checksum, err := fetchChecksumFromFile(ctx,
+		snapshotBase+"/"+rollingChecksumsAsset, assetName,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("check for updates: %w", err)
 	}
@@ -82,7 +137,7 @@ func checkRollingUpdate(ctx context.Context,
 		)
 	}
 
-	downloadURL := baseURL + "/" + assetName
+	downloadURL := snapshotBase + "/" + assetName
 	size, err := fetchContentLength(ctx, downloadURL)
 	if err != nil {
 		return nil, fmt.Errorf(
@@ -91,44 +146,42 @@ func checkRollingUpdate(ctx context.Context,
 		)
 	}
 
-	return &UpdateInfo{
-		CurrentVersion: currentVersion,
-		LatestVersion:  latestVersion,
-		DownloadURL:    downloadURL,
-		AssetName:      assetName,
-		Size:           size,
-		Checksum:       checksum,
-		rawBinary:      true,
-	}, nil
+	full := *info
+	full.DownloadURL = downloadURL
+	full.AssetName = assetName
+	full.Size = size
+	full.Checksum = checksum
+	full.cacheOnly = false
+	return &full, nil
+}
+
+// fetchRollingBuildTag reads the one-line BUILD_TAG asset of the
+// "latest" release, which names the snapshot release of its build.
+// Without it there is no consistent set of files to read, so the check
+// fails instead of falling back to the mutable "latest" assets.
+func fetchRollingBuildTag(ctx context.Context, url string) (string, error) {
+	body, err := fetchSmallAsset(ctx, url, maxRollingTextSize)
+	if err == nil {
+		tag := strings.TrimSpace(body)
+		if rollingBuildTagPattern.MatchString(tag) {
+			return tag, nil
+		}
+		err = fmt.Errorf("invalid build tag %q", tag)
+	}
+	return "", fmt.Errorf(
+		"read rolling build tag (the rolling release may be "+
+			"mid-publish; try again shortly): %w", err,
+	)
 }
 
 // fetchRollingVersion reads the one-line VERSION asset that names the
-// build in the rolling release.
+// build in a rolling snapshot release.
 func fetchRollingVersion(ctx context.Context, url string) (string, error) {
-	client := &http.Client{Timeout: 30 * time.Second}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	body, err := fetchSmallAsset(ctx, url, maxRollingTextSize)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("fetch rolling version: %w", err)
 	}
-	req.Header.Set("User-Agent", updateUserAgent)
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("fetch rolling version: %s", resp.Status)
-	}
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxRollingVersionSize+1))
-	if err != nil {
-		return "", err
-	}
-	if len(body) > maxRollingVersionSize {
-		return "", fmt.Errorf("rolling version exceeds %d bytes", maxRollingVersionSize)
-	}
-	version := strings.TrimSpace(string(body))
+	version := strings.TrimSpace(body)
 	if version == "" || strings.ContainsAny(version, " \t\r\n") {
 		return "", fmt.Errorf("invalid rolling version %q", version)
 	}

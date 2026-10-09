@@ -906,6 +906,155 @@ func TestShouldUpgradeDaemonRuntimeTreatsMissingDaemonVersionAsOlderRelease(t *t
 	assert.False(t, shouldUpgradeDaemonRuntime(rt, "dev"))
 }
 
+// stubRollingBuildRepo makes this binary report repo as its rolling-build
+// source for the test. An empty repo makes it a non-rolling build.
+func stubRollingBuildRepo(t *testing.T, repo string) {
+	t.Helper()
+	old := rollingBuildRepo
+	rollingBuildRepo = func() string { return repo }
+	t.Cleanup(func() { rollingBuildRepo = old })
+}
+
+func TestShouldUpgradeDaemonRuntimeRollingBuilds(t *testing.T) {
+	const repo = "example/agentsview"
+	tests := []struct {
+		name          string
+		repo          string
+		current       string
+		daemonVersion string
+		readOnly      bool
+		want          bool
+	}{
+		{
+			name: "rolling newer", repo: repo,
+			current: "v0.44.0-40-g1a2b3c4d", daemonVersion: "v0.44.0-39-g0f0f0f0f",
+			want: true,
+		},
+		{
+			name: "rolling newer across digit boundary", repo: repo,
+			current: "v0.44.0-10-g1a2b3c4d", daemonVersion: "v0.44.0-9-g0f0f0f0f",
+			want: true,
+		},
+		{
+			name: "rolling past stable daemon", repo: repo,
+			current: "v0.44.0-40-g1a2b3c4d", daemonVersion: "v0.44.0",
+			want: true,
+		},
+		{
+			name: "rolling unknown daemon version", repo: repo,
+			current: "v0.44.0-40-g1a2b3c4d", daemonVersion: "",
+			want: true,
+		},
+		{
+			name: "rolling same", repo: repo,
+			current: "v0.44.0-40-g1a2b3c4d", daemonVersion: "v0.44.0-40-g1a2b3c4d",
+			want: false,
+		},
+		{
+			name: "rolling older", repo: repo,
+			current: "v0.44.0-39-g0f0f0f0f", daemonVersion: "v0.44.0-40-g1a2b3c4d",
+			want: false,
+		},
+		{
+			name: "rolling older than stable daemon", repo: repo,
+			current: "v0.44.0-40-g1a2b3c4d", daemonVersion: "v0.45.0",
+			want: false,
+		},
+		{
+			name: "rolling against dev daemon", repo: repo,
+			current: "v0.44.0-40-g1a2b3c4d", daemonVersion: "dev",
+			want: false,
+		},
+		{
+			name: "rolling read-only daemon", repo: repo,
+			current: "v0.44.0-40-g1a2b3c4d", daemonVersion: "v0.44.0-39-g0f0f0f0f",
+			readOnly: true, want: false,
+		},
+		{
+			name: "dirty rolling stays a dev build", repo: repo,
+			current: "v0.44.0-41-g1a2b3c4d-dirty", daemonVersion: "v0.44.0-40-g0f0f0f0f",
+			want: false,
+		},
+		{
+			name: "dirty rolling with unknown daemon version", repo: repo,
+			current: "v0.44.0-41-g1a2b3c4d-dirty", daemonVersion: "",
+			want: false,
+		},
+		{
+			name:    "non-rolling git describe dev build",
+			current: "v0.44.0-40-g1a2b3c4d", daemonVersion: "v0.44.0-39-g0f0f0f0f",
+			want: false,
+		},
+		{
+			name:    "non-rolling git describe with unknown daemon version",
+			current: "v0.44.0-40-g1a2b3c4d", daemonVersion: "",
+			want: false,
+		},
+		{
+			name:    "non-rolling dev build",
+			current: "dev", daemonVersion: "v0.44.0",
+			want: false,
+		},
+		{
+			name:    "non-rolling newer release",
+			current: "v0.45.0", daemonVersion: "v0.44.0",
+			want: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stubRollingBuildRepo(t, tt.repo)
+			rt := &DaemonRuntime{ReadOnly: tt.readOnly}
+			rt.Record.Version = tt.daemonVersion
+
+			assert.Equal(t, tt.want, shouldUpgradeDaemonRuntime(rt, tt.current))
+		})
+	}
+}
+
+func TestShouldUpgradeIncompatibleDaemonRuntimeRollingBuilds(t *testing.T) {
+	const repo = "example/agentsview"
+	tests := []struct {
+		name          string
+		repo          string
+		current       string
+		daemonVersion string
+		api           int
+		want          bool
+	}{
+		{
+			name: "rolling newer with older API", repo: repo,
+			current: "v0.44.0-40-g1a2b3c4d", daemonVersion: "v0.44.0-39-g0f0f0f0f",
+			api: daemonAPIVersion - 1, want: true,
+		},
+		{
+			name: "rolling newer with API ahead", repo: repo,
+			current: "v0.44.0-40-g1a2b3c4d", daemonVersion: "v0.44.0-39-g0f0f0f0f",
+			api: daemonAPIVersion + 1, want: false,
+		},
+		{
+			name: "rolling older with older API", repo: repo,
+			current: "v0.44.0-39-g0f0f0f0f", daemonVersion: "v0.44.0-40-g1a2b3c4d",
+			api: daemonAPIVersion - 1, want: false,
+		},
+		{
+			name:    "non-rolling git describe with older API",
+			current: "v0.44.0-40-g1a2b3c4d", daemonVersion: "v0.44.0-39-g0f0f0f0f",
+			api: daemonAPIVersion - 1, want: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stubRollingBuildRepo(t, tt.repo)
+			rt := &DaemonRuntime{API: tt.api, Data: db.CurrentDataVersion()}
+			rt.Record.Version = tt.daemonVersion
+
+			assert.Equal(t, tt.want,
+				shouldUpgradeIncompatibleDaemonRuntime(rt, tt.current))
+		})
+	}
+}
+
 func TestEnsureTransport_ArchiveWriteRefusesUnauthenticatedNonLoopbackAutoStart(
 	t *testing.T,
 ) {

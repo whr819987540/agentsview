@@ -2168,7 +2168,7 @@ func TestGetSessionTree_CycleProtection(t *testing.T) {
 func TestGetSessionTree_TruncatesAtNodeLimit(t *testing.T) {
 	te := setup(t)
 	te.seedSession(t, "wide-root", "my-app", 4)
-	for i := 0; i < 505; i++ {
+	for i := range 505 {
 		id := fmt.Sprintf("wide-child-%03d", i)
 		te.seedSession(t, id, "my-app", 1, func(s *db.Session) {
 			s.ParentSessionID = new("wide-root")

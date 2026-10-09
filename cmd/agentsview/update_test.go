@@ -3,11 +3,13 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
 	"strconv"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -252,6 +254,108 @@ func TestRestartDaemonAfterUpdateArgsDropsKnownUnauthenticatedNonLoopback(t *tes
 	assert.Equal(t, []string{
 		"serve", "--background", "--host", "127.0.0.1", "--restart-port", "18080",
 	}, args)
+}
+
+func TestForceUpdateCheck(t *testing.T) {
+	tests := []struct {
+		name        string
+		cfg         UpdateConfig
+		rollingRepo string
+		want        bool
+	}{
+		{name: "stable build uses cache", want: false},
+		{name: "stable build with --check uses cache", cfg: UpdateConfig{Check: true}, want: false},
+		{name: "stable build with --force", cfg: UpdateConfig{Force: true}, want: true},
+		{name: "rolling build", rollingRepo: "example/agentsview", want: true},
+		{
+			name:        "rolling build with --check",
+			cfg:         UpdateConfig{Check: true},
+			rollingRepo: "example/agentsview",
+			want:        true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, forceUpdateCheck(tt.cfg, tt.rollingRepo))
+		})
+	}
+}
+
+// cachedUpdateInfo returns display-only info the way a cached update
+// check reports it: a dev build with a fresh stable-release cache.
+func cachedUpdateInfo(t *testing.T) *update.UpdateInfo {
+	t.Helper()
+	dir := t.TempDir()
+	data := fmt.Sprintf(`{"checked_at":%q,"version":"v0.45.0"}`,
+		time.Now().Format(time.RFC3339Nano))
+	require.NoError(t, os.WriteFile(
+		filepath.Join(dir, "update_check.json"), []byte(data), 0o600,
+	))
+	info, err := update.CheckForUpdate(t.Context(), "dev", false, dir)
+	require.NoError(t, err)
+	require.NotNil(t, info)
+	require.True(t, info.NeedsRefetch())
+	return info
+}
+
+func TestInstallableUpdate(t *testing.T) {
+	complete := &update.UpdateInfo{
+		LatestVersion: "v0.45.0",
+		DownloadURL:   "https://example.invalid/agentsview",
+		Checksum:      "abc123",
+	}
+	refetched := &update.UpdateInfo{LatestVersion: "v0.45.1", Checksum: "def456"}
+	recheckErr := errors.New("network down")
+	tests := []struct {
+		name        string
+		info        func(t *testing.T) *update.UpdateInfo
+		recheck     *update.UpdateInfo
+		recheckErr  error
+		want        *update.UpdateInfo
+		wantRecheck bool
+	}{
+		{
+			name: "complete info installs as is",
+			info: func(*testing.T) *update.UpdateInfo { return complete },
+			want: complete,
+		},
+		{
+			name:        "display-only info is re-fetched",
+			info:        cachedUpdateInfo,
+			recheck:     refetched,
+			want:        refetched,
+			wantRecheck: true,
+		},
+		{
+			name:        "re-fetch that finds no update returns nil",
+			info:        cachedUpdateInfo,
+			wantRecheck: true,
+		},
+		{
+			name:        "re-fetch error is returned",
+			info:        cachedUpdateInfo,
+			recheckErr:  recheckErr,
+			wantRecheck: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rechecked := false
+			got, err := installableUpdate(t.Context(), tt.info(t),
+				func(context.Context) (*update.UpdateInfo, error) {
+					rechecked = true
+					return tt.recheck, tt.recheckErr
+				},
+			)
+			assert.Equal(t, tt.wantRecheck, rechecked)
+			if tt.recheckErr != nil {
+				require.ErrorIs(t, err, tt.recheckErr)
+				return
+			}
+			require.NoError(t, err)
+			assert.Same(t, tt.want, got)
+		})
+	}
 }
 
 func TestRestartDaemonAfterUpdateArgsKeepsLegacyNonLoopbackWithAuthConfig(t *testing.T) {

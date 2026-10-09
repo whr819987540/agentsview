@@ -1,12 +1,17 @@
 #!/bin/bash
 # agentsview rolling-build installer for Linux
 #
-# Installs the newest build from the rolling "latest" prerelease that
-# .github/workflows/rolling-release.yml publishes on every push to main.
-# The workflow attaches this script to that release as install.sh with
-# the repository filled in:
+# Installs the newest build that .github/workflows/rolling-release.yml
+# publishes on every push to main. The workflow attaches this script to
+# the rolling "latest" prerelease as install.sh with the repository
+# filled in:
 #
 #   curl -fsSL https://github.com/<owner>/<repo>/releases/download/latest/install.sh | bash
+#
+# "latest" is updated in place on every push, so the installer reads
+# only its BUILD_TAG file there. SHA256SUMS and the binary come from the
+# immutable build-YYYYMMDD-<sha> release that BUILD_TAG names, so a push
+# during the install cannot mix files from two builds.
 #
 # Environment overrides:
 #   AGENTSVIEW_REPO            owner/repo that publishes the rolling release
@@ -19,7 +24,10 @@ set -euo pipefail
 # The release workflow replaces the placeholder when it publishes this
 # script. Running the unpublished copy requires AGENTSVIEW_REPO.
 DEFAULT_REPO="@AGENTSVIEW_REPO@"
-RELEASE_TAG="latest"
+LATEST_TAG="latest"
+# Snapshot tags look like build-20260102-0123abcd. Explicit character
+# lists keep locale collation from widening the ranges.
+BUILD_TAG_PATTERN='^build-[0123456789]{8}-[0123456789abcdef]{7,40}$'
 BINARY_NAME="agentsview"
 ASSET_NAME="agentsview-linux-amd64"
 
@@ -60,6 +68,31 @@ download() {
     else
         error "Neither curl nor wget found"
     fi
+}
+
+# Prints the snapshot tag named by the rolling release's BUILD_TAG file.
+# Exits when the file is missing or invalid, which can happen while the
+# workflow is republishing "latest". There is deliberately no fallback
+# to the assets on "latest".
+resolve_build_tag() {
+    local repo="$1"
+    local tmpdir="$2"
+    local url="https://github.com/${repo}/releases/download/${LATEST_TAG}/BUILD_TAG"
+    local retry="The rolling release may be mid-publish; try again in a few minutes."
+
+    if ! download "$url" "$tmpdir/BUILD_TAG"; then
+        error "Could not read the current build from $url\n$retry"
+    fi
+
+    local tag
+    tag=$(cat "$tmpdir/BUILD_TAG")
+    # Trim leading and trailing whitespace, including CRLF line endings.
+    tag="${tag#"${tag%%[![:space:]]*}"}"
+    tag="${tag%"${tag##*[![:space:]]}"}"
+    if ! [[ "$tag" =~ $BUILD_TAG_PATTERN ]]; then
+        error "BUILD_TAG on the rolling release does not name a build.\n$retry"
+    fi
+    echo "$tag"
 }
 
 verify_checksum() {
@@ -118,31 +151,91 @@ path_contains() {
     esac
 }
 
+# Prints the ways a startup file might spell the directory, one per line.
+dir_spellings() {
+    local dir="$1"
+    [ "$dir" = "/" ] || dir="${dir%/}"
+    echo "$dir"
+    case "$dir" in
+        "$HOME"/*)
+            local rel="${dir#"$HOME"/}"
+            echo "\$HOME/$rel"
+            echo "\${HOME}/$rel"
+            echo "~/$rel"
+            ;;
+    esac
+}
+
+# Reports whether a startup file line uses the spelling as a whole PATH
+# element: after a start of line, whitespace, quote, ":" or "=", and
+# before an optional "/" and then an end of line, whitespace, quote or
+# ":". Comments do not count, and neither do longer paths that start
+# with the spelling, such as ~/.local/binaries.
+line_names_dir() {
+    local line="$1"
+    local spelling="$2"
+    # Skip comment lines, then drop any trailing comment.
+    line="${line#"${line%%[![:space:]]*}"}"
+    case "$line" in
+        "#"*) return 1 ;;
+    esac
+    line="${line%%[[:space:]]#*}"
+    # Pad so the start and end of the line count as separators.
+    line=" $line "
+    [[ "$line" == *[[:space:]:=\"\']"$spelling"[[:space:]:\"\']* ]] && return 0
+    [[ "$line" == *[[:space:]:=\"\']"$spelling"/[[:space:]:\"\']* ]] && return 0
+    return 1
+}
+
 rc_mentions_dir() {
     local rc="$1"
     local dir="$2"
     [ -f "$rc" ] || return 1
-    grep -qF "$dir" "$rc" && return 0
-    case "$dir" in
-        "$HOME"/*)
-            local rel="${dir#"$HOME"/}"
-            grep -qF "\$HOME/$rel" "$rc" && return 0
-            grep -qF "\${HOME}/$rel" "$rc" && return 0
-            grep -qF "~/$rel" "$rc" && return 0
-            ;;
-    esac
+    local spellings=()
+    local spelling
+    while IFS= read -r spelling; do
+        spellings+=("$spelling")
+    done < <(dir_spellings "$dir")
+    local line
+    while IFS= read -r line || [ -n "$line" ]; do
+        for spelling in "${spellings[@]}"; do
+            line_names_dir "$line" "$spelling" && return 0
+        done
+    done < "$rc"
+    return 1
+}
+
+# Prints the first executable file named $2 in the colon-separated
+# directory list $1.
+first_in_path() {
+    local list="$1"
+    local name="$2"
+    local entries=()
+    local entry
+    IFS=: read -r -a entries <<< "$list"
+    for entry in "${entries[@]}"; do
+        [ -n "$entry" ] || continue
+        if [ -f "$entry/$name" ] && [ -x "$entry/$name" ]; then
+            echo "$entry/$name"
+            return 0
+        fi
+    done
     return 1
 }
 
 # Makes sure new shells find the install directory. Sets RC_TO_RELOAD
-# when the user must reload a startup file to pick up the change.
+# when the user must reload a startup file to pick up the change. Sets
+# NEW_SHELL_PATH to the PATH new shells will see, or leaves it empty
+# when the installer cannot tell where the directory will sit in it.
 ensure_path() {
     local dir="$1"
     local rc
     rc=$(shell_rc_file)
+    NEW_SHELL_PATH=""
 
     if path_contains "$dir"; then
         info "$dir is already in PATH"
+        NEW_SHELL_PATH="$PATH"
         return 0
     fi
 
@@ -169,6 +262,34 @@ ensure_path() {
     printf '\n# Added by the agentsview installer\n%s\n' "$line" >> "$rc"
     info "Added $dir to PATH in $rc"
     RC_TO_RELOAD="$rc"
+    # The new line runs last in the startup file and puts dir first.
+    NEW_SHELL_PATH="$dir:$PATH"
+}
+
+# Warns when another agentsview may run instead of $1, the binary just
+# installed. Returns 1 when that is certain.
+check_other_copy() {
+    local dest="$1"
+    local dir
+    dir=$(dirname "$dest")
+    local found
+
+    if [ -n "$NEW_SHELL_PATH" ]; then
+        found=$(first_in_path "$NEW_SHELL_PATH" "$BINARY_NAME") || return 0
+        # -ef also accepts a symlink to the new binary.
+        [ "$found" -ef "$dest" ] && return 0
+        warn "Another agentsview at $found comes first in PATH and will run instead."
+        warn "Remove it, or put $dir before $(dirname "$found") in PATH."
+        return 1
+    fi
+
+    # Where dir will sit in new shells is unknown, so only the current
+    # PATH, which lacks dir, can be searched.
+    found=$(first_in_path "$PATH" "$BINARY_NAME") || return 0
+    [ "$found" -ef "$dest" ] && return 0
+    warn "Another agentsview is at $found. If $(dirname "$found") comes before $dir in PATH, that copy will run instead."
+    warn "Check with 'command -v agentsview' in a new terminal."
+    return 0
 }
 
 install_binary() {
@@ -194,20 +315,23 @@ main() {
     local repo
     repo=$(resolve_repo)
     local install_dir="${AGENTSVIEW_INSTALL_DIR:-$HOME/.local/bin}"
-    local base_url="https://github.com/${repo}/releases/download/${RELEASE_TAG}"
-
-    info "Release: ${repo} (${RELEASE_TAG})"
-    info "Install directory: ${install_dir}"
-    echo
 
     local tmpdir
     tmpdir=$(mktemp -d)
     # shellcheck disable=SC2064
     trap "rm -rf '$tmpdir'" EXIT
 
+    info "Release: ${repo} (${LATEST_TAG})"
+    local build_tag
+    build_tag=$(resolve_build_tag "$repo" "$tmpdir")
+    local base_url="https://github.com/${repo}/releases/download/${build_tag}"
+    info "Build: ${build_tag}"
+    info "Install directory: ${install_dir}"
+    echo
+
     info "Downloading ${ASSET_NAME}..."
     if ! download "${base_url}/${ASSET_NAME}" "$tmpdir/$ASSET_NAME"; then
-        error "Download failed. Check https://github.com/${repo}/releases/tag/${RELEASE_TAG}"
+        error "Download failed. Check https://github.com/${repo}/releases/tag/${build_tag}"
     fi
 
     if [ "${AGENTSVIEW_SKIP_CHECKSUM:-0}" = "1" ]; then
@@ -220,20 +344,21 @@ main() {
     fi
 
     install_binary "$tmpdir/$ASSET_NAME" "$install_dir"
-    info "Installed ${install_dir}/${BINARY_NAME}"
+    info "Installed ${install_dir}/${BINARY_NAME} (${build_tag})"
     echo
 
     RC_TO_RELOAD=""
     ensure_path "$install_dir"
 
-    local found
-    found=$(command -v "$BINARY_NAME" 2>/dev/null || true)
-    if [ -n "$found" ] && [ "$found" != "$install_dir/$BINARY_NAME" ]; then
-        warn "Another agentsview at $found comes first in PATH and will run instead."
-    fi
+    local shadowed=0
+    check_other_copy "$install_dir/$BINARY_NAME" || shadowed=1
 
     echo
-    info "Installation complete!"
+    if [ "$shadowed" = "1" ]; then
+        warn "Installed, but another agentsview runs first in PATH (see above)."
+    else
+        info "Installation complete!"
+    fi
     if [ -n "$RC_TO_RELOAD" ]; then
         echo
         warn "Refresh your shell to use agentsview:"

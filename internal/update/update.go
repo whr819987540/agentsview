@@ -46,13 +46,14 @@ type UpdateInfo struct {
 	// rawBinary is set for rolling builds, which publish the bare
 	// executable instead of an archive.
 	rawBinary bool
-	// cacheOnly is set when the info came from cache and lacks
-	// download metadata. The caller must re-fetch for installs.
+	// cacheOnly is set when the info lacks download metadata because
+	// it came from cache or a display-only rolling check. The caller
+	// must re-fetch for installs.
 	cacheOnly bool
 }
 
-// NeedsRefetch returns true when the info came from cache
-// and lacks the download URL/checksum needed for an install.
+// NeedsRefetch returns true when the info is display-only and
+// lacks the download URL/checksum needed for an install.
 func (u *UpdateInfo) NeedsRefetch() bool {
 	return u.cacheOnly
 }
@@ -64,7 +65,8 @@ type cachedCheck struct {
 
 // CheckForUpdate checks if a newer version is available.
 // Uses a 1-hour cache to avoid hitting the GitHub API often.
-// Rolling builds check their own repository's rolling release.
+// Rolling builds check their own repository's rolling release and
+// cache for 15 minutes; see checkRollingUpdate.
 func CheckForUpdate(ctx context.Context,
 	currentVersion string,
 	forceCheck bool,
@@ -72,7 +74,7 @@ func CheckForUpdate(ctx context.Context,
 ) (*UpdateInfo, error) {
 	if rollingRepo != "" {
 		return checkRollingUpdate(ctx,
-			rollingDownloadBase(rollingRepo),
+			rollingDownloadRoot(rollingRepo),
 			currentVersion, forceCheck, cacheDir,
 		)
 	}
@@ -171,18 +173,16 @@ func PerformUpdate(ctx context.Context,
 		fmt.Println()
 	}
 	fmt.Println("Verifying and installing...")
+	dstPath, err := installTarget(info.rawBinary)
+	if err != nil {
+		return err
+	}
+	install := installFromArchiveTo
 	if info.rawBinary {
-		dstPath, err := installedBinaryPath()
-		if err != nil {
-			return err
-		}
-		if err := installRawBinaryTo(
-			archivePath, info.Checksum, dstPath, downloadChecksum,
-		); err != nil {
-			return err
-		}
-	} else if err := installFromArchive(
-		archivePath, info.Checksum, downloadChecksum,
+		install = installRawBinaryTo
+	}
+	if err := install(
+		archivePath, info.Checksum, dstPath, downloadChecksum,
 	); err != nil {
 		return err
 	}
@@ -204,23 +204,24 @@ func hashFile(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-func installFromArchive(
-	archivePath, expectedChecksum, precomputedChecksum string,
-) error {
-	dstPath, err := installedBinaryPath()
-	if err != nil {
-		return err
+// executablePath locates the running program. Tests replace it.
+var executablePath = os.Executable
+
+// binaryName is the file name of the agentsview executable that
+// release archives contain and archive updates install.
+func binaryName() string {
+	if runtime.GOOS == "windows" {
+		return "agentsview.exe"
 	}
-	return installFromArchiveTo(
-		archivePath, expectedChecksum, dstPath,
-		precomputedChecksum,
-	)
+	return "agentsview"
 }
 
-// installedBinaryPath returns where the update is installed: the
-// agentsview binary beside the running executable.
-func installedBinaryPath() (string, error) {
-	currentExe, err := os.Executable()
+// installTarget returns the file an update replaces. Archive updates
+// install the agentsview binary beside the running executable. Raw
+// binary updates replace the running executable itself, whatever its
+// name, so the next run and a restarted daemon use the new build.
+func installTarget(rawBinary bool) (string, error) {
+	currentExe, err := executablePath()
 	if err != nil {
 		return "", fmt.Errorf("find current executable: %w", err)
 	}
@@ -228,11 +229,10 @@ func installedBinaryPath() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("resolve symlinks: %w", err)
 	}
-	binaryName := "agentsview"
-	if runtime.GOOS == "windows" {
-		binaryName = "agentsview.exe"
+	if rawBinary {
+		return currentExe, nil
 	}
-	return filepath.Join(filepath.Dir(currentExe), binaryName), nil
+	return filepath.Join(filepath.Dir(currentExe), binaryName()), nil
 }
 
 // verifyChecksum checks path against expectedChecksum. A non-empty
@@ -288,14 +288,10 @@ func installFromArchiveTo(
 		}
 	}
 
-	binaryName := "agentsview"
-	if runtime.GOOS == "windows" {
-		binaryName = "agentsview.exe"
-	}
-	srcPath := filepath.Join(extractDir, binaryName)
+	srcPath := filepath.Join(extractDir, binaryName())
 	if _, err := os.Stat(srcPath); os.IsNotExist(err) {
 		return fmt.Errorf(
-			"binary %s not found in archive", binaryName,
+			"binary %s not found in archive", binaryName(),
 		)
 	}
 
@@ -700,14 +696,32 @@ func copyFile(src, dst string) error {
 	return out.Close()
 }
 
+// maxChecksumsSize bounds a SHA256SUMS download.
+const maxChecksumsSize = 1 << 20
+
 func fetchChecksumFromFile(ctx context.Context,
 	url, assetName string,
+) (string, error) {
+	body, err := fetchSmallAsset(ctx, url, maxChecksumsSize)
+	if err != nil {
+		return "", fmt.Errorf("failed to fetch checksums: %w", err)
+	}
+	return extractChecksum(body, assetName), nil
+}
+
+// fetchSmallAsset GETs a small text release asset, such as VERSION,
+// BUILD_TAG, or SHA256SUMS. It fails on any status other than 200 and
+// on bodies longer than limit bytes.
+func fetchSmallAsset(ctx context.Context,
+	url string, limit int64,
 ) (string, error) {
 	client := &http.Client{Timeout: 30 * time.Second}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return "", err
 	}
+	req.Header.Set("User-Agent", updateUserAgent)
+
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", err
@@ -715,16 +729,16 @@ func fetchChecksumFromFile(ctx context.Context,
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf(
-			"failed to fetch checksums: %s", resp.Status,
-		)
+		return "", fmt.Errorf("GET %s: %s", url, resp.Status)
 	}
-
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("GET %s: %w", url, err)
 	}
-	return extractChecksum(string(body), assetName), nil
+	if int64(len(body)) > limit {
+		return "", fmt.Errorf("GET %s: body exceeds %d bytes", url, limit)
+	}
+	return string(body), nil
 }
 
 func extractChecksum(releaseBody, assetName string) string {

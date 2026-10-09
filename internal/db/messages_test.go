@@ -86,7 +86,7 @@ func openLargeSessionFixtureDB(t *testing.T, withFKPoison bool) *DB {
 func TestGetInputOutlineFiltersUserInputs(t *testing.T) {
 	t.Parallel()
 	d := testDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 	const sessionID = "outline-session"
 
 	insertSession(t, d, sessionID, "project")

@@ -1,0 +1,162 @@
+name: Fork Checks
+
+# The upstream CI workflow runs on Namespace runner profiles that exist only
+# in the upstream repository, so its jobs queue in this fork until GitHub
+# cancels them. This workflow runs the lint, Go, and script tests on
+# GitHub-hosted runners instead. Its steps mirror ci.yml; keep them in sync
+# when upstream changes how those checks run. It never runs upstream.
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint
+    if: github.repository != 'kenn-io/agentsview'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Prepare SQLite header
+        run: |
+          make sqlite-vec-header
+          echo "CGO_CFLAGS=-O2 -g -I$GITHUB_WORKSPACE/.sqlite-include" >> "$GITHUB_ENV"
+
+      - name: Install lint tools
+        run: |
+          make lint-tools
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Run Go linters
+        run: make lint-ci
+
+  scripts:
+    name: Shell scripts
+    if: github.repository != 'kenn-io/agentsview'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run shell script tests
+        run: |
+          bash scripts/install_test.sh
+          bash scripts/install_rolling_test.sh
+          bash scripts/retry_test.sh
+          bash scripts/e2e-server_test.sh
+          bash desktop/scripts/test-repair-appimage-diricon.sh
+          bash desktop/scripts/test-prepare-sidecar.sh
+
+  go-linux:
+    name: Go Test (Linux)
+    if: github.repository != 'kenn-io/agentsview'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Prepare SQLite header
+        run: |
+          make sqlite-vec-header
+          echo "CGO_CFLAGS=-O2 -g -I$GITHUB_WORKSPACE/.sqlite-include" >> "$GITHUB_ENV"
+
+      - name: Restore pricing snapshot
+        run: go run ./internal/pricing/cmd/litellm-snapshot -restore
+
+      - name: Run go vet
+        run: go vet -tags "fts5" ./...
+        env:
+          CGO_ENABLED: "1"
+
+      - name: Run Go tests
+        run: go test -tags "fts5" ./... -count=1 -timeout=30m
+        env:
+          CGO_ENABLED: "1"
+
+  go-windows:
+    name: Go Test (Windows)
+    if: github.repository != 'kenn-io/agentsview'
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Setup MinGW
+        id: setup_mingw
+        continue-on-error: true
+        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884  # v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: mingw-w64-x86_64-gcc
+          path-type: inherit
+
+      - name: Setup MinGW (retry on transient failure)
+        if: steps.setup_mingw.outcome == 'failure'
+        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884  # v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: mingw-w64-x86_64-gcc
+          path-type: inherit
+
+      - name: Restore pricing snapshot
+        run: go run ./internal/pricing/cmd/litellm-snapshot -restore
+
+      # Includes the cases that need the real registry and file locking.
+      - name: Run installer tests
+        shell: pwsh
+        run: ./scripts/install_rolling_test.ps1
+
+      # The SQLite-heavy packages that upstream CI tests on separate Windows
+      # runners are left to the Linux job here to keep this job's runtime
+      # reasonable.
+      - name: Run Go tests
+        shell: pwsh
+        run: |
+          $packages = @(go list ./...)
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+          $isolatedPackages = @(
+            'go.kenn.io/agentsview/internal/capture'
+            'go.kenn.io/agentsview/internal/db'
+            'go.kenn.io/agentsview/internal/duckdb'
+            'go.kenn.io/agentsview/internal/parser'
+            'go.kenn.io/agentsview/internal/sync'
+          )
+          $packages = $packages | Where-Object { $_ -notin $isolatedPackages }
+          go test -tags "fts5" $packages -count=1 -timeout=40m
+        env:
+          CGO_ENABLED: "1"

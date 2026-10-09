@@ -406,15 +406,35 @@ func waitForBackgroundLaunchBeforeArchiveWrite(
 	return true, ctx.Err()
 }
 
+// rollingBuildRepo reports the repository this binary takes rolling builds
+// from, or "" otherwise. Tests replace it because the release workflow sets
+// the value in another package.
+var rollingBuildRepo = update.RollingRepo
+
+// isRollingDaemonUpgradeVersion reports whether this binary is a rolling
+// build whose version orders against daemon versions. Rolling builds embed
+// `git describe` output such as v0.44.0-40-g1a2b3c4d, which
+// IsDevBuildVersion treats as a dev build, but their installers rely on
+// serve replacing an older daemon. A dirty or unparsable rolling version
+// stays a dev build.
+func isRollingDaemonUpgradeVersion(currentVersion string) bool {
+	return rollingBuildRepo() != "" &&
+		update.IsRollingBuildVersion(currentVersion)
+}
+
 func shouldUpgradeDaemonRuntime(rt *DaemonRuntime, currentVersion string) bool {
 	if rt == nil || rt.ReadOnly {
 		return false
 	}
-	if update.IsDevBuildVersion(currentVersion) {
+	rolling := isRollingDaemonUpgradeVersion(currentVersion)
+	if !rolling && update.IsDevBuildVersion(currentVersion) {
 		return false
 	}
 	if rt.Record.Version == "" {
 		return true
+	}
+	if rolling {
+		return update.IsNewerRollingBuild(currentVersion, rt.Record.Version)
 	}
 	return update.IsNewer(currentVersion, rt.Record.Version)
 }

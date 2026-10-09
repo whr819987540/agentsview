@@ -266,14 +266,17 @@ func serveDaemonRefusalReason(
 			rt.API, rt.Data, daemonAPIVersion, db.CurrentDataVersion(),
 		)
 	}
-	if update.IsDevBuildVersion(version) {
+	daemonNewer := update.IsNewer
+	if isRollingDaemonUpgradeVersion(version) {
+		daemonNewer = update.IsNewerRollingBuild
+	} else if update.IsDevBuildVersion(version) {
 		return fmt.Sprintf(
 			"current binary version %s is a dev build; dev builds do not "+
 				"replace running daemons automatically",
 			serveCurrentVersion(),
 		)
 	}
-	if rt != nil && update.IsNewer(rt.Record.Version, version) {
+	if rt != nil && daemonNewer(rt.Record.Version, version) {
 		return fmt.Sprintf(
 			"daemon version %s is newer than current binary version %s",
 			serveDaemonVersion(rt), serveCurrentVersion(),

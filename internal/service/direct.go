@@ -424,8 +424,8 @@ func findMessagePageStart(
 		}
 		return len(msgs)
 	}
-	for i := len(msgs) - 1; i >= 0; i-- {
-		if msgs[i].Ordinal <= from {
+	for i, m := range slices.Backward(msgs) {
+		if m.Ordinal <= from {
 			return i
 		}
 	}
@@ -528,7 +528,7 @@ func truncateForkContextToReplay(
 	contextMsgs []db.Message,
 	replay []parser.ParsedMessage,
 ) []db.Message {
-	if len(replay) > len(contextMsgs) {
+	if len(contextMsgs) == 0 || len(replay) > len(contextMsgs) {
 		return contextMsgs
 	}
 	for i, replayMsg := range replay {

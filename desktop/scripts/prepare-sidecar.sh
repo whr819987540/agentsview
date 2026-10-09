@@ -56,7 +56,7 @@ resolve_version() {
   fi
 
   local resolved
-  resolved="$(git -C "$REPO_ROOT" describe --tags --always --dirty 2>/dev/null || true)"
+  resolved="$(git -C "$REPO_ROOT" describe --tags --always --dirty --match 'v*' 2>/dev/null || true)"
   if [ -n "$resolved" ]; then
     echo "$resolved"
     return 0

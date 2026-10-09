@@ -10708,7 +10708,7 @@ func TestSyncRewindAfterInitialSyncReplacesMainTail(t *testing.T) {
 		String()
 
 	path := env.writeClaudeSession(t, "proj", "rewind-live.jsonl", base)
-	env.engine.SyncAll(context.Background(), nil)
+	env.engine.SyncAll(t.Context(), nil)
 	assertSessionMessageCount(t, env.db, "rewind-live", 10)
 
 	// The user rewinds back to b (esc+esc) and continues: Claude
@@ -10724,7 +10724,7 @@ func TestSyncRewindAfterInitialSyncReplacesMainTail(t *testing.T) {
 	require.NoError(t, os.WriteFile(path, []byte(rewound), 0o644),
 		"append rewound branch")
 
-	env.engine.SyncAll(context.Background(), nil)
+	env.engine.SyncAll(t.Context(), nil)
 
 	msgs := fetchMessages(t, env.db, "rewind-live")
 	require.Len(t, msgs, 4, "main session must shrink to the live branch")

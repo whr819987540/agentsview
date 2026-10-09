@@ -187,6 +187,94 @@ func TestFetchContentLength(t *testing.T) {
 	}
 }
 
+func TestFetchSmallAsset(t *testing.T) {
+	const limit = 8
+	tests := []struct {
+		name       string
+		status     int
+		body       string
+		want       string
+		wantErrSub string
+	}{
+		{name: "body under limit", status: http.StatusOK, body: "v1\n", want: "v1\n"},
+		{name: "body at limit", status: http.StatusOK, body: "12345678", want: "12345678"},
+		{
+			name:       "body over limit",
+			status:     http.StatusOK,
+			body:       "123456789",
+			wantErrSub: "body exceeds 8 bytes",
+		},
+		{name: "not found", status: http.StatusNotFound, wantErrSub: "404"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var method, userAgent string
+			srv := httptest.NewServer(http.HandlerFunc(
+				func(w http.ResponseWriter, r *http.Request) {
+					method, userAgent = r.Method, r.UserAgent()
+					w.WriteHeader(tt.status)
+					_, _ = w.Write([]byte(tt.body))
+				},
+			))
+			t.Cleanup(srv.Close)
+
+			got, err := fetchSmallAsset(t.Context(), srv.URL+"/VERSION", limit)
+			assert.Equal(t, http.MethodGet, method)
+			assert.Equal(t, updateUserAgent, userAgent)
+			if tt.wantErrSub != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantErrSub)
+				assert.Contains(t, err.Error(), srv.URL+"/VERSION")
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestFetchChecksumFromFile(t *testing.T) {
+	sum := sha256Hex("binary")
+	tests := []struct {
+		name       string
+		status     int
+		want       string
+		wantErrSub string
+	}{
+		{name: "listed asset", status: http.StatusOK, want: sum},
+		{
+			name:       "missing checksums file",
+			status:     http.StatusNotFound,
+			wantErrSub: "failed to fetch checksums",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var userAgent string
+			srv := httptest.NewServer(http.HandlerFunc(
+				func(w http.ResponseWriter, r *http.Request) {
+					userAgent = r.UserAgent()
+					w.WriteHeader(tt.status)
+					_, _ = fmt.Fprintf(w, "%s  agentsview-linux-amd64\n", sum)
+				},
+			))
+			t.Cleanup(srv.Close)
+
+			got, err := fetchChecksumFromFile(t.Context(),
+				srv.URL+"/SHA256SUMS", "agentsview-linux-amd64",
+			)
+			assert.Equal(t, updateUserAgent, userAgent)
+			if tt.wantErrSub != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantErrSub)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
 func TestSanitizePath(t *testing.T) {
 	destDir := t.TempDir()
 
@@ -473,4 +561,146 @@ func createTestTarGz(
 	require.NoError(t, tw.WriteHeader(header))
 	_, err = tw.Write(data)
 	require.NoError(t, err)
+}
+
+// fakeExecutable makes executablePath report path for the test.
+func fakeExecutable(t *testing.T, path string, err error) {
+	t.Helper()
+	old := executablePath
+	executablePath = func() (string, error) { return path, err }
+	t.Cleanup(func() { executablePath = old })
+}
+
+func TestInstallTarget(t *testing.T) {
+	rolling := rollingAssetName(runtime.GOOS, runtime.GOARCH)
+	tests := []struct {
+		name      string
+		exeName   string
+		symlink   bool
+		rawBinary bool
+		want      string
+	}{
+		{
+			name:      "raw update replaces renamed executable",
+			exeName:   rolling,
+			rawBinary: true,
+			want:      rolling,
+		},
+		{
+			name:      "raw update replaces symlink target",
+			exeName:   rolling,
+			symlink:   true,
+			rawBinary: true,
+			want:      rolling,
+		},
+		{
+			name:    "archive update installs agentsview beside executable",
+			exeName: rolling,
+			want:    binaryName(),
+		},
+		{
+			name:    "archive update resolves symlink directory",
+			exeName: binaryName(),
+			symlink: true,
+			want:    binaryName(),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.symlink && runtime.GOOS == "windows" {
+				t.Skip("symlinks need extra privileges on Windows")
+			}
+			// Resolve the temp dir itself, which may sit behind a symlink.
+			realDir, err := filepath.EvalSymlinks(t.TempDir())
+			require.NoError(t, err)
+			exe := filepath.Join(realDir, tt.exeName)
+			require.NoError(t, os.WriteFile(exe, []byte("old"), 0o755))
+			if tt.symlink {
+				link := filepath.Join(t.TempDir(), "agentsview-link")
+				require.NoError(t, os.Symlink(exe, link))
+				exe = link
+			}
+			fakeExecutable(t, exe, nil)
+
+			got, err := installTarget(tt.rawBinary)
+			require.NoError(t, err)
+			assert.Equal(t, filepath.Join(realDir, tt.want), got)
+		})
+	}
+}
+
+func TestInstallTargetExecutableError(t *testing.T) {
+	fakeExecutable(t, "", os.ErrNotExist)
+
+	_, err := installTarget(true)
+	require.ErrorIs(t, err, os.ErrNotExist)
+	assert.Contains(t, err.Error(), "find current executable")
+}
+
+// archiveBytes returns a release archive holding the agentsview binary.
+func archiveBytes(t *testing.T, content string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "release.tar.gz")
+	createTestTarGz(t, path, binaryName(), content)
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	return string(data)
+}
+
+func TestPerformUpdateInstallTarget(t *testing.T) {
+	rolling := rollingAssetName(runtime.GOOS, runtime.GOARCH)
+	tests := []struct {
+		name      string
+		rawBinary bool
+		assetName string
+		asset     func(t *testing.T) string
+		wantFiles map[string]string
+	}{
+		{
+			name:      "raw update replaces the running executable in place",
+			rawBinary: true,
+			assetName: rolling,
+			asset:     func(*testing.T) string { return "new" },
+			wantFiles: map[string]string{rolling: "new"},
+		},
+		{
+			name:      "archive update installs agentsview beside it",
+			assetName: "agentsview_0.45.0_test.tar.gz",
+			asset:     func(t *testing.T) string { t.Helper(); return archiveBytes(t, "new") },
+			wantFiles: map[string]string{rolling: "old", binaryName(): "new"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			asset := tt.asset(t)
+			srv := httptest.NewServer(http.HandlerFunc(
+				func(w http.ResponseWriter, _ *http.Request) {
+					_, _ = w.Write([]byte(asset))
+				},
+			))
+			t.Cleanup(srv.Close)
+
+			dir := t.TempDir()
+			exe := filepath.Join(dir, rolling)
+			require.NoError(t, os.WriteFile(exe, []byte("old"), 0o755))
+			fakeExecutable(t, exe, nil)
+
+			require.NoError(t, PerformUpdate(t.Context(), &UpdateInfo{
+				DownloadURL: srv.URL + "/" + tt.assetName,
+				AssetName:   tt.assetName,
+				Checksum:    sha256Hex(asset),
+				rawBinary:   tt.rawBinary,
+			}, nil))
+
+			entries, err := os.ReadDir(dir)
+			require.NoError(t, err)
+			got := map[string]string{}
+			for _, e := range entries {
+				data, err := os.ReadFile(filepath.Join(dir, e.Name()))
+				require.NoError(t, err)
+				got[e.Name()] = string(data)
+			}
+			assert.Equal(t, tt.wantFiles, got)
+		})
+	}
 }
