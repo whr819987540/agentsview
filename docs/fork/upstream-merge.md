@@ -10,9 +10,10 @@ Claude 活分支选择、Codex rollback、会话关系树、input outline、roll
   `build-*` tag 并发布 rolling release，rebase 会改写这些历史。
 - 每次合并只产生一个合并提交。它的 message 集中记录 fork 的每个功能是保留、重做
   还是丢弃，以及原因。
-- 先在单独的合并分支上完成合并和验证，再通过 PR 进入 `main`。fork 的 lint 和测试
-  （`fork-checks.yml`）只在 PR 上运行，而每次推送 `main` 都会发布 rolling
-  release。
+- 先在单独的合并分支上完成合并和验证，再把 `main` fast-forward 到合并分支并推送。
+  推送 `main` 会立即发布 rolling release。fork 的 lint 和测试
+  （`fork-checks.yml`）只在 PR 上运行；想在发布前让 CI 跑一遍，可以先推送合并分支
+  并开 PR，CI 通过后再 fast-forward。
 
 ## 步骤
 
@@ -42,11 +43,13 @@ Claude 活分支选择、Codex rollback、会话关系树、input outline、roll
 
 1. 按下文的清单验证。
 
-1. 提交合并提交，推送合并分支，在 fork 上开 PR，由维护者合并：
+1. 提交合并提交，推送合并分支，把 `main` fast-forward 过去并推送：
 
    ```sh
    git push -u origin merge/upstream-YYYYMMDD
-   gh pr create --repo <fork>/agentsview --base main --head merge/upstream-YYYYMMDD
+   git checkout main
+   git merge --ff-only merge/upstream-YYYYMMDD
+   git push origin main
    ```
 
 ## 解决冲突的规则
