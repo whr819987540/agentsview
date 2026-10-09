@@ -510,9 +510,25 @@ jobs:
           # Move the existing tag first. The guard reads it, so a later job
           # for an older commit skips even if this upload fails part way.
           # Creating or publishing a release creates the tag when absent.
-          if [ -n "$CURRENT_LATEST" ]; then
-            gh api -X PATCH "repos/$GH_REPO/git/refs/tags/latest" \
-              -f sha="$GITHUB_SHA" -F force=true --silent
+          if [ -n "$CURRENT_LATEST" ] && ! gh api -X PATCH "repos/$GH_REPO/git/refs/tags/latest" \
+              -f sha="$GITHUB_SHA" -F force=true --silent; then
+            # GITHUB_TOKEN cannot hold the workflows permission, so GitHub
+            # may refuse to move a ref across commits that change
+            # .github/workflows. Creating the tag through the release API
+            # works for those commits, so delete the tag and let the release
+            # recreate it at this commit. Download URLs may 404 for the few
+            # seconds in between. If this fails part way, the next run finds
+            # no tag (or a draft) and publishes normally.
+            if [ "$STATE" != published ]; then
+              echo "Could not move the latest tag of a $STATE release." >&2
+              exit 1
+            fi
+            echo "::warning::Moving the latest tag failed; recreating it through the release."
+            RELEASE_ID=$(gh api "repos/$GH_REPO/releases/tags/latest" --jq .id)
+            gh api -X DELETE "repos/$GH_REPO/git/refs/tags/latest" --silent
+            gh api -X PATCH "repos/$GH_REPO/releases/$RELEASE_ID" \
+              -f tag_name=latest -f target_commitish="$GITHUB_SHA" \
+              -F draft=false -F prerelease=true --silent
           fi
 
           if [ "$STATE" = absent ]; then
