@@ -18,6 +18,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cenkalti/backoff/v7"
+	"github.com/mattn/go-sqlite3"
+
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/export"
 	"go.kenn.io/agentsview/internal/parser"
@@ -51,13 +54,13 @@ CREATE INDEX IF NOT EXISTS idx_provider_freshness_updated_at
 // trigger a non-destructive re-sync (mtime reset + skip cache
 // clear) so existing session data is preserved.
 //
-// Bumped to 114: Codex thread_rolled_back events are honored, the Claude
-// rewind (esc+esc) live branch is followed instead of the abandoned one,
-// the fork threshold counts only real user turns, and Claude /branch
-// (forkedFrom) sessions link to their parent as a fork without restoring
-// the replayed parent prefix. Existing Codex and Claude rows need
-// re-parsing so rolled-back turns and abandoned branches are dropped and
-// the session relationship tree reflects real branch points.
+// Fork note: this fork's own bump to 114, made before upstream reused that
+// number, re-parsed Codex and Claude rows because Codex thread_rolled_back
+// events are honored, the Claude rewind (esc+esc) live branch is followed
+// instead of the abandoned one, the fork threshold counts only real user
+// turns, and Claude /branch (forkedFrom) sessions link to their parent as a
+// fork without restoring the replayed parent prefix. Archives at the fork's
+// 114 re-parse at the merged upstream version, which keeps these behaviors.
 //
 // Bumped to 63: the Codex parser now persists current subagent lineage,
 // links spawn events, restores plaintext agent messages, suppresses opaque
@@ -521,7 +524,57 @@ CREATE INDEX IF NOT EXISTS idx_provider_freshness_updated_at
 // messages and classifying user prompts. Re-parse unchanged sources to
 // remove retained context, restore omitted prompts, and correct first-message
 // previews and user-message counts.)
-const dataVersion = 114
+// (114: Codex `apply_patch` calls record the files named in the patch body,
+// one tool call per file, so file-keyed views such as Recent Edits include
+// them. Re-parse unchanged Codex sources to backfill file_path.)
+// (115: Cursor IDE sessions start at their earliest timestamped bubble;
+// composerData.createdAt is only a fallback for composers without bubble
+// timestamps. Re-parse unchanged state.vscdb containers to correct started_at.)
+// (116: Claude and Amp tool results retain explicit failure/completion status,
+// and Cline results retain image markers. Re-parse unchanged sources to restore
+// outcome evidence lost from summaries.)
+// (117: an Antigravity conversation whose own stream is encrypted is stored
+// from the plaintext transcript its agent brain wrote, and .gemini/antigravity-ide
+// is a default Antigravity root. Re-parse unchanged Antigravity sources so those
+// conversations reach the archive.)
+// (118: Claude custom-title, Qwen custom_title, Copilot user_named, and OpenClaw
+// session labels now become session names, and a Copilot name the user chose no
+// longer replaces the first message. Re-parse unchanged sources so sessions
+// renamed before the upgrade show those names.)
+// (119: Codebuff and Freebuff sessions gain git_branch, termination status,
+// per-prompt cost rows, attachment and ask-user content, and linked subagent
+// sessions. Re-parse unchanged Codebuff/Freebuff sources to backfill them.)
+// (120: each agent's own session title becomes the session name, preferring a
+// name the user chose: generated Qwen and OpenClaw titles, every Copilot
+// workspace name, OpenCode/Kilo/MiMo Code and Amp titles, VS Code customTitle,
+// Kimi state titles, Gemini summaries, and legacy Kiro titles. Titles no longer
+// replace the first message. Re-parse unchanged sources so existing sessions
+// pick up their titles.)
+// (121: Cursor IDE stored hashes carry a composer-document digest ahead of the
+// full content digest, which the watcher compares to skip unchanged
+// composers. The bump reparses the whole archive once, which rewrites every
+// live Cursor IDE row to the new hash; until then the watcher parses the
+// whole container. Trashed rows keep their old hash and are vouched as
+// suppressed.)
+// (122: a Claude sub-agent that ran again under a second parent session has
+// that second transcript's entries appended to the same sub-agent session.
+// Re-parse unchanged Claude sources so a sub-agent session reaches its later
+// run's last entry.)
+// (123: Codex cache-write input tokens are split out of uncached input into
+// cache_creation_input_tokens so GPT-5.6 and later writes price at the
+// cache-write rate. Re-parse unchanged Codex-format sources because the
+// stored token_usage changes while source bytes do not.)
+// (124: OpenCode dispatch timestamps are retained as tool-execution events so
+// unchanged sessions gain dispatch-to-completion timing.)
+// (125: Gemini and Cursor files that share a session ID remain separate
+// conversations. Re-parse unchanged sources, including cached remote mirrors,
+// to recover conversations previously collapsed into one archived session.)
+// (126: Claude messages from another Claude Code session, persisted as
+// queued_command prompts wrapped in <cross-session-message>, are now system
+// rows with source_subtype peer_message instead of user prompts. Re-parse
+// unchanged Claude sources so user-message counts and first messages drop
+// them.)
+const dataVersion = 126
 
 const tokenCoverageRepairStatsKey = "token_coverage_repair_v1"
 
@@ -701,28 +754,6 @@ CREATE TRIGGER IF NOT EXISTS recall_entries_au AFTER UPDATE ON recall_entries BE
 END;
 `
 
-const recallEntriesFTS4 = `
-CREATE VIRTUAL TABLE IF NOT EXISTS recall_entries_fts USING fts4(
-    title,
-    body,
-    trigger,
-    tokenize=porter
-);
-
-CREATE TRIGGER IF NOT EXISTS recall_entries_ai AFTER INSERT ON recall_entries BEGIN
-    INSERT INTO recall_entries_fts(rowid, title, body, trigger)
-        VALUES (new.rowid, new.title, new.body, new.trigger);
-END;
-CREATE TRIGGER IF NOT EXISTS recall_entries_ad AFTER DELETE ON recall_entries BEGIN
-    DELETE FROM recall_entries_fts WHERE rowid = old.rowid;
-END;
-CREATE TRIGGER IF NOT EXISTS recall_entries_au AFTER UPDATE ON recall_entries BEGIN
-    DELETE FROM recall_entries_fts WHERE rowid = old.rowid;
-    INSERT INTO recall_entries_fts(rowid, title, body, trigger)
-        VALUES (new.rowid, new.title, new.body, new.trigger);
-END;
-`
-
 const recallEvidenceFTS = `
 CREATE VIRTUAL TABLE IF NOT EXISTS recall_evidence_fts USING fts5(
     snippet,
@@ -747,26 +778,6 @@ CREATE TRIGGER IF NOT EXISTS recall_evidence_au AFTER UPDATE ON recall_evidence 
 END;
 `
 
-const recallEvidenceFTS4 = `
-CREATE VIRTUAL TABLE IF NOT EXISTS recall_evidence_fts USING fts4(
-    snippet,
-    tokenize=porter
-);
-
-CREATE TRIGGER IF NOT EXISTS recall_evidence_ai AFTER INSERT ON recall_evidence BEGIN
-    INSERT INTO recall_evidence_fts(rowid, snippet)
-        VALUES (new.id, new.snippet);
-END;
-CREATE TRIGGER IF NOT EXISTS recall_evidence_ad AFTER DELETE ON recall_evidence BEGIN
-    DELETE FROM recall_evidence_fts WHERE rowid = old.id;
-END;
-CREATE TRIGGER IF NOT EXISTS recall_evidence_au AFTER UPDATE ON recall_evidence BEGIN
-    DELETE FROM recall_evidence_fts WHERE rowid = old.id;
-    INSERT INTO recall_evidence_fts(rowid, snippet)
-        VALUES (new.id, new.snippet);
-END;
-`
-
 // DB manages a write connection and a read-only pool.
 // The reader and writer fields use atomic.Pointer so that
 // concurrent HTTP handler goroutines can safely read while
@@ -781,6 +792,7 @@ type DB struct {
 	usageBackfillDone    chan struct{}
 	usageBackfillErr     error
 	usageBackfillStarted func()
+	usageBackfillRerun   bool // queues one more pass after the active one
 	// usageBackfillEnabled records that this process explicitly started
 	// background backfill (the daemon lifecycle). Reopen restarts a pass
 	// only then, so CLI resyncs never trigger an unrequested archive scan.
@@ -1246,7 +1258,7 @@ func OpenFreshIsolatedContext(ctx context.Context, path string) (*DB, error) {
 		return nil, errors.Join(err, d.CloseContext(ctx))
 	}
 	d.mu.Lock()
-	err = ensureConversationSchemaLocked(ctx, d.getWriter(), d.usageOnlyStorage())
+	err = ensureConversationSchemaLocked(ctx, d.getWriter())
 	d.mu.Unlock()
 	if err != nil {
 		return closeOnError(fmt.Errorf("initializing conversation export state: %w", err))
@@ -1848,7 +1860,6 @@ var readOnlyRequiredTables = []string{
 	"artifact_import_attempt_generations",
 	"artifact_peer_checkpoint_heads",
 	"artifact_checkpoint_landings",
-	"artifact_checkpoint_landing_sessions",
 	"artifact_checkpoint_stages",
 	"artifact_checkpoint_stage_sessions",
 	"artifact_imported_sessions",
@@ -2174,6 +2185,7 @@ func legacySchemaColumnMigrations() []schemaColumnMigration {
 
 func schemaColumnMigrations() []schemaColumnMigration {
 	return []schemaColumnMigration{
+		{"excluded_sessions", "file_path", "ALTER TABLE excluded_sessions ADD COLUMN file_path TEXT"},
 		{
 			"session_project_assignments", "original_project",
 			"ALTER TABLE session_project_assignments ADD COLUMN original_project TEXT NOT NULL DEFAULT '';" +
@@ -2979,7 +2991,7 @@ func (db *DB) migrateColumns(ctx context.Context, progress OpenProgressFunc) err
 	if err := scopeLegacyDevinSourceUUIDsLocked(ctx, w); err != nil {
 		return err
 	}
-	if err := ensureConversationSchemaLocked(ctx, w, db.usageOnlyStorage()); err != nil {
+	if err := ensureConversationSchemaLocked(ctx, w); err != nil {
 		return err
 	}
 
@@ -3610,6 +3622,11 @@ func (db *DB) createPartialIndexesLocked(ctx context.Context, w *writerHandle) e
 		   AND timestamp IS NOT NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_sessions_cwd
 		 ON sessions(cwd) WHERE cwd != ''`,
+		`CREATE INDEX IF NOT EXISTS idx_sessions_recent_source_activity
+		 ON sessions(agent, machine, julianday(ended_at) DESC, id)
+		 WHERE file_path IS NOT NULL AND file_path != ''
+		   AND file_path NOT LIKE 's3://%'
+		   AND deleted_at IS NULL AND source_missing_at IS NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_sessions_project_git_branch
 		 ON sessions(project, git_branch) WHERE git_branch != ''`,
 		`CREATE INDEX IF NOT EXISTS idx_messages_compact_boundary
@@ -4441,6 +4458,16 @@ func openAndInit(
 		_ = db.CloseContext(ctx)
 		return nil, err
 	}
+	db.mu.Lock()
+	err = migrateRecallReviewStateConstraintLocked(ctx, db.getWriter())
+	db.mu.Unlock()
+	if err != nil {
+		_ = db.CloseContext(ctx)
+		return nil, fmt.Errorf(
+			"migrating recall review state: %w", err,
+		)
+	}
+
 	if err := db.init(ctx, progress); err != nil {
 		_ = db.CloseContext(ctx)
 		return nil, fmt.Errorf("initializing schema: %w", err)
@@ -4492,28 +4519,22 @@ func (db *DB) CheckpointWALTruncate(ctx context.Context) error {
 // pages after large rewrites such as a full resync. Persistent readers simply
 // leave the WAL for the next periodic attempt.
 func (db *DB) CheckpointWALTruncateWithRetry(ctx context.Context) error {
-	var lastErr error
-	for i := range walCheckpointAttempts {
+	_, err := backoff.Retry(ctx, func() (struct{}, error) {
 		err := db.CheckpointWALTruncate(ctx)
-		if err == nil {
-			return nil
+		if err != nil && !errors.Is(err, ErrWALCheckpointBusy) {
+			err = backoff.Permanent(err)
 		}
-		lastErr = err
-		if !errors.Is(err, ErrWALCheckpointBusy) {
-			return err
-		}
-		if i == walCheckpointAttempts-1 {
-			break
-		}
-		timer := time.NewTimer(walCheckpointRetryDelay)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return ctx.Err()
-		case <-timer.C:
-		}
+		return struct{}{}, err
+	}, backoff.WithBackOff(backoff.NewConstantBackOff(walCheckpointRetryDelay)),
+		backoff.WithMaxTries(walCheckpointAttempts), backoff.WithMaxElapsedTime(0))
+	if err == nil {
+		return nil
 	}
-	return lastErr
+	retryErr := backoff.AsRetryError(err)
+	if errors.Is(retryErr.Cause, backoff.ErrPermanent) || errors.Is(retryErr.Cause, backoff.ErrExhausted) {
+		return retryErr.LastErr
+	}
+	return ctx.Err()
 }
 
 // MaybeCheckpointLargeWAL attempts a truncate checkpoint only when the WAL file
@@ -4547,14 +4568,11 @@ func (db *DB) startWALCheckpointLoop() {
 		defer close(done)
 		ticker := time.NewTicker(walCheckpointInterval)
 		defer ticker.Stop()
+		var diag walDiagnostics
 		for {
 			select {
 			case <-ticker.C:
-				attempted, err := db.MaybeCheckpointLargeWAL(context.Background())
-				if attempted && err != nil &&
-					!errors.Is(err, ErrWALCheckpointBusy) {
-					log.Printf("sqlite wal checkpoint: %v", err)
-				}
+				db.walMaintenanceTick(context.Background(), &diag)
 			case <-stop:
 				return
 			}
@@ -4632,11 +4650,30 @@ func (db *DB) RebuildFTS(ctx context.Context) error {
 	return nil
 }
 
+// bulkImportWALAutocheckpointBytes is the WAL growth between automatic
+// checkpoints in a disposable resync archive. Tests shrink it.
+var bulkImportWALAutocheckpointBytes = 128 << 20
+
+func bulkImportWALAutocheckpointPages(pageSize int) int {
+	return max(1, bulkImportWALAutocheckpointBytes/pageSize)
+}
+
 // DropBulkImportIndexes omits derived index maintenance in a disposable
-// full-resync archive. RebuildBulkImportIndexes must succeed before the swap.
+// full-resync archive and defers its automatic WAL checkpoints.
+// RebuildBulkImportIndexes and CheckpointWALTruncate must succeed before the swap.
 func (db *DB) DropBulkImportIndexes(ctx context.Context) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
+	w := db.getWriter()
+	var pageSize int
+	if err := w.QueryRow(ctx, "PRAGMA page_size").Scan(&pageSize); err != nil {
+		return fmt.Errorf("reading page_size: %w", err)
+	}
+	// This policy belongs to the disposable writer connection and ends on close.
+	if _, err := w.Exec(ctx, fmt.Sprintf("PRAGMA wal_autocheckpoint = %d",
+		bulkImportWALAutocheckpointPages(pageSize))); err != nil {
+		return fmt.Errorf("setting wal_autocheckpoint: %w", err)
+	}
 	for _, name := range []string{
 		"idx_messages_usage_timestamp",
 		"idx_messages_usage_session_covering",
@@ -4645,7 +4682,7 @@ func (db *DB) DropBulkImportIndexes(ctx context.Context) error {
 		"idx_tool_result_events_identity",
 		"idx_tool_result_events_summary",
 	} {
-		if _, err := db.getWriter().Exec(ctx, `DROP INDEX IF EXISTS `+name); err != nil {
+		if _, err := w.Exec(ctx, `DROP INDEX IF EXISTS `+name); err != nil {
 			return fmt.Errorf("dropping bulk import index %s: %w", name, err)
 		}
 	}
@@ -4676,6 +4713,32 @@ func (db *DB) RebuildBulkImportIndexes(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// checkFTSModuleLoads fails when messages_fts is in the schema but this
+// executable's SQLite cannot load its virtual table module. Writes to
+// messages fire triggers into messages_fts, so such an archive is
+// read-only for this build no matter how the open succeeds.
+func (db *DB) checkFTSModuleLoads(
+	ctx context.Context, w *writerHandle,
+) error {
+	_, err := w.ExecContext(ctx, "SELECT 1 FROM messages_fts LIMIT 1")
+	if err == nil {
+		return nil
+	}
+	// The statement is fixed and the table row exists, so a generic
+	// SQLITE_ERROR here is the schema failing to load its module. I/O,
+	// corruption, and busy failures carry their own codes.
+	sqliteErr, ok := errors.AsType[sqlite3.Error](err)
+	if !ok || sqliteErr.Code != sqlite3.ErrError {
+		return nil
+	}
+	return fmt.Errorf(
+		"archive %s has a full-text index this executable cannot load"+
+			" (%w); rebuild agentsview with CGO_ENABLED=1 -tags fts5"+
+			" so SQLite is compiled with SQLITE_ENABLE_FTS5",
+		db.path, err,
+	)
 }
 
 // HasFTS checks if Full Text Search is available.
@@ -4779,11 +4842,10 @@ func (db *DB) init(ctx context.Context, progress OpenProgressFunc) error {
 	}
 
 	progress.report("Initializing full-text search")
-	var fts5Available, fts4Available bool
+	var fts5Available bool
 	if err := w.QueryRowContext(ctx,
-		`SELECT EXISTS(SELECT 1 FROM pragma_module_list WHERE name = 'fts5'),
-		 EXISTS(SELECT 1 FROM pragma_module_list WHERE name = 'fts4')`,
-	).Scan(&fts5Available, &fts4Available); err != nil {
+		`SELECT EXISTS(SELECT 1 FROM pragma_module_list WHERE name = 'fts5')`,
+	).Scan(&fts5Available); err != nil {
 		return fmt.Errorf("checking full-text search modules: %w", err)
 	}
 
@@ -4803,7 +4865,15 @@ func (db *DB) init(ctx context.Context, progress OpenProgressFunc) error {
 		if fts5Available {
 			return fmt.Errorf("initializing FTS: %w", err)
 		}
-	} else if !hadFTS {
+	} else if hadFTS {
+		// IF NOT EXISTS skips the module lookup for an existing
+		// table, so an archive indexed by an fts5 build opens on an
+		// executable without fts5 and every message write then fails
+		// inside the messages triggers. Refuse the open instead.
+		if err := db.checkFTSModuleLoads(ctx, w); err != nil {
+			return err
+		}
+	} else {
 		// Schema init succeeded and we didn't have FTS
 		// before. Populate the index for existing messages.
 		if _, err := w.ExecContext(ctx,
@@ -4827,21 +4897,7 @@ func (db *DB) init(ctx context.Context, progress OpenProgressFunc) error {
 	}
 	hadRecallFTS := recallFTSCount > 0
 	if _, err := w.ExecContext(ctx, recallEntriesFTS); err != nil {
-		if fts5Available {
-			return fmt.Errorf("initializing recall entries FTS: %w", err)
-		}
-		if _, err := w.ExecContext(ctx, recallEntriesFTS4); err != nil {
-			if fts4Available {
-				return fmt.Errorf("initializing recall entries FTS4: %w", err)
-			}
-		} else if !hadRecallFTS {
-			if _, err := w.ExecContext(ctx,
-				"INSERT INTO recall_entries_fts(rowid, title, body, trigger)"+
-					" SELECT rowid, title, body, trigger FROM recall_entries",
-			); err != nil {
-				return fmt.Errorf("backfilling recall entries FTS4: %w", err)
-			}
-		}
+		return fmt.Errorf("initializing recall entries FTS5 (build with -tags fts5): %w", err)
 	} else if !hadRecallFTS {
 		if _, err := w.ExecContext(ctx,
 			"INSERT INTO recall_entries_fts(recall_entries_fts)"+
@@ -4860,25 +4916,7 @@ func (db *DB) init(ctx context.Context, progress OpenProgressFunc) error {
 	}
 	hadRecallEvidenceFTS := recallEvidenceFTSCount > 0
 	if _, err := w.ExecContext(ctx, recallEvidenceFTS); err != nil {
-		if fts5Available {
-			return fmt.Errorf("initializing recall evidence FTS: %w", err)
-		}
-		if _, err := w.ExecContext(ctx, recallEvidenceFTS4); err != nil {
-			if fts4Available {
-				return fmt.Errorf(
-					"initializing recall evidence FTS4: %w", err,
-				)
-			}
-		} else if !hadRecallEvidenceFTS {
-			if _, err := w.ExecContext(ctx,
-				"INSERT INTO recall_evidence_fts(rowid, snippet)"+
-					" SELECT id, snippet FROM recall_evidence",
-			); err != nil {
-				return fmt.Errorf(
-					"backfilling recall evidence FTS4: %w", err,
-				)
-			}
-		}
+		return fmt.Errorf("initializing recall evidence FTS5 (build with -tags fts5): %w", err)
 	} else if !hadRecallEvidenceFTS {
 		if _, err := w.ExecContext(ctx,
 			"INSERT INTO recall_evidence_fts(recall_evidence_fts)"+

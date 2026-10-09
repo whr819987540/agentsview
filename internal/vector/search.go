@@ -9,6 +9,7 @@ import (
 
 	"go.kenn.io/agentsview/internal/db"
 	"go.kenn.io/agentsview/internal/stringutil"
+	"go.kenn.io/kit/embedmodel"
 	kitvec "go.kenn.io/kit/vector"
 )
 
@@ -119,18 +120,20 @@ func (ix *Index) SearchPage(
 		return nil, false, ix.noActiveGenerationError(ctx)
 	}
 
-	vectors, err := kitvec.EncodeBatched(ctx, enc,
-		[]kitvec.Chunk{{Index: 0, Text: query}})
+	queryVector, err := kitvec.EncodeOne(ctx, enc, query)
 	if err != nil {
 		return nil, false, &QueryEncodeError{Err: err}
 	}
 
-	hits, err := ix.store.QueryGeneration(ctx, active, vectors[0], limit)
+	hits, err := ix.store.QueryGeneration(ctx, active, queryVector, limit)
 	if err != nil {
 		return nil, false, fmt.Errorf("search: %w", err)
 	}
 	exhausted := len(hits) < limit
-	hits = kitvec.RollupByDocument(hits)
+	hits, err = kitvec.RollupByDocument(hits)
+	if err != nil {
+		return nil, false, fmt.Errorf("search: %w", err)
+	}
 	if len(hits) > limit {
 		hits = hits[:limit]
 	}
@@ -476,9 +479,9 @@ SELECT doc_key, ordinal, ordinal_end, subordinate
 	return out, nil
 }
 
-// StaleActive reports whether the active generation's fingerprint differs
-// from want or the last successfully completed corpus revision differs from
-// wantRevision. It returns false when there is no active generation at all:
+// StaleActive reports whether the active generation does not belong to space
+// (see embedmodel.Descriptor.Matches) or the last successfully completed
+// corpus revision differs from wantRevision. It returns false when there is no active generation at all:
 // Search already distinguishes that case with ErrNoActiveGeneration /
 // BuildingError. An expected revision with no completed stamp is stale.
 //
@@ -489,7 +492,22 @@ SELECT doc_key, ordinal, ordinal_end, subordinate
 // index would surface a raw SQL error (or a wrong staleness verdict) here
 // and the sentinel in Search would never be reached.
 func (ix *Index) StaleActive(
-	ctx context.Context, want, wantRevision string,
+	ctx context.Context, space embedmodel.Descriptor, wantRevision string,
+) (bool, error) {
+	return ix.StaleActiveWithin(ctx, space, wantRevision, func(completed, want string) bool {
+		return completed == want
+	})
+}
+
+// StaleActiveWithin is StaleActive with a caller-supplied revision test:
+// fresh(completed, want) reports whether an active generation completed at
+// corpus revision completed may still answer for a corpus at want. The
+// space check and the missing-stamp rule are unchanged, so only a revision
+// lag can be tolerated; a different model, config, or generation is always
+// stale. Revisions stay opaque here; the caller owns their format.
+func (ix *Index) StaleActiveWithin(
+	ctx context.Context, space embedmodel.Descriptor, wantRevision string,
+	fresh func(completed, want string) bool,
 ) (bool, error) {
 	if ix.versionMismatch {
 		return false, ErrMirrorVersionMismatch
@@ -501,7 +519,11 @@ func (ix *Index) StaleActive(
 	if !hasActive {
 		return false, nil
 	}
-	if active != want {
+	matches, err := space.Matches(active)
+	if err != nil {
+		return false, fmt.Errorf("matching active generation: %w", err)
+	}
+	if !matches {
 		return true, nil
 	}
 	if wantRevision == "" {
@@ -511,5 +533,5 @@ func (ix *Index) StaleActive(
 	if err != nil {
 		return false, fmt.Errorf("reading completed corpus revision: %w", err)
 	}
-	return !ok || completed != wantRevision, nil
+	return !ok || !fresh(completed, wantRevision), nil
 }

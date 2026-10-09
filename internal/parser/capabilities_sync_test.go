@@ -58,6 +58,13 @@ func TestProviderSyncSemanticsDeclarations(t *testing.T) {
 		AgentGemini: {
 			FingerprintHashRequiredForFreshness: true,
 		},
+		AgentPositron: {
+			FingerprintHashRequiredForFreshness: true,
+		},
+		AgentJunie: {
+			FingerprintHashInCacheKey:           true,
+			FingerprintHashRequiredForFreshness: true,
+		},
 		AgentGoose: {
 			FingerprintHashInCacheKey:           true,
 			FingerprintHashRequiredForFreshness: true,
@@ -133,6 +140,16 @@ func TestProviderSyncSemanticsDeclarations(t *testing.T) {
 			FingerprintHashRequiredForFreshness: true,
 		},
 		AgentCopilot: {
+			FingerprintHashRequiredForFreshness: true,
+		},
+		AgentOpenClaw: {
+			FingerprintHashInCacheKey:           true,
+			FingerprintHashRequiredForFreshness: true,
+		},
+		// Grok companion edits can keep the summary's size and mtime, so
+		// freshness depends on the content fingerprint.
+		AgentGrok: {
+			FingerprintHashInCacheKey:           true,
 			FingerprintHashRequiredForFreshness: true,
 		},
 	}

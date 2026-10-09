@@ -2,6 +2,8 @@ package parser
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json/jsontext"
 	"encoding/json/v2"
 	"strings"
@@ -32,6 +34,7 @@ const (
 	AgentCursor         AgentType = "cursor"
 	AgentCursorIDE      AgentType = "cursor-ide"
 	AgentIflow          AgentType = "iflow"
+	AgentJunie          AgentType = "junie"
 	AgentAmp            AgentType = "amp"
 	AgentZencoder       AgentType = "zencoder"
 	AgentVSCodeCopilot  AgentType = "vscode-copilot"
@@ -42,6 +45,8 @@ const (
 	AgentTau            AgentType = "tau"
 	AgentPrimeAgent     AgentType = "prime-agent"
 	AgentOMP            AgentType = "omp"
+	AgentOMO            AgentType = "omo"
+	AgentStepCode       AgentType = "stepcode"
 	AgentQwen           AgentType = "qwen"
 	AgentCommandCode    AgentType = "commandcode"
 	AgentDeepSeekTUI    AgentType = "deepseek-tui"
@@ -385,6 +390,10 @@ var Registry = []AgentDef{
 		// encryption keys. Remote sync stays disabled until there is an
 		// allowlisted export schema, matching Omnigent's chat.db precedent.
 		RemoteSyncExcluded: true,
+		// Watcher events parse only composers whose composerData document
+		// changed, so bubble-only edits rely on the scheduled
+		// fingerprint-gated container reparse.
+		PeriodicReconcile: true,
 	},
 	{
 		Type:        AgentAmp,
@@ -394,6 +403,18 @@ var Registry = []AgentDef{
 		DefaultDirs: []string{".local/share/amp/threads"},
 		IDPrefix:    "amp:",
 		FileBased:   true,
+	},
+	{
+		Type:              AgentJunie,
+		DisplayName:       "Junie",
+		EnvVar:            "JUNIE_DIR",
+		DefaultRootEnvVar: "JUNIE_HOME",
+		DefaultRootDir:    ".junie",
+		ConfigKey:         "junie_dirs",
+		HomesSupported:    true,
+		DefaultDirs:       []string{".junie/sessions"},
+		IDPrefix:          "junie:",
+		FileBased:         true,
 	},
 	{
 		Type:        AgentZencoder,
@@ -558,6 +579,31 @@ var Registry = []AgentDef{
 		FileBased:   true,
 	},
 	{
+		Type:        AgentOMO,
+		DisplayName: "OMO",
+		EnvVar:      "OMO_DIR",
+		ConfigKey:   "omo_dirs",
+		DefaultDirs: []string{".omo/agent/sessions"},
+		IDPrefix:    "omo:",
+		FileBased:   true,
+	},
+	{
+		// StepCode packages the Pi harness as a product, so its transcripts
+		// use Pi's JSONL format and layout verbatim and go through the Pi
+		// provider. It keeps its own agent root, so a Pi default root would
+		// otherwise never see StepCode sessions.
+		Type:              AgentStepCode,
+		DisplayName:       "StepCode",
+		EnvVar:            "STEPCODE_DIR",
+		NativeEnvVar:      "STEP_CODING_AGENT_SESSION_DIR",
+		DefaultRootEnvVar: "STEP_CODING_AGENT_DIR",
+		DefaultRootDir:    ".stepcode/agent",
+		ConfigKey:         "stepcode_dirs",
+		DefaultDirs:       []string{".stepcode/agent/sessions"},
+		IDPrefix:          "stepcode:",
+		FileBased:         true,
+	},
+	{
 		Type:        AgentQwen,
 		DisplayName: "Qwen Code",
 		EnvVar:      "QWEN_PROJECTS_DIR",
@@ -711,7 +757,7 @@ var Registry = []AgentDef{
 		DisplayName:           "Hermes Agent",
 		EnvVar:                "HERMES_SESSIONS_DIR",
 		ConfigKey:             "hermes_sessions_dirs",
-		DefaultDirs:           []string{".hermes/sessions"},
+		DefaultDirs:           []string{".hermes/sessions", "AppData/Local/hermes/sessions"},
 		IDPrefix:              "hermes:",
 		FileBased:             true,
 		WatchRootsFunc:        ResolveHermesWatchRoots,
@@ -888,7 +934,11 @@ var Registry = []AgentDef{
 		DisplayName: "Antigravity",
 		EnvVar:      "ANTIGRAVITY_DIR",
 		ConfigKey:   "antigravity_dirs",
-		DefaultDirs: []string{".gemini/antigravity"},
+		// The IDE variant writes to .gemini/antigravity-ide, its own standard
+		// directory, in the same layout. .gemini/antigravity-backup is
+		// deliberately not a default: it is a copy, so every conversation it
+		// holds would be stored twice.
+		DefaultDirs: []string{".gemini/antigravity", ".gemini/antigravity-ide"},
 		IDPrefix:    "antigravity:",
 		WatchSubdirs: []string{
 			"conversations",
@@ -1100,6 +1150,8 @@ var Registry = []AgentDef{
 		EnvVar:            "CODEBUFF_DIR",
 		ConfigKey:         "codebuff_dirs",
 		DefaultDirs:       []string{".config/manicode/projects"},
+		DefaultRootEnvVar: "FREEBUFF_CONFIG_DIR",
+		DefaultRootDir:    ".config/manicode",
 		IDPrefix:          "codebuff:",
 		FileBased:         true,
 		PeriodicReconcile: true,
@@ -1282,6 +1334,31 @@ const (
 	RelFork         RelationshipType = "fork"
 )
 
+// altSessionMarker joins a session id to the source-path hash of a second
+// file that resolved to the same id. "~" is reserved for host prefixes.
+const altSessionMarker = "_alt-"
+
+// AltSessionID returns the id under which the source file at path is stored
+// when another file already owns id.
+func AltSessionID(id, path string) string {
+	sum := sha256.Sum256([]byte(path))
+	return id + altSessionMarker + hex.EncodeToString(sum[:8])
+}
+
+// BaseSessionID strips an AltSessionID suffix, returning the id the agent
+// itself recorded. Only agents whose provider declares SharedSessionIDs have
+// derived ids; their native ids never end in the suffix.
+func BaseSessionID(id string) string {
+	i := strings.LastIndex(id, altSessionMarker)
+	if i < 0 || len(id)-i != len(altSessionMarker)+16 {
+		return id
+	}
+	if _, err := hex.DecodeString(id[i+len(altSessionMarker):]); err != nil {
+		return id
+	}
+	return id[:i]
+}
+
 // RoleType identifies the role of a message sender.
 type RoleType string
 
@@ -1396,6 +1473,12 @@ type ParsedSession struct {
 	// linear-bound sessions. Only set by the Claude parser; nil for
 	// all other agents.
 	ClaudeLinearParse *bool
+	// ClaudeSubagentSources records the files that contributed to this full
+	// parse. Sync keeps this local provenance with the archived messages.
+	ClaudeSubagentSources []string
+	// claudeRenameSeen preserves explicit title precedence when combining
+	// transcripts, including a /rename command that cleared the title.
+	claudeRenameSeen bool
 
 	TotalOutputTokens    int
 	PeakContextTokens    int
@@ -1476,6 +1559,8 @@ type ParsedMessageTokenUsageUpdate struct {
 // user message (the response to a prior tool_use).
 type ParsedToolResult struct {
 	ToolUseID     string
+	Source        string
+	Status        string
 	ContentLength int
 	ContentRaw    string // raw JSON of the content field; decode with DecodeContent
 }
@@ -1612,18 +1697,16 @@ func accumulateMessageTokenUsageContext(
 // applyUsageEventTokenTotals recomputes session token totals from the
 // usage-event set whenever events exist. Callers must only use it when
 // events are a superset of per-message token metadata — true for the
-// Antigravity gen_metadata parsers, where every token-bearing message
-// derives from a gen row that also emits an event and undecodable
-// steps emit events with no message. Deriving totals from events
-// therefore covers transcripts that dropped steps (sidecar wins,
-// undecodable rows) without double counting. Message-derived totals
-// are kept where the events are silent.
+// Antigravity gen_metadata and Junie model-usage parsers. Deriving totals
+// from events covers token-bearing steps without normalized messages
+// (sidecar wins, undecodable rows) without double counting. Message-derived
+// totals are kept where the events are silent.
 //
 // Peak context counts the full context window per event: fresh input
 // plus cache-creation and cache-read tokens. That keeps event-derived
 // session totals consistent with per-message ContextTokens attribution
-// (input + cacheRead) from parsers whose events carry cache fields,
-// such as the Antigravity CLI sidecar parser.
+// (input + cacheRead) from parsers whose events carry cache fields, such as
+// Antigravity and Junie.
 func applyUsageEventTokenTotals(
 	sess *ParsedSession,
 	events []ParsedUsageEvent,
@@ -1721,7 +1804,7 @@ func InferTokenPresence(
 // TokenPresence reports whether context/output token fields were
 // present in the provider payload. Falls back to raw token_usage
 // key inspection when parser-specific flags were not populated.
-func (m ParsedMessage) TokenPresence() (bool, bool) {
+func (m *ParsedMessage) TokenPresence() (bool, bool) {
 	if m.tokenPresenceKnown {
 		return m.HasContextTokens, m.HasOutputTokens
 	}
@@ -1735,7 +1818,7 @@ func (m ParsedMessage) TokenPresence() (bool, bool) {
 // metrics were present. This preserves explicit flags and falls
 // back to non-zero aggregates for providers like Kimi that only
 // expose truthful session-level totals in current Task 1 paths.
-func (s ParsedSession) AggregateTokenPresence() (bool, bool) {
+func (s *ParsedSession) AggregateTokenPresence() (bool, bool) {
 	if s.aggregateTokenPresenceKnown {
 		return s.HasTotalOutputTokens, s.HasPeakContextTokens
 	}
@@ -1747,7 +1830,7 @@ func (s ParsedSession) AggregateTokenPresence() (bool, bool) {
 // TokenCoverage reports the truthful aggregate/session coverage
 // after combining session-level aggregate presence with per-message
 // token presence.
-func (s ParsedSession) TokenCoverage(
+func (s *ParsedSession) TokenCoverage(
 	msgs []ParsedMessage,
 ) (bool, bool) {
 	hasTotal, hasPeak, _ := s.TokenCoverageContext(
@@ -1758,7 +1841,7 @@ func (s ParsedSession) TokenCoverage(
 
 // TokenCoverageContext reports aggregate coverage while allowing bounded
 // transcript preparation to stop between messages.
-func (s ParsedSession) TokenCoverageContext(
+func (s *ParsedSession) TokenCoverageContext(
 	ctx context.Context, msgs []ParsedMessage,
 ) (bool, bool, error) {
 	hasTotal, hasPeak := s.AggregateTokenPresence()
@@ -1810,4 +1893,21 @@ func InferRelationshipTypes(results []ParseResult) {
 			results[i].Session.RelationshipType = RelContinuation
 		}
 	}
+}
+
+// TokenPresenceKnown reports whether provider flags override legacy inference.
+// Transport adapters must preserve it alongside the exported token fields.
+func (m *ParsedMessage) TokenPresenceKnown() bool { return m.tokenPresenceKnown }
+
+// RestoreTokenPresenceKnown restores transport metadata without inferring or
+// changing the provider's exported token values and coverage flags.
+func (m *ParsedMessage) RestoreTokenPresenceKnown(known bool) { m.tokenPresenceKnown = known }
+
+// AggregateTokenPresenceKnown reports whether session aggregate coverage is
+// authoritative rather than inferred from nonzero legacy values.
+func (s *ParsedSession) AggregateTokenPresenceKnown() bool { return s.aggregateTokenPresenceKnown }
+
+// RestoreAggregateTokenPresenceKnown restores the session transport metadata.
+func (s *ParsedSession) RestoreAggregateTokenPresenceKnown(known bool) {
+	s.aggregateTokenPresenceKnown = known
 }

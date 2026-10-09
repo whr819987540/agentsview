@@ -29,11 +29,11 @@ func TestPaddedUTCBoundClampsBeforeYearOne(t *testing.T) {
 	t.Parallel()
 	assert.Equal(t,
 		"0001-01-01T00:00:00Z",
-		paddedUTCBound("0001-01-01T00:00:00Z", -14),
+		PaddedUTCBound("0001-01-01T00:00:00Z", -14),
 	)
 	assert.Equal(t,
 		"2026-03-10T10:00:00Z",
-		paddedUTCBound("2026-03-11T00:00:00Z", -14),
+		PaddedUTCBound("2026-03-11T00:00:00Z", -14),
 	)
 }
 
@@ -184,6 +184,42 @@ func TestDailyUsageAmountsPricingBandApplicationCounts(t *testing.T) {
 			RequestCount:     1,
 		}},
 	}, provenance.Resolutions[0].Application)
+}
+
+func TestDailyUsageAmountsRecordsChargedLookup(t *testing.T) {
+	tests := []struct {
+		name       string
+		reported   sql.NullInt64
+		wantCost   int64
+		wantOutput int64
+	}{
+		{name: "computed uses billed rate", wantCost: 1_100_000, wantOutput: 1_100_000},
+		{
+			name:     "reported keeps catalog rate",
+			reported: sql.NullInt64{Int64: 77, Valid: true},
+			wantCost: 77, wantOutput: 1_000_000,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			resolver := export.NewPricingResolver([]export.EffectivePricingRow{{
+				ModelPattern: "model-a",
+				Rates:        export.ModelRates{OutputPerMTok: money.Money{Microdollars: 1_000_000}},
+			}})
+			_, _, _, _, cost, _, err := dailyUsageAmounts(dailyUsageScanRow{
+				usageSource: "session", model: "model-a", providerID: "positai",
+				outputTokens: 1_000_000, cost: tt.reported, costSource: "provider-reported",
+			}, resolver)
+			require.NoError(t, err)
+			block, err := resolver.BuildBlock()
+			require.NoError(t, err)
+			resolutions := block.Models["model-a"].Resolutions
+			require.Len(t, resolutions, 1)
+
+			assert.Equal(t, tt.wantCost, cost.Microdollars)
+			assert.Equal(t, tt.wantOutput, resolutions[0].OutputCostPerMTok.Microdollars)
+		})
+	}
 }
 
 func TestSessionRowCostPricingBandRequestScope(t *testing.T) {
@@ -4561,7 +4597,7 @@ func usageRollupExceptionMetrics(
 	tb testing.TB, cache *usageCache, filter UsageFilter,
 ) (int64, int64) {
 	tb.Helper()
-	identity := usageTimezoneIdentityFor(filter.location(), nil)
+	identity := usageTimezoneIdentityFor(filter.Location(), nil)
 	var rows, groups int64
 	require.NoError(tb, cache.db.QueryRowContext(tb.Context(), `SELECT COUNT(*),
 		COUNT(DISTINCT e.group_kind || char(0) || e.group_key)
@@ -5854,9 +5890,75 @@ func TestGetDailyUsage_GPTReserveLunaPricing(t *testing.T) {
 	assert.NotContains(t, reserve.Pricing.Models, pricingpkg.GPT56LunaCanonical)
 }
 
+// TestGetDailyUsage_CodexAutoReviewLunaPricing proves Codex auto-review turns
+// that persist codex-auto-review keep that reported name in the pricing block
+// while costing the same as an explicit gpt-5.6-luna row. There is no
+// codex-auto-review catalog key, so a missed mapping yields zero against a
+// priced Luna sibling.
+func TestGetDailyUsage_CodexAutoReviewLunaPricing(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+
+	ts := "2026-10-01T12:00:00Z"
+	tokenUsage := jsontext.Value(`{"cache_read_input_tokens":900000,"input_tokens":100000,"output_tokens":10000}`)
+	for _, fixture := range []struct {
+		id    string
+		model string
+	}{
+		{id: "codex-auto-review", model: pricingpkg.CodexAutoReviewModelName},
+		{id: "codex-luna", model: pricingpkg.GPT56LunaCanonical},
+	} {
+		insertSession(t, d, fixture.id, "proj", func(s *Session) {
+			s.Agent = "codex"
+			s.StartedAt = new(ts)
+		})
+		insertMessages(t, d, Message{
+			SessionID:  fixture.id,
+			Ordinal:    0,
+			Role:       "assistant",
+			Timestamp:  ts,
+			Model:      fixture.model,
+			TokenUsage: tokenUsage,
+		})
+	}
+
+	luna, err := d.GetDailyUsage(ctx, UsageFilter{
+		From:     "2026-10-01",
+		To:       "2026-10-01",
+		Timezone: "UTC",
+		Model:    pricingpkg.GPT56LunaCanonical,
+	})
+	requireNoError(t, err, "GetDailyUsage luna")
+	assert.NotZero(t, luna.Totals.TotalCost.Microdollars,
+		"explicit Luna usage must be priced")
+
+	review, err := d.GetDailyUsage(ctx, UsageFilter{
+		From:     "2026-10-01",
+		To:       "2026-10-01",
+		Timezone: "UTC",
+		Model:    pricingpkg.CodexAutoReviewModelName,
+	})
+	requireNoError(t, err, "GetDailyUsage auto-review")
+	assert.NotZero(t, review.Totals.TotalCost.Microdollars,
+		"auto-review usage must be priced")
+	assert.Equal(t, luna.Totals.TotalCost, review.Totals.TotalCost, "TotalCost")
+	require.NotNil(t, review.Pricing, "pricing block")
+	require.Contains(t, review.Pricing.Models, pricingpkg.CodexAutoReviewModelName)
+	resolutions := review.Pricing.Models[pricingpkg.CodexAutoReviewModelName].Resolutions
+	require.Len(t, resolutions, 1)
+	assert.Equal(t, pricingpkg.GPT56LunaCanonical, resolutions[0].PricedModel)
+	assert.NotNil(t, resolutions[0].MatchedPattern, "MatchedPattern")
+	assert.NotContains(t, review.Pricing.Models, pricingpkg.GPT56LunaCanonical)
+
+	session, err := d.GetSessionUsage(ctx, "codex-auto-review", false)
+	requireNoError(t, err, "GetSessionUsage auto-review")
+	assert.True(t, session.HasCost, "HasCost")
+	assert.Empty(t, session.UnpricedModels, "UnpricedModels")
+}
+
 func TestGetDailyUsage_CodexNamespacedPricing(t *testing.T) {
 	d := testDB(t)
-	d.SetEmptyCatalogPricing(fallbackRateMap())
+	d.SetEmptyCatalogPricing(FallbackRateMap())
 	// This region-qualified row is newer than the embedded snapshot.
 	d.SetEffectivePricing(map[string]export.ModelRates{
 		"bedrock_mantle/us-gov-west-1/openai.gpt-5.4": {
@@ -6008,4 +6110,20 @@ func TestDailyUsageAmountsPrefersExactCustomKimiAlias(t *testing.T) {
 	resolutions := block.Models["kimi-for-coding"].Resolutions
 	require.Len(t, resolutions, 1)
 	assert.Equal(t, "kimi-for-coding", resolutions[0].PricedModel)
+}
+
+func TestUsageDedupTokenForRowFallsBackToSourceUUIDWhenClaudePairIncomplete(t *testing.T) {
+	got, ok := UsageDedupTokenForRow(
+		"message",
+		"claude-code",
+		"msg-dup",
+		"",
+		"source-dup",
+		"",
+	)
+	require.True(t, ok, "expected source_uuid fallback key")
+	assert.Equal(t, UsageDedupToken{
+		Kind:  "source",
+		Value: "claude-code:source-dup",
+	}, got)
 }

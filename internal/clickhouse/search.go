@@ -8,10 +8,8 @@ import (
 	"sort"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"go.kenn.io/agentsview/internal/db"
-	"go.kenn.io/agentsview/internal/secrets"
 )
 
 // embeddableMessagePredicate matches messages the search surfaces: not
@@ -89,7 +87,7 @@ func (s *Store) Search(ctx context.Context, f db.SearchFilter) (db.SearchPage, e
 	args = append(args, f.Limit+1, f.Cursor)
 	rows, err := s.queryContext(ctx, `
 		WITH msg_ranked AS (
-			SELECT m.session_id AS session_id, s.project AS project, s.agent AS agent,
+			SELECT m.session_id AS session_id, s.project AS project, s.agent AS agent, s.machine AS machine,
 				COALESCE(s.display_name, s.session_name, s.first_message, '') AS name,
 				COALESCE(s.ended_at, s.started_at, s.created_at) AS session_ended_at,
 				m.ordinal AS ordinal, substringUTF8(m.content, 1, 200) AS snippet,
@@ -108,13 +106,13 @@ func (s *Store) Search(ctx context.Context, f db.SearchFilter) (db.SearchPage, e
 				`+project+`
 		),
 		msg_matches AS (
-			SELECT session_id, project, agent, name, session_ended_at,
+			SELECT session_id, project, agent, machine, name, session_ended_at,
 				ordinal, snippet, rank, match_priority, match_pos
 			FROM msg_ranked
 			WHERE rn = 1
 		),
 		name_matches AS (
-			SELECT s.id AS session_id, s.project AS project, s.agent AS agent,
+			SELECT s.id AS session_id, s.project AS project, s.agent AS agent, s.machine AS machine,
 				COALESCE(s.display_name, s.session_name, s.first_message, '') AS name,
 				COALESCE(s.ended_at, s.started_at, s.created_at) AS session_ended_at,
 				toInt64(-1) AS ordinal,
@@ -137,7 +135,7 @@ func (s *Store) Search(ctx context.Context, f db.SearchFilter) (db.SearchPage, e
 				AND s.id NOT IN (SELECT session_id FROM msg_matches)
 				`+nameProject+`
 		)
-		SELECT session_id, project, agent, name,
+		SELECT session_id, project, agent, machine, name,
 			session_ended_at, ordinal, snippet, rank
 		FROM (
 			SELECT * FROM msg_matches
@@ -154,7 +152,7 @@ func (s *Store) Search(ctx context.Context, f db.SearchFilter) (db.SearchPage, e
 	for rows.Next() {
 		var r db.SearchResult
 		var ended any
-		if err := rows.Scan(&r.SessionID, &r.Project, &r.Agent, &r.Name,
+		if err := rows.Scan(&r.SessionID, &r.Project, &r.Agent, &r.Machine, &r.Name,
 			&ended, &r.Ordinal, &r.Snippet, &r.Rank); err != nil {
 			return db.SearchPage{}, fmt.Errorf("scanning clickhouse search result: %w", err)
 		}
@@ -222,8 +220,13 @@ func (s *Store) SearchContent(ctx context.Context, f db.ContentSearchFilter) (db
 		if err := db.ValidateSemanticFilter(f); err != nil {
 			return db.ContentSearchPage{}, err
 		}
-		return db.ContentSearchPage{}, db.NewSemanticUnavailableError(
-			"semantic search is not supported by the ClickHouse backend")
+		if s.getVectorSearcher() == nil {
+			return db.ContentSearchPage{}, s.semanticUnavailableError()
+		}
+		if f.Mode == "hybrid" {
+			return s.searchContentHybrid(ctx, f)
+		}
+		return s.searchContentSemantic(ctx, f)
 	}
 	if len(f.Sources) == 0 {
 		f.Sources = []string{"messages", "tool_input", "tool_result"}
@@ -384,10 +387,10 @@ func (s *Store) collectContentSubstringMatches(
 	return scanContentRows(rows, func(body string) string {
 		if f.Mode == "fts" {
 			start, end := db.FTSSnippetRange(f.Pattern, body)
-			return contentSnippet(f, body, start, end)
+			return f.BuildSnippet(body, start, end)
 		}
 		start, end, _ := db.CaseInsensitiveSpan(body, f.Pattern)
-		return contentSnippet(f, body, start, end)
+		return f.BuildSnippet(body, start, end)
 	})
 }
 
@@ -412,7 +415,7 @@ func (s *Store) collectContentRegexMatches(
 	filtered := all[:0]
 	for _, m := range all {
 		if loc := re.FindStringIndex(m.body); loc != nil {
-			m.match.Snippet = contentSnippet(f, m.body, loc[0], loc[1])
+			m.match.Snippet = f.BuildSnippet(m.body, loc[0], loc[1])
 			filtered = append(filtered, m)
 		}
 	}
@@ -500,26 +503,6 @@ func (s *Store) collectContentSource(
 		return nil, fmt.Errorf("clickhouse content search: %w", err)
 	}
 	return scanContentCandidateRows(rows)
-}
-
-func contentSnippet(f db.ContentSearchFilter, body string, start, end int) string {
-	lo, hi := snippetBounds(body, start, end, 60)
-	if f.RevealSecrets {
-		return body[lo:hi]
-	}
-	return secrets.RedactWindow(body, lo, hi)
-}
-
-func snippetBounds(text string, start, end, radius int) (int, int) {
-	lo := max(start-radius, 0)
-	hi := min(end+radius, len(text))
-	for lo < start && !utf8.RuneStart(text[lo]) {
-		lo++
-	}
-	for hi > end && hi < len(text) && !utf8.RuneStart(text[hi]) {
-		hi--
-	}
-	return lo, hi
 }
 
 type contentCandidate struct {

@@ -705,6 +705,7 @@ func TestParseCodexSession_FunctionCalls(t *testing.T) {
 
 		assert.True(t, msgs[2].HasToolUse)
 		assertToolCalls(t, msgs[2].ToolCalls, []ParsedToolCall{{ToolName: "apply_patch", Category: "Edit"}})
+		assert.Empty(t, msgs[2].ToolCalls[0].FilePath)
 
 		for i, m := range msgs {
 			assert.Equal(t, i, m.Ordinal)
@@ -740,6 +741,45 @@ func TestParseCodexSession_FunctionCalls(t *testing.T) {
 		assert.Equal(t, want, msgs[1].Content)
 		assert.NotEmpty(t, msgs[1].ToolCalls[0].InputJSON)
 		assert.Contains(t, msgs[1].ToolCalls[0].InputJSON, "Begin Patch")
+		require.Len(t, msgs[1].ToolCalls, 2)
+		assert.Equal(t, "internal/parser/codex.go", msgs[1].ToolCalls[0].FilePath)
+		assert.Equal(t, "internal/parser/parser_test.go", msgs[1].ToolCalls[1].FilePath)
+	})
+
+	t.Run("apply_patch records the single edited file path", func(t *testing.T) {
+		patch := "*** Begin Patch\n" +
+			"*** Update File: internal/db/recentedits.go\n" +
+			"@@\n-old\n+new\n" +
+			"*** End Patch"
+		content := testjsonl.JoinJSONL(
+			testjsonl.CodexSessionMetaJSON("fc-patch-single", "/tmp", "user", tsEarly),
+			testjsonl.CodexMsgJSON("user", "fix the feed", tsEarlyS1),
+			testjsonl.CodexFunctionCallArgsJSON("apply_patch", map[string]any{
+				"patch": patch,
+			}, tsEarlyS5),
+		)
+
+		_, msgs := runCodexParserTest(t, "test.jsonl", content, false)
+
+		require.Len(t, msgs, 2)
+		require.Len(t, msgs[1].ToolCalls, 1)
+		assert.Equal(t, "internal/db/recentedits.go", msgs[1].ToolCalls[0].FilePath)
+	})
+
+	t.Run("apply_patch without file headers records no path", func(t *testing.T) {
+		content := testjsonl.JoinJSONL(
+			testjsonl.CodexSessionMetaJSON("fc-patch-pathless", "/tmp", "user", tsEarly),
+			testjsonl.CodexMsgJSON("user", "patch", tsEarlyS1),
+			testjsonl.CodexFunctionCallArgsJSON("apply_patch", map[string]any{
+				"patch": "*** Begin Patch\n*** End Patch",
+			}, tsEarlyS5),
+		)
+
+		_, msgs := runCodexParserTest(t, "test.jsonl", content, false)
+
+		require.Len(t, msgs, 2)
+		require.Len(t, msgs[1].ToolCalls, 1)
+		assert.Empty(t, msgs[1].ToolCalls[0].FilePath)
 	})
 
 	t.Run("custom_tool_call apply_patch input and output", func(t *testing.T) {
@@ -766,6 +806,7 @@ func TestParseCodexSession_FunctionCalls(t *testing.T) {
 		}})
 		tc := msgs[1].ToolCalls[0]
 		assert.Contains(t, tc.InputJSON, "Begin Patch")
+		assert.Equal(t, "infra/scripts/with-resolved-images.sh", tc.FilePath)
 		assertToolResultEvents(t, tc.ResultEvents, []ParsedToolResultEvent{{
 			ToolUseID: "call_abc",
 			Source:    "custom_tool_call_output",
@@ -1634,6 +1675,72 @@ func TestParseCodexSession_TokenUsage(t *testing.T) {
 		assert.Equal(t, 500, sess.TotalOutputTokens)
 		assert.True(t, sess.HasPeakContextTokens)
 		assert.Equal(t, 10000, sess.PeakContextTokens)
+	})
+
+	t.Run("cache writes split from uncached input", func(t *testing.T) {
+		content := testjsonl.JoinJSONL(
+			testjsonl.CodexSessionMetaJSON("tu-cw-1", "/tmp", "user", tsEarly),
+			testjsonl.CodexTurnContextJSON("gpt-5.6-luna", tsEarlyS1),
+			testjsonl.CodexMsgJSON("user", "hello", tsEarlyS1),
+			testjsonl.CodexMsgJSON("assistant", "hi there", tsEarlyS5),
+			testjsonl.CodexTokenCountWithCacheWriteJSON(tsEarlyS5, 100000, 10000, 40000, 60000),
+		)
+		sess, msgs := runCodexParserTest(t, "test.jsonl", content, false)
+		require.NotNil(t, sess)
+		require.Len(t, msgs, 2)
+
+		// Codex counts writes inside input_tokens: 100000 = 40000 read + 60000 written.
+		assert.Equal(t, `{"cache_creation_input_tokens":60000,"cache_read_input_tokens":40000,"input_tokens":0,"output_tokens":10000}`,
+			string(msgs[1].TokenUsage),
+		)
+		assert.Equal(t, 10000, msgs[1].OutputTokens)
+		assert.Equal(t, 100000, msgs[1].ContextTokens)
+		assert.True(t, msgs[1].HasContextTokens)
+		assert.Equal(t, 100000, sess.PeakContextTokens)
+	})
+
+	t.Run("zero cache write keeps base shape", func(t *testing.T) {
+		tokenCount := `{"type":"event_msg","timestamp":"` + tsEarlyS5 + `","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":21052,"cached_input_tokens":11520,"cache_write_input_tokens":0,"output_tokens":50,"reasoning_output_tokens":0,"total_tokens":21102}}}}`
+		content := testjsonl.JoinJSONL(
+			testjsonl.CodexSessionMetaJSON("tu-cw-2", "/tmp", "user", tsEarly),
+			testjsonl.CodexTurnContextJSON("gpt-5.6-luna", tsEarlyS1),
+			testjsonl.CodexMsgJSON("user", "hello", tsEarlyS1),
+			testjsonl.CodexMsgJSON("assistant", "hi there", tsEarlyS5),
+			tokenCount,
+		)
+		_, msgs := runCodexParserTest(t, "test.jsonl", content, false)
+		require.Len(t, msgs, 2)
+		assert.Equal(t, `{"cache_read_input_tokens":11520,"input_tokens":9532,"output_tokens":50}`,
+			string(msgs[1].TokenUsage),
+		)
+		assert.Equal(t, 21052, msgs[1].ContextTokens)
+		assert.Equal(t, 50, msgs[1].OutputTokens)
+	})
+
+	t.Run("cache write clamped to uncached input", func(t *testing.T) {
+		tests := []struct {
+			name       string
+			cacheWrite int
+			want       string
+		}{
+			{"write above uncached input", 90, `{"cache_creation_input_tokens":60,"cache_read_input_tokens":40,"input_tokens":0,"output_tokens":10}`},
+			{"negative write", -5, `{"cache_read_input_tokens":40,"input_tokens":60,"output_tokens":10}`},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				content := testjsonl.JoinJSONL(
+					testjsonl.CodexSessionMetaJSON("tu-cw-3", "/tmp", "user", tsEarly),
+					testjsonl.CodexTurnContextJSON("gpt-5.6-luna", tsEarlyS1),
+					testjsonl.CodexMsgJSON("user", "hello", tsEarlyS1),
+					testjsonl.CodexMsgJSON("assistant", "hi there", tsEarlyS5),
+					testjsonl.CodexTokenCountWithCacheWriteJSON(tsEarlyS5, 100, 10, 40, tt.cacheWrite),
+				)
+				_, msgs := runCodexParserTest(t, "test.jsonl", content, false)
+				require.Len(t, msgs, 2)
+				assert.Equal(t, tt.want, string(msgs[1].TokenUsage))
+				assert.Equal(t, 100, msgs[1].ContextTokens)
+			})
+		}
 	})
 
 	t.Run("duplicate token_count events deduplicated", func(t *testing.T) {

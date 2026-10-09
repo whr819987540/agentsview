@@ -135,6 +135,7 @@ func newRootCommand() *cobra.Command {
 	root.AddCommand(newClassifierCommand())
 	root.AddCommand(newSecretsCommand())
 	root.AddCommand(newSkillsCommand())
+	root.AddCommand(newMemoryCommand())
 	root.AddCommand(newDoctorCommand())
 	root.AddCommand(newVersionCommand())
 	root.AddCommand(newOpenAPICommand())
@@ -159,6 +160,7 @@ func newServeCommandWithDaemonDeps(deps daemonCommandDeps) *cobra.Command {
 	var background bool
 	var checkDataVersion bool
 	var replace bool
+	var basePath string
 	var pprofEnabled bool
 	var skipInitialSync bool
 	var restartPort int
@@ -194,7 +196,11 @@ func newServeCommandWithDaemonDeps(deps daemonCommandDeps) *cobra.Command {
 				ReplaceDaemon:   replace,
 				NoSyncExplicit:  cmd.Flags().Changed("no-sync"),
 				SkipInitialSync: skipInitialSync,
+				BasePath:        basePath,
 				Pprof:           pprofEnabled,
+				ReloadConfig: func() (config.Config, error) {
+					return config.LoadPFlags(cmd.Flags())
+				},
 			}, restartPort)
 			return nil
 		},
@@ -210,6 +216,12 @@ func newServeCommandWithDaemonDeps(deps daemonCommandDeps) *cobra.Command {
 		"replace",
 		false,
 		"Replace a running local daemon before starting",
+	)
+	cmd.Flags().StringVar(
+		&basePath,
+		"base-path",
+		"",
+		"URL prefix for reverse-proxy subpath (e.g. /agentsview)",
 	)
 	cmd.Flags().BoolVar(
 		&checkDataVersion,
@@ -359,25 +371,17 @@ func newSyncCommandWithRunner(run func(SyncConfig)) *cobra.Command {
 			"stop the daemon first, then use `AGENTSVIEW_NO_DAEMON=1 agentsview sync`.\n\n" +
 			"With no --host, sync runs the local sync and then fans out to\n" +
 			"every host listed in the [[remote_hosts]] array in config.toml,\n" +
-			"syncing each by its configured transport. A failure on one\n" +
+			"syncing each over HTTP. A failure on one\n" +
 			"configured host is logged and the run continues; the command\n" +
 			"exits non-zero if any configured host failed.\n\n" +
-			"With --host, syncs only that host. A running local daemon may use a\n" +
-			"matching configured remote_hosts entry and transport; otherwise,\n" +
-			"ad hoc --host sync uses your existing SSH configuration and requires\n" +
-			"key-based (passwordless) auth; it never prompts for a password.",
+			"With --host, syncs only the matching configured remote_hosts entry.\n" +
+			"Each remote requires an HTTP URL and its daemon's auth token.",
 		GroupID:      groupCore,
 		SilenceUsage: true,
 		Args:         cobra.NoArgs,
 		PreRunE: func(cmd *cobra.Command, _ []string) error {
 			if err := validateArtifactSyncConfig(cfg); err != nil {
 				return err
-			}
-			if cfg.Host == "" {
-				if cmd.Flags().Changed("user") ||
-					cmd.Flags().Changed("port") {
-					return errors.New("--user and --port require --host")
-				}
 			}
 			return nil
 		},
@@ -391,21 +395,13 @@ func newSyncCommandWithRunner(run func(SyncConfig)) *cobra.Command {
 	)
 	cmd.Flags().StringVar(
 		&cfg.Host, "host", "",
-		"Configured HTTP host name or deprecated SSH hostname",
+		"Configured HTTP host name",
 	)
 	cmd.Flags().StringVar(
 		&cfg.Target,
 		"target",
 		"",
 		"Exchange normalized session artifacts with a trusted folder",
-	)
-	cmd.Flags().StringVar(
-		&cfg.User, "user", "",
-		"SSH user for deprecated remote sync",
-	)
-	cmd.Flags().IntVar(
-		&cfg.Port, "port", 0,
-		"SSH port for deprecated remote sync (default: 22)",
 	)
 	cmd.Flags().StringVar(
 		&cfg.CPUProfile, "cpuprofile", "",
@@ -496,6 +492,7 @@ func newTokenUseCommand() *cobra.Command {
 
 func newImportCommand() *cobra.Command {
 	var importType string
+	var replace []string
 	cmd := &cobra.Command{
 		Use:          "import --type <type> <path>",
 		Short:        "Import conversations",
@@ -503,10 +500,11 @@ func newImportCommand() *cobra.Command {
 		SilenceUsage: true,
 		Args:         cobra.ExactArgs(1),
 		Run: func(cmd *cobra.Command, args []string) {
-			runImport(ImportConfig{Type: importType, Path: args[0]})
+			runImport(ImportConfig{Type: importType, Path: args[0], Replace: replace})
 		},
 	}
 	cmd.Flags().StringVar(&importType, "type", "", "Import type: claude-ai, chatgpt, gemini-apps")
+	cmd.Flags().StringArrayVar(&replace, "replace", nil, "Session ID whose archived messages this import may replace when the default import refuses them; repeatable (claude-ai, chatgpt)")
 	_ = cmd.MarkFlagRequired("type")
 	return cmd
 }
@@ -670,6 +668,7 @@ func newActivityReportCommand() *cobra.Command {
 func newPGCommand() *cobra.Command {
 	return newReplicaCommand(
 		pgReplica{}, newPGVectorsCommand(), newPGServiceCommand(),
+		newPGHostedProvisionCommand(), newPGRawReparseCommand(),
 	)
 }
 
@@ -855,10 +854,14 @@ func writeRootHelp(w io.Writer, root *cobra.Command) {
 	fmt.Fprintln(w, "  CLINE_DIR               Cline sessions directory")
 	fmt.Fprintln(w, "  CURSOR_PROJECTS_DIR     Cursor projects directory")
 	fmt.Fprintln(w, "  IFLOW_DIR               iFlow projects directory")
+	fmt.Fprintln(w, "  JUNIE_DIR               Junie sessions directory")
+	fmt.Fprintln(w, "  JUNIE_HOME              Junie home (re-roots sessions directory)")
 	fmt.Fprintln(w, "  AMP_DIR                 Amp threads directory")
 	fmt.Fprintln(w, "  ZED_DIR                 Zed data directory")
 	fmt.Fprintln(w, "  QWEN_PROJECTS_DIR       Qwen Code projects directory")
 	fmt.Fprintln(w, "  QWENPAW_DIR             QwenPaw workspaces directory")
+	fmt.Fprintln(w, "  OMO_DIR                 OMO sessions directory")
+	fmt.Fprintln(w, "  STEPCODE_DIR            StepCode sessions directory")
 	fmt.Fprintln(w, "  OMP_DIR                 OhMyPi sessions directory")
 	fmt.Fprintln(w, "  DEEPSEEK_TUI_SESSIONS_DIR")
 	fmt.Fprintln(w, "                          DeepSeek TUI sessions directory")
@@ -904,13 +907,6 @@ func writeRootHelp(w io.Writer, root *cobra.Command) {
 	fmt.Fprintln(w, "Remote hosts:")
 	fmt.Fprintln(w, "  Add a [[remote_hosts]] array to ~/.agentsview/config.toml so that")
 	fmt.Fprintln(w, "  \"agentsview sync\" (no --host) also syncs each configured host:")
-	fmt.Fprintln(w, "  [[remote_hosts]]")
-	fmt.Fprintln(w, "  host = \"devbox1\"")
-	fmt.Fprintln(w, "  transport = \"ssh\" # optional; default")
-	fmt.Fprintln(w, "  user = \"jesse\"  # optional")
-	fmt.Fprintln(w, "  port = 22        # optional")
-	fmt.Fprintln(w, "  Requires key-based (passwordless) SSH to each host.")
-	fmt.Fprintln(w)
 	fmt.Fprintln(w, "  For daemon-backed HTTP sync over a private network such as Tailscale:")
 	fmt.Fprintln(w, "  [[remote_hosts]]")
 	fmt.Fprintln(w, "  host = \"devbox1\"")

@@ -32,6 +32,7 @@ const VISIBLE_SYSTEM_SUBTYPES = new Set([
   "fork_boundary",
   "task_notification",
   "stop_hook",
+  "peer_message",
 ]);
 
 /**
@@ -53,8 +54,8 @@ export function isSystemBoundaryMessage(m: Message): m is Message & { source_sub
  *
  * Compact boundary messages and promoted system-subtype messages
  * (continuation, resume, interrupted, fork_boundary, task_notification,
- * stop_hook) are system-flagged but rendered as dividers/cards, so they
- * are kept visible here.
+ * stop_hook, peer_message) are system-flagged but rendered as
+ * dividers/cards, so they are kept visible here.
  */
 export function isSystemMessage(m: Message): boolean {
   if (m.is_compact_boundary) return false;

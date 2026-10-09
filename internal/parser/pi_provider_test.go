@@ -11,6 +11,49 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestOMOProviderKeepsPiLineageAndOMOIdentity(t *testing.T) {
+	root := t.TempDir()
+	sourcePath := filepath.Join(root, "encoded-cwd", "session-omo.jsonl")
+	writeSourceFile(t, sourcePath, strings.Join([]string{
+		`{"type":"session","version":3,"id":"session-omo","timestamp":"2025-01-01T10:00:00Z","cwd":"/Users/alice/code/pi-project"}`,
+		`{"type":"message","id":"msg-1","timestamp":"2025-01-01T10:00:01Z","message":{"role":"user","content":[{"type":"text","text":"Inspect the source."}]}}`,
+		`{"type":"message","id":"msg-2","timestamp":"2025-01-01T10:00:02Z","message":{"role":"assistant","content":[{"type":"text","text":"Looks ready."},{"type":"toolCall","id":"t1","name":"bash","arguments":{"command":"ls"}}],"model":"claude-opus-4-5"}}`,
+	}, "\n"))
+
+	provider, ok := NewProvider(AgentOMO, ProviderConfig{
+		Roots:   []string{root},
+		Machine: "devbox",
+	})
+	require.True(t, ok)
+
+	discovered, err := provider.Discover(t.Context())
+	require.NoError(t, err)
+	require.Len(t, discovered, 1)
+	assert.Equal(t, AgentOMO, discovered[0].Provider)
+	assert.Equal(t, sourcePath, discovered[0].DisplayPath)
+
+	outcome, err := provider.Parse(t.Context(), ParseRequest{Source: discovered[0]})
+	require.NoError(t, err)
+	require.Len(t, outcome.Results, 1)
+	sess := outcome.Results[0].Result.Session
+	assert.Equal(t, "omo:session-omo", sess.ID)
+	assert.Equal(t, AgentOMO, sess.Agent)
+	assert.NotEqual(t, AgentPi, sess.Agent)
+	assert.Empty(t, sess.Entrypoint)
+	assert.Equal(t, "pi_project", sess.Project)
+	assert.Equal(t, sourcePath, sess.File.Path)
+	require.NotEmpty(t, outcome.Results[0].Result.Messages)
+	foundTool := false
+	for _, msg := range outcome.Results[0].Result.Messages {
+		for _, call := range msg.ToolCalls {
+			if call.ToolName == "bash" {
+				foundTool = true
+			}
+		}
+	}
+	assert.True(t, foundTool)
+}
+
 func TestOMPProviderSourceMethods(t *testing.T) {
 	root := t.TempDir()
 	sourcePath := filepath.Join(root, "encoded-cwd", "session-123.jsonl")
@@ -126,6 +169,104 @@ func TestOMPProviderDiscoversTitleSlotSession(t *testing.T) {
 	assert.Equal(t, "Fix the widget", sess.SessionName)
 }
 
+// TestStepCodeProviderSourceMethods covers StepCode's real on-disk shape: a
+// project-encoded directory holding timestamp-prefixed transcripts, including
+// a spawned subagent child written beside its parent. All must be discovered
+// and land under the stepcode: prefix instead of merging into Pi's sessions.
+func TestStepCodeProviderSourceMethods(t *testing.T) {
+	root := t.TempDir()
+	project := "--Users-alice-code-my-project--"
+	parentID := "0199e4c2-1111-2222-3333-444455556666"
+	parentStem := "2026-09-01T12-00-00-000Z_" + parentID
+	sourcePath := filepath.Join(root, project, parentStem+".jsonl")
+	writeSourceFile(t, sourcePath, strings.Join([]string{
+		`{"type":"session","version":3,"id":"` + parentID + `","timestamp":"2026-09-01T12:00:00.000Z","cwd":"/Users/alice/code/my-project"}`,
+		`{"type":"message","id":"m1","parentId":null,"timestamp":"2026-09-01T12:00:01.000Z","message":{"role":"user","content":"Inspect the StepCode source."}}`,
+		`{"type":"message","id":"m2","parentId":"m1","timestamp":"2026-09-01T12:00:02.000Z","message":{"role":"assistant","content":"Looks ready.","model":"step-5-preview","usage":{"input_tokens":10,"output_tokens":5}}}`,
+		"",
+	}, "\n"))
+
+	// StepCode spawns subagents with --session-id subagent-<uuid>, so the child
+	// lands beside its parent with no parentSession header.
+	subagentID := "subagent-0199e4c2-7777-8888-9999-000011112222"
+	subagentPath := filepath.Join(root, project, "2026-09-01T12-00-10-000Z_"+subagentID+".jsonl")
+	writeSourceFile(t, subagentPath, strings.Join([]string{
+		`{"type":"session","version":3,"id":"` + subagentID + `","timestamp":"2026-09-01T12:00:10.000Z","cwd":"/Users/alice/code/my-project"}`,
+		`{"type":"message","id":"s1","parentId":null,"timestamp":"2026-09-01T12:00:11.000Z","message":{"role":"user","content":"Summarize the diff."}}`,
+		"",
+	}, "\n"))
+
+	// Rejected: the first line's type is not "session".
+	writeSourceFile(t, filepath.Join(root, project, "notes.jsonl"), `{"type":"message"}`+"\n")
+
+	provider, ok := NewProvider(AgentStepCode, ProviderConfig{
+		Roots:   []string{root},
+		Machine: "devbox",
+	})
+	require.True(t, ok)
+
+	discovered, err := provider.Discover(t.Context())
+	require.NoError(t, err)
+	require.Len(t, discovered, 2)
+	assert.ElementsMatch(t, []string{sourcePath, subagentPath},
+		[]string{discovered[0].DisplayPath, discovered[1].DisplayPath})
+	for _, source := range discovered {
+		assert.Equal(t, AgentStepCode, source.Provider)
+	}
+
+	plan, err := provider.WatchPlan(t.Context())
+	require.NoError(t, err)
+	require.Len(t, plan.Roots, 1)
+	assert.Equal(t, root, plan.Roots[0].Path)
+	assert.True(t, plan.Roots[0].Recursive)
+
+	// Timestamp-prefixed filenames defeat a filename lookup, so this resolves
+	// through the session-header scan.
+	found, ok, err := provider.FindSource(t.Context(), FindSourceRequest{
+		FullSessionID: "host~stepcode:" + parentID,
+	})
+	require.NoError(t, err)
+	require.True(t, ok)
+	assert.Equal(t, AgentStepCode, found.Provider)
+	assert.Equal(t, sourcePath, found.DisplayPath)
+
+	found, ok, err = provider.FindSource(t.Context(), FindSourceRequest{
+		RawSessionID: "stepcode:" + subagentID,
+	})
+	require.NoError(t, err)
+	require.True(t, ok)
+	assert.Equal(t, subagentPath, found.DisplayPath)
+
+	parentSource := discovered[0]
+	if parentSource.DisplayPath != sourcePath {
+		parentSource = discovered[1]
+	}
+	outcome, err := provider.Parse(t.Context(), ParseRequest{
+		Source:      parentSource,
+		Fingerprint: SourceFingerprint{Key: sourcePath, Hash: "abc123"},
+	})
+	require.NoError(t, err)
+	require.True(t, outcome.ResultSetComplete)
+	require.Len(t, outcome.Results, 1)
+	sess := outcome.Results[0].Result.Session
+	assert.Equal(t, "stepcode:"+parentID, sess.ID)
+	assert.Equal(t, AgentStepCode, sess.Agent)
+	assert.Equal(t, "abc123", sess.File.Hash)
+
+	// The parent transcript doesn't record the child's ID, so the child stays
+	// unlinked but is classified as a subagent to keep it out of session lists.
+	assert.Empty(t, sess.RelationshipType)
+	childOutcome, err := provider.Parse(t.Context(), ParseRequest{
+		Source: SourceRef{Provider: AgentStepCode, DisplayPath: subagentPath},
+	})
+	require.NoError(t, err)
+	require.Len(t, childOutcome.Results, 1)
+	child := childOutcome.Results[0].Result.Session
+	assert.Equal(t, "stepcode:"+subagentID, child.ID)
+	assert.Empty(t, child.ParentSessionID)
+	assert.Equal(t, RelSubagent, child.RelationshipType)
+}
+
 func TestPiProviderSourceMethods(t *testing.T) {
 	root := t.TempDir()
 	sourcePath := filepath.Join(root, "encoded-cwd", "session-123.jsonl")
@@ -135,7 +276,8 @@ func TestPiProviderSourceMethods(t *testing.T) {
 	writeSourceFile(t, filepath.Join(root, "encoded-cwd", "notes.txt"), "{}\n")
 	rootPath := filepath.Join(root, "root-session.jsonl")
 	writeSourceFile(t, rootPath, piProviderFixture("root-session"))
-	writeSourceFile(t, filepath.Join(root, "encoded-cwd", "nested", "deep.jsonl"), piProviderFixture("deep"))
+	deepPath := filepath.Join(root, "encoded-cwd", "nested", "deep.jsonl")
+	writeSourceFile(t, deepPath, piProviderFixture("deep"))
 
 	provider, ok := NewProvider(AgentPi, ProviderConfig{
 		Roots:   []string{root},
@@ -145,9 +287,9 @@ func TestPiProviderSourceMethods(t *testing.T) {
 
 	discovered, err := provider.Discover(t.Context())
 	require.NoError(t, err)
-	require.Len(t, discovered, 2)
-	assert.ElementsMatch(t, []string{sourcePath, rootPath},
-		[]string{discovered[0].DisplayPath, discovered[1].DisplayPath})
+	require.Len(t, discovered, 3)
+	assert.ElementsMatch(t, []string{sourcePath, rootPath, deepPath},
+		[]string{discovered[0].DisplayPath, discovered[1].DisplayPath, discovered[2].DisplayPath})
 
 	plan, err := provider.WatchPlan(t.Context())
 	require.NoError(t, err)
@@ -531,20 +673,235 @@ func TestOMPProviderMapsSubagentChangedPath(t *testing.T) {
 	assert.Equal(t, subPath, changed[0].DisplayPath)
 }
 
-// TestPiProviderRejectsNestedSubagents pins that the depth relaxation is
-// OMP-only: upstream pi keeps the strict <project>/<session>.jsonl layout and
-// never discovers a nested transcript.
-func TestPiProviderRejectsNestedSubagents(t *testing.T) {
+// TestPiProviderDiscoversSubagentSessionsInSubdirectory reproduces issue #1894:
+// the pi-subagents extension keeps a child session under the parent
+// transcript's directory name (<project>/<parent>/<runId>/run-N/session.jsonl)
+// instead of beside interactive chats, and Pi discovery rejected anything
+// deeper than one project directory. Toggle-provable: restoring the
+// root-or-one-level IncludePath drops the child and fails here.
+func TestPiProviderDiscoversSubagentSessionsInSubdirectory(t *testing.T) {
 	root := t.TempDir()
 	proj := filepath.Join(root, "encoded-cwd")
-	stem := "session-123"
-	writeSourceFile(t, filepath.Join(proj, stem+".jsonl"), piProviderFixture(stem))
-	writeSourceFile(t, filepath.Join(proj, stem, "nested.jsonl"), piProviderFixture("nested"))
+	parentStem := "2026-09-21T10-00-00-000Z_parent-uuid"
+	parentPath := filepath.Join(proj, parentStem+".jsonl")
+	childPath := filepath.Join(proj, parentStem, "run-abc", "run-0", "session.jsonl")
+	writeSourceFile(t, parentPath, piProviderFixture("parent-uuid"))
+	writeSourceFile(t, childPath, piProviderFixture("child-uuid"))
 
 	provider, ok := NewProvider(AgentPi, ProviderConfig{Roots: []string{root}})
 	require.True(t, ok)
+
 	discovered, err := provider.Discover(t.Context())
 	require.NoError(t, err)
-	require.Len(t, discovered, 1, "pi ignores nested transcripts")
-	assert.Equal(t, filepath.Join(proj, stem+".jsonl"), discovered[0].DisplayPath)
+	paths := make([]string, len(discovered))
+	for i, d := range discovered {
+		paths[i] = d.DisplayPath
+	}
+	assert.ElementsMatch(t, []string{parentPath, childPath}, paths)
+
+	byPath := make(map[string]ParsedSession, len(discovered))
+	for _, d := range discovered {
+		outcome, err := provider.Parse(t.Context(), ParseRequest{Source: d})
+		require.NoError(t, err)
+		require.Len(t, outcome.Results, 1)
+		byPath[d.DisplayPath] = outcome.Results[0].Result.Session
+	}
+
+	assert.Equal(t, "pi:parent-uuid", byPath[parentPath].ID)
+	assert.Equal(t, AgentPi, byPath[parentPath].Agent)
+	assert.Empty(t, byPath[parentPath].ParentSessionID)
+
+	// Fresh pi-subagents children are all named session.jsonl, so the header id
+	// has to win over the filename-derived id.
+	assert.Equal(t, "pi:child-uuid", byPath[childPath].ID)
+	assert.Equal(t, AgentPi, byPath[childPath].Agent)
+	assert.Equal(t, "pi:parent-uuid", byPath[childPath].ParentSessionID)
+	assert.Equal(t, RelSubagent, byPath[childPath].RelationshipType)
+}
+
+// TestPiProviderLinksForkedSubagentToParent checks that a forked child keeps
+// the parent link its header records when discovery reaches it under the
+// parent transcript's directory instead of beside it.
+func TestPiProviderLinksForkedSubagentToParent(t *testing.T) {
+	root := t.TempDir()
+	proj := filepath.Join(root, "encoded-cwd")
+	parentStem := "2026-09-21T10-00-00-000Z_parent-uuid"
+	parentPath := filepath.Join(proj, parentStem+".jsonl")
+	writeSourceFile(t, parentPath, piProviderFixture("parent-uuid"))
+	parentPathJSON, err := json.Marshal(parentPath)
+	require.NoError(t, err)
+	forkPath := filepath.Join(
+		proj, parentStem, "forks", "2026-09-21T10-05-00-000Z_fork-uuid.jsonl",
+	)
+	writeSourceFile(t, forkPath, strings.Join([]string{
+		`{"type":"session","version":3,"id":"fork-uuid","timestamp":"2026-09-21T10:05:00Z","cwd":"/Users/alice/code/pi-project","parentSession":` + string(parentPathJSON) + `}`,
+		`{"type":"message","id":"f1","timestamp":"2026-09-21T10:05:01Z","message":{"role":"user","content":"continue"}}`,
+		"",
+	}, "\n"))
+
+	provider, ok := NewProvider(AgentPi, ProviderConfig{Roots: []string{root}})
+	require.True(t, ok)
+
+	discovered, err := provider.Discover(t.Context())
+	require.NoError(t, err)
+	require.Len(t, discovered, 2)
+
+	byPath := make(map[string]SourceRef, len(discovered))
+	for _, d := range discovered {
+		byPath[d.DisplayPath] = d
+	}
+	require.Contains(t, byPath, forkPath)
+
+	outcome, err := provider.Parse(t.Context(), ParseRequest{Source: byPath[forkPath]})
+	require.NoError(t, err)
+	require.Len(t, outcome.Results, 1)
+	fork := outcome.Results[0].Result.Session
+	assert.Equal(t, "pi:fork-uuid", fork.ID)
+	assert.Equal(t, "pi:parent-uuid", fork.ParentSessionID)
+	assert.Equal(t, RelFork, fork.RelationshipType)
+}
+
+// TestPiProviderDiscoversNestedSubagentsWithoutDuplicates checks that a child
+// that delegates to its own child is found at every depth exactly once. The
+// nested path reuses the child's session.jsonl stem because that is what
+// pi-subagents derives the next session root from.
+func TestPiProviderDiscoversNestedSubagentsWithoutDuplicates(t *testing.T) {
+	root := t.TempDir()
+	proj := filepath.Join(root, "encoded-cwd")
+	parentStem := "2026-09-21T10-00-00-000Z_parent-uuid"
+	parentPath := filepath.Join(proj, parentStem+".jsonl")
+	childPath := filepath.Join(proj, parentStem, "run-abc", "run-0", "session.jsonl")
+	deepPath := filepath.Join(
+		proj, parentStem, "run-abc", "run-0", "session",
+		"run-def", "run-0", "session.jsonl",
+	)
+	writeSourceFile(t, parentPath, piProviderFixture("parent-uuid"))
+	writeSourceFile(t, childPath, piProviderFixture("child-uuid"))
+	writeSourceFile(t, deepPath, piProviderFixture("grandchild-uuid"))
+
+	provider, ok := NewProvider(AgentPi, ProviderConfig{Roots: []string{root}})
+	require.True(t, ok)
+
+	discovered, err := provider.Discover(t.Context())
+	require.NoError(t, err)
+	byPath := make(map[string]SourceRef, len(discovered))
+	for _, d := range discovered {
+		require.NotContains(t, byPath, d.DisplayPath, "source discovered once")
+		byPath[d.DisplayPath] = d
+	}
+	require.Len(t, byPath, 3)
+	for _, path := range []string{parentPath, childPath, deepPath} {
+		require.Contains(t, byPath, path)
+	}
+
+	outcome, err := provider.Parse(t.Context(), ParseRequest{Source: byPath[deepPath]})
+	require.NoError(t, err)
+	require.Len(t, outcome.Results, 1)
+	grandchild := outcome.Results[0].Result.Session
+	assert.Equal(t, "pi:grandchild-uuid", grandchild.ID)
+	assert.Equal(t, "pi:child-uuid", grandchild.ParentSessionID)
+	assert.Equal(t, RelSubagent, grandchild.RelationshipType)
+}
+
+// TestPiProviderLeavesUnmatchedSubagentShapesUnlinked checks that a
+// session.jsonl is linked only when it sits in a run-N directory with a Pi
+// transcript at <parent>.jsonl. An explicit pi-subagents sessionDir has no
+// parent transcript above the run, so it must stay a standalone session.
+func TestPiProviderLeavesUnmatchedSubagentShapesUnlinked(t *testing.T) {
+	tests := []struct {
+		name  string
+		child string
+		files map[string]string
+	}{
+		{
+			name:  "explicit session dir without parent transcript",
+			child: filepath.Join("run-abc", "run-0", "session.jsonl"),
+		},
+		{
+			name:  "parent transcript is not a Pi session",
+			child: filepath.Join("encoded-cwd", "notes", "run-abc", "run-0", "session.jsonl"),
+			files: map[string]string{
+				filepath.Join("encoded-cwd", "notes.jsonl"): `{"type":"message"}` + "\n",
+			},
+		},
+		{
+			name:  "attempt directory is not run-N",
+			child: filepath.Join("encoded-cwd", "parent", "run-abc", "attempt", "session.jsonl"),
+			files: map[string]string{
+				filepath.Join("encoded-cwd", "parent.jsonl"): piProviderFixture("parent-uuid"),
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			root := t.TempDir()
+			for rel, content := range tt.files {
+				writeSourceFile(t, filepath.Join(root, rel), content)
+			}
+			childPath := filepath.Join(root, tt.child)
+			writeSourceFile(t, childPath, piProviderFixture("child-uuid"))
+
+			provider, ok := NewProvider(AgentPi, ProviderConfig{Roots: []string{root}})
+			require.True(t, ok)
+			source, ok, err := provider.FindSource(t.Context(), FindSourceRequest{
+				StoredFilePath: childPath,
+			})
+			require.NoError(t, err)
+			require.True(t, ok)
+
+			outcome, err := provider.Parse(t.Context(), ParseRequest{Source: source})
+			require.NoError(t, err)
+			require.Len(t, outcome.Results, 1)
+			child := outcome.Results[0].Result.Session
+			assert.Equal(t, "pi:child-uuid", child.ID)
+			assert.Empty(t, child.ParentSessionID)
+			assert.Empty(t, child.RelationshipType)
+		})
+	}
+}
+
+// TestPiProviderIgnoresTranscriptlessSubagentDirectory checks that a subagent
+// run directory holding only companion files does not fail discovery or add a
+// source.
+func TestPiProviderIgnoresTranscriptlessSubagentDirectory(t *testing.T) {
+	root := t.TempDir()
+	proj := filepath.Join(root, "encoded-cwd")
+	parentStem := "2026-09-21T10-00-00-000Z_parent-uuid"
+	parentPath := filepath.Join(proj, parentStem+".jsonl")
+	writeSourceFile(t, parentPath, piProviderFixture("parent-uuid"))
+	runDir := filepath.Join(proj, parentStem, "run-abc", "run-0")
+	writeSourceFile(t, filepath.Join(runDir, "output.md"), "no transcript here")
+
+	provider, ok := NewProvider(AgentPi, ProviderConfig{Roots: []string{root}})
+	require.True(t, ok)
+
+	discovered, err := provider.Discover(t.Context())
+	require.NoError(t, err)
+	require.Len(t, discovered, 1)
+	assert.Equal(t, parentPath, discovered[0].DisplayPath)
+}
+
+// TestPiProviderDiscoversSubagentsUnderOverlappingRoots checks that adding a
+// project directory as a second Pi root does not index the same nested
+// transcript twice.
+func TestPiProviderDiscoversSubagentsUnderOverlappingRoots(t *testing.T) {
+	root := t.TempDir()
+	proj := filepath.Join(root, "encoded-cwd")
+	parentStem := "2026-09-21T10-00-00-000Z_parent-uuid"
+	childPath := filepath.Join(proj, parentStem, "run-abc", "run-0", "session.jsonl")
+	writeSourceFile(t, filepath.Join(proj, parentStem+".jsonl"), piProviderFixture("parent-uuid"))
+	writeSourceFile(t, childPath, piProviderFixture("child-uuid"))
+
+	provider, ok := NewProvider(AgentPi, ProviderConfig{Roots: []string{root, proj}})
+	require.True(t, ok)
+
+	discovered, err := provider.Discover(t.Context())
+	require.NoError(t, err)
+	require.Len(t, discovered, 2)
+
+	seen := make(map[string]int, len(discovered))
+	for _, d := range discovered {
+		seen[d.DisplayPath]++
+	}
+	assert.Equal(t, 1, seen[childPath], "overlapping roots index one child source")
 }

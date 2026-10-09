@@ -12,6 +12,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"os/exec"
 	"strings"
 	"sync"
 	"testing"
@@ -997,67 +999,73 @@ func TestLoadPricingUsesDBRowsAsEffectiveTableAndOverlaysOverrides(t *testing.T)
 	require.NoError(t, err)
 
 	assert.NotContains(t, got, "gpt-5.5")
-	assert.Equal(t, duckRates{
-		input: money.MustParseDollars("30"), output: money.MustParseDollars("150"), cacheCreation: money.MustParseDollars("37.5"), cacheRead: money.MustParseDollars("3"),
-		updatedAt: ptrTime(t, "2026-06-08T12:00:00Z"),
-		source:    export.PricingRowSourceFetched,
+	assert.Equal(t, export.ModelRates{
+		InputPerMTok: money.MustParseDollars("30"), OutputPerMTok: money.MustParseDollars("150"), CacheWritePerMTok: money.MustParseDollars("37.5"), CacheReadPerMTok: money.MustParseDollars("3"),
+		UpdatedAt: ptrTime(t, "2026-06-08T12:00:00Z"),
+		Source:    export.PricingRowSourceFetched,
 	}, got["claude-sonnet-4-6"])
 	assert.NotContains(t, got, "_fallback_version")
-	assert.Equal(t, duckRates{
-		input: money.MustParseDollars("9"), output: money.MustParseDollars("10"), cacheCreation: money.MustParseDollars("11"), cacheRead: money.MustParseDollars("12"),
-		source: export.PricingRowSourceCustom,
+	assert.Equal(t, export.ModelRates{
+		InputPerMTok: money.MustParseDollars("9"), OutputPerMTok: money.MustParseDollars("10"), CacheWritePerMTok: money.MustParseDollars("11"), CacheReadPerMTok: money.MustParseDollars("12"),
+		Source: export.PricingRowSourceCustom,
 	}, got["custom-model"])
 }
 
 func TestProjectIdentityMapLegacyFallbackUsesFilePath(t *testing.T) {
-	ctx := t.Context()
-	conn := openTestDuckDB(t)
-	require.NoError(t, EnsureSchema(ctx, conn))
-	store := NewStoreFromDB(conn)
-
-	_, err := conn.ExecContext(ctx, `
+	for _, fixture := range []struct {
+		name        string
+		withArchive bool
+	}{
+		{name: "file path with archive", withArchive: true},
+		{name: "distinct keys without archive"},
+	} {
+		t.Run(fixture.name, func(t *testing.T) {
+			ctx := t.Context()
+			conn := openTestDuckDB(t)
+			require.NoError(t, EnsureSchema(ctx, conn))
+			store := NewStoreFromDB(conn)
+			if fixture.withArchive {
+				_, err := conn.ExecContext(ctx, `
 		INSERT INTO source_archives (source_archive_id, source_archive_salt)
 		VALUES (?, ?)`, "legacy-test-archive", "legacy-test-salt")
-	require.NoError(t, err)
+				require.NoError(t, err)
 
-	_, err = conn.ExecContext(ctx, `
+				_, err = conn.ExecContext(ctx, `
 		INSERT INTO sessions (id, project, machine, agent, cwd, file_path)
 		VALUES (?, ?, ?, ?, ?, ?)`,
-		"file-path-identity", "file-project", "laptop", "codex", "",
-		"/fixtures/duck-file-project/session.jsonl",
-	)
-	require.NoError(t, err)
+					"file-path-identity", "file-project", "laptop", "codex", "",
+					"/fixtures/duck-file-project/session.jsonl",
+				)
+				require.NoError(t, err)
 
-	got, err := store.BuildProjectIdentityMap(ctx, []string{"file-project"})
-	require.NoError(t, err)
-	require.Equal(t, export.ProjectResolutionUnknown,
-		got["file-project"].Resolution)
-	assert.Nil(t, got["file-project"].Identity)
-}
+				got, err := store.BuildProjectIdentityMap(ctx, []string{"file-project"})
+				require.NoError(t, err)
+				require.Equal(t, export.ProjectResolutionUnknown,
+					got["file-project"].Resolution)
+				assert.Nil(t, got["file-project"].Identity)
 
-func TestProjectIdentityMapLegacySessionsUseDistinctFallbackKeys(t *testing.T) {
-	ctx := t.Context()
-	conn := openTestDuckDB(t)
-	require.NoError(t, EnsureSchema(ctx, conn))
-	_, err := conn.ExecContext(ctx, `
+				return
+			}
+			_, err := conn.ExecContext(ctx, `
 		INSERT INTO sessions (id, project, machine, agent)
 		VALUES
 			('legacy-alpha', 'alpha', 'host', 'codex'),
 			('legacy-beta', 'beta', 'host', 'codex')`)
-	require.NoError(t, err)
+			require.NoError(t, err)
 
-	store := NewStoreFromDB(conn)
-	first, err := store.BuildProjectIdentityMap(ctx, []string{"alpha", "beta"})
-	require.NoError(t, err)
-	second, err := store.BuildProjectIdentityMap(ctx, []string{"alpha", "beta"})
-	require.NoError(t, err)
+			first, err := store.BuildProjectIdentityMap(ctx, []string{"alpha", "beta"})
+			require.NoError(t, err)
+			second, err := store.BuildProjectIdentityMap(ctx, []string{"alpha", "beta"})
+			require.NoError(t, err)
 
-	assert.NotEmpty(t, first["alpha"].ProjectKey)
-	assert.NotEmpty(t, first["beta"].ProjectKey)
-	assert.NotEqual(t, first["alpha"].ProjectKey, first["beta"].ProjectKey)
-	assert.Equal(t, first["alpha"].ProjectKey, second["alpha"].ProjectKey)
-	assert.Equal(t, first["beta"].ProjectKey, second["beta"].ProjectKey)
-	assert.Len(t, export.ProjectMapForWire(first), 2)
+			assert.NotEmpty(t, first["alpha"].ProjectKey)
+			assert.NotEmpty(t, first["beta"].ProjectKey)
+			assert.NotEqual(t, first["alpha"].ProjectKey, first["beta"].ProjectKey)
+			assert.Equal(t, first["alpha"].ProjectKey, second["alpha"].ProjectKey)
+			assert.Equal(t, first["beta"].ProjectKey, second["beta"].ProjectKey)
+			assert.Len(t, export.ProjectMapForWire(first), 2)
+		})
+	}
 }
 
 func TestProjectIdentityObservationRoundTripsRepositoryContext(t *testing.T) {
@@ -1123,6 +1131,9 @@ func TestProjectIdentityObservationsAggregateSourceArchives(t *testing.T) {
 	assert.NotEmpty(t, aggregate["missing"].ProjectKey)
 	assert.Contains(t, export.ProjectMapForWire(aggregate), aggregate["app"].ProjectKey)
 	assert.Contains(t, export.ProjectMapForWire(aggregate), aggregate["missing"].ProjectKey)
+
+	assert.Equal(t, export.ProjectResolutionAmbiguous, aggregate["app"].Resolution)
+	assert.Nil(t, aggregate["app"].Identity)
 }
 
 func TestSourceArchiveScopeRejectsSaltMismatch(t *testing.T) {
@@ -1154,10 +1165,10 @@ func TestLoadPricingUsesFallbackWhenEffectiveTableEmpty(t *testing.T) {
 
 	fallback := pricingByPattern(t, pricingpkg.FallbackPricing(), "gpt-5.5")
 	require.Contains(t, got, "gpt-5.5")
-	assert.Equal(t, fallback.InputPerMTok, got["gpt-5.5"].input)
-	assert.Equal(t, fallback.OutputPerMTok, got["gpt-5.5"].output)
-	assert.Equal(t, export.PricingRowSourceEmbedded, got["gpt-5.5"].source)
-	assert.Equal(t, duckCatalogPricingBands(fallback.Bands), got["gpt-5.5"].bands)
+	assert.Equal(t, fallback.InputPerMTok, got["gpt-5.5"].InputPerMTok)
+	assert.Equal(t, fallback.OutputPerMTok, got["gpt-5.5"].OutputPerMTok)
+	assert.Equal(t, export.PricingRowSourceEmbedded, got["gpt-5.5"].Source)
+	assert.Equal(t, db.FallbackRateMap()["gpt-5.5"].Bands, got["gpt-5.5"].Bands)
 }
 
 func TestLoadPricingClassifiesBandOnlyFallbackMismatchAsFetched(t *testing.T) {
@@ -1186,7 +1197,7 @@ func TestLoadPricingClassifiesBandOnlyFallbackMismatchAsFetched(t *testing.T) {
 
 	got, err := store.loadPricing(ctx)
 	require.NoError(t, err)
-	assert.Equal(t, export.PricingRowSourceFetched, got["gpt-5.5"].source)
+	assert.Equal(t, export.PricingRowSourceFetched, got["gpt-5.5"].Source)
 }
 
 func TestLoadPricingRetainsCustomOverrideSource(t *testing.T) {
@@ -1206,8 +1217,8 @@ func TestLoadPricingRetainsCustomOverrideSource(t *testing.T) {
 
 	got, err := store.loadPricing(ctx)
 	require.NoError(t, err)
-	assert.Empty(t, got["gpt-5.5"].bands)
-	block, err := export.NewPricingResolver(duckPricingRows(got)).BuildBlock()
+	assert.Empty(t, got["gpt-5.5"].Bands)
+	block, err := export.NewPricingResolver(db.MirrorPricingRows(got)).BuildBlock()
 	require.NoError(t, err)
 
 	assert.Equal(t, "custom+embedded", block.Source)
@@ -2468,10 +2479,19 @@ func TestTrendsTermsApplySessionFiltersAndSystemPrefixExclusion(t *testing.T) {
 }
 
 func TestDailyUsageDefaultsToLocalTimezone(t *testing.T) {
-	oldLocal := time.Local                             //nolint:forbidigo // Exercise report formatting and date buckets in the local calendar timezone.
-	time.Local = time.FixedZone("DuckLocal", -5*60*60) //nolint:forbidigo // Exercise report formatting and date buckets in the local calendar timezone.
-	t.Cleanup(func() { time.Local = oldLocal })        //nolint:forbidigo // Exercise report formatting and date buckets in the local calendar timezone.
-
+	// A fresh process pins a DST zone before the default zone is cached.
+	if os.Getenv("AGENTSVIEW_TEST_DUCK_USAGE_TZ") != "1" {
+		exe, err := os.Executable()
+		require.NoError(t, err)
+		cmd := exec.CommandContext(t.Context(), exe,
+			"-test.run=^TestDailyUsageDefaultsToLocalTimezone$")
+		cmd.Env = append(os.Environ(),
+			"AGENTSVIEW_TEST_DUCK_USAGE_TZ=1", "TZ=America/New_York")
+		output, err := cmd.CombinedOutput()
+		require.NoError(t, err, "%s", output)
+		require.Contains(t, string(output), "PASS")
+		return
+	}
 	ctx := t.Context()
 	local := newLocalDB(t)
 	require.NoError(t, local.UpsertModelPricing([]db.ModelPricing{{
@@ -2480,10 +2500,14 @@ func TestDailyUsageDefaultsToLocalTimezone(t *testing.T) {
 		OutputPerMTok: money.MustParseDollars("15"),
 	}}))
 	sessionID := "duck-usage-local-day"
+	// Near-midnight UTC events in winter and summer land on different local
+	// days depending on the zone and its DST rules.
+	timestamps := []string{"2026-01-02T02:00:00.000Z", "2026-07-02T04:30:00.000Z"}
 	_, err := local.WriteSessionBatchAtomic(ctx, []db.SessionBatchWrite{{
-		Session: syncSession(sessionID, "alpha", "local usage", "2026-01-02T02:00:00.000Z", 1),
+		Session: syncSession(sessionID, "alpha", "local usage", timestamps[0], 2),
 		Messages: []db.Message{
-			syncMessage(sessionID, 0, "assistant", "local usage", "2026-01-02T02:00:00.000Z"),
+			syncMessage(sessionID, 0, "assistant", "winter usage", timestamps[0]),
+			syncMessage(sessionID, 1, "assistant", "summer usage", timestamps[1]),
 		},
 		DataVersion:     1,
 		ReplaceMessages: true,
@@ -2494,16 +2518,32 @@ func TestDailyUsageDefaultsToLocalTimezone(t *testing.T) {
 	_, err = syncer.pushEverything(ctx, nil)
 	require.NoError(t, err)
 	store := NewStoreFromDB(syncer.DB())
+	filter := db.UsageFilter{From: "2026-01-01", To: "2026-07-31"}
+	location := filter.Location()
+	require.Equal(t, "America/New_York", location.String())
+	var wantDates []string
+	for _, timestamp := range timestamps {
+		at, err := time.Parse(time.RFC3339, timestamp)
+		require.NoError(t, err)
+		wantDates = append(wantDates, at.In(location).Format(time.DateOnly))
+	}
 
-	got, err := store.GetDailyUsage(ctx, db.UsageFilter{
-		From: "2026-01-01",
-		To:   "2026-01-01",
-	})
+	got, err := store.GetDailyUsage(ctx, filter)
 	require.NoError(t, err)
-	require.Len(t, got.Daily, 1)
-	assert.Equal(t, "2026-01-01", got.Daily[0].Date)
-	assert.Equal(t, 1, got.Totals.InputTokens)
-	assert.Equal(t, 2, got.Totals.OutputTokens)
+	sqlite, err := local.GetDailyUsage(ctx, filter)
+	require.NoError(t, err)
+
+	dates := func(result db.DailyUsageResult) []string {
+		out := make([]string, 0, len(result.Daily))
+		for _, day := range result.Daily {
+			out = append(out, day.Date)
+		}
+		return out
+	}
+	assert.Equal(t, wantDates, dates(got), "zone %s", location)
+	assert.Equal(t, dates(sqlite), dates(got), "DuckDB and SQLite must agree")
+	assert.Equal(t, 2, got.Totals.InputTokens)
+	assert.Equal(t, 4, got.Totals.OutputTokens)
 }
 
 func TestDailyUsageActiveSinceUsesSessionActivity(t *testing.T) {

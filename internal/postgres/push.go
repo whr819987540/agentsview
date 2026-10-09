@@ -441,7 +441,7 @@ func (s *Sync) PushWithOptions(
 			}
 			sess := sessionByID[id]
 			sessionFingerprints[id] = sessionPushFingerprint(
-				sess, pushedSessionMachine(sess, s.machine),
+				sess, db.MirroredSessionMachine(sess, s.machine),
 				s.archiveID, usageFP, markerID,
 				dependencyFP+"\x00source-database-generation:"+
 					s.databaseGeneration+"\x00archive-content:"+string(s.local.ArchiveContent()),
@@ -781,7 +781,7 @@ func (s *Sync) syncProjectIdentityObservations(
 		if err != nil {
 			return fmt.Errorf("loading project identity observations: %w", err)
 		}
-		observations = filterProjectIdentityObservations(
+		observations = db.FilterIdentityScope(
 			observations, s.projects, s.excludeProjects,
 		)
 		snapshots, err = s.local.ListPublishableSessionProjectIdentitySnapshots(
@@ -810,7 +810,7 @@ func (s *Sync) syncProjectIdentityObservations(
 				loadErr,
 			)
 		}
-		snapshots = mergeProjectIdentitySnapshots(snapshots, refreshSnapshots)
+		snapshots = db.MergeProjectIdentitySnapshots(snapshots, refreshSnapshots)
 	}
 
 	archiveID, err := s.local.GetArchiveID(ctx)
@@ -915,47 +915,6 @@ func (s *Sync) syncProjectIdentityObservations(
 	return nil
 }
 
-func mergeProjectIdentitySnapshots(
-	base, refresh []export.ProjectIdentityObservation,
-) []export.ProjectIdentityObservation {
-	merged := make(map[string]export.ProjectIdentityObservation, len(base)+len(refresh))
-	for _, snapshot := range base {
-		merged[snapshot.SessionID] = snapshot
-	}
-	for _, snapshot := range refresh {
-		merged[snapshot.SessionID] = snapshot
-	}
-	out := make([]export.ProjectIdentityObservation, 0, len(merged))
-	for _, snapshot := range merged {
-		out = append(out, snapshot)
-	}
-	sort.Slice(out, func(i, j int) bool {
-		return out[i].SessionID < out[j].SessionID
-	})
-	return out
-}
-
-func filterProjectIdentityObservations(
-	observations []export.ProjectIdentityObservation,
-	projects []string,
-	excludeProjects []string,
-) []export.ProjectIdentityObservation {
-	if len(projects) == 0 && len(excludeProjects) == 0 {
-		return observations
-	}
-	out := observations[:0]
-	for _, obs := range observations {
-		if len(projects) > 0 && !slices.Contains(projects, obs.Project) {
-			continue
-		}
-		if slices.Contains(excludeProjects, obs.Project) {
-			continue
-		}
-		out = append(out, obs)
-	}
-	return out
-}
-
 // pgPushMarkerMachineState reports whether this host's push marker is present
 // in PG and returns the current machine plus legacy machine aliases stored with
 // the marker.
@@ -968,7 +927,7 @@ func filterProjectIdentityObservations(
 // dropped or recreated) since this host last pushed, so a full re-push is
 // needed. Counting rows by machine cannot detect this reliably: another host
 // pushing to the same PG can repopulate rows under a machine value this host
-// also writes -- a remote host's sessions synced in over SSH, or this host's
+// also writes -- a remote host's sessions synced from a remote, or this host's
 // own renamed identity -- masking the loss of this host's own rows. The marker
 // is per-local-DB, so no other pusher can satisfy this check.
 func (s *Sync) pgPushMarkerMachineState(
@@ -1919,10 +1878,10 @@ func reconcilePGProjectScopeMoves(
 		if err := rows.Scan(&id, &project); err != nil {
 			return nil, fmt.Errorf("scanning owned pg session for scope reconciliation: %w", err)
 		}
-		if !projectInPGSyncScope(project, projects, excludeProjects) {
+		if !db.ProjectMatchesPushScope(project, projects, excludeProjects) {
 			continue
 		}
-		if !projectInPGSyncScope(
+		if !db.ProjectMatchesPushScope(
 			localProjects[id], projects, excludeProjects,
 		) {
 			staleIDs = append(staleIDs, id)
@@ -1954,17 +1913,6 @@ func listPGProjectScopeMoveCandidates(
 	lastPush string,
 ) ([]db.Session, error) {
 	return local.ListSessionsForMirrorWindow(ctx, lastPush, nil, nil)
-}
-
-func projectInPGSyncScope(
-	project string,
-	projects []string,
-	excludeProjects []string,
-) bool {
-	if len(projects) > 0 && !slices.Contains(projects, project) {
-		return false
-	}
-	return !slices.Contains(excludeProjects, project)
 }
 
 func hasPGExcludedSessionID(
@@ -2023,7 +1971,7 @@ func deletePGSessionIfExcluded(
 
 // sessionPushFingerprint builds the change-detection fingerprint for a
 // session. pushedMachine is the value pushSession actually writes to PG
-// (pushedSessionMachine), not the raw sess.Machine: a "local"/empty sentinel
+// (db.MirroredSessionMachine), not the raw sess.Machine: a "local"/empty sentinel
 // row is written under the fallback machine, so the fingerprint must track the
 // fallback to force a re-push when s.machine changes.
 func sessionPushFingerprint(
@@ -2108,16 +2056,6 @@ func sessionPushFingerprint(
 	return b.String()
 }
 
-// pushedSessionMachine resolves the machine field for a PG row. Old rows
-// pushed before this fix with machine="local" will be repaired gradually as
-// each session is modified (message count change, etc.) and re-fingerprinted.
-func pushedSessionMachine(sess db.Session, fallbackMachine string) string {
-	if sess.Machine != "" && sess.Machine != "local" {
-		return sess.Machine
-	}
-	return fallbackMachine
-}
-
 func sameSessionOwner(
 	existingOwnerMarker, existingMachine, markerID, pushedMachine string,
 	legacyMarkerMachines []string,
@@ -2140,13 +2078,6 @@ func sameSessionOwner(
 func stringValue(value *string) string {
 	if value == nil {
 		return ""
-	}
-	return *value
-}
-
-func transcriptRevisionValue(value *string) string {
-	if value == nil || *value == "" {
-		return "0"
 	}
 	return *value
 }
@@ -2200,6 +2131,21 @@ func (s *Sync) pushSession(
 	ctx context.Context, tx *sql.Tx, sess db.Session, markerID string,
 	legacyMarkerMachines []string,
 ) error {
+	return writePGSession(ctx, tx, sess, markerID, legacyMarkerMachines, pgSessionWriteOptions{
+		Machine: s.machine, ArchiveID: s.archiveID, DatabaseGeneration: s.databaseGeneration, UsageOnly: s.local.ArchiveContent().UsageOnly(),
+	})
+}
+
+type pgSessionWriteOptions struct {
+	Machine, ArchiveID string
+	DatabaseGeneration string
+	UsageOnly          bool
+	SkipAliases        bool
+}
+
+// writePGSession is the shared transaction-owned row kernel. Mirror ownership
+// is passed explicitly; it never reads the source archive or global pool.
+func writePGSession(ctx context.Context, tx *sql.Tx, sess db.Session, markerID string, legacyMarkerMachines []string, options pgSessionWriteOptions) error {
 	createdAt, ok := ParseSQLiteTimestamp(sess.CreatedAt)
 	if !ok {
 		return fmt.Errorf(
@@ -2220,7 +2166,7 @@ func (s *Sync) pushSession(
 		return fmt.Errorf("parsing session %s deleted_at: %w", sess.ID, err)
 	}
 	isAutomated := sess.IsAutomated
-	pushedMachine := pushedSessionMachine(sess, s.machine)
+	pushedMachine := db.MirroredSessionMachine(sess, options.Machine)
 	var existingMachine sql.NullString
 	var existingOwnerMarker sql.NullString
 	checkErr := tx.QueryRowContext(ctx,
@@ -2520,16 +2466,16 @@ func (s *Sync) pushSession(
 		sess.MissingVerificationCount, sess.DuplicatePromptCount,
 		sess.NoCodeContextCount, sess.RunawayToolLoopCount,
 		sanitizePG(sess.TranscriptFidelity),
-		transcriptRevisionValue(sess.TranscriptRevision),
+		db.TranscriptRevisionValue(sess.TranscriptRevision),
 		sanitizePG(sess.AgentLabel),
 		sanitizePG(sess.Entrypoint),
 		sanitizePG(sess.SessionKind),
-		s.archiveID,
-		s.databaseGeneration,
+		options.ArchiveID,
+		options.DatabaseGeneration,
 		sess.FilePath,
 		sess.ProjectAssigned,
 		string(legacyMarkerMachinesJSON),
-		s.local.ArchiveContent().UsageOnly(),
+		options.UsageOnly,
 	)
 	if err != nil {
 		return err
@@ -2575,13 +2521,15 @@ func (s *Sync) pushSession(
 	if excluded {
 		return errSessionExcluded
 	}
-	if s.local.ArchiveContent().UsageOnly() {
+	if options.UsageOnly {
 		if err := clearSessionVectorsTx(ctx, tx, sess.ID); err != nil {
 			return err
 		}
 	}
-	if err := replacePGSessionAliases(ctx, tx, sess); err != nil {
-		return err
+	if !options.SkipAliases {
+		if err := replacePGSessionAliases(ctx, tx, sess); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -3973,7 +3921,7 @@ func bulkInsertToolCalls(
 				sanitizePG(r.tc.ToolUseID),
 				nilIfEmpty(r.tc.InputJSON),
 				nilIfEmpty(r.tc.SkillName),
-				nilIfZero(r.tc.ResultContentLength),
+				db.NilIfZero(r.tc.ResultContentLength),
 				nilIfEmpty(db.DedupToolCallResultSummary(
 					r.tc.ResultContent, r.tc.ResultEvents,
 				)),
@@ -4107,6 +4055,13 @@ func (s *Sync) pushSecretFindings(
 		return deleted > 0, nil
 	}
 
+	if err := bulkInsertSecretFindings(ctx, tx, sessionID, findings); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func bulkInsertSecretFindings(ctx context.Context, tx *sql.Tx, sessionID string, findings []db.SecretFinding) error {
 	const sfBatch = 50
 	for i := 0; i < len(findings); i += sfBatch {
 		end := min(i+sfBatch, len(findings))
@@ -4143,13 +4098,13 @@ func (s *Sync) pushSecretFindings(
 		if _, err := tx.ExecContext(
 			ctx, b.String(), args...,
 		); err != nil {
-			return false, fmt.Errorf(
+			return fmt.Errorf(
 				"bulk inserting secret_findings for %s: %w",
 				sessionID, err,
 			)
 		}
 	}
-	return true, nil
+	return nil
 }
 
 // normalizeSyncTimestamps ensures schema exists and normalizes
@@ -4180,13 +4135,6 @@ func nilIfEmpty(s string) any {
 		return nil
 	}
 	return s
-}
-
-func nilIfZero(n int) any {
-	if n == 0 {
-		return nil
-	}
-	return n
 }
 
 func (s *Sync) syncCursorUsageEvents(ctx context.Context) error {

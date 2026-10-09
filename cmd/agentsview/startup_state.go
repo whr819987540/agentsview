@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"go.kenn.io/agentsview/internal/db"
+	syncpkg "go.kenn.io/agentsview/internal/sync"
 )
 
 // startupStateFileName is the data-dir file holding the starting
@@ -62,12 +63,13 @@ func serveLogPath(dataDir string) string {
 // Write failures are logged once and otherwise ignored: startup
 // transparency must never break startup.
 type startupStateWriter struct {
-	mu        sync.Mutex
-	path      string
-	state     startupState
-	lastWrite time.Time
-	warnOnce  sync.Once
-	now       func() time.Time
+	mu           sync.Mutex
+	path         string
+	state        startupState
+	syncProgress syncpkg.Progress
+	lastWrite    time.Time
+	warnOnce     sync.Once
+	now          func() time.Time
 }
 
 func newStartupStateWriter(
@@ -140,6 +142,31 @@ func (w *startupStateWriter) SetCaddyProcess(pid int) {
 	w.write()
 }
 
+// SetSyncProgress publishes one-shot stages immediately; only repeated session
+// counters may be throttled. A dropped stage has no later callback to retry it.
+func (w *startupStateWriter) SetSyncProgress(p syncpkg.Progress) {
+	if w == nil {
+		return
+	}
+	phase := "initial sync"
+	if p.Resync {
+		phase = "full resync"
+	}
+	detail := startupProgressDetail(p)
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	previous := w.syncProgress
+	w.syncProgress = p
+	if phase != w.state.Phase || p.Phase != previous.Phase ||
+		p.Detail != previous.Detail || p.Hint != previous.Hint ||
+		(p.SessionsTotal > 0) != (previous.SessionsTotal > 0) {
+		w.state.Phase, w.state.Detail = phase, detail
+		w.write()
+	} else {
+		w.setDetailLocked(detail)
+	}
+}
+
 // SetDetail records fine-grained progress within the current phase,
 // persisted at most once per startupDetailThrottle.
 func (w *startupStateWriter) SetDetail(detail string) {
@@ -148,6 +175,10 @@ func (w *startupStateWriter) SetDetail(detail string) {
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	w.setDetailLocked(detail)
+}
+
+func (w *startupStateWriter) setDetailLocked(detail string) {
 	// state.Detail only changes when a write happens, so this dedup
 	// compares against what a reader can actually see. Storing a
 	// throttled detail in memory first would make a stable detail
@@ -175,16 +206,26 @@ func (w *startupStateWriter) write() {
 		w.warn(err)
 		return
 	}
-	tmp := w.path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		w.warn(err)
-		return
-	}
-	if err := os.Rename(tmp, w.path); err != nil {
+	if err := writeStartupState(filepath.Dir(w.path), data); err != nil {
 		w.warn(err)
 		return
 	}
 	w.lastWrite = w.now()
+}
+
+func writeStartupState(dataDir string, data []byte) error {
+	root, err := os.OpenRoot(dataDir)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	tmp := startupStateFileName + ".tmp"
+	if err := root.WriteFile(tmp, data, 0o600); err != nil {
+		return err
+	}
+	defer func() { _ = root.Remove(tmp) }()
+	// Root.Rename can replace a snapshot still open by Windows readers.
+	return root.Rename(tmp, startupStateFileName)
 }
 
 func (w *startupStateWriter) warn(err error) {
@@ -196,7 +237,13 @@ func (w *startupStateWriter) warn(err error) {
 // readStartupState loads the startup snapshot, or nil when the file is
 // missing or unreadable (legacy daemon version, mid-write race).
 func readStartupState(dataDir string) *startupState {
-	data, err := os.ReadFile(startupStatePath(dataDir))
+	root, err := os.OpenRoot(dataDir)
+	if err != nil {
+		return nil
+	}
+	defer root.Close()
+	// Root readers share delete access on Windows so snapshots can be replaced.
+	data, err := root.ReadFile(startupStateFileName)
 	if err != nil {
 		return nil
 	}
@@ -244,13 +291,7 @@ func publishStartupStateFallback(
 	if err != nil {
 		return
 	}
-	tmp := startupStatePath(dataDir) + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return
-	}
-	if err := os.Rename(tmp, startupStatePath(dataDir)); err != nil {
-		_ = os.Remove(tmp)
-	}
+	_ = writeStartupState(dataDir, data)
 }
 
 func removeStartupState(dataDir string) {

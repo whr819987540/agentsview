@@ -10,7 +10,9 @@ import (
 	"encoding/json/v2"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
+	"strings"
 	"unicode/utf8"
 
 	"go.kenn.io/agentsview/internal/export"
@@ -118,6 +120,21 @@ func (db *DB) ExportConversationChanges(ctx context.Context, opts ConversationEx
 		}
 		if position.Version != 1 || position.Kind != kind || position.DatabaseID == "" || position.After < 0 || position.Through < position.After || kind == "checkpoint" && position.After != position.Through {
 			return result, fmt.Errorf("%w: invalid conversation position", ErrInvalidCursor)
+		}
+	}
+	// The first export pays for the projection instead of every sync write.
+	// Only writable handles (embedders and tests) build it here; the CLI reads
+	// read-only and builds through the writer owner on
+	// ErrConversationInitializationRequired.
+	if !db.readOnly {
+		var active bool
+		if err := db.getReader().QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM archive_metadata WHERE key=?)`, conversationExportInitializedKey).Scan(&active); err != nil {
+			return result, err
+		}
+		if !active {
+			if _, err := db.EnsureConversationExportInitialized(ctx); err != nil {
+				return result, err
+			}
 		}
 	}
 	tx, err := db.getReader().BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
@@ -261,20 +278,30 @@ func (db *DB) GetConversationMessage(ctx context.Context, opts ConversationMessa
 		return ConversationMessage{}, err
 	}
 	result.Project = changes[0].Project
-	var body sql.NullString
-	if err := tx.QueryRowContext(ctx, `SELECT substr(CAST(body AS BLOB), ?, ?) FROM conversation_messages WHERE session_id = ? AND message_id = ?`, opts.Offset+1, opts.MaxBytes, opts.SessionID, opts.MessageID).Scan(&body); err != nil {
-		return ConversationMessage{}, err
-	}
 	result.Offset, result.NextOffset = opts.Offset, opts.Offset
-	if body.Valid {
-		chunk := body.String
+	if result.Digest != "" {
+		// The projection holds the digest; the archived message holds the text.
+		var content string
+		err := tx.QueryRowContext(ctx, `SELECT m.content FROM conversation_messages c JOIN messages m ON m.session_id = c.session_id AND m.ordinal = c.ordinal
+		 WHERE c.session_id = ? AND c.message_id = ?`, opts.SessionID, opts.MessageID).Scan(&content)
+		if errors.Is(err, sql.ErrNoRows) {
+			return ConversationMessage{}, ErrConversationRevisionChanged
+		} else if err != nil {
+			return ConversationMessage{}, err
+		}
+		text := SanitizeUTF8(content)
+		if sum := sha256.Sum256([]byte(text)); hex.EncodeToString(sum[:]) != result.Digest {
+			return ConversationMessage{}, ErrConversationRevisionChanged
+		}
+		chunk := text[opts.Offset : opts.Offset+min(int64(len(text))-opts.Offset, int64(opts.MaxBytes))]
 		if len(chunk) > 0 && !utf8.RuneStart(chunk[0]) {
 			return ConversationMessage{}, errors.New("offset is not a UTF-8 boundary")
 		}
 		for !utf8.ValidString(chunk) && len(chunk) > 0 {
 			chunk = chunk[:len(chunk)-1]
 		}
-		result.Text, result.NextOffset = new(chunk), opts.Offset+int64(len(chunk))
+		// Clone so a small chunk does not pin the whole message in memory.
+		result.Text, result.NextOffset = new(strings.Clone(chunk)), opts.Offset+int64(len(chunk))
 	}
 	if err := tx.Commit(); err != nil {
 		return ConversationMessage{}, err
@@ -329,8 +356,10 @@ type conversationRow struct {
 	body     *string
 }
 
-func conversationRowsTx(tx transactionQueries, sessionID string) ([]conversationRow, error) {
-	rows, err := tx.Query(`SELECT `+conversationChangeColumns+`, source_id, body FROM conversation_messages WHERE session_id = ? AND removed = 0 ORDER BY ordinal`, sessionID)
+// conversationRowsFromTx returns the live projection rows at or after
+// fromOrdinal.
+func conversationRowsFromTx(tx transactionQueries, sessionID string, fromOrdinal int) ([]conversationRow, error) {
+	rows, err := tx.Query(`SELECT `+conversationChangeColumns+`, source_id FROM conversation_messages WHERE session_id = ? AND removed = 0 AND ordinal >= ? ORDER BY ordinal`, sessionID, fromOrdinal)
 	if err != nil {
 		return nil, err
 	}
@@ -338,7 +367,7 @@ func conversationRowsTx(tx transactionQueries, sessionID string) ([]conversation
 	var result []conversationRow
 	for rows.Next() {
 		var row conversationRow
-		if err := rows.Scan(&row.SessionID, &row.MessageID, &row.Revision, &row.Ordinal, &row.Role, &row.Timestamp, &row.Deleted, &row.Gap, &row.Digest, &row.TextBytes, &row.sourceID, &row.body); err != nil {
+		if err := rows.Scan(&row.SessionID, &row.MessageID, &row.Revision, &row.Ordinal, &row.Role, &row.Timestamp, &row.Deleted, &row.Gap, &row.Digest, &row.TextBytes, &row.sourceID); err != nil {
 			return nil, err
 		}
 		result = append(result, row)
@@ -368,12 +397,44 @@ func conversationRowFromMessage(m Message) (conversationRow, bool) {
 // native source identity or an unchanged complete projection preserves IDs;
 // content digests are equality evidence, never logical message identifiers.
 func reconcileConversationMessagesTx(tx transactionQueries, sessionID string, msgs []Message, replace, usageOnly bool) error {
+	return reconcileConversationRangeTx(tx, sessionID, msgs, replace, usageOnly, math.MinInt)
+}
+
+// reconcileConversationRangeTx reconciles the projection for a replacement
+// of only the rows at or after fromOrdinal; rows below it are kept as
+// stored. The whole-session reconciler is the same call with no lower bound.
+func reconcileConversationRangeTx(tx transactionQueries, sessionID string, msgs []Message, replace, usageOnly bool, fromOrdinal int) error {
 	if replace && usageOnly {
 		// Usage storage omits messages and text, so its projection cannot prove
 		// deletion or changed identity. Preserve existing IDs as policy gaps;
 		// the session gap covers activity without retained message records.
 		return clearUsageOnlyConversationTx(tx, sessionID)
 	}
+	active, err := conversationExportActiveTx(tx)
+	if err != nil {
+		return err
+	}
+	if active {
+		if err := projectConversationMessagesTx(tx, sessionID, msgs, replace, usageOnly, fromOrdinal); err != nil {
+			return err
+		}
+	}
+	if replace && !usageOnly {
+		var hadGap, deleted bool
+		if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM conversation_session_changes WHERE session_id=? AND gap='archive_content_excluded'),
+		 COALESCE((SELECT deleted_at IS NOT NULL FROM sessions WHERE id=?),1)`, sessionID, sessionID).Scan(&hadGap, &deleted); err != nil {
+			return err
+		}
+		if hadGap {
+			return putConversationSessionChangeTx(tx, sessionID, "", deleted)
+		}
+	}
+	return nil
+}
+
+// projectConversationMessagesTx writes the message rows of an active archive
+// at or after fromOrdinal.
+func projectConversationMessagesTx(tx transactionQueries, sessionID string, msgs []Message, replace, usageOnly bool, fromOrdinal int) error {
 	var incoming []conversationRow
 	counts := map[string]int{}
 	for _, msg := range msgs {
@@ -390,7 +451,7 @@ func reconcileConversationMessagesTx(tx transactionQueries, sessionID string, ms
 	var old []conversationRow
 	var err error
 	if replace {
-		old, err = conversationRowsTx(tx, sessionID)
+		old, err = conversationRowsFromTx(tx, sessionID, fromOrdinal)
 		if err != nil {
 			return err
 		}
@@ -399,6 +460,13 @@ func reconcileConversationMessagesTx(tx transactionQueries, sessionID string, ms
 	for i := range incoming {
 		if equal && !conversationRowsEqual(old[i], incoming[i]) {
 			equal = false
+		}
+	}
+	// Tombstones are absent from old, so only the table can prove a session is new.
+	fresh := len(old) == 0
+	if fresh {
+		if err := tx.QueryRow(`SELECT NOT EXISTS(SELECT 1 FROM conversation_messages WHERE session_id=?)`, sessionID).Scan(&fresh); err != nil {
+			return err
 		}
 	}
 	retained := map[string]bool{}
@@ -411,6 +479,11 @@ func reconcileConversationMessagesTx(tx transactionQueries, sessionID string, ms
 			if old[i].Gap != "archive_content_excluded" {
 				row.Gap = old[i].Gap
 			}
+		} else if row.sourceID != "" && fresh {
+			// No stored rows to match, so only in-batch duplicates are ambiguous.
+			if counts[row.sourceID] > 1 {
+				row.Gap = "identity_ambiguous"
+			}
 		} else if row.sourceID != "" {
 			var count int
 			var id string
@@ -420,9 +493,18 @@ func reconcileConversationMessagesTx(tx transactionQueries, sessionID string, ms
 			if err != nil {
 				return err
 			}
-			if count == 1 && counts[row.sourceID] == 1 && (replace || removed) {
+			// A kept row below the range that shares this source ID is an
+			// occurrence the whole-session replace would also have counted.
+			var kept int
+			if fromOrdinal != math.MinInt {
+				if err := tx.QueryRow(`SELECT COUNT(*) FROM conversation_messages
+				 WHERE session_id=? AND source_id=? AND removed=0 AND ordinal < ?`, sessionID, row.sourceID, fromOrdinal).Scan(&kept); err != nil {
+					return err
+				}
+			}
+			if count == 1 && counts[row.sourceID]+kept == 1 && (replace || removed) {
 				row.MessageID = id
-			} else if count > 0 || counts[row.sourceID] > 1 {
+			} else if count > 0 || counts[row.sourceID]+kept > 1 {
 				// A native ID can restore its sole tombstone, but a reused source
 				// ID cannot identify which occurrence survived a replacement.
 				if !replace {
@@ -455,38 +537,58 @@ func reconcileConversationMessagesTx(tx transactionQueries, sessionID string, ms
 			}
 		}
 	}
-	for _, row := range incoming {
-		if err := putConversationRowTx(tx, row); err != nil {
-			return err
-		}
-	}
-	if replace && !usageOnly {
-		var hadGap, deleted bool
-		if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM conversation_session_changes WHERE session_id=? AND gap='archive_content_excluded'),
-		 COALESCE((SELECT deleted_at IS NOT NULL FROM sessions WHERE id=?),1)`, sessionID, sessionID).Scan(&hadGap, &deleted); err != nil {
-			return err
-		}
-		if hadGap {
-			return putConversationSessionChangeTx(tx, sessionID, "", deleted)
-		}
-	}
-	return nil
+	return putConversationRowsTx(tx, incoming, fresh)
 }
 
 func conversationRowsEqual(a, b conversationRow) bool {
 	sameTime := a.Timestamp == nil && b.Timestamp == nil || a.Timestamp != nil && b.Timestamp != nil && *a.Timestamp == *b.Timestamp
-	return a.Ordinal == b.Ordinal && a.Role == b.Role && sameTime && a.sourceID == b.sourceID && a.Digest == b.Digest && (a.body == nil) == (b.body == nil)
+	return a.Ordinal == b.Ordinal && a.Role == b.Role && sameTime && a.sourceID == b.sourceID && a.Digest == b.Digest
 }
 
-func putConversationRowTx(tx transactionQueries, row conversationRow) error {
-	_, err := tx.Exec(`INSERT INTO conversation_messages (session_id,message_id,ordinal,role,timestamp,source_id,body,digest,text_bytes,gap,deleted)
-		VALUES (?,?,?,?,COALESCE(?,''),?,?,?,?,?,COALESCE((SELECT deleted_at IS NOT NULL FROM sessions WHERE id = ?),0))
-		ON CONFLICT(session_id,message_id) DO UPDATE SET ordinal=excluded.ordinal,role=excluded.role,timestamp=excluded.timestamp,source_id=excluded.source_id,
-		body=excluded.body,digest=excluded.digest,text_bytes=excluded.text_bytes,gap=excluded.gap,deleted=excluded.deleted,removed=0
+const conversationRowsPerStmt = 35 // 12 params per row
+
+// putConversationRowsTx upserts rows in multi-row statements. A fresh session
+// takes its revisions from one counter reservation instead of the insert
+// trigger; existing sessions keep trigger-assigned revisions so an unchanged
+// rewrite leaves the publication counter alone.
+func putConversationRowsTx(tx transactionQueries, rows []conversationRow, fresh bool) error {
+	if len(rows) == 0 {
+		return nil
+	}
+	var revision int64
+	if fresh {
+		if err := tx.QueryRow(`INSERT INTO archive_metadata(key,value) VALUES(?,CAST(? AS TEXT))
+		 ON CONFLICT(key) DO UPDATE SET value=CAST(CAST(value AS INTEGER)+CAST(excluded.value AS INTEGER) AS TEXT) RETURNING CAST(value AS INTEGER)`, conversationRevisionKey, len(rows)).Scan(&revision); err != nil {
+			return err
+		}
+		revision -= int64(len(rows))
+	}
+	for start := 0; start < len(rows); start += conversationRowsPerStmt {
+		chunk := rows[start:min(start+conversationRowsPerStmt, len(rows))]
+		var sb strings.Builder
+		sb.WriteString(`INSERT INTO conversation_messages (session_id,message_id,ordinal,role,timestamp,source_id,body,digest,text_bytes,gap,deleted,revision) VALUES `)
+		args := make([]any, 0, len(chunk)*12)
+		for i, row := range chunk {
+			if i > 0 {
+				sb.WriteByte(',')
+			}
+			sb.WriteString(`(?,?,?,?,COALESCE(?,''),?,?,?,?,?,COALESCE((SELECT deleted_at IS NOT NULL FROM sessions WHERE id = ?),0),?)`)
+			var rev int64
+			if fresh {
+				rev = revision + int64(start+i) + 1
+			}
+			// Text stays in messages; a NULL body also retires any copy an older version stored.
+			args = append(args, row.SessionID, row.MessageID, row.Ordinal, row.Role, row.Timestamp, row.sourceID, nil, row.Digest, row.TextBytes, row.Gap, row.SessionID, rev)
+		}
+		sb.WriteString(` ON CONFLICT(session_id,message_id) DO UPDATE SET ordinal=excluded.ordinal,role=excluded.role,timestamp=excluded.timestamp,source_id=excluded.source_id,
+		body=NULL,digest=excluded.digest,text_bytes=excluded.text_bytes,gap=excluded.gap,deleted=excluded.deleted,removed=0
 		WHERE ordinal IS NOT excluded.ordinal OR role IS NOT excluded.role OR timestamp IS NOT excluded.timestamp OR source_id IS NOT excluded.source_id
-		OR body IS NOT excluded.body OR digest IS NOT excluded.digest OR text_bytes IS NOT excluded.text_bytes OR gap IS NOT excluded.gap OR deleted IS NOT excluded.deleted OR removed != 0`,
-		row.SessionID, row.MessageID, row.Ordinal, row.Role, row.Timestamp, row.sourceID, row.body, row.Digest, row.TextBytes, row.Gap, row.SessionID)
-	return err
+		OR digest IS NOT excluded.digest OR text_bytes IS NOT excluded.text_bytes OR gap IS NOT excluded.gap OR deleted IS NOT excluded.deleted OR removed != 0`)
+		if _, err := tx.Exec(sb.String(), args...); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func putConversationSessionChangeTx(tx transactionQueries, sessionID, gap string, deleted bool) error {

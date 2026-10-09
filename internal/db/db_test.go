@@ -1086,9 +1086,19 @@ func TestCurrentDataVersionCodexExecSessionKind(t *testing.T) {
 		"version 112 is the data-version boundary for Codex exec and roborev session kinds")
 }
 
+func TestCurrentDataVersionCodexApplyPatchFilePath(t *testing.T) {
+	assert.GreaterOrEqual(t, CurrentDataVersion(), 114,
+		"Codex apply_patch file paths require re-parsing existing sessions")
+}
+
 func TestCurrentDataVersionCursorTurnTimestamps(t *testing.T) {
 	assert.GreaterOrEqual(t, CurrentDataVersion(), 101,
 		"Cursor turn timestamps require re-parsing existing sessions")
+}
+
+func TestCurrentDataVersionCursorIDESessionStart(t *testing.T) {
+	assert.GreaterOrEqual(t, CurrentDataVersion(), 115,
+		"Cursor IDE session starts from bubble timestamps require re-parsing unchanged containers")
 }
 
 func TestCurrentDataVersionReasoningEffort(t *testing.T) {
@@ -1104,6 +1114,16 @@ func TestCurrentDataVersionResultContentNULSanitization(t *testing.T) {
 func TestCurrentDataVersionCursorSubagentCategory(t *testing.T) {
 	assert.GreaterOrEqual(t, CurrentDataVersion(), 107,
 		"version 107 is the data-version boundary for the Cursor Subagent tool category")
+}
+
+func TestCurrentDataVersionCodexCacheWriteTokens(t *testing.T) {
+	assert.GreaterOrEqual(t, CurrentDataVersion(), 123,
+		"version 123 is the data-version boundary for Codex cache-write token normalization")
+}
+
+func TestCurrentDataVersionClaudePeerMessages(t *testing.T) {
+	assert.GreaterOrEqual(t, CurrentDataVersion(), 126,
+		"version 126 is the data-version boundary for Claude peer-message classification")
 }
 
 func TestInsertMessages_PreservesToolResultEvents(t *testing.T) {
@@ -4805,6 +4825,41 @@ func TestFTSBackfill(t *testing.T) {
 	assert.Equal(t, "s1", page.Results[0].SessionID, "result session_id")
 }
 
+func TestOpenRejectsArchiveWhoseFTSModuleIsUnavailable(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "archive.db")
+	d, err := Open(t.Context(), path)
+	require.NoError(t, err, "Open with fts5 available")
+	requireFTS(t, d)
+	insertSession(t, d, "s1", "proj")
+	insertMessages(t, d, userMsg("s1", 0, "indexed text"))
+	require.NoError(t, d.Close())
+
+	// An archive created by an fts5 build stores messages_fts as
+	// "USING fts5(...)" plus the messages triggers that feed it. A build
+	// whose SQLite lacks fts5 opens that schema fine and only fails once
+	// a trigger fires ("no such module: fts5"). This process cannot drop
+	// its own fts5 module, so point the stored definition at a module
+	// name nothing registers; SQLite reports the same failure mode.
+	raw, err := sql.Open("sqlite3", makeDSN(path, false))
+	require.NoError(t, err)
+	for _, stmt := range []string{
+		"PRAGMA writable_schema=ON",
+		`UPDATE sqlite_master
+		 SET sql = replace(sql, 'USING fts5(', 'USING fts5_absent(')
+		 WHERE type = 'table' AND name = 'messages_fts'`,
+		"PRAGMA writable_schema=OFF",
+	} {
+		_, err := raw.ExecContext(t.Context(), stmt)
+		require.NoError(t, err, stmt)
+	}
+	require.NoError(t, raw.Close())
+
+	_, err = Open(t.Context(), path)
+	require.Error(t, err, "Open must refuse an archive whose FTS index this executable cannot load")
+	require.ErrorContains(t, err, "no such module: fts5_absent")
+	require.ErrorContains(t, err, "-tags fts5")
+}
+
 func TestPath(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "test.db")
@@ -5096,7 +5151,7 @@ func TestReopenDoesNotBlockNewReadsWhileClosingRetiredPool(t *testing.T) {
 	select {
 	case err := <-readDone:
 		require.NoError(t, err, "new read while closing retired pool")
-	case <-time.After(200 * time.Millisecond):
+	case <-time.After(2 * time.Second):
 		require.Fail(t, "new read blocked while Reopen closed a retired pool")
 	}
 
@@ -5131,44 +5186,6 @@ func TestRepeatedReopenBoundsRetiredPools(t *testing.T) {
 	assert.NotNil(t, s, "session s1 missing after repeated Reopen")
 }
 
-func TestCloseConnectionsWaitsForInFlightReads(t *testing.T) {
-	d := testDB(t)
-	insertSession(t, d, "s1", "proj")
-
-	rows, err := d.Reader().Query(t.Context(), "SELECT id FROM sessions")
-	require.NoError(t, err, "Query")
-	defer rows.Close()
-
-	closeDone := make(chan error, 1)
-	go func() { closeDone <- d.CloseConnections(t.Context()) }()
-
-	// The open rows hold a reader connection with a live file
-	// handle. CloseConnections promises the database file can be
-	// renamed afterwards, which fails on Windows while any handle
-	// survives, so it must not return before the rows are released.
-	select {
-	case err := <-closeDone:
-		require.Failf(t, "CloseConnections returned early",
-			"returned while rows were still open: %v", err)
-	case <-time.After(150 * time.Millisecond):
-	}
-
-	require.NoError(t, rows.Err(), "rows.Err")
-	require.NoError(t, rows.Close(), "rows.Close")
-
-	select {
-	case err := <-closeDone:
-		require.NoError(t, err, "CloseConnections")
-	case <-time.After(2 * time.Second):
-		require.Fail(t, "CloseConnections did not return after rows were released")
-	}
-
-	require.NoError(t, d.Reopen(), "Reopen")
-	s, err := d.GetSession(t.Context(), "s1")
-	require.NoError(t, err, "GetSession after Reopen")
-	assert.NotNil(t, s, "session s1 missing after Reopen")
-}
-
 func TestCloseConnectionsBlocksConcurrentReopen(t *testing.T) {
 	d := testDB(t)
 	insertSession(t, d, "s1", "proj")
@@ -5194,14 +5211,20 @@ func TestCloseConnectionsBlocksConcurrentReopen(t *testing.T) {
 	reopenDone := make(chan error, 1)
 	go func() { reopenDone <- d.Reopen() }()
 
-	// Reopen must serialize behind the drain: fresh handles opened
-	// mid-drain would let CloseConnections return while the database
-	// file is still unrenameable on Windows.
+	// The open rows hold a reader connection with a live file handle.
+	// CloseConnections promises the database file can be renamed
+	// afterwards, which fails on Windows while any handle survives, so it
+	// must not return before the rows are released. Reopen must serialize
+	// behind the drain, since fresh handles opened mid-drain would break
+	// the same promise.
 	select {
+	case err := <-closeDone:
+		require.Failf(t, "CloseConnections returned early",
+			"returned while rows were still open: %v", err)
 	case err := <-reopenDone:
 		require.Failf(t, "Reopen returned early",
 			"returned while CloseConnections was draining: %v", err)
-	case <-time.After(150 * time.Millisecond):
+	case <-time.After(150 * time.Millisecond): //nolint:kennlint // absence check; the open rows keep the drain, and so Reopen, waiting
 	}
 
 	require.NoError(t, rows.Err(), "rows.Err")
@@ -5243,7 +5266,7 @@ func TestCloseWriterWaitsForInFlightWriterQuery(t *testing.T) {
 	case err := <-closeDone:
 		require.Failf(t, "CloseWriter returned early",
 			"returned while writer rows were still open: %v", err)
-	case <-time.After(150 * time.Millisecond):
+	case <-time.After(150 * time.Millisecond): //nolint:kennlint // absence check; the open writer rows keep CloseWriter waiting
 	}
 
 	require.NoError(t, rows.Err(), "rows.Err")

@@ -36,6 +36,7 @@ describe("KNOWN_AGENTS", () => {
       "vscode-copilot",
       "visualstudio-copilot",
       "pi",
+      "stepcode",
       "tau",
       "prime-agent",
       "qwen",
@@ -45,6 +46,7 @@ describe("KNOWN_AGENTS", () => {
       "openclaw",
       "qclaw",
       "iflow",
+      "junie",
       "kimi",
       "kimi-work",
       "claude-ai",
@@ -95,6 +97,7 @@ describe("agentColor", () => {
     expect(agentColor("zencoder")).toBe("var(--accent-red)");
     expect(agentColor("zed")).toBe("var(--accent-green)");
     expect(agentColor("pi")).toBe("var(--accent-indigo)");
+    expect(agentColor("stepcode")).toBe("var(--accent-indigo)");
     expect(agentColor("tau")).toBe("var(--accent-amber)");
     expect(agentColor("prime-agent")).toBe("var(--accent-indigo)");
     expect(agentColor("qwen")).toBe("var(--accent-cyan)");
@@ -168,6 +171,7 @@ describe("agentLabel", () => {
     expect(agentLabel("openclaw")).toBe("OpenClaw");
     expect(agentLabel("qclaw")).toBe("QClaw");
     expect(agentLabel("iflow")).toBe("iFlow");
+    expect(agentLabel("junie")).toBe("Junie");
     expect(agentLabel("kimi-work")).toBe("Kimi Work");
     expect(agentLabel("workbuddy")).toBe("WorkBuddy");
     expect(agentLabel("codebuddy")).toBe("CodeBuddy");
@@ -178,6 +182,7 @@ describe("agentLabel", () => {
     expect(agentLabel("deepseek-tui")).toBe("DeepSeek TUI");
     expect(agentLabel("deepseek-harness")).toBe("DeepSeek Harness");
     expect(agentLabel("prime-agent")).toBe("Prime Agent");
+    expect(agentLabel("stepcode")).toBe("StepCode");
     expect(agentLabel("qoder")).toBe("Qoder");
     expect(agentLabel("roocode")).toBe("RooCode");
     expect(agentLabel("omnigent")).toBe("Omnigent");

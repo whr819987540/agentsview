@@ -23,8 +23,10 @@ import (
 	"github.com/spf13/cobra"
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/insight"
 	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/poller"
+	"go.kenn.io/agentsview/internal/rawderive"
 	"go.kenn.io/agentsview/internal/recall/extract"
 	"go.kenn.io/agentsview/internal/remotesync"
 	"go.kenn.io/agentsview/internal/secrets"
@@ -42,7 +44,7 @@ var (
 
 const (
 	periodicSyncInterval           = 15 * time.Minute
-	telemetryPingInterval          = 24 * time.Hour
+	telemetryDailyCheckInterval    = time.Hour
 	unwatchedPollInterval          = 2 * time.Minute
 	watcherBatchDelay              = 500 * time.Millisecond
 	watcherSyncMinInterval         = 5 * time.Second
@@ -61,6 +63,9 @@ const (
 )
 
 func main() {
+	if handled, code := rawderive.RunParserChild(os.Args[1:]); handled {
+		os.Exit(code)
+	}
 	// Turn on the agentsview-test-fixture deny-list before any scan
 	// runs. The secrets package keeps the filter off by default so unit
 	// tests in this repo (which use the same random-looking fixtures
@@ -107,7 +112,12 @@ type serveOptions struct {
 	ReplaceDaemon   bool
 	NoSyncExplicit  bool
 	SkipInitialSync bool
+	BasePath        string
 	Pprof           bool
+	// ReloadConfig rebuilds the configuration with the same layers and flags
+	// as startup so saved provider settings apply without a restart. Nil
+	// leaves the startup provider set in place until the daemon restarts.
+	ReloadConfig func() (config.Config, error)
 }
 
 // serveMemoryLimitBytes is the default Go soft memory limit for the
@@ -272,11 +282,7 @@ func runServe(ctx context.Context, cfg config.Config, opts serveOptions, restart
 
 	idleTracker := newDaemonIdleTracker(cfg, stop)
 
-	telemetryReporter := telemetry.NewReporterOrDisabled(telemetry.Options{
-		InstallationID: cfg.InstallationID,
-		Version:        version,
-		Commit:         commit,
-	})
+	telemetryReporter := telemetry.NewReporterOrDisabled(telemetryOptions(cfg))
 	defer func() {
 		if err := telemetryReporter.Close(); err != nil {
 			log.Printf("close telemetry: %v", err)
@@ -313,11 +319,9 @@ func runServe(ctx context.Context, cfg config.Config, opts serveOptions, restart
 	}
 
 	var engine *sync.Engine
-	var stopWatcher func()
-	var openWatcherDispatch func()
-	var queueWatchRetry func(sync.WatchBatch)
-	var unwatchedPoller *sharedUnwatchedPollCoordinator
+	var reloadIngestion server.IngestionReloader
 	var completeWorkerStartup func()
+	var memoryRefresh *memoryRefreshQueue
 	if !cfg.NoSync {
 		var onStartupReconciled func(sync.SyncStats, error)
 		engine = sync.NewEngine(ctx, database, sync.EngineConfig{
@@ -339,42 +343,17 @@ func runServe(ctx context.Context, cfg config.Config, opts serveOptions, restart
 			},
 		})
 		defer engine.Close()
-		unwatchedPoller = newUnwatchedPollCoordinator(ctx, engine, idleTracker)
-		defer unwatchedPoller.Stop()
-		stopWatcher, openWatcherDispatch, _, queueWatchRetry = startFileWatcher(
-			cfg, engine, func(_ context.Context, batch sync.WatchBatch) error {
-				done, ok := idleTracker.BeginWork()
-				if !ok {
-					return context.Canceled
-				}
-				defer done()
-				// The serve ctx reaches watcher-driven syncs so SIGTERM can
-				// interrupt database reconciliation before Stop waits for it.
-				return syncWatchBatch(ctx, engine, batch, func() watchRecoveryScope {
-					return probeWatchRecoveryScope(cfg)
-				})
-			},
-			sync.WatcherOptions{
-				OnCoverageDegraded: func(degradedRoots []string) error {
-					scopes := make([]pollingScope, 0, len(degradedRoots))
-					for _, r := range degradedRoots {
-						scopes = append(scopes, pollingScope{Root: r})
-					}
-					return unwatchedPoller.AddObligation(pollingObligation{
-						Key: "watcher-fallback", Scopes: scopes,
-					})
-				},
-				OnPollingRequired: func(obligation sync.PollingObligation) error {
-					return unwatchedPoller.AddObligation(syncObligationToPoller(obligation))
-				},
-				OnPollingReleased: unwatchedPoller.RemoveObligation,
-			},
+		ingestion := newDaemonIngestion(
+			ctx, cfg, engine, database, idleTracker, opts.ReloadConfig,
 		)
-		defer stopWatcher()
+		defer ingestion.Stop()
+		if opts.ReloadConfig != nil {
+			reloadIngestion = ingestion.Reload
+		}
 		onStartupReconciled = newStartupReconciliationHandler(
 			ctx,
 			database.CheckpointWALTruncateWithRetry,
-			openWatcherDispatch,
+			ingestion.OpenWatcherDispatch,
 		)
 
 		if !opts.SkipInitialSync {
@@ -398,10 +377,11 @@ func runServe(ctx context.Context, cfg config.Config, opts serveOptions, restart
 				completeWorkerStartup = func() {
 					completeWorkerStartupReconciliation(
 						ctx,
-						reconcileRootPaths(cfg),
+						reconcileRootPaths(ingestion.Config()),
 						statsFromWorkerResult(workerStartupResult),
+						engine.RetainSubagentLinkRetry,
 						engine.ReconcileWatchRoots,
-						queueWatchRetry,
+						ingestion.QueueWatchRetry,
 						engine.RecordStartupReconciled,
 					)
 				}
@@ -443,13 +423,28 @@ func runServe(ctx context.Context, cfg config.Config, opts serveOptions, restart
 			log.Printf("warning: remote_hosts config invalid, skipping periodic remote sync: %v", err)
 			validRemotes = false
 		}
-		stopLiveActivity := startLiveActivityPoller(
-			ctx, cfg, database, engine, idleTracker,
-		)
-		defer stopLiveActivity()
+		ingestion.StartLiveActivity()
 		go startPeriodicSync(
-			ctx, cfg, engine, database, writeLock, idleTracker, validRemotes, emitter,
+			ctx, cfg, ingestion.Config, engine, database, writeLock, idleTracker,
+			validRemotes, emitter,
 		)
+		memoryRefresh = newMemoryRefreshQueue()
+		go runMemoryRefreshScheduler(
+			ctx, memoryRefresh.requests, memoryRefreshDebounce,
+			func() {
+				idleTracker.Do(func() {
+					runScheduledSyncPass(
+						ctx, engine, scheduledReconcileTargets(ingestion.Config()),
+					)
+				})
+			},
+		)
+	} else if opts.ReloadConfig != nil {
+		// Without a background engine the server reconfigures its own
+		// on-demand engine from the reloaded settings.
+		reloadIngestion = func(context.Context) (config.Config, error) {
+			return opts.ReloadConfig()
+		}
 	}
 
 	identityBackfillEngine := engine
@@ -495,6 +490,7 @@ func runServe(ctx context.Context, cfg config.Config, opts serveOptions, restart
 		fatal("%v", prepErr)
 	}
 	cfg = preparedCfg
+	rtOpts.BasePath = opts.BasePath
 
 	srvOpts := []server.Option{
 		server.WithVersion(server.VersionInfo{
@@ -508,6 +504,10 @@ func runServe(ctx context.Context, cfg config.Config, opts serveOptions, restart
 		server.WithIdleTracker(idleTracker),
 		server.WithHTTPRemoteCleanupRegistry(httpRemoteCleanupRegistry),
 		server.WithPprof(opts.Pprof),
+		server.WithTelemetryCapture(telemetryReporter.CaptureHandler()),
+	}
+	if rtOpts.BasePath != "" {
+		srvOpts = append(srvOpts, server.WithBasePath(rtOpts.BasePath))
 	}
 	srvOpts = append(srvOpts, pushBackendOptions()...)
 	srvOpts = append(srvOpts, vectorServe.ServerOpts...)
@@ -533,10 +533,17 @@ func runServe(ctx context.Context, cfg config.Config, opts serveOptions, restart
 			newForegroundResyncRunner(ctx, cfg, engine, database),
 		))
 	}
+	if memoryRefresh != nil {
+		srvOpts = append(srvOpts,
+			server.WithMemoryRefreshRequester(memoryRefresh.Notify))
+	}
 	if engine != nil {
 		srvOpts = append(srvOpts, server.WithLocalCompactRunner(
 			newForegroundCompactRunner(engine, database),
 		))
+	}
+	if reloadIngestion != nil {
+		srvOpts = append(srvOpts, server.WithIngestionReloader(reloadIngestion))
 	}
 	srvOpts = append(srvOpts, server.WithArtifactExchangeRunner(
 		newDaemonArtifactExchangeRunner(cfg, database, engine, emitter),
@@ -612,7 +619,7 @@ func runServe(ctx context.Context, cfg config.Config, opts serveOptions, restart
 	}
 	fmt.Printf("Database: %s\n", cfg.DBPath)
 
-	startTelemetryPings(ctx, telemetryReporter)
+	startTelemetryPings(ctx, telemetryReporter, cfg)
 
 	if vectorServe.Scheduler != nil {
 		go vectorServe.Scheduler.Run(ctx)
@@ -766,13 +773,11 @@ func runStartupSyncViaWorker(
 		// Database opening ends before either the full resync or incremental
 		// session sync begins.
 		if p.Resync {
-			progress.SetPhase("full resync")
 			if !resyncAnnounced {
 				resyncAnnounced = true
 				fmt.Println("Data version changed, running full resync...")
 			}
 		} else {
-			progress.SetPhase("initial sync")
 			if !syncAnnounced {
 				syncAnnounced = true
 				fmt.Println("Running initial sync...")
@@ -781,9 +786,9 @@ func runStartupSyncViaWorker(
 		if writeSyncProgress(os.Stdout, terminal, p) {
 			progressShown = true
 		}
-		progress.SetDetail(startupProgressDetail(p))
+		progress.SetSyncProgress(p)
 	}
-	result, err := launchSyncWorker(ctx, cfg, "startup", onLine)
+	result, err := launchSyncWorker(ctx, cfg, syncWorkerRequest{Mode: "startup"}, onLine)
 	if err == nil && result.Stats != nil {
 		printSyncSummary(*result.Stats, t)
 	} else if progressShown {
@@ -816,6 +821,12 @@ func startupWorkerOutcome(result workerResult, err error) (workerResult, bool) {
 			result.Status = "aborted"
 		}
 		result.DiscoveryComplete = false
+		if result.Stats == nil {
+			// The worker may have committed sessions before losing its result.
+			// Keep linking pending for recovery even when sources are unchanged.
+			result.Stats = new(statsFromWorkerResult(result))
+			result.Stats.LinksPending = true
+		}
 		return result, true
 	}
 }
@@ -1161,7 +1172,7 @@ func runWorkerResyncBuild(
 	var result workerResult
 	var launchErr error
 	var doneStats sync.SyncStats
-	barrierErr := engine.RunExclusive(func() error {
+	barrierErr := engine.RunExclusive(func() (err error) {
 		engine.UpdateProgress(sync.Progress{
 			Phase:  sync.PhasePreparingResync,
 			Detail: "Starting resync worker",
@@ -1180,8 +1191,11 @@ func runWorkerResyncBuild(
 		); cerr != nil {
 			return cerr
 		}
-		result, launchErr = launchSyncWorker(ctx, cfg, "resync-build", relay)
+		result, launchErr = launchSyncWorker(ctx, cfg, syncWorkerRequest{Mode: "resync-build"}, relay)
 		if launchErr != nil {
+			if result.Stats != nil {
+				result.Stats.LinksUpdated = 0
+			}
 			// The worker never swapped; restore the writer the barrier closed.
 			// Restoration is mandatory — abandoning it would leave every write
 			// endpoint failing until restart.
@@ -1195,14 +1209,28 @@ func runWorkerResyncBuild(
 			return launchErr
 		}
 		installed, serr := engine.SwapResyncDatabase(engine.ResyncTempPath())
+		if installed {
+			doneStats = statsFromWorkerResult(result)
+			doneStats.ArchiveRebuilt = true
+			if result.Stats != nil {
+				engine.SetSubagentLinkRetryExclusive(doneStats.LinksPending)
+			}
+			// Record installed changes even when later recovery fails. The
+			// completion notification runs after releasing the exclusive lock.
+			defer func() {
+				doneStats.Aborted = doneStats.Aborted || err != nil
+				engine.RecordStartupReconciledExclusive(doneStats, err)
+			}()
+		}
 		if serr != nil {
 			if !installed {
-				// The replacement was discarded, so its tombstones never
+				// The replacement was discarded, so its changes never
 				// reached the archive. A post-install failure keeps them:
 				// the replacement is the live archive there.
 				result.Tombstoned = 0
 				if result.Stats != nil {
 					result.Stats.Tombstoned = 0
+					result.Stats.LinksUpdated = 0
 				}
 			}
 			// Swap failures happen at or after CloseConnections closed the
@@ -1227,23 +1255,17 @@ func runWorkerResyncBuild(
 		if cerr := engine.ResetCachesAfterSwap(ctx); cerr != nil {
 			return cerr
 		}
-		// Record the completed resync with ResyncAll parity before the
-		// exclusive lock is released: last-sync state feeds /sync/status
-		// hydration, and the closed startup gate keeps the deferred startup
-		// fallback from launching another archive-scale pass. The emit and
-		// startup callback fire after the lock below.
-		doneStats = statsFromWorkerResult(result)
-		doneStats.ArchiveRebuilt = true
-		engine.RecordStartupReconciledExclusive(doneStats, nil)
 		return nil
 	})
+	if doneStats.ArchiveRebuilt {
+		engine.FinishStartupReconciled(doneStats)
+	}
 	if barrierErr != nil {
 		if errors.Is(barrierErr, errWorkerSpawn) {
 			return workerResult{}, barrierErr, true
 		}
 		return result, barrierErr, false
 	}
-	engine.FinishStartupReconciled(doneStats)
 	return result, nil, false
 }
 
@@ -1306,28 +1328,58 @@ func newDaemonIdleTracker(cfg config.Config, stop context.CancelFunc) *server.Id
 	})
 }
 
-func startTelemetryPings(ctx context.Context, reporter *telemetry.Reporter) {
+func telemetryOptions(cfg config.Config) telemetry.Options {
+	opts := telemetry.Options{
+		InstallationID:  cfg.InstallationID,
+		InstalledAt:     cfg.InstallationCreatedAt,
+		ClaimScreenView: cfg.ClaimScreenView,
+		Version:         version,
+		Commit:          commit,
+	}
+	for _, def := range parser.Registry {
+		opts.AgentTypes = append(opts.AgentTypes, string(def.Type))
+	}
+	// Freebuff shares Codebuff's registry entry but keeps its own agent type.
+	opts.AgentTypes = append(opts.AgentTypes, string(parser.AgentFreebuff))
+	// Canned insights report their template; other insights report their type.
+	for kind, valid := range insight.ValidTypes {
+		if valid && kind != insight.CannedType {
+			opts.InsightKinds = append(opts.InsightKinds, kind)
+		}
+	}
+	for kind, valid := range insight.ValidCannedKinds {
+		if valid {
+			opts.InsightKinds = append(opts.InsightKinds, string(kind))
+		}
+	}
+	return opts
+}
+
+func startTelemetryPings(ctx context.Context, reporter *telemetry.Reporter, cfg config.Config) {
 	if reporter == nil || !reporter.Enabled() {
 		return
 	}
-	captureTelemetryPing(ctx, reporter)
-	go func() {
-		ticker := time.NewTicker(telemetryPingInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				captureTelemetryPing(ctx, reporter)
-			}
-		}
-	}()
+	go runDailyTelemetryPings(ctx, telemetryDailyCheckInterval, cfg, func() error {
+		return reporter.CaptureDaemonActive(ctx)
+	})
 }
 
-func captureTelemetryPing(ctx context.Context, reporter *telemetry.Reporter) {
-	if err := reporter.CaptureDaemonActive(ctx); err != nil && ctx.Err() == nil {
-		log.Printf("capture telemetry event: %v", err)
+// runDailyTelemetryPings sends daemon_active at most once per installation
+// per UTC day. It checks at start and every interval, so a daemon that runs
+// across midnight UTC reports the new day within one interval, and a daemon
+// that restarts repeatedly finds the day already recorded.
+func runDailyTelemetryPings(ctx context.Context, interval time.Duration, cfg config.Config, send func() error) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		if err := cfg.ClaimDaemonActive(time.Now(), send); err != nil && ctx.Err() == nil {
+			log.Printf("capture telemetry event: %v", err)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
 	}
 }
 
@@ -1660,7 +1712,7 @@ func runInitialSync(
 	progress := newSyncProgressPrinter(os.Stdout)
 	stats := engine.SyncAll(ctx, func(p sync.Progress) {
 		progress(p)
-		startupProgress.SetDetail(startupProgressDetail(p))
+		startupProgress.SetSyncProgress(p)
 	})
 	printSyncSummary(stats, t)
 	return stats
@@ -1679,7 +1731,7 @@ func runInitialResync(
 	progress := newResyncProgressPrinter(os.Stdout, time.Now)
 	stats := engine.ResyncAll(ctx, func(p sync.Progress) {
 		progress.Print(p)
-		startupProgress.SetDetail(startupProgressDetail(p))
+		startupProgress.SetSyncProgress(p)
 	})
 	progress.Finish()
 	printSyncSummary(stats, t)
@@ -1692,7 +1744,7 @@ func runInitialResync(
 		progress := newSyncProgressPrinter(os.Stdout)
 		stats = engine.SyncAll(ctx, func(p sync.Progress) {
 			progress(p)
-			startupProgress.SetDetail(startupProgressDetail(p))
+			startupProgress.SetSyncProgress(p)
 		})
 		printSyncSummary(stats, t)
 		fellBack = true
@@ -1773,13 +1825,14 @@ func printSyncSummary(stats sync.SyncStats, t time.Time) {
 }
 
 type resyncProgressPrinter struct {
-	w        io.Writer
-	now      func() time.Time
-	terminal bool
-	label    string
-	started  time.Time
-	inPlace  bool
-	finished bool
+	w         io.Writer
+	now       func() time.Time
+	terminal  bool
+	label     string
+	started   time.Time
+	inPlace   bool
+	finished  bool
+	lastPrint time.Time
 }
 
 func newResyncProgressPrinter(
@@ -1801,6 +1854,23 @@ func (p *resyncProgressPrinter) Print(progress sync.Progress) {
 	}
 	label := resyncProgressLabel(progress)
 	if label == "" {
+		return
+	}
+
+	if progress.Phase == sync.PhaseFinalizing && progress.SessionsTotal > 0 {
+		if p.label != label {
+			p.finishCurrent()
+			p.label = label
+			p.started = p.now()
+		}
+		p.inPlace = p.terminal
+		if p.terminal {
+			fmt.Fprintf(p.w, "\r  %s\x1b[K", formatSyncProgress(progress))
+		} else if p.lastPrint.IsZero() || p.now().Sub(p.lastPrint) >= 5*time.Second ||
+			progress.SessionsDone == progress.SessionsTotal {
+			fmt.Fprintf(p.w, "  %s\n", formatSyncProgress(progress))
+			p.lastPrint = p.now()
+		}
 		return
 	}
 
@@ -1863,6 +1933,7 @@ func (p *resyncProgressPrinter) finishCurrent() {
 	p.label = ""
 	p.started = time.Time{}
 	p.inPlace = false
+	p.lastPrint = time.Time{}
 }
 
 func resyncProgressLabel(p sync.Progress) string {
@@ -2002,11 +2073,16 @@ func formatSyncProgress(p sync.Progress) string {
 			detail = fmt.Sprintf("%s: %s", detail, formatByteProgress(p))
 		}
 		if p.SessionsTotal > 0 {
-			detail = fmt.Sprintf(
-				"%s: %d/%d sessions (%.0f%%) · %d messages",
-				detail, p.SessionsDone, p.SessionsTotal,
-				p.Percent(), p.MessagesIndexed,
-			)
+			if p.Phase == sync.PhaseFinalizing {
+				detail = fmt.Sprintf("%s: %d/%d sessions checked (%.0f%%)",
+					detail, p.SessionsDone, p.SessionsTotal, p.Percent())
+			} else {
+				detail = fmt.Sprintf(
+					"%s: %d/%d sessions (%.0f%%) · %d messages",
+					detail, p.SessionsDone, p.SessionsTotal,
+					p.Percent(), p.MessagesIndexed,
+				)
+			}
 		}
 		if p.Hint != "" {
 			detail += " - " + p.Hint
@@ -2490,6 +2566,8 @@ type watchScope struct {
 type watchRoot struct {
 	path                  string
 	recursive             bool
+	maxDepth              int
+	extraDirectories      []string
 	exists                bool
 	scopes                []watchScope
 	pendingPollingDirs    []string
@@ -2505,10 +2583,12 @@ func (r watchRoot) registeredRoot() sync.WatchRoot {
 		})
 	}
 	return sync.WatchRoot{
-		Path:      r.path,
-		Recursive: r.recursive,
-		Exists:    r.exists,
-		Scopes:    scopes,
+		Path:             r.path,
+		Recursive:        r.recursive,
+		MaxDepth:         r.maxDepth,
+		ExtraDirectories: append([]string(nil), r.extraDirectories...),
+		Exists:           r.exists,
+		Scopes:           scopes,
 	}
 }
 
@@ -2581,10 +2661,19 @@ func collectWatchRoots(cfg config.Config) (
 			persistentDirAgents[cleanDir] = append(persistentDirAgents[cleanDir], agent)
 		}
 	}
-	addRoot := func(agent parser.AgentType, dir, path string, recursive, exists bool) {
+	addRoot := func(
+		agent parser.AgentType, dir, path string,
+		recursive bool, maxDepth int, extra []string, exists bool,
+	) {
 		path = filepath.Clean(path)
 		scope := watchScope{agent: agent, syncDir: dir}
 		if idx, ok := rootIndexes[path]; ok {
+			roots[idx].maxDepth = sync.MergeWatchDepth(
+				roots[idx].recursive, roots[idx].maxDepth, recursive, maxDepth,
+			)
+			roots[idx].extraDirectories = sync.MergeExtraDirectories(
+				roots[idx].extraDirectories, extra,
+			)
 			roots[idx].recursive = roots[idx].recursive || recursive
 			roots[idx].exists = roots[idx].exists || exists
 			if !slices.Contains(roots[idx].scopes, scope) {
@@ -2594,17 +2683,21 @@ func collectWatchRoots(cfg config.Config) (
 		}
 		rootIndexes[path] = len(roots)
 		roots = append(roots, watchRoot{
-			path:      path,
-			recursive: recursive,
-			exists:    exists,
-			scopes:    []watchScope{scope},
+			path:             path,
+			recursive:        recursive,
+			maxDepth:         sync.MergeWatchDepth(recursive, maxDepth, false, 0),
+			extraDirectories: sync.MergeExtraDirectories(nil, extra),
+			exists:           exists,
+			scopes:           []watchScope{scope},
 		})
 	}
 	for _, factory := range cfg.LocalProviderFactories() {
 		def := factory.Definition()
 		for _, d := range cfg.ResolveDirs(def.Type) {
-			addAgentRoot := func(dir, root string, recursive, exists bool) {
-				addRoot(def.Type, dir, root, recursive, exists)
+			addAgentRoot := func(
+				dir, root string, recursive bool, maxDepth int, extra []string, exists bool,
+			) {
+				addRoot(def.Type, dir, root, recursive, maxDepth, extra, exists)
 			}
 			if providerWatched, polling := collectProviderWatchRoots(factory, d, addAgentRoot); providerWatched {
 				if polling.persistent {
@@ -2632,7 +2725,11 @@ func collectWatchRoots(cfg config.Config) (
 				addPersistent(def.Type, d)
 				continue
 			}
-			fallbackUnwatched := collectLegacyWatchRoots(def, d, addAgentRoot)
+			fallbackUnwatched := collectLegacyWatchRoots(
+				def, d, func(dir, root string, recursive, exists bool) {
+					addAgentRoot(dir, root, recursive, 0, nil, exists)
+				},
+			)
 			for _, pollingDir := range fallbackUnwatched {
 				addPersistent(def.Type, pollingDir)
 			}
@@ -2664,7 +2761,7 @@ type providerPollingReasons struct {
 func collectProviderWatchRoots(
 	factory parser.ProviderFactory,
 	dir string,
-	addRoot func(dir, root string, recursive, exists bool),
+	addRoot func(dir, root string, recursive bool, maxDepth int, extra []string, exists bool),
 ) (bool, providerPollingReasons) {
 	def := factory.Definition()
 	provider := factory.NewProvider(parser.ProviderConfig{
@@ -2693,7 +2790,10 @@ func collectProviderWatchRoots(
 		}
 		_, err := os.Stat(root)
 		exists := err == nil
-		addRoot(dir, root, providerRoot.Recursive, exists)
+		addRoot(
+			dir, root, providerRoot.Recursive, providerRoot.MaxDepth,
+			providerRoot.ExtraDirectories, exists,
+		)
 		if exists {
 			continue
 		}
@@ -2800,6 +2900,7 @@ func collectLegacyWatchRoots(
 func startPeriodicSync(
 	ctx context.Context,
 	cfg config.Config,
+	sourceConfig func() config.Config,
 	engine *sync.Engine,
 	database *db.DB,
 	lock *writeOwnerLock,
@@ -2822,11 +2923,6 @@ func startPeriodicSync(
 	// scheduled reconcile below (Task 5) untouched.
 	go startArchiveAudit(ctx, cfg, engine, database, lock, idleTracker, emitter)
 
-	// Remote object roots are static config; resolve them once. The scheduled
-	// reconcile targets are re-probed each tick because disk availability
-	// changes.
-	remoteRoots := remoteSourceSyncRoots(cfg)
-
 	ticker := time.NewTicker(periodicSyncInterval)
 	defer ticker.Stop()
 	for {
@@ -2837,8 +2933,12 @@ func startPeriodicSync(
 		}
 		log.Println("Running scheduled reconciliation...")
 		idleTracker.Do(func() {
-			runScheduledSyncPass(ctx, engine, scheduledReconcileTargets(cfg))
-			runRemoteSourceSyncPass(ctx, engine, remoteRoots)
+			// Roots follow provider settings changes, and the scheduled
+			// reconcile targets are re-probed each tick because disk
+			// availability changes.
+			current := sourceConfig()
+			runScheduledSyncPass(ctx, engine, scheduledReconcileTargets(current))
+			runRemoteSourceSyncPass(ctx, engine, remoteSourceSyncRoots(current))
 			recomputePendingSessions(engine, database)
 		})
 	}
@@ -2957,14 +3057,14 @@ func runArchiveAudit(
 }
 
 // workerResultHasSessionChanges reports whether a worker pass changed rows
-// clients must refetch. Cwd-only reconciliations ride the serialized
-// SyncStats payload rather than the summary counters, so the audit emit
-// must consult it or a cwd-only pass would leave the UI stale.
+// clients must refetch. Cwd-only changes and parent-link repairs ride the
+// serialized SyncStats payload rather than the summary counters, so the audit
+// emit must consult it or a metadata-only pass would leave the UI stale.
 func workerResultHasSessionChanges(result workerResult) bool {
 	if result.Synced > 0 || result.Tombstoned > 0 {
 		return true
 	}
-	return result.Stats != nil && result.Stats.CwdUpdated > 0
+	return result.Stats != nil && (result.Stats.CwdUpdated > 0 || result.Stats.LinksUpdated > 0)
 }
 
 // scheduledSyncEngine is the reconciliation surface the scheduled pass needs.
@@ -3097,7 +3197,7 @@ type remoteSyncRunner func(
 
 // remoteHostSyncFunc owns the HTTP cleanup registry around the engine lock.
 // Its injected transport must therefore run HTTP without acquiring that
-// registry recursively; SSH transports have no cleanup-registry ownership.
+// registry recursively.
 func remoteHostSyncFunc(
 	ctx context.Context,
 	cfg config.Config,
@@ -3121,13 +3221,7 @@ func remoteHostSyncFunc(
 			})
 			return stats, err
 		}
-		var stats remotesync.SyncStats
-		var err error
-		if rh.Transport == config.RemoteTransportHTTP {
-			stats, err = httpRemoteCleanupRegistry.Run(runExclusive)
-		} else {
-			stats, err = runExclusive()
-		}
+		stats, err := httpRemoteCleanupRegistry.Run(runExclusive)
 		return stats.SessionsSynced, err
 	}
 }

@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/tidwall/gjson"
+	"go.kenn.io/agentsview/internal/ctxio"
 )
 
 // Codex JSONL entry types.
@@ -659,6 +660,28 @@ func (b *codexSessionBuilder) handleFunctionCall(
 		waitAgentIDs = codexWaitAgentIDs(args)
 	}
 
+	call := ParsedToolCall{
+		ToolUseID: callID,
+		ToolName:  name,
+		Category:  NormalizeToolCategory(name),
+		InputJSON: inputJSON,
+		Rendering: content,
+		SkillName: skillName,
+	}
+	toolCalls := []ParsedToolCall{call}
+	if name == "apply_patch" {
+		// The patch body is the only place the paths appear, and one
+		// patch can touch several files. Emit a call per file so
+		// file-keyed views such as Recent Edits can group by path.
+		if files := codexApplyPatchFiles(payload); len(files) > 0 {
+			toolCalls = make([]ParsedToolCall, len(files))
+			for i, file := range files {
+				toolCalls[i] = call
+				toolCalls[i].FilePath = file
+			}
+		}
+	}
+
 	messageOrdinal := b.sink.AppendMessage(ParsedMessage{
 		Role:            RoleAssistant,
 		Content:         content,
@@ -667,14 +690,7 @@ func (b *codexSessionBuilder) handleFunctionCall(
 		ContentLength:   len(content),
 		Model:           b.model,
 		ReasoningEffort: b.reasoningEffort,
-		ToolCalls: []ParsedToolCall{{
-			ToolUseID: callID,
-			ToolName:  name,
-			Category:  NormalizeToolCategory(name),
-			InputJSON: inputJSON,
-			Rendering: content,
-			SkillName: skillName,
-		}},
+		ToolCalls:       toolCalls,
 	})
 	if callID != "" {
 		position := &ParsedToolCallPosition{
@@ -1092,12 +1108,7 @@ func formatCodexWriteStdinCall(
 func formatCodexApplyPatchCall(
 	summary string, args gjson.Result, rawArgs string,
 ) string {
-	patch := codexArgString(args, "patch")
-	if patch == "" && strings.Contains(rawArgs, "*** Begin Patch") {
-		patch = rawArgs
-	}
-
-	files := extractPatchedFiles(patch)
+	files := extractPatchedFiles(codexApplyPatchText(args, rawArgs))
 	if summary == "" {
 		summary = summarizePatchedFiles(files)
 	}
@@ -1116,6 +1127,26 @@ func formatCodexApplyPatchCall(
 		return header + "\n" + preview
 	}
 	return header
+}
+
+// codexApplyPatchFiles returns the files an apply_patch call names, in
+// patch order. Codex carries the patch either as a JSON "patch" argument
+// or, for custom_tool_call items, as raw patch text in "input"; the paths
+// appear only inside the patch body.
+func codexApplyPatchFiles(payload gjson.Result) []string {
+	args, rawArgs := parseCodexFunctionArgs(payload)
+	return extractPatchedFiles(codexApplyPatchText(args, rawArgs))
+}
+
+// codexApplyPatchText extracts the patch body from an apply_patch call's
+// parsed arguments, falling back to the raw argument string when it is
+// itself patch text.
+func codexApplyPatchText(args gjson.Result, rawArgs string) string {
+	patch := codexArgString(args, "patch")
+	if patch == "" && strings.Contains(rawArgs, "*** Begin Patch") {
+		patch = rawArgs
+	}
+	return patch
 }
 
 func formatCodexSpawnAgentCall(
@@ -1681,7 +1712,7 @@ func codexReplayParentIDContext(
 
 	parentID := ""
 	resolutionNeeded := false
-	scanner := bufio.NewScanner(checkedContextReader{ctx: ctx, reader: f})
+	scanner := bufio.NewScanner(ctxio.Reader{Context: ctx, Reader: f})
 	scanner.Buffer(make([]byte, 0, 64*1024), maxLineSize)
 	for scanner.Scan() {
 		if ctx.Err() != nil {

@@ -44,6 +44,7 @@ type VersionInfo struct {
 	BuildDate                  string `json:"build_date"`
 	ReadOnly                   bool   `json:"read_only,omitempty"`
 	InsightGenerationAvailable bool   `json:"insight_generation_available"`
+	SessionStatsAvailable      bool   `json:"session_stats_available"`
 	APIVersion                 int    `json:"api_version"`
 	DataVersion                int    `json:"data_version"`
 }
@@ -76,9 +77,15 @@ const (
 
 // Server is the HTTP server that serves the SPA and REST API.
 type Server struct {
-	mu                    gosync.RWMutex
-	cfg                   config.Config
-	activeDisabledAgents  []parser.AgentType
+	mu                   gosync.RWMutex
+	cfg                  config.Config
+	activeDisabledAgents []parser.AgentType
+	// ingestionReloader applies saved provider settings to the running
+	// daemon; settingsApplyMu keeps saves and their reloads in order.
+	ingestionReloader IngestionReloader
+	settingsApplyMu   gosync.Mutex
+	// onDemandReconfigureMu serializes source updates to onDemandEngine.
+	onDemandReconfigureMu gosync.Mutex
 	db                    db.Store
 	activityReports       *activityReportCache
 	assetCache            *assetCache
@@ -179,16 +186,26 @@ type Server struct {
 	// with the worker-backed build-and-swap instead of an in-process resync.
 	localResyncRunner LocalResyncRunner
 
+	// memoryRefreshRequest queues a background reconciliation for the local
+	// conversation-memory lifecycle hook. It must return immediately and
+	// coalesce duplicate requests outside the HTTP handler.
+	memoryRefreshRequest func()
+
 	// localCompactRunner, when set, backs archive compaction with the daemon's
 	// maintenance barrier instead of allowing a CLI to bypass the writer.
 	localCompactRunner LocalCompactRunner
 
+	// telemetryCapture receives UI telemetry events; nil leaves the route unregistered.
+	telemetryCapture http.Handler
+
 	artifactExchangeRunner ArtifactExchangeRunner
+	rawSyncTenant          string
 	rawSyncDeviceAuth      RawSyncDeviceAuth
 	rawSyncCustody         RawSyncCustody
 	rawSyncStatus          RawSyncStatusReader
 	rawSyncSchemaOnly      bool
 	rawSyncUploads         RawSyncUploads
+	rawSyncJobHealth       RawSyncJobHealth
 
 	ensurePricing func(context.Context, *db.DB) error
 }
@@ -284,14 +301,34 @@ func insightGenerateOptions(cfg config.Config) insight.GenerateOptions {
 	return opts
 }
 
-// ingestionConfig returns the daemon-start configuration for local filesystem
-// provider selection. Settings updates are persisted and reflected by GET
-// immediately, but the running local engine, watchers, and polling keep one
-// provider set until restart. Remote import and export ignore DisabledAgents.
+// resolvedInsightDefaultAgent reports the agent insight generation falls back
+// to when a request does not choose one: the configured [insights]
+// default_agent, or the built-in default. Config loading normalizes and
+// validates the configured name.
+func resolvedInsightDefaultAgent(cfg config.Config) string {
+	if cfg.Insights.DefaultAgent != "" {
+		return cfg.Insights.DefaultAgent
+	}
+	return config.DefaultInsightAgent
+}
+
+// insightDefaultAgent reports the default agent for generation requests on
+// this server's current configuration.
+func (s *Server) insightDefaultAgent() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return resolvedInsightDefaultAgent(s.cfg)
+}
+
+// ingestionConfig returns the configuration for local filesystem provider
+// selection as the running daemon applies it. Without an IngestionReloader,
+// settings updates are persisted and reflected by GET immediately, but the
+// running local engine, watchers, and polling keep the startup provider set.
+// Remote import and export ignore DisabledAgents.
 func (s *Server) ingestionConfig() config.Config {
 	s.mu.RLock()
+	defer s.mu.RUnlock()
 	cfg := s.cfg
-	s.mu.RUnlock()
 	cfg.DisabledAgents = append(
 		[]parser.AgentType(nil), s.activeDisabledAgents...,
 	)
@@ -300,6 +337,18 @@ func (s *Server) ingestionConfig() config.Config {
 
 // Option configures a Server.
 type Option func(*Server)
+
+// IngestionReloader reloads the saved session provider settings and applies
+// them to the running daemon's sync engine, watchers, and polling. It returns
+// the reloaded configuration once accepted; applying it to the engine may
+// finish in the background.
+type IngestionReloader func(ctx context.Context) (config.Config, error)
+
+// WithIngestionReloader applies provider settings changes without a daemon
+// restart.
+func WithIngestionReloader(r IngestionReloader) Option {
+	return func(s *Server) { s.ingestionReloader = r }
+}
 
 // RawSyncDeviceAuth exchanges device credentials and authenticates scoped
 // raw-transport tokens.
@@ -360,6 +409,15 @@ type RawSyncUploads interface {
 	) (rawsync.UploadSession, error)
 }
 
+// RawSyncJobHealth exposes read-only tenant-scoped raw parse-job health.
+type RawSyncJobHealth interface {
+	RawJobHealth(
+		context.Context,
+		rawsync.AuthIdentity,
+		rawsync.JobHealthQuery,
+	) (rawsync.JobHealthReport, error)
+}
+
 // WithRawSyncServices enables authenticated raw-sync machine routes.
 func WithRawSyncServices(auth RawSyncDeviceAuth, custody RawSyncCustody) Option {
 	return func(s *Server) {
@@ -379,6 +437,13 @@ func WithRawSyncUploads(uploads RawSyncUploads) Option {
 func WithRawSyncStatus(status RawSyncStatusReader) Option {
 	return func(s *Server) {
 		s.rawSyncStatus = status
+	}
+}
+
+// WithRawSyncJobHealth enables the scoped raw parse-job health read.
+func WithRawSyncJobHealth(health RawSyncJobHealth) Option {
+	return func(s *Server) {
+		s.rawSyncJobHealth = health
 	}
 }
 
@@ -580,6 +645,12 @@ func WithLocalResyncRunner(r LocalResyncRunner) Option {
 	return func(s *Server) { s.localResyncRunner = r }
 }
 
+// WithMemoryRefreshRequester enables the narrow SessionStart refresh route.
+// fn must only enqueue work; the request path must never run reconciliation.
+func WithMemoryRefreshRequester(fn func()) Option {
+	return func(s *Server) { s.memoryRefreshRequest = fn }
+}
+
 // LocalCompactRunner runs staged maintenance against the local SQLite archive.
 // The daemon injects this runner so the command shares the archive-wide
 // maintenance barrier with sync and resync.
@@ -648,6 +719,8 @@ func (s *Server) routes() {
 	configureHuma()
 	s.api = humago.New(s.mux, s.humaConfig())
 	s.registerTypedAPIRoutes()
+	s.registerMemoryRefreshRoute()
+	s.registerTelemetryCaptureRoute()
 
 	if s.pprofEnabled {
 		s.handleHTTP(&huma.Operation{Method: http.MethodGet, Path: "/debug/pprof/", Hidden: true}, httppprof.Index)
@@ -1580,3 +1653,6 @@ func logMiddleware(next http.Handler) http.Handler {
 		next.ServeHTTP(w, r)
 	})
 }
+
+// WithRawSyncTenant binds every raw credential/token identity before route work.
+func WithRawSyncTenant(tenant string) Option { return func(s *Server) { s.rawSyncTenant = tenant } }

@@ -34,6 +34,8 @@ const (
 	mappingRevisionKeyBase     = "agentsview_mapping_revision"
 	curationFingerprintKeyBase = "agentsview_curation_fingerprint"
 	cursorUsageMaxIDKeyBase    = "agentsview_cursor_usage_max_id"
+	usageSnapshotReadyKeyBase  = "agentsview_usage_snapshot_ready"
+	storedCountRepairKeyBase   = "agentsview_stored_message_count_repair"
 )
 
 // archiveMetadataKey scopes a sync_metadata key to one source archive so
@@ -54,6 +56,7 @@ const (
 	tTime          = "DateTime64(6, 'UTC')"
 	tNullTime      = "Nullable(DateTime64(6, 'UTC'))"
 	tVersion       = "UInt64"
+	tFloatArray    = "Array(Float32)"
 	pushVersionCol = "push_version"
 )
 
@@ -222,6 +225,7 @@ var mirrorTables = []tableSpec{
 			col("last_message_at", tNullTime),
 			col("agentsview_push_fingerprint", tString),
 			col("source_archive_id", tString),
+			col("stored_message_count", tNullInt),
 		},
 		orderBy: []string{"id"},
 	},
@@ -448,6 +452,57 @@ var mirrorTables = []tableSpec{
 		},
 		orderBy: []string{"session_id", "finding_index"},
 	},
+	// Vector tables mirror the local vectors.db export (see vector_push.go).
+	// A generation is keyed by its config fingerprint: ClickHouse has no
+	// serial ids, and the fingerprint is what a serving process matches on.
+	{
+		name: "vector_generations",
+		columns: []columnSpec{
+			col("fingerprint", tString),
+			col("model", tString),
+			col("dimension", tInt),
+			col("created_at", tNullTime),
+		},
+		orderBy: []string{"fingerprint"},
+	},
+	{
+		name: "vector_documents",
+		columns: []columnSpec{
+			col("doc_key", tString),
+			col("session_id", tString),
+			col("source_uuid", tString),
+			col("ordinal", tInt),
+			col("ordinal_end", tInt),
+			col("subordinate", tBool),
+			colDefault("offsets", tString, "'[]'"),
+			col("content", tString),
+			col("content_hash", tString),
+		},
+		orderBy: []string{"doc_key"},
+	},
+	{
+		// session_id is denormalized so a session's chunks delete in one
+		// statement without a subquery over vector_documents.
+		name: "vector_chunks",
+		columns: []columnSpec{
+			col("generation_fingerprint", tString),
+			col("doc_key", tString),
+			col("chunk_index", tInt),
+			col("session_id", tString),
+			col("embedding", tFloatArray),
+		},
+		orderBy: []string{"generation_fingerprint", "doc_key", "chunk_index"},
+	},
+	{
+		name: "vector_push_state",
+		columns: []columnSpec{
+			col("source_archive_id", tString),
+			col("generation_fingerprint", tString),
+			col("session_id", tString),
+			col("doc_agg_hash", tString),
+		},
+		orderBy: []string{"source_archive_id", "generation_fingerprint", "session_id"},
+	},
 	{
 		name:    "starred_sessions",
 		columns: []columnSpec{col("session_id", tString), col("created_at", tNullTime)},
@@ -533,6 +588,9 @@ func EnsureSchemaOn(ctx context.Context, conn *sql.DB) error {
 	if err := ensureTerminalEventSnapshots(ctx, conn); err != nil {
 		return err
 	}
+	if err := ensureUsageSessionSnapshots(ctx, conn); err != nil {
+		return err
+	}
 	return writeMetadata(ctx, conn, map[string]string{
 		schemaVersionKey:     strconv.Itoa(SchemaVersion),
 		sourceDataVersionKey: strconv.Itoa(db.CurrentDataVersion()),
@@ -580,6 +638,15 @@ func CheckSchemaCompat(ctx context.Context, conn *sql.DB) error {
 		for _, c := range append(t.columns, col(pushVersionCol, tVersion)) {
 			if _, has := cols[c.name]; !has {
 				missing = append(missing, t.name+"."+c.name)
+			}
+		}
+	}
+	if snapshot, err := usageSessionSnapshotSpec(); err != nil {
+		return err
+	} else if cols, ok := existing[snapshot.name]; ok {
+		for _, c := range snapshot.columns {
+			if _, has := cols[c.name]; !has {
+				missing = append(missing, snapshot.name+"."+c.name)
 			}
 		}
 	}

@@ -141,6 +141,7 @@ func TestStoreSessionsMessagesAndSearch(t *testing.T) {
 		require.NoError(t, err)
 		require.Len(t, page.Results, 1)
 		assert.Equal(t, fixtureAlphaID, page.Results[0].SessionID)
+		assert.Equal(t, fixtureMachine, page.Results[0].Machine)
 
 		content, err := store.SearchContent(ctx, db.ContentSearchFilter{
 			Pattern:        "clickhouse result",
@@ -152,6 +153,9 @@ func TestStoreSessionsMessagesAndSearch(t *testing.T) {
 		require.NotEmpty(t, content.Matches)
 		assert.Equal(t, "tool_result", content.Matches[0].Location)
 		assert.Equal(t, fixtureAlphaID, content.Matches[0].SessionID)
+		assert.Equal(t, fixtureMachine, content.Matches[0].Machine)
+		require.NotNil(t, content.Matches[0].DisplayName)
+		assert.Equal(t, "Alpha Saved Title", *content.Matches[0].DisplayName)
 
 		findings, err := store.ListSecretFindings(ctx, db.SecretFindingFilter{
 			Project: "alpha", Limit: 10,
@@ -306,4 +310,41 @@ func TestStoreGetSessionVersionChangesAfterPush(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, 3, count2)
 	assert.NotEqual(t, version, version2)
+}
+
+func TestStoreMessageWindowReportsRevisionWithRows(t *testing.T) {
+	store, _, _ := newPushedStore(t)
+	ctx := context.Background()
+
+	from := 0
+	revision := ""
+	msgs, err := store.GetMessagesWindow(ctx, fixtureAlphaID, db.MessageWindow{
+		From: &from, Limit: 10, Asc: true,
+		Roles:            []string{"user", "assistant"},
+		ObservedRevision: &revision,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []int{0, 1}, []int{msgs[0].Ordinal, msgs[1].Ordinal})
+	assert.Equal(t, "1", revision,
+		"linear page must report the fixture session revision")
+
+	anchor := 1
+	revision = ""
+	msgs, err = store.GetMessagesWindow(ctx, fixtureAlphaID, db.MessageWindow{
+		Around: &anchor, Before: 5, After: 5,
+		Roles:            []string{"user", "assistant"},
+		ObservedRevision: &revision,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []int{0, 1}, []int{msgs[0].Ordinal, msgs[1].Ordinal})
+	assert.Equal(t, "1", revision,
+		"around window must report the fixture session revision")
+
+	revision = ""
+	msgs, err = store.GetMessagesWindow(ctx, "missing", db.MessageWindow{
+		Around: &anchor, Before: 5, After: 5, ObservedRevision: &revision,
+	})
+	require.NoError(t, err)
+	assert.Empty(t, msgs)
+	assert.Empty(t, revision, "no rows means no revision to describe them")
 }

@@ -97,8 +97,10 @@ func parsePiLikeSession(
 	if branchedFrom := gjson.Get(headerLine, "branchedFrom").Str; branchedFrom != "" {
 		parentSessionID = idPrefix + piPersistedPathSessionID(branchedFrom)
 	} else if parentSession := gjson.Get(headerLine, "parentSession").Str; parentSession != "" &&
-		(agent == AgentPi || agent == AgentOMP || agent == AgentPrimeAgent) {
-		if agent == AgentPrimeAgent || agent == AgentPi {
+		(agent == AgentPi || agent == AgentOMP || agent == AgentPrimeAgent ||
+			agent == AgentOMO || agent == AgentStepCode) {
+		if agent == AgentPrimeAgent || agent == AgentPi || agent == AgentOMO ||
+			agent == AgentStepCode {
 			parentSession = primeParentSessionID(path, parentSession)
 		}
 		parentSessionID = idPrefix + parentSession
@@ -114,6 +116,17 @@ func parsePiLikeSession(
 		if parentID := ompParentHeaderSessionID(path); parentID != "" {
 			parentSessionID = idPrefix + parentID
 			isOMPSubagent = true
+		}
+	}
+
+	// The pi-subagents extension writes a fresh child to
+	// <project>/<parent>/<runId>/run-N/session.jsonl with no parentSession in
+	// its header, so lineage comes from the parent transcript three levels up.
+	var isPiSubagent bool
+	if (agent == AgentPi || agent == AgentOMO) && parentSessionID == "" {
+		if parentID := piSubagentParentSessionID(path); parentID != "" {
+			parentSessionID = idPrefix + parentID
+			isPiSubagent = true
 		}
 	}
 
@@ -349,16 +362,27 @@ func parsePiLikeSession(
 			Mtime: info.ModTime().UnixNano(),
 		},
 	}
-	if (agent == AgentPrimeAgent || agent == AgentPi) && parentSessionID != "" {
+	// A persisted parent means the transcript was branched from another
+	// session (/fork, /clone), not spawned as a subagent. A subagent child
+	// that got its lineage from the run directory still overrides this below.
+	if (agent == AgentPrimeAgent || agent == AgentPi || agent == AgentOMO ||
+		agent == AgentStepCode) && parentSessionID != "" {
 		sess.RelationshipType = RelFork
 	}
-	if isOMPSubagent {
+	if isOMPSubagent || isPiSubagent || (agent == AgentStepCode && isStepCodeChildSessionID(sessionID)) {
 		sess.RelationshipType = RelSubagent
 	}
 
 	accumulateMessageTokenUsage(sess, messages)
 
 	return sess, messages, nil
+}
+
+// isStepCodeChildSessionID reports whether a StepCode header ID belongs to a
+// spawned subagent or workflow agent. StepCode writes those children beside
+// the parent with no parentSession, so the ID prefix is the only marker.
+func isStepCodeChildSessionID(id string) bool {
+	return strings.HasPrefix(id, "subagent-") || strings.HasPrefix(id, "workflow-")
 }
 
 func piPersistedPathSessionID(value string) string {
@@ -761,7 +785,43 @@ func piTimestamp(line string) time.Time {
 // plus ".jsonl". The ID resolution mirrors parent parsing: prefer the header
 // id, but support V1 parent transcripts by falling back to the parent filename.
 func ompParentHeaderSessionID(childPath string) string {
-	parent := filepath.Dir(childPath) + ".jsonl"
+	return parentTranscriptSessionID(filepath.Dir(childPath) + ".jsonl")
+}
+
+// piSubagentParentSessionID returns the parent Pi session's stored raw ID for a
+// pi-subagents child at <parent>/<runId>/run-N/session.jsonl, or "" when
+// childPath does not have that shape or no Pi transcript sits at
+// <parent>.jsonl. A delegated child's own children resolve to that child,
+// because the extension nests them below its session.jsonl stem.
+func piSubagentParentSessionID(childPath string) string {
+	if filepath.Base(childPath) != "session.jsonl" {
+		return ""
+	}
+	runDir := filepath.Dir(childPath)
+	if !isPiSubagentRunDir(filepath.Base(runDir)) {
+		return ""
+	}
+	return parentTranscriptSessionID(filepath.Dir(filepath.Dir(runDir)) + ".jsonl")
+}
+
+// isPiSubagentRunDir reports whether name is a pi-subagents attempt directory
+// (run-0, run-1, ...).
+func isPiSubagentRunDir(name string) bool {
+	n, ok := strings.CutPrefix(name, "run-")
+	if !ok || n == "" {
+		return false
+	}
+	for _, r := range n {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// parentTranscriptSessionID returns the session ID a parent transcript at
+// parent parses to, or "" when parent is not a Pi-format transcript.
+func parentTranscriptSessionID(parent string) string {
 	parentID, ok := piSessionHeaderID(parent)
 	if !ok {
 		return ""

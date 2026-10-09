@@ -18,6 +18,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"go.kenn.io/agentsview/internal/config"
+	"go.kenn.io/agentsview/internal/db"
 	duckdbsync "go.kenn.io/agentsview/internal/duckdb"
 	"go.kenn.io/agentsview/internal/pathutil"
 	"go.kenn.io/agentsview/internal/server"
@@ -138,7 +139,11 @@ func runDuckDBPush(cfg DuckDBPushConfig) {
 	)
 	defer stop()
 
-	backend, cleanup, err := resolveArchiveWriteBackend(ctx, appCfg)
+	intent := transportIntentArchiveWrite
+	if cfg.Watch {
+		intent = transportIntentLongLived
+	}
+	backend, cleanup, err := resolveArchiveWriteBackend(ctx, appCfg, intent)
 	if err != nil {
 		fatal("opening writer: %v", err)
 	}
@@ -337,7 +342,7 @@ func runDuckDBStatus() {
 		scope = "all projects"
 	}
 	fmt.Printf("Machine:         %s\n", machine)
-	fmt.Printf("Last push:       %s\n", valueOrNever(status.LastPushAt))
+	fmt.Printf("Last push:       %s\n", db.ValueOrNever(status.LastPushAt))
 	fmt.Printf("Schema version:  %d\n", status.SchemaVersion)
 	fmt.Printf("Data version:    %d\n", status.DataVersion)
 	fmt.Printf("Scope:           %s\n", scope)

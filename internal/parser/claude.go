@@ -21,6 +21,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/tidwall/gjson"
+	"go.kenn.io/agentsview/internal/ctxio"
 	"go.kenn.io/agentsview/internal/stringutil"
 )
 
@@ -62,7 +63,9 @@ type dagEntry struct {
 // claudeQueuedCommand is a user message Claude Code persisted as
 // type=attachment with attachment.type=queued_command — i.e. a
 // prompt the user typed while a tool call was still running.
-// These records have no uuid/parentUuid, so we collect them out
+// Claude Code also uses this shape for task notifications and for
+// messages another session sent, which queuedCommandMessage
+// classifies as system rows. These records have no uuid/parentUuid, so we collect them out
 // of band and splice them into the message stream by timestamp
 // after DAG processing completes.
 type claudeQueuedCommand struct {
@@ -262,16 +265,6 @@ func claudeParseFile(
 				}
 			}
 		}
-		if opts.compatibleTitleEvents {
-			switch entryType {
-			case "custom-title":
-				if value := strings.TrimSpace(
-					gjson.GetBytes(lineBytes, "customTitle").Str,
-				); value != "" {
-					compatibleCustom = strings.Clone(value)
-				}
-			}
-		}
 		if agentLabel == "" {
 			if value := gjson.GetBytes(lineBytes, "agentSetting").Str; strings.TrimSpace(value) != "" {
 				agentLabel = strings.Clone(value)
@@ -350,6 +343,20 @@ func claudeParseFile(
 			if qc, ok := extractQueuedCommand(string(lineBytes)); ok {
 				qc.prompt = strings.Clone(qc.prompt)
 				queuedCommands = append(queuedCommands, qc)
+			}
+			continue
+		}
+
+		// Current Claude Code records /rename as a custom-title
+		// record and repeats it after later turns. It rejects empty
+		// names, so an empty value is not a clear.
+		if entryType == "custom-title" {
+			if value := strings.TrimSpace(
+				gjson.GetBytes(lineBytes, "customTitle").Str,
+			); value != "" {
+				displayName = strings.Clone(value)
+				compatibleCustom = displayName
+				renameSeen = true
 			}
 			continue
 		}
@@ -582,6 +589,7 @@ func claudeParseFile(
 			lastAssistantStopReason(results[i].Messages),
 			lastLineFailed,
 		)
+		results[i].Session.claudeRenameSeen = renameSeen
 	}
 
 	// Drop content-free /usage probe sessions (e.g. CodexBar's
@@ -825,6 +833,8 @@ type ClaudeSubagentLink struct {
 	SubagentSessionID string
 	ResultContentRaw  string
 	ResultContentLen  int
+	ResultStatus      string
+	ResultTimestamp   time.Time
 	HasResult         bool
 }
 
@@ -865,9 +875,9 @@ type claudeIncrementalScan struct {
 	// storedSessionName is the session_name already persisted for this
 	// session ("" when the row carries none), or nil when the call site
 	// cannot supply it. An appended ai-title can only change the stored
-	// session while that name is still empty, so a session that already
-	// carries its title keeps repeated title records on the incremental
-	// path. nil keeps the append incremental.
+	// session while that name is still empty, and an appended custom-title
+	// only when it differs from that name, so repeated title records stay on
+	// the incremental path. nil keeps the append incremental.
 	storedSessionName *string
 }
 
@@ -891,6 +901,7 @@ func claudeParseSessionFrom(
 		sawRename              bool
 		sawAITitle             bool
 		sawSessionIdentityEdit bool
+		appendedCustomTitle    string
 	)
 
 	consumed, err := readJSONLFrom(
@@ -908,6 +919,14 @@ func claudeParseSessionFrom(
 			if entryType == "ai-title" &&
 				strings.TrimSpace(gjson.Get(line, "aiTitle").Str) != "" {
 				sawAITitle = true
+			}
+			if entryType == "custom-title" {
+				if value := strings.TrimSpace(
+					gjson.Get(line, "customTitle").Str,
+				); value != "" {
+					appendedCustomTitle = value
+				}
+				return
 			}
 			if entryType == "system" {
 				if _, ok := extractRenameName(
@@ -989,8 +1008,11 @@ func claudeParseSessionFrom(
 	// appended assistant message; when a queued command would sort
 	// ahead of that head and mask the check, the parser itself falls
 	// back to a full parse (claudeQueuedCommandMasksSplitDetection).
+	var chunkAlias map[string]string
 	if len(entries) > 1 {
-		entries = mergeClaudeAssistantMessageChunks(entries)
+		entries, chunkAlias, _ = mergeClaudeAssistantMessageChunksContext(
+			context.Background(), entries,
+		)
 	}
 
 	// A rename-only append produces no entries and no queued commands, so
@@ -1008,6 +1030,12 @@ func claudeParseSessionFrom(
 	// full parse on every later window.
 	if sawAITitle && scan.storedSessionName != nil &&
 		*scan.storedSessionName == "" {
+		return nil, nil, time.Time{}, 0, ErrClaudeIncrementalNeedsFullParse
+	}
+	// Claude Code repeats the custom-title record after later turns, so
+	// escalate only when the appended name differs from the stored one.
+	if appendedCustomTitle != "" && scan.storedSessionName != nil &&
+		*scan.storedSessionName != appendedCustomTitle {
 		return nil, nil, time.Time{}, 0, ErrClaudeIncrementalNeedsFullParse
 	}
 	if sawSessionIdentityEdit {
@@ -1056,7 +1084,7 @@ func claudeParseSessionFrom(
 	} else if (dagBound || scan.lastEntryUUID != "") &&
 		appendMissingEntryUUID(entries) {
 		return nil, nil, time.Time{}, 0, ErrDAGDetected
-	} else if hasDAGFork(entries, scan.lastEntryUUID) {
+	} else if hasDAGFork(entries, scan.lastEntryUUID, chunkAlias) {
 		return nil, nil, time.Time{}, 0, ErrDAGDetected
 	}
 
@@ -1183,6 +1211,8 @@ func collectClaudeUnmatchedToolResults(
 				ToolUseID:        result.ToolUseID,
 				ResultContentRaw: result.ContentRaw,
 				ResultContentLen: result.ContentLength,
+				ResultStatus:     result.Status,
+				ResultTimestamp:  parseTimestamp(gjson.Get(e.line, "timestamp").Str),
 				HasResult:        true,
 			})
 			return true
@@ -1204,6 +1234,8 @@ func collectClaudeSubagentLinks(entries []dagEntry) []ClaudeSubagentLink {
 		if gjson.Get(entry.line, "isMeta").Bool() {
 			link.ResultContentRaw = ""
 			link.ResultContentLen = 0
+			link.ResultStatus = ""
+			link.ResultTimestamp = time.Time{}
 			link.HasResult = false
 		}
 		links = append(links, link)
@@ -1295,14 +1327,23 @@ func appendMissingEntryUUID(entries []dagEntry) bool {
 // parsing; forks require full DAG processing. Callers skip this
 // check entirely for parseLinear-bound sessions (see
 // claudeIncrementalScan.storedLinearParse).
-func hasDAGFork(entries []dagEntry, lastEntryUUID string) bool {
+//
+// chunkAlias maps each chunk uuid absorbed into a merged
+// same-message.id run to the merged entry's uuid. A merged run
+// takes its first chunk's parent, so when a re-parse of a response
+// split across syncs re-reads the stored tail chunk, the run
+// continues the chain through that absorbed chunk instead.
+func hasDAGFork(
+	entries []dagEntry, lastEntryUUID string, chunkAlias map[string]string,
+) bool {
 	lastUUID := lastEntryUUID
 	for _, e := range entries {
 		if e.uuid == "" {
 			continue // non-UUID entries are always linear
 		}
 		if lastUUID != "" &&
-			e.parentUuid != lastUUID {
+			e.parentUuid != lastUUID &&
+			chunkAlias[lastUUID] != e.uuid {
 			return true
 		}
 		lastUUID = e.uuid
@@ -1883,6 +1924,8 @@ func extractToolResultAgentIDLink(line string) (ClaudeSubagentLink, bool) {
 		SubagentSessionID: sessionID,
 		ResultContentRaw:  toolResult.ContentRaw,
 		ResultContentLen:  toolResult.ContentLength,
+		ResultStatus:      toolResult.Status,
+		ResultTimestamp:   parseTimestamp(gjson.Get(line, "timestamp").Str),
 		HasResult:         true,
 	}, true
 }
@@ -2598,7 +2641,7 @@ func readClaudePersistedToolResultContext(
 			return "", false, nil //nolint:nilerr // Optional persisted-output enrichment preserves the original transcript on failure.
 		}
 		b, readErr := io.ReadAll(io.LimitReader(
-			checkedContextReader{ctx: ctx, reader: f}, maxPersistedToolResultSize+1,
+			ctxio.Reader{Context: ctx, Reader: f}, maxPersistedToolResultSize+1,
 		))
 		closeErr := f.Close()
 		if errors.Is(readErr, context.Canceled) ||
@@ -3306,6 +3349,11 @@ func classifyClaudeSystemMessage(content string) string {
 		return "interrupted"
 	case strings.HasPrefix(trimmed, "<task-notification>"):
 		return "task_notification"
+	case strings.HasPrefix(trimmed, "<cross-session-message"):
+		// Another Claude Code session sent this message. Claude Code
+		// persists it as a queued_command whose prompt keeps the
+		// sender attributes in this wrapper.
+		return "peer_message"
 	case strings.HasPrefix(trimmed, "Stop hook feedback:"):
 		return "stop_hook"
 	case strings.HasPrefix(trimmed, "<system-reminder>"):

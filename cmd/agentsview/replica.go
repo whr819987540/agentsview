@@ -43,6 +43,9 @@ type ReplicaPushConfig struct {
 	// pushes leave them nil and retain the historical unscoped sync.
 	WatchBatch    *syncpkg.WatchBatch
 	WatchRecovery *syncpkg.WatchRecoveryScope
+	// LifecycleWake carries nonblocking SessionStart notifications from the
+	// process runtime owner into the existing debounced push loop.
+	LifecycleWake <-chan struct{}
 }
 
 type ReplicaStatusConfig struct {
@@ -102,7 +105,7 @@ func runReplicaPush(
 	)
 	defer stop()
 
-	writer, cleanup, err := resolveArchiveWriteBackend(ctx, appCfg)
+	writer, cleanup, err := resolveArchiveWriteBackend(ctx, appCfg, transportIntentArchiveWrite)
 	if err != nil {
 		return fmt.Errorf("opening writer: %w", err)
 	}
@@ -151,6 +154,15 @@ func runReplicaPushTarget(
 	cfg ReplicaPushConfig,
 	ref storage.ReplicaTargetRef,
 ) error {
+	if backend.Name() == "pg" {
+		pg, err := appCfg.ResolvePGTarget(ref.Name)
+		if err != nil {
+			return err
+		}
+		if pg.RawTenant != "" || pg.RawDerivation {
+			return errors.New("pg push cannot mutate a hosted-owned projection")
+		}
+	}
 	target, err := backend.ResolveTarget(appCfg, ref)
 	if err != nil {
 		return err
@@ -467,11 +479,12 @@ func loadReplicaServeConfig(cmd *cobra.Command) (config.Config, string, error) {
 }
 
 type replicaServeStartup struct {
-	cfg     config.Config
-	ctx     context.Context
-	rtOpts  serveRuntimeOptions
-	srv     *server.Server
-	cleanup func()
+	cfg         config.Config
+	ctx         context.Context
+	rtOpts      serveRuntimeOptions
+	srv         *server.Server
+	cleanup     func()
+	startWorker func()
 }
 
 var prepareReplicaServe = prepareReplicaServeImpl
@@ -490,6 +503,18 @@ func prepareReplicaServeImpl(
 	}
 	if target.Target.URL == "" {
 		return replicaServeStartup{}, fmt.Errorf("%s serve: url not configured", name)
+	}
+	if name == "pg" {
+		pg, err := appCfg.ResolvePG()
+		if err != nil {
+			return replicaServeStartup{}, err
+		}
+		if err := pg.ValidateRawDerivation(appCfg.RequireAuth); err != nil {
+			return replicaServeStartup{}, err
+		}
+		if pg.RawTenant != "" {
+			return prepareHostedPGServe(appCfg, pg, basePath)
+		}
 	}
 
 	applyClassifierConfig(appCfg)
@@ -511,6 +536,11 @@ func prepareReplicaServeImpl(
 	if len(appCfg.CustomModelPricing) > 0 {
 		store.SetCustomPricing(appCfg.CustomModelPricing)
 	}
+	// A store that prepares reads in the background starts only now, so
+	// that work uses every serve-time setting installed above.
+	if starter, ok := store.(interface{ StartBackground(context.Context) }); ok {
+		starter.StartBackground(ctx)
+	}
 
 	var closeExtras func() error
 	cleanup := func() {
@@ -521,6 +551,10 @@ func prepareReplicaServeImpl(
 			}
 		}
 		cleanupStore()
+	}
+	if err := wireReplicaVectorSearch(ctx, appCfg, backend, store, name+" serve"); err != nil {
+		cleanup()
+		return replicaServeStartup{}, fmt.Errorf("%s serve: %w", name, err)
 	}
 
 	rtOpts := serveRuntimeOptions{
@@ -583,8 +617,16 @@ func runReplicaServe(backend storage.Replica, appCfg config.Config, basePath str
 	if err != nil {
 		fatal("%v", err)
 	}
+	if err := runPreparedReplicaServe(name, startup); err != nil {
+		fatal("%v", err)
+	}
+}
+
+// Return through cleanup before the outer CLI may call os.Exit, including
+// readiness failures and unexpected server/proxy exits.
+func runPreparedReplicaServe(name string, startup replicaServeStartup) error {
 	defer startup.cleanup()
-	appCfg = startup.cfg
+	appCfg := startup.cfg
 	ctx := startup.ctx
 	rtOpts := startup.rtOpts
 	srv := startup.srv
@@ -597,11 +639,14 @@ func runReplicaServe(backend storage.Replica, appCfg config.Config, basePath str
 	)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
-			return
+			return nil
 		}
-		fatal("%s serve: %v", name, err)
+		return fmt.Errorf("%s serve: %w", name, err)
 	}
 
+	if startup.startWorker != nil {
+		startup.startWorker()
+	}
 	// Write the kit runtime record so CLI commands can discover this
 	// daemon. ReadOnly=true marks it as a replica serve (read-only)
 	// so clients can select an appropriate transport.
@@ -628,8 +673,9 @@ func runReplicaServe(backend storage.Replica, appCfg config.Config, basePath str
 	}
 
 	if err := waitForServerRuntime(ctx, srv, rt); err != nil {
-		fatal("%s serve: %v", name, err)
+		return fmt.Errorf("%s serve: %w", name, err)
 	}
+	return nil
 }
 
 func writeReplicaServeRuntimeRecord(name string, rt *serveRuntime) bool {

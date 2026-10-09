@@ -125,11 +125,13 @@ func (p *piProvider) FindSource(
 			return source, ok, err
 		}
 	}
-	// Native Pi default filenames are timestamp-prefixed, so a bare header
-	// UUID lookup finds nothing by filename. Fall back to scanning session
-	// headers only after the filename/directory lookup misses, so files with
-	// no header still resolve by their filename-derived identity.
-	if p.Def.Type == AgentPi {
+	// Native Pi, OMO, and StepCode default filenames are timestamp-prefixed, so
+	// a bare header UUID lookup finds nothing by filename. Fall back to
+	// scanning session headers only after the filename/directory lookup
+	// misses, so files with no header still resolve by their
+	// filename-derived identity.
+	if p.Def.Type == AgentPi || p.Def.Type == AgentOMO ||
+		p.Def.Type == AgentStepCode {
 		return p.sourceForHeaderSessionID(ctx, req.RawSessionID)
 	}
 	return SourceRef{}, false, nil
@@ -297,15 +299,16 @@ func newPiSourceSet(agent AgentType, roots []string) JSONLSourceSet {
 	}
 
 	// Pi's native session-dir override writes transcripts directly into the
-	// chosen directory; default homes group them by project instead.
-	if agent == AgentPi {
+	// chosen directory, and default homes group them by project. The
+	// pi-subagents extension nests subagent runs several levels below the
+	// project directory, so transcript depth is not capped. OMO and StepCode
+	// reuse Pi's harness, layout, and session-dir override, so they share the
+	// set.
+	if agent == AgentPi || agent == AgentOMO || agent == AgentStepCode {
 		return NewJSONLSourceSet(agent, roots,
 			WithRecursive(),
 			WithSymlinkFollowing(),
-			WithIncludePath(func(root, path string) bool {
-				return isPiSourcePath(root, path) &&
-					(filepath.Dir(path) == filepath.Clean(root) || IsDirectoryJSONLPath(root, path))
-			}),
+			WithIncludePath(isPiSourcePathAtAnyDepth),
 			WithProjectHint(func(root, path string) string { return "" }),
 			WithSessionIDFromPath(piSessionIDFromPath),
 			WithContentHashing(),
@@ -340,6 +343,30 @@ func newPiSourceSet(agent AgentType, roots []string) JSONLSourceSet {
 
 func isPiSourcePath(root, path string) bool {
 	return strings.HasSuffix(filepath.Base(path), ".jsonl")
+}
+
+// isPiSourcePathAtAnyDepth accepts a Pi transcript anywhere under a configured
+// sessions root: directly inside it (the native session-dir override), one
+// project directory down (default homes), or deeper, where pi-subagents keeps
+// each run's child session under the parent transcript's name
+// (<project>/<parent>/<runId>/run-N/session.jsonl). A delegated child can
+// spawn its own children, so the depth is not capped; only empty and traversal
+// segments are rejected. IsPiSessionFile still filters the file contents, so a
+// nested .jsonl that is not a Pi session is not indexed.
+func isPiSourcePathAtAnyDepth(root, path string) bool {
+	if !isPiSourcePath(root, path) {
+		return false
+	}
+	rel, err := filepath.Rel(filepath.Clean(root), filepath.Clean(path))
+	if err != nil {
+		return false
+	}
+	for part := range strings.SplitSeq(rel, string(filepath.Separator)) {
+		if part == "" || part == "." || part == ".." {
+			return false
+		}
+	}
+	return true
 }
 
 // isOMPSourcePath accepts OMP transcripts at the main-session depth

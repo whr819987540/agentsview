@@ -357,7 +357,7 @@ func TestStoredMemberFreshnessPagerEmitsOnlyVouchableRows(t *testing.T) {
 	}))
 
 	e := &Engine{db: database, machine: "local"}
-	rows, done, err := e.storedMemberFreshnessPager(container)(
+	rows, done, err := e.storedMemberFreshnessPager(container, "opencode:")(
 		t.Context(), "", 10,
 	)
 	require.NoError(t, err)
@@ -395,7 +395,7 @@ func TestStoredMemberFreshnessPagerAdvancesPastAllStalePages(t *testing.T) {
 	seedCoveredVirtualMember(t, database, "opencode:c", container+"#c", 500)
 
 	e := &Engine{db: database, machine: "local"}
-	rows, done, err := e.storedMemberFreshnessPager(container)(
+	rows, done, err := e.storedMemberFreshnessPager(container, "opencode:")(
 		t.Context(), "", 2,
 	)
 	require.NoError(t, err)
@@ -543,14 +543,14 @@ func TestDiscoveredFileWatermarkCutoffRequiresLiveCapture(t *testing.T) {
 func TestCaptureSQLiteContainerStatesScopesChangedPathToImpactedContainer(t *testing.T) {
 	firstDB, _ := newContainerTestDB(t)
 	secondDB, _ := newContainerTestDB(t)
-	engine := &Engine{
+	engine := withTestSources(&Engine{}, &engineSources{
 		agentDirs: map[parser.AgentType][]string{
 			parser.AgentOpenCode: {
 				filepath.Dir(firstDB),
 				filepath.Dir(secondDB),
 			},
 		},
-	}
+	})
 
 	origStat := statSQLiteContainerState
 	t.Cleanup(func() { statSQLiteContainerState = origStat })

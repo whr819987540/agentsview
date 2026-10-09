@@ -83,13 +83,11 @@ func TestIncrementalClaudeLateResultLinkScansDefiniteSecret(t *testing.T) {
 	require.True(t, sess.LastWriteIncremental,
 		"the late result must take the incremental path")
 
-	var stored string
-	require.NoError(t, database.Reader().QueryRow(t.Context(),
-		`SELECT COALESCE(result_content, '') FROM tool_calls
-		 WHERE session_id = ? AND tool_use_id = ?`,
-		sessionID, "toolu_r",
-	).Scan(&stored))
-	require.Contains(t, stored, secret,
+	stored, err := database.GetAllMessages(t.Context(), sessionID)
+	require.NoError(t, err)
+	require.Len(t, stored, 3)
+	require.Len(t, stored[2].ToolCalls, 1)
+	require.Contains(t, stored[2].ToolCalls[0].ResultContent, secret,
 		"the late link must update the stored result content")
 
 	findings, err := database.SessionSecretFindings(
@@ -98,7 +96,7 @@ func TestIncrementalClaudeLateResultLinkScansDefiniteSecret(t *testing.T) {
 	require.NoError(t, err)
 	found := false
 	for _, finding := range findings {
-		if finding.LocationKind == "tool_result" &&
+		if finding.LocationKind == "tool_result_event" &&
 			strings.Contains(finding.RedactedMatch, "AKIA") {
 			found = true
 			break
@@ -737,17 +735,18 @@ func TestClassifyProviderChangedPathWatchRootPlanCached(t *testing.T) {
 		watchRootsCalls: &watchRootsCalls,
 		watchPlanCalls:  &watchPlanCalls,
 	}
-	engine := &Engine{
+	engine := withTestSources(&Engine{
+		providerMigrationModes: map[parser.AgentType]parser.ProviderMigrationMode{
+			watchRootCountingAgent: parser.ProviderMigrationProviderAuthoritative,
+		},
+	}, &engineSources{
 		agentDirs: map[parser.AgentType][]string{
 			watchRootCountingAgent: {root},
 		},
 		providerFactories: map[parser.AgentType]parser.ProviderFactory{
 			watchRootCountingAgent: factory,
 		},
-		providerMigrationModes: map[parser.AgentType]parser.ProviderMigrationMode{
-			watchRootCountingAgent: parser.ProviderMigrationProviderAuthoritative,
-		},
-	}
+	})
 
 	for i := range 1000 {
 		path := filepath.Join(root, "archive", fmt.Sprintf("session-%04d.jsonl", i))
@@ -3777,14 +3776,15 @@ func TestTombstoneMissingWatchSourcesPreservesOneWayRewrittenOwnership(t *testin
 			Agent: string(parser.AgentClaude), FilePath: storedPath,
 		}},
 	))
-	engine := &Engine{
+	engine := withTestSources(&Engine{
 		db: database, machine: "remote",
-		agentDirs: map[parser.AgentType][]string{parser.AgentClaude: {root}},
 		pathRewriter: func(path string) string {
 			require.Equal(t, localPath, path)
 			return storedPath
 		},
-	}
+	}, &engineSources{
+		agentDirs: map[parser.AgentType][]string{parser.AgentClaude: {root}},
+	})
 
 	deleted, err := tombstoneMissingWatchSourcesUnderSyncLock(
 		t.Context(), engine, []string{root},
@@ -4317,13 +4317,16 @@ func TestStartupSyncFallbackRechecksAfterInFlightForegroundSync(t *testing.T) {
 		err error
 	}
 	fallbackDone := make(chan fallbackResult, 1)
+	fallbackFinished := make(chan struct{})
 	go func() {
 		_, ran, err := engine.RunStartupSyncFallback(t.Context(), nil)
 		fallbackDone <- fallbackResult{ran: ran, err: err}
+		close(fallbackFinished)
 	}()
+	// Never can leave a poll running after it returns; keep the result for the assertion below.
 	assert.Never(t, func() bool {
 		select {
-		case <-fallbackDone:
+		case <-fallbackFinished:
 			return true
 		default:
 			return false
@@ -7483,7 +7486,7 @@ func TestProcessAntigravityWALOnlyUpdateNotSkipped(t *testing.T) {
 
 	// WAL-only update: the main .db is untouched.
 	walPath := dbPath + "-wal"
-	require.NoError(t, os.WriteFile(walPath, []byte("wal bytes"), 0o644))
+	require.NoError(t, os.WriteFile(walPath, []byte(strings.Repeat("w", 4096)), 0o644))
 	info, err := os.Stat(dbPath)
 	require.NoError(t, err)
 	walTime := info.ModTime().Add(5 * time.Second)
@@ -7745,21 +7748,22 @@ func TestProcessFileSkipCacheReparsesStaleCodexProject(t *testing.T) {
 		sess.ID, db.CurrentDataVersion(),
 	))
 
-	e := &Engine{
+	e := withTestSources(&Engine{
 		db:        database,
 		idPrefix:  "host~",
 		skipCache: map[string]int64{path: info.ModTime().UnixNano()},
-		agentDirs: map[parser.AgentType][]string{
-			parser.AgentCodex: {root},
-		},
-		providerFactories: providerFactoryMap(parser.ProviderFactories()),
 		providerMigrationModes: map[parser.AgentType]parser.ProviderMigrationMode{
 			parser.AgentCodex: parser.ProviderMigrationProviderAuthoritative,
 		},
 		pathRewriter: func(path string) string {
 			return "host:" + path
 		},
-	}
+	}, &engineSources{
+		agentDirs: map[parser.AgentType][]string{
+			parser.AgentCodex: {root},
+		},
+		providerFactories: providerFactoryMap(parser.ProviderFactories()),
+	})
 
 	res := e.processFile(t.Context(), parser.DiscoveredFile{
 		Agent:   parser.AgentCodex,
@@ -7804,21 +7808,22 @@ func TestProcessFileSkipCacheReparsesStaleCodexDataVersion(t *testing.T) {
 		sess.ID, db.CurrentDataVersion()-1,
 	))
 
-	e := &Engine{
+	e := withTestSources(&Engine{
 		db:        database,
 		idPrefix:  "host~",
 		skipCache: map[string]int64{path: info.ModTime().UnixNano()},
-		agentDirs: map[parser.AgentType][]string{
-			parser.AgentCodex: {root},
-		},
-		providerFactories: providerFactoryMap(parser.ProviderFactories()),
 		providerMigrationModes: map[parser.AgentType]parser.ProviderMigrationMode{
 			parser.AgentCodex: parser.ProviderMigrationProviderAuthoritative,
 		},
 		pathRewriter: func(path string) string {
 			return "host:" + path
 		},
-	}
+	}, &engineSources{
+		agentDirs: map[parser.AgentType][]string{
+			parser.AgentCodex: {root},
+		},
+		providerFactories: providerFactoryMap(parser.ProviderFactories()),
+	})
 
 	res := e.processFile(t.Context(), parser.DiscoveredFile{
 		Agent: parser.AgentCodex,
@@ -7912,10 +7917,10 @@ func cacheCodexProviderFingerprint(
 ) (string, int64) {
 	t.Helper()
 
-	factory, ok := engine.providerFactories[parser.AgentCodex]
+	factory, ok := engine.sources().providerFactories[parser.AgentCodex]
 	require.True(t, ok)
 	provider := factory.NewProvider(parser.ProviderConfig{
-		Roots:        engine.agentDirs[parser.AgentCodex],
+		Roots:        engine.sources().agentDirs[parser.AgentCodex],
 		Machine:      engine.machine,
 		PathRewriter: engine.pathRewriter,
 	})
@@ -8093,21 +8098,22 @@ func TestProcessFileCodexDBFreshSkipIsNotCached(t *testing.T) {
 		sess.ID, db.CurrentDataVersion(),
 	))
 
-	e := &Engine{
+	e := withTestSources(&Engine{
 		db:        database,
 		idPrefix:  "host~",
 		skipCache: map[string]int64{},
-		agentDirs: map[parser.AgentType][]string{
-			parser.AgentCodex: {root},
-		},
-		providerFactories: providerFactoryMap(parser.ProviderFactories()),
 		providerMigrationModes: map[parser.AgentType]parser.ProviderMigrationMode{
 			parser.AgentCodex: parser.ProviderMigrationProviderAuthoritative,
 		},
 		pathRewriter: func(path string) string {
 			return "host:" + path
 		},
-	}
+	}, &engineSources{
+		agentDirs: map[parser.AgentType][]string{
+			parser.AgentCodex: {root},
+		},
+		providerFactories: providerFactoryMap(parser.ProviderFactories()),
+	})
 
 	// Missing optimization state must not force an unchanged remote source
 	// through a full parse. Preserve the database freshness skip without
@@ -8214,20 +8220,21 @@ func TestProcessCodexAppendedStaleProjectDoesFullReparse(t *testing.T) {
 	require.NoError(t, err, "append codex fixture")
 	require.NoError(t, f.Close(), "close codex fixture")
 
-	e := &Engine{
+	e := withTestSources(&Engine{
 		db:       database,
 		idPrefix: "host~",
-		agentDirs: map[parser.AgentType][]string{
-			parser.AgentCodex: {root},
-		},
-		providerFactories: providerFactoryMap(parser.ProviderFactories()),
 		providerMigrationModes: map[parser.AgentType]parser.ProviderMigrationMode{
 			parser.AgentCodex: parser.ProviderMigrationProviderAuthoritative,
 		},
 		pathRewriter: func(path string) string {
 			return "host:" + path
 		},
-	}
+	}, &engineSources{
+		agentDirs: map[parser.AgentType][]string{
+			parser.AgentCodex: {root},
+		},
+		providerFactories: providerFactoryMap(parser.ProviderFactories()),
+	})
 
 	res := e.processFile(t.Context(), parser.DiscoveredFile{
 		Agent: parser.AgentCodex,
@@ -8309,20 +8316,21 @@ func TestProcessCodexAppendedStaleProjectCarriesForceReplace(t *testing.T) {
 	require.NoError(t, err, "append codex fixture")
 	require.NoError(t, f.Close(), "close codex fixture")
 
-	e := &Engine{
+	e := withTestSources(&Engine{
 		db:       database,
 		idPrefix: "host~",
-		agentDirs: map[parser.AgentType][]string{
-			parser.AgentCodex: {root},
-		},
-		providerFactories: providerFactoryMap(parser.ProviderFactories()),
 		providerMigrationModes: map[parser.AgentType]parser.ProviderMigrationMode{
 			parser.AgentCodex: parser.ProviderMigrationProviderAuthoritative,
 		},
 		pathRewriter: func(path string) string {
 			return "host:" + path
 		},
-	}
+	}, &engineSources{
+		agentDirs: map[parser.AgentType][]string{
+			parser.AgentCodex: {root},
+		},
+		providerFactories: providerFactoryMap(parser.ProviderFactories()),
+	})
 
 	res := e.processFile(t.Context(), parser.DiscoveredFile{
 		Agent: parser.AgentCodex,
@@ -8775,19 +8783,20 @@ func newAiderProviderTestEngine(
 	forceParse bool,
 ) *Engine {
 	root := filepath.Dir(filepath.Dir(path))
-	return &Engine{
+	return withTestSources(&Engine{
 		db:         database,
 		machine:    "local",
 		forceParse: forceParse,
 		skipCache:  make(map[string]int64),
+		providerMigrationModes: map[parser.AgentType]parser.ProviderMigrationMode{
+			parser.AgentAider: parser.ProviderMigrationProviderAuthoritative,
+		},
+	}, &engineSources{
 		agentDirs: map[parser.AgentType][]string{
 			parser.AgentAider: {root},
 		},
 		providerFactories: providerFactoryMap(parser.ProviderFactories()),
-		providerMigrationModes: map[parser.AgentType]parser.ProviderMigrationMode{
-			parser.AgentAider: parser.ProviderMigrationProviderAuthoritative,
-		},
-	}
+	})
 }
 
 func persistAiderProviderResults(
@@ -8981,18 +8990,19 @@ func TestFindSourceFileProviderAuthoritativePrefersProviderOverStoredPath(t *tes
 			FingerprintKey: currentPath,
 		},
 	}
-	engine := &Engine{
+	engine := withTestSources(&Engine{
 		db: database,
+		providerMigrationModes: map[parser.AgentType]parser.ProviderMigrationMode{
+			parser.AgentCowork: parser.ProviderMigrationProviderAuthoritative,
+		},
+	}, &engineSources{
 		agentDirs: map[parser.AgentType][]string{
 			parser.AgentCowork: {root},
 		},
 		providerFactories: providerFactoryMap([]parser.ProviderFactory{
 			lookupSourceFactory{provider: provider},
 		}),
-		providerMigrationModes: map[parser.AgentType]parser.ProviderMigrationMode{
-			parser.AgentCowork: parser.ProviderMigrationProviderAuthoritative,
-		},
-	}
+	})
 
 	got := engine.FindSourceFile(t.Context(), "cowork:lookup")
 

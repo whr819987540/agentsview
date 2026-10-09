@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -38,6 +39,10 @@ import (
 //
 // Fixture sizes scale via AGENTSVIEW_BENCH_SYNC_SESSIONS and
 // AGENTSVIEW_BENCH_SYNC_MESSAGES for larger local runs.
+// AGENTSVIEW_BENCH_SYNC_REPLY_BYTES pads each assistant reply in the
+// usage fixture so ingest runs can exercise transcript text volume.
+// AGENTSVIEW_BENCH_SYNC_PENDING_MIB overrides the bulk pending-result budget
+// for cold-archive runs, so budgets can be compared on one fixture.
 
 const (
 	defaultBenchSyncSessions = 40
@@ -123,6 +128,9 @@ func writeBenchClaudeUsageArchive(
 	if err := os.MkdirAll(proj, 0o755); err != nil {
 		require.FailNowf(b, "test failed", "MkdirAll: %v", err)
 	}
+	padding := strings.Repeat(
+		"x", benchIntFromEnv("AGENTSVIEW_BENCH_SYNC_REPLY_BYTES", 0),
+	)
 	for s := range sessions {
 		builder := testjsonl.NewSessionBuilder()
 		for m := 0; m < perSession; m += 2 {
@@ -134,7 +142,7 @@ func writeBenchClaudeUsageArchive(
 			))
 			builder.AddClaudeAssistantUsage(ts, fmt.Sprintf(
 				"assistant reply %d in session %d", m, s,
-			), testjsonl.ClaudeAssistantUsage{
+			)+padding, testjsonl.ClaudeAssistantUsage{
 				MessageID:    fmt.Sprintf("msg_bench_%04d_%04d", s, m),
 				RequestID:    fmt.Sprintf("req_bench_%04d_%04d", s, m),
 				Model:        "claude-sonnet-4-20250514",
@@ -374,6 +382,11 @@ func benchColdArchive(
 	dir := b.TempDir()
 	writeArchive(b, dir, sessions, perSession)
 	dbDir := b.TempDir()
+	if mib := benchIntFromEnv("AGENTSVIEW_BENCH_SYNC_PENDING_MIB", 0); mib > 0 {
+		prev := bulkPendingRetentionBytes
+		bulkPendingRetentionBytes = int64(mib) << 20
+		b.Cleanup(func() { bulkPendingRetentionBytes = prev })
+	}
 
 	b.ReportAllocs()
 	b.ResetTimer()
@@ -515,8 +528,8 @@ func benchResyncBulkContributorIngest(b *testing.B, withUsage bool) {
 	ctx := b.Context()
 	benchColdArchive(b, withUsage,
 		func(engine *Engine) SyncStats {
-			dir := engine.agentDirs[parser.AgentClaude][0]
-			engine.agentDirs = nil
+			dir := engine.sources().agentDirs[parser.AgentClaude][0]
+			engine.sources().agentDirs = nil
 			stats, err := engine.ResyncAllWithOptions(ctx, nil, RebuildOptions{
 				Contributors: []RebuildContributor{{
 					Name: "benchmark-contributor",
@@ -552,6 +565,9 @@ func benchResyncBulkContributorIngest(b *testing.B, withUsage bool) {
 					writes, sessions,
 				)
 			}
+			// Each batch is one write transaction; a smaller pending budget
+			// trades more transactions for less retained parser data.
+			b.ReportMetric(float64(stats.RebuildPhases[1].Batches), "batches/op")
 		},
 	)
 }

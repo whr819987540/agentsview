@@ -52,6 +52,18 @@ func TestProviderCapabilitiesS3DiscoveryMatchConsumers(t *testing.T) {
 	}
 }
 
+// Only the providers with reported same-id files opt into keeping both.
+func TestProviderCapabilitiesSharedSessionIDsOptIn(t *testing.T) {
+	for _, factory := range ProviderFactories() {
+		agent := factory.Definition().Type
+		want := CapabilityUnsupported
+		if agent == AgentGemini || agent == AgentCursor {
+			want = CapabilitySupported
+		}
+		assert.Equalf(t, want, factory.Capabilities().Source.SharedSessionIDs, "%s", agent)
+	}
+}
+
 func TestProviderCapabilitiesActivityHintsMatchConsumers(t *testing.T) {
 	assert.Equal(t, CapabilityUnsupported, (SourceCapabilities{}).ActivityHints,
 		"new providers must opt in explicitly")
@@ -84,7 +96,8 @@ func TestProviderCapabilitiesChangedPathRelevanceMatchConsumers(t *testing.T) {
 		agent := factory.Definition().Type
 		got := factory.Capabilities().Source.ChangedPathRelevance
 		if agent == AgentOpenCode || agent == AgentKilo ||
-			agent == AgentMiMoCode || agent == AgentIcodemate {
+			agent == AgentMiMoCode || agent == AgentIcodemate || agent == AgentJunie ||
+			agent == AgentCodebuff {
 			assert.Equal(t, CapabilitySupported, got)
 			provider := factory.NewProvider(ProviderConfig{
 				Roots: []string{t.TempDir()},
@@ -94,6 +107,33 @@ func TestProviderCapabilitiesChangedPathRelevanceMatchConsumers(t *testing.T) {
 		}
 		assert.Equalf(t, CapabilityUnsupported, got,
 			"%s must not classify watch path relevance", agent)
+	}
+}
+
+func TestProviderCapabilitiesStoredMemberFreshnessListingMatchConsumers(t *testing.T) {
+	assert.Equal(t, CapabilityUnsupported, (SourceCapabilities{}).StoredMemberFreshnessListing,
+		"new providers must opt in explicitly")
+
+	for _, factory := range ProviderFactories() {
+		agent := factory.Definition().Type
+		got := factory.Capabilities().Source.StoredMemberFreshnessListing
+		root := t.TempDir()
+		provider := factory.NewProvider(ProviderConfig{Roots: []string{root}})
+		// Every SourceSetProvider forwards the resolver method, so the capability is the gate.
+		if agent == AgentCursorIDE {
+			assert.Equal(t, CapabilitySupported, got)
+			dbPath := filepath.Join(root, CursorIDEDBRelPath)
+			container, ok := ResolveStoredMemberFreshnessContainer(provider, dbPath)
+			assert.True(t, ok)
+			assert.Equal(t, dbPath, container)
+			continue
+		}
+		assert.Equalf(t, CapabilityUnsupported, got,
+			"%s must not declare a stored member freshness listing", agent)
+		_, ok := ResolveStoredMemberFreshnessContainer(
+			provider, filepath.Join(root, "x.db"),
+		)
+		assert.Falsef(t, ok, "%s must not resolve a stored freshness container", agent)
 	}
 }
 

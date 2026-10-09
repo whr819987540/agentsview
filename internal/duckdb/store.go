@@ -17,15 +17,15 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
 
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
-	"go.kenn.io/agentsview/internal/secrets"
 )
 
 // Compile-time check: *Store satisfies db.Store.
 var _ db.Store = (*Store)(nil)
+
+func (s *Store) MemoryBackendName() string { return "duckdb" }
 
 // Store wraps a DuckDB connection for read-mostly serve mode. path and
 // handleMu support live reopening after a mirror rebuild swaps in a new
@@ -244,6 +244,12 @@ func (s *Store) GetRecallEntry(
 	return nil, db.ErrReadOnly
 }
 
+func (s *Store) ReviewRecallEntry(
+	_ context.Context, _ string, _ db.RecallReviewAction,
+) (db.RecallEntry, error) {
+	return db.RecallEntry{}, db.ErrReadOnly
+}
+
 func (s *Store) QueryRecallEntries(
 	_ context.Context, _ db.RecallQuery,
 ) (db.RecallPage, error) {
@@ -312,7 +318,7 @@ func scanSessionWithSource(
 	rs interface{ Scan(...any) error }, includeSource bool,
 ) (db.Session, error) {
 	var s db.Session
-	var createdAt any
+	var createdAt, localModifiedAt any
 	var startedAt, endedAt, deletedAt any
 	targets := []any{
 		&s.ID, &s.Project, &s.ProjectAssigned, &s.Machine, &s.Agent,
@@ -345,13 +351,16 @@ func scanSessionWithSource(
 		&deletedAt, &s.DeletionCause, &s.TerminationStatus, &s.TranscriptRevision,
 	}
 	if includeSource {
-		targets = append(targets, &s.FilePath)
+		targets = append(targets, &s.FilePath, &s.FileSize, &localModifiedAt)
 	}
 	err := rs.Scan(targets...)
 	if err != nil {
 		return s, err
 	}
 	s.CreatedAt = formatDBTime(createdAt)
+	if v := formatDBTime(localModifiedAt); v != "" {
+		s.LocalModifiedAt = &v
+	}
 	if v := formatDBTime(startedAt); v != "" {
 		s.StartedAt = &v
 	}
@@ -530,9 +539,7 @@ func (s *Store) DecodeCursor(raw string) (db.SessionCursor, error) {
 }
 
 func (s *Store) ListSessions(ctx context.Context, f db.SessionFilter) (db.SessionPage, error) {
-	if f.Limit <= 0 || f.Limit > db.MaxSessionLimit {
-		f.Limit = db.DefaultSessionLimit
-	}
+	f.Limit = db.NormalizeSessionLimit(f.Limit)
 	where, args := db.BuildSessionFilterSQL(f, db.DuckDBQueryDialect())
 	rs := db.ResolveSort(f)
 	total := 0
@@ -565,7 +572,7 @@ func (s *Store) ListSessions(ctx context.Context, f db.SessionFilter) (db.Sessio
 	}
 	columns := duckSessionCols
 	if f.IncludeSource {
-		columns += ", file_path"
+		columns += ", file_path, file_size, local_modified_at"
 	}
 	query := "SELECT " + columns +
 		" FROM sessions WHERE " + cursorWhere + " " +
@@ -581,13 +588,7 @@ func (s *Store) ListSessions(ctx context.Context, f db.SessionFilter) (db.Sessio
 	if err != nil {
 		return db.SessionPage{}, err
 	}
-	page := db.SessionPage{Sessions: sessions, Total: total}
-	if len(sessions) > f.Limit {
-		page.Sessions = sessions[:f.Limit]
-		last := page.Sessions[f.Limit-1]
-		page.NextCursor = s.EncodeCursor(db.NextSessionCursor(&last, rs, total, f))
-	}
-	return page, nil
+	return db.BuildSessionPage(sessions, total, f, rs, s.EncodeCursor), nil
 }
 
 func (s *Store) GetSidebarSessionIndex(ctx context.Context, f db.SessionFilter) (db.SidebarSessionIndex, error) {
@@ -999,7 +1000,7 @@ func (s *Store) Search(ctx context.Context, f db.SearchFilter) (db.SearchPage, e
 	args = append(args, f.Limit+1, f.Cursor)
 	rows, err := s.queryContext(ctx, `
 		WITH msg_ranked AS (
-			SELECT m.session_id, s.project, s.agent,
+			SELECT m.session_id, s.project, s.agent, s.machine,
 				COALESCE(s.display_name, s.session_name, s.first_message, '') AS name,
 				COALESCE(s.ended_at, s.started_at, s.created_at) AS session_ended_at,
 				m.ordinal, SUBSTRING(m.content, 1, 200) AS snippet,
@@ -1019,13 +1020,13 @@ func (s *Store) Search(ctx context.Context, f db.SearchFilter) (db.SearchPage, e
 				`+project+`
 		),
 		msg_matches AS (
-			SELECT session_id, project, agent, name, session_ended_at,
+			SELECT session_id, project, agent, machine, name, session_ended_at,
 				ordinal, snippet, rank, match_priority, match_pos
 			FROM msg_ranked
 			WHERE rn = 1
 		),
 		name_matches AS (
-			SELECT s.id AS session_id, s.project, s.agent,
+			SELECT s.id AS session_id, s.project, s.agent, s.machine,
 				COALESCE(s.display_name, s.session_name, s.first_message, '') AS name,
 				COALESCE(s.ended_at, s.started_at, s.created_at) AS session_ended_at,
 				-1 AS ordinal,
@@ -1050,7 +1051,7 @@ func (s *Store) Search(ctx context.Context, f db.SearchFilter) (db.SearchPage, e
 				AND s.id NOT IN (SELECT session_id FROM msg_matches)
 				`+nameProject+`
 		)
-		SELECT session_id, project, agent, name,
+		SELECT session_id, project, agent, machine, name,
 			session_ended_at, ordinal, snippet, rank
 		FROM (
 			SELECT * FROM msg_matches
@@ -1069,7 +1070,7 @@ func (s *Store) Search(ctx context.Context, f db.SearchFilter) (db.SearchPage, e
 	for rows.Next() {
 		var r db.SearchResult
 		var ended any
-		if err := rows.Scan(&r.SessionID, &r.Project, &r.Agent, &r.Name,
+		if err := rows.Scan(&r.SessionID, &r.Project, &r.Agent, &r.Machine, &r.Name,
 			&ended, &r.Ordinal, &r.Snippet, &r.Rank); err != nil {
 			return db.SearchPage{}, err
 		}
@@ -1215,7 +1216,7 @@ func (s *Store) collectContentMatches(ctx context.Context, f db.ContentSearchFil
 		for _, m := range all {
 			loc := re.FindStringIndex(m.body)
 			if loc != nil {
-				m.match.Snippet = duckContentSnippet(f, m.body, loc[0], loc[1])
+				m.match.Snippet = f.BuildSnippet(m.body, loc[0], loc[1])
 				filtered = append(filtered, m)
 			}
 		}
@@ -1335,10 +1336,10 @@ func (s *Store) collectContentSubstringMatches(
 	return s.scanContentMatches(ctx, query, args, func(body string) string {
 		if f.Mode == "fts" {
 			start, end := db.FTSSnippetRange(f.Pattern, body)
-			return duckContentSnippet(f, body, start, end)
+			return f.BuildSnippet(body, start, end)
 		}
 		start, end, _ := db.CaseInsensitiveSpan(body, f.Pattern)
-		return duckContentSnippet(f, body, start, end)
+		return f.BuildSnippet(body, start, end)
 	})
 }
 
@@ -1363,26 +1364,6 @@ func duckContentSearchPredicate(
 		return "FALSE"
 	}
 	return strings.Join(clauses, " AND ")
-}
-
-func duckContentSnippet(f db.ContentSearchFilter, body string, start, end int) string {
-	lo, hi := duckSnippetBounds(body, start, end, 60)
-	if f.RevealSecrets {
-		return body[lo:hi]
-	}
-	return secrets.RedactWindow(body, lo, hi)
-}
-
-func duckSnippetBounds(text string, start, end, radius int) (int, int) {
-	lo := max(start-radius, 0)
-	hi := min(end+radius, len(text))
-	for lo < start && !utf8.RuneStart(text[lo]) {
-		lo++
-	}
-	for hi > end && hi < len(text) && !utf8.RuneStart(text[hi]) {
-		hi--
-	}
-	return lo, hi
 }
 
 type duckContentCandidate struct {

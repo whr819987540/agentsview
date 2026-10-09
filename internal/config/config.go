@@ -32,6 +32,8 @@ import (
 	"go.kenn.io/agentsview/internal/jsonutil"
 	"go.kenn.io/agentsview/internal/parser"
 	"go.kenn.io/agentsview/internal/pathutil"
+	"go.kenn.io/kit/atomicfile"
+	"go.kenn.io/kit/embedconfig"
 )
 
 // TerminalConfig holds terminal launch preferences.
@@ -66,6 +68,12 @@ type ProxyConfig struct {
 
 // PGConfig holds PostgreSQL connection settings.
 type PGConfig struct {
+	RawTenant         string `toml:"raw_tenant" json:"raw_tenant,omitempty"`
+	RawDerivation     bool   `toml:"raw_derivation" json:"raw_derivation,omitempty"`
+	RawPollSeconds    int    `toml:"raw_poll_seconds" json:"raw_poll_seconds,omitempty"`
+	RawAttemptSeconds int    `toml:"raw_attempt_seconds" json:"raw_attempt_seconds,omitempty"`
+	RawMaxAttempts    int    `toml:"raw_max_attempts" json:"raw_max_attempts,omitempty"`
+
 	URL             string   `toml:"url" json:"url"`
 	Schema          string   `toml:"schema" json:"schema"`
 	MachineName     string   `toml:"machine_name" json:"machine_name"`
@@ -98,6 +106,8 @@ type ResolvedPGTarget struct {
 }
 
 var pgConfigKeys = map[string]struct{}{
+	"raw_tenant": {}, "raw_derivation": {}, "raw_poll_seconds": {}, "raw_attempt_seconds": {}, "raw_max_attempts": {},
+
 	"url":              {},
 	"schema":           {},
 	"machine_name":     {},
@@ -115,6 +125,15 @@ type ClickHouseConfig struct {
 	AllowInsecure   bool     `toml:"allow_insecure" json:"allow_insecure"`
 	Projects        []string `toml:"projects" json:"projects,omitempty"`
 	ExcludeProjects []string `toml:"exclude_projects" json:"exclude_projects,omitempty"`
+	// PushVectors gates the vector phase of clickhouse push. A pointer so an
+	// omitted key keeps the default (enabled) while an explicit false opts out.
+	PushVectors *bool `toml:"push_vectors" json:"push_vectors,omitempty"`
+}
+
+// PushVectorsEnabled reports whether clickhouse push should run its vector
+// phase: on unless push_vectors = false.
+func (c ClickHouseConfig) PushVectorsEnabled() bool {
+	return c.PushVectors == nil || *c.PushVectors
 }
 
 type clickHouseEnvOverrides struct {
@@ -138,6 +157,7 @@ var clickHouseConfigKeys = map[string]struct{}{
 	"allow_insecure":   {},
 	"projects":         {},
 	"exclude_projects": {},
+	"push_vectors":     {},
 }
 
 // DuckDBConfig holds DuckDB mirror and Quack connection settings.
@@ -186,9 +206,18 @@ type VectorConfig struct {
 	// archive's index with content that search already hides by default.
 	// `embeddings build --include-automated` can override this for a
 	// one-off build; see that flag's help for the scheduled-build caveat.
-	IncludeAutomated bool                   `toml:"include_automated" json:"include_automated"`
-	Embeddings       VectorEmbeddingsConfig `toml:"embeddings" json:"embeddings"`
-	Embed            VectorEmbedConfig      `toml:"embed" json:"embed"`
+	IncludeAutomated bool `toml:"include_automated" json:"include_automated"`
+	// RecallMaxRevisionLag is how many Recall corpus revisions the Recall
+	// vector index may trail the corpus and still answer vector and hybrid
+	// queries. Every insert, delete, or text edit of an accepted Recall entry
+	// is one revision, so while extraction runs the index trails by a few
+	// until the next build. Entries newer than the index are missing only
+	// from the vector ranking; hybrid still finds them by keyword. 0 requires
+	// an exact match, which was the only behavior before this setting.
+	// Default 256.
+	RecallMaxRevisionLag int                    `toml:"recall_max_revision_lag" json:"recall_max_revision_lag"`
+	Embeddings           VectorEmbeddingsConfig `toml:"embeddings" json:"embeddings"`
+	Embed                VectorEmbedConfig      `toml:"embed" json:"embed"`
 }
 
 // VectorEmbeddingsConfig describes the embedding space — the model identity
@@ -397,11 +426,21 @@ type VectorEmbedConfig struct {
 	BackstopInterval string `toml:"backstop_interval" json:"backstop_interval"`
 }
 
+// DefaultRecallMaxRevisionLag is the default [vector]
+// recall_max_revision_lag: room for about 50 minutes of steady extraction
+// between Recall index builds.
+const DefaultRecallMaxRevisionLag = 256
+
 // Validate checks the vector config for internal consistency. It is a
 // no-op when the section is disabled.
 func (c VectorConfig) Validate() error {
 	if !c.Enabled {
 		return nil
+	}
+	if c.RecallMaxRevisionLag < 0 {
+		return fmt.Errorf(
+			"[vector] recall_max_revision_lag must be 0 or greater, got %d",
+			c.RecallMaxRevisionLag)
 	}
 	if c.Embeddings.Model == "" {
 		return errors.New("[vector.embeddings] model is required when [vector] is enabled")
@@ -439,6 +478,48 @@ func (c VectorConfig) ResolvedDBPath(dataDir string) string {
 		return c.DBPath
 	}
 	return filepath.Join(dataDir, "vectors.db")
+}
+
+// EmbedModel maps the configured model identity onto kit's shared model
+// contract. Vectors are stored as the endpoint returns them (no client-side
+// normalization) so existing generations keep their exact values.
+func (c VectorEmbeddingsConfig) EmbedModel() embedconfig.Model {
+	return embedconfig.Model{
+		Name:              c.Model,
+		Dimensions:        c.Dimension,
+		Metric:            embedconfig.MetricCosine,
+		Normalization:     embedconfig.NormalizationNone,
+		RequestDimensions: c.RequestDimensions,
+	}
+}
+
+// EmbedRoles maps the configured prefixes and the shared input suffix onto
+// kit's role contract: documents get document_prefix, queries get
+// query_prefix, and both get input_suffix.
+func (c VectorEmbeddingsConfig) EmbedRoles() embedconfig.Roles {
+	return embedconfig.Roles{
+		DocumentPrefix: c.DocumentPrefix,
+		DocumentSuffix: c.InputSuffix,
+		QueryPrefix:    c.QueryPrefix,
+		QuerySuffix:    c.InputSuffix,
+		InputType:      embedconfig.InputTypeNone,
+	}
+}
+
+// EmbedDeployment maps the server endpoint onto kit's deployment contract.
+// agentsview has always accepted plaintext endpoints on the local network, so
+// private addresses and host names are trusted.
+func (c VectorEmbeddingsServerConfig) EmbedDeployment() embedconfig.Deployment {
+	return embedconfig.Deployment{BaseURL: c.Endpoint, TrustPrivateNetwork: true}
+}
+
+// EmbedTransport maps the server timeout onto kit's transport contract.
+func (c VectorEmbeddingsServerConfig) EmbedTransport() (embedconfig.Transport, error) {
+	timeout, err := time.ParseDuration(c.Timeout)
+	if err != nil {
+		return embedconfig.Transport{}, fmt.Errorf("invalid timeout %q: %w", c.Timeout, err)
+	}
+	return embedconfig.Transport{Timeout: timeout}, nil
 }
 
 // APIKey reads the API key from the environment variable named by
@@ -561,6 +642,43 @@ type InsightsConfig struct {
 	Model     string `json:"model,omitempty" toml:"model"`
 	APIKeyEnv string `json:"api_key_env,omitempty" toml:"api_key_env"`
 	AllowHTTP bool   `json:"allow_http,omitempty" toml:"allow_http"`
+	// DefaultAgent selects the agent CLI insight generation uses when a
+	// request does not choose one. Empty keeps DefaultInsightAgent.
+	DefaultAgent string `json:"default_agent,omitempty" toml:"default_agent"`
+}
+
+// DefaultInsightAgent is the insight agent used when neither the request nor
+// [insights] default_agent selects one.
+const DefaultInsightAgent = "claude"
+
+// insightAgentNames lists the agent CLIs that can generate stored insights,
+// in display order. internal/insight re-exports the same names so config
+// validation and generation stay in step.
+var insightAgentNames = []string{
+	"claude",
+	"codex",
+	"copilot",
+	"gemini",
+	"kiro",
+}
+
+// InsightAgentNames returns the supported insight agent names in display
+// order.
+func InsightAgentNames() []string {
+	return slices.Clone(insightAgentNames)
+}
+
+// ParseInsightAgent normalizes an insight agent name and rejects names this
+// build cannot generate with.
+func ParseInsightAgent(value string) (string, error) {
+	name := strings.ToLower(strings.TrimSpace(value))
+	if slices.Contains(insightAgentNames, name) {
+		return name, nil
+	}
+	return "", fmt.Errorf(
+		"insight agent must be one of %s (got %q)",
+		strings.Join(insightAgentNames, ", "), value,
+	)
 }
 
 // APIKey reads the configured key from the environment. The key itself is
@@ -572,8 +690,13 @@ func (c InsightsConfig) APIKey() string {
 	return os.Getenv(strings.TrimSpace(c.APIKeyEnv))
 }
 
-// Validate checks endpoint intent and transport safety.
+// Validate checks endpoint intent, transport safety, and the default agent.
 func (c InsightsConfig) Validate() error {
+	if strings.TrimSpace(c.DefaultAgent) != "" {
+		if _, err := ParseInsightAgent(c.DefaultAgent); err != nil {
+			return fmt.Errorf("[insights] %w", err)
+		}
+	}
 	endpoint := strings.TrimSpace(c.Endpoint)
 	model := strings.TrimSpace(c.Model)
 	configured := endpoint != "" || model != "" ||
@@ -639,12 +762,7 @@ func decodeCustomModelPricing(data string) (map[string]CustomModelRate, error) {
 
 type RemoteTransport string
 
-const (
-	// RemoteTransportSSH is retained for compatibility but deprecated. New
-	// remote sync configurations should use RemoteTransportHTTP.
-	RemoteTransportSSH  RemoteTransport = "ssh"
-	RemoteTransportHTTP RemoteTransport = "http"
-)
+const RemoteTransportHTTP RemoteTransport = "http"
 
 type ChartPalette string
 
@@ -712,17 +830,13 @@ func (a ArchiveContent) UsageOnly() bool {
 }
 
 // RemoteHost describes one target for config-driven `agentsview sync`
-// fan-out. Host is required. Deprecated SSH remotes may set User and Port
-// (Port 0 means the ssh default of 22). HTTP remotes must set URL
-// and Token. A zero/empty Interval disables periodic remote
-// sync for this host.
+// fan-out over HTTP. Host, URL, and Token are required. An omitted Transport
+// selects HTTP. A zero/empty Interval disables periodic remote sync for this host.
 //
 //nolint:recvcheck // Value encoding and pointer decoding intentionally implement distinct interfaces.
 type RemoteHost struct {
 	Host      string          `toml:"host" json:"host"`
 	Transport RemoteTransport `toml:"transport,omitempty" json:"transport,omitempty"`
-	User      string          `toml:"user,omitempty" json:"user,omitempty"`
-	Port      int             `toml:"port,omitempty" json:"port,omitzero"`
 	URL       string          `toml:"url,omitempty" json:"url,omitempty"`
 	Token     string          `toml:"token,omitempty" json:"-"`
 	Interval  time.Duration   `toml:"interval,omitempty" json:"interval,omitzero"`
@@ -800,6 +914,9 @@ type Config struct {
 	WriteTimeout         time.Duration               `json:"-" toml:"-"`
 	// InstallationID identifies this data directory independently of its label.
 	InstallationID string `json:"-" toml:"-"`
+	// InstallationCreatedAt is when InstallationID was created, or zero for
+	// IDs created before the time was recorded.
+	InstallationCreatedAt time.Time `json:"-" toml:"-"`
 	// LocalMachineName is the display label, defaulting to the system hostname.
 	LocalMachineName string `json:"-" toml:"local_machine_name"`
 
@@ -839,8 +956,9 @@ type Config struct {
 
 	// ScanProtectedPaths allows local Git discovery to read working
 	// directories inside macOS locations guarded by a TCC consent prompt
-	// (Documents, Downloads, Desktop, iCloud Drive, and cloud-provider
-	// folders such as Dropbox). It defaults to false so a first sync never
+	// (Documents, Downloads, Desktop, iCloud Drive, cloud-provider folders
+	// such as Dropbox, and removable or network volumes under /Volumes). It
+	// defaults to false so a first sync never
 	// asks for access to folders the user did not point us at; sessions
 	// there keep path-only project identity instead of Git remote,
 	// worktree, and branch detail. Setting it accepts one macOS prompt per
@@ -984,76 +1102,29 @@ func (c Config) ValidateRemoteHosts() error {
 	var problems []string
 	seen := make(map[string]int, len(c.RemoteHosts))
 	for i, h := range c.RemoteHosts {
-		transport := h.Transport
-		if transport == "" {
-			transport = RemoteTransportSSH
-		}
 		if h.Host == "" {
 			problems = append(problems,
 				fmt.Sprintf("entry %d: host is required", i+1))
-		}
-		if trimmed := strings.TrimSpace(h.Host); isSSHOptionShaped(h.Host) {
-			problems = append(problems,
-				fmt.Sprintf("entry %d: host must not begin with '-' (got %q)",
-					i+1, trimmed))
-		}
-		if trimmed := strings.TrimSpace(h.User); isSSHOptionShaped(h.User) {
-			problems = append(problems,
-				fmt.Sprintf("entry %d (%q): user must not begin with '-' (got %q)",
-					i+1, h.Host, trimmed))
-		}
-		if h.Port < 0 || h.Port > 65535 {
-			problems = append(problems,
-				fmt.Sprintf("entry %d (%q): invalid port %d",
-					i+1, h.Host, h.Port))
 		}
 		if h.Interval < 0 {
 			problems = append(problems,
 				fmt.Sprintf("entry %d (%q): invalid interval %s",
 					i+1, h.Host, h.Interval))
 		}
-		switch transport {
-		case RemoteTransportSSH:
-			if h.URL != "" {
-				problems = append(problems,
-					fmt.Sprintf("entry %d (%q): url is only valid for http",
-						i+1, h.Host))
-			}
-			if h.Token != "" {
-				problems = append(problems,
-					fmt.Sprintf("entry %d (%q): token is only valid for http",
-						i+1, h.Host))
-			}
-		case RemoteTransportHTTP:
-			if h.User != "" {
-				problems = append(problems,
-					fmt.Sprintf("entry %d (%q): user is only valid for ssh",
-						i+1, h.Host))
-			}
-			if h.Port != 0 {
-				problems = append(problems,
-					fmt.Sprintf("entry %d (%q): port is only valid for ssh",
-						i+1, h.Host))
-			}
-			if err := validateRemoteHTTPURL(h.URL); err != nil {
-				problems = append(problems,
-					fmt.Sprintf("entry %d (%q): %v",
-						i+1, h.Host, err))
-			}
-			if h.Token == "" {
-				problems = append(problems,
-					fmt.Sprintf("entry %d (%q): token is required for http",
-						i+1, h.Host))
-			}
-		default:
+		if h.Transport != "" && h.Transport != RemoteTransportHTTP {
 			problems = append(problems,
-				fmt.Sprintf("entry %d (%q): invalid transport %q",
+				fmt.Sprintf("entry %d (%q): invalid transport %q; use http with a url and token",
 					i+1, h.Host, h.Transport))
 		}
-		// Remote sync namespaces sessions and the skip cache by
-		// host alone (see ssh.RemoteSync), so two entries sharing a
-		// host collide regardless of user/port. Reject duplicates
-		// rather than silently share or overwrite cached state.
+		if err := validateRemoteHTTPURL(h.URL); err != nil {
+			problems = append(problems,
+				fmt.Sprintf("entry %d (%q): %v", i+1, h.Host, err))
+		}
+		if h.Token == "" {
+			problems = append(problems,
+				fmt.Sprintf("entry %d (%q): token is required for http", i+1, h.Host))
+		}
+		// Remote sync namespaces sessions and cached state by host.
 		if h.Host != "" {
 			if first, ok := seen[h.Host]; ok {
 				problems = append(problems,
@@ -1097,10 +1168,6 @@ func validateRemoteHTTPURL(raw string) error {
 		return errors.New("url must not include fragment")
 	}
 	return nil
-}
-
-func isSSHOptionShaped(value string) bool {
-	return strings.HasPrefix(strings.TrimSpace(value), "-")
 }
 
 // Default returns a Config with default values.
@@ -1187,6 +1254,7 @@ func Default() (Config, error) {
 		DaemonIdleTimeout:              20 * time.Minute,
 		Agent:                          map[string]AgentConfig{},
 		Vector: VectorConfig{
+			RecallMaxRevisionLag: DefaultRecallMaxRevisionLag,
 			Embeddings: VectorEmbeddingsConfig{
 				MaxInputChars: 8192,
 			},
@@ -1433,7 +1501,7 @@ func (c *Config) migrateJSONToTOML() error {
 		if err := os.WriteFile(tomlPath, buf.Bytes(), 0o600); err != nil {
 			return fmt.Errorf("writing config.toml: %w", err)
 		}
-		if err := os.Rename(jsonPath, jsonPath+".bak"); err != nil {
+		if err := atomicfile.Replace(jsonPath, jsonPath+".bak"); err != nil {
 			return fmt.Errorf("renaming config.json to .bak: %w", err)
 		}
 		return nil
@@ -1777,6 +1845,9 @@ func (c *Config) applyConfigTOML(data string) error {
 		if legacyCH.ExcludeProjects != nil {
 			c.ClickHouse.ExcludeProjects = legacyCH.ExcludeProjects
 		}
+		if legacyCH.PushVectors != nil {
+			c.ClickHouse.PushVectors = legacyCH.PushVectors
+		}
 	}
 	// Merge duckdb field-by-field so env vars override only
 	// the fields they set, preserving config-file settings.
@@ -1815,6 +1886,9 @@ func (c *Config) applyConfigTOML(data string) error {
 	// section fields' treatment even though both currently agree.
 	if meta.IsDefined("vector", "include_automated") {
 		c.Vector.IncludeAutomated = file.Vector.IncludeAutomated
+	}
+	if meta.IsDefined("vector", "recall_max_revision_lag") {
+		c.Vector.RecallMaxRevisionLag = file.Vector.RecallMaxRevisionLag
 	}
 	if file.Vector.Embeddings.Model != "" {
 		c.Vector.Embeddings.Model = file.Vector.Embeddings.Model
@@ -1861,6 +1935,9 @@ func (c *Config) applyConfigTOML(data string) error {
 		c.Insights.Endpoint = strings.TrimSpace(c.Insights.Endpoint)
 		c.Insights.Model = strings.TrimSpace(c.Insights.Model)
 		c.Insights.APIKeyEnv = strings.TrimSpace(c.Insights.APIKeyEnv)
+		c.Insights.DefaultAgent = strings.ToLower(
+			strings.TrimSpace(c.Insights.DefaultAgent),
+		)
 	}
 	// IsDefined distinguishes "unset" (leave default 10s) from an
 	// explicit "0s" (disable coalescing). Checking != 0 would silently
@@ -1902,8 +1979,6 @@ func (c *Config) applyConfigTOML(data string) error {
 			hosts[i] = RemoteHost{
 				Host:      strings.TrimSpace(h.Host),
 				Transport: RemoteTransport(strings.TrimSpace(string(h.Transport))),
-				User:      strings.TrimSpace(h.User),
-				Port:      h.Port,
 				URL:       strings.TrimSpace(h.URL),
 				Token:     strings.TrimSpace(h.Token),
 				Interval:  h.Interval,

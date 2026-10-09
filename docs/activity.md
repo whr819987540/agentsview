@@ -64,7 +64,7 @@ flag, including subagents.
 If the selected range reaches into the future, the page marks it as partial and
 shows the report's current **as of** time.
 
-## Concurrency
+## Concurrency and messages
 
 The **Concurrency** chart is a stacked bar chart on one time axis. Each bucket
 is a single bar whose segments are **Interactive** in blue, **Subagents** in
@@ -72,23 +72,36 @@ violet, and **Automated** in orange, stacked from the baseline in that order on
 one shared scale. Bar height is the bucket's combined concurrency peak, and each
 segment is that class's count at the instant of that peak, so the segments
 always add up to the bar. The legend above the chart names the segments, and the
-label on the right gives the combined peak for the range. The strip below the
-bars marks active versus idle buckets across all sessions. Interactive
+label on the right gives the combined peak for the range. Interactive
 concurrency counts overlapping human-facing conversations; human attention is
 not measured.
+
+Switch the chart to **User messages** to see how often you send prompts, or
+**Assistant messages** to see agent output. Both views count timestamped
+transcript messages in the same time buckets as concurrency. Each view has its
+own scale, so high assistant volume cannot hide sparse user prompts. The label
+above the chart shows the bucket size and the total for the selected range.
+
+User messages count only interactive conversations; automated runs and subagent
+instructions are excluded. Assistant messages include all sessions selected by
+the page filters. Both counts exclude system entries and tool results. Assistant
+messages can contain tool calls or thinking; they are transcript messages, not
+completed turns. Messages without timestamps cannot be placed on the chart.
+Hover a bucket in either message view to compare both counts.
 
 ![Weekly Activity concurrency chart](/docs/assets/generated/screenshots/activity-concurrency.png)
 
 Hover a bucket to see its time range, the stacked split at the combined peak,
-the combined peak, each class's own peak within the bucket, agent-minutes, input
-and output tokens, and cost. A class's own peak can exceed its segment when that
+the combined peak, each class's own peak within the bucket, agent-minutes,
+uncached input and output tokens, and cost. A class's own peak can exceed its segment when that
 class peaked at a different instant from the combined peak. The **All-session
 overlay** control draws a combined **Tokens** or **Cost** trend over the bars,
 with its own scale on the right. These usage totals include all three classes.
 
-Clicking a bucket filters the Sessions table to the sessions active in that time
-slot. Drag across buckets to select a range. Keyboard users can select with
-Enter or Space, extend with Shift+Arrow, and clear with Escape. Click the same
+Clicking a bucket filters the Sessions table to sessions with activity or counted
+messages in that time slot. This time filter stays the same when you switch
+chart metrics. Drag across buckets to select a range. Keyboard users can select
+with Enter or Space, extend with Shift+Arrow, and clear with Escape. Click the same
 bucket again, or dismiss the **Active:** badge in the table header, to clear the
 slot filter. Membership is computed by the same shared aggregator that builds
 the chart, then fetched as a bounded page; the browser no longer downloads every

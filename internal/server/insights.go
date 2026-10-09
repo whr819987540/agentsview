@@ -17,12 +17,6 @@ import (
 	"go.kenn.io/agentsview/internal/timeutil"
 )
 
-var validInsightTypes = map[string]bool{
-	"daily_activity":   true,
-	"agent_analysis":   true,
-	insight.CannedType: true,
-}
-
 type generateInsightRequest struct {
 	Type           string                     `json:"type"`
 	DateFrom       string                     `json:"date_from"`
@@ -179,7 +173,7 @@ func (s *Server) humaGenerateCannedInsight(
 			"date_to must be >= date_from")
 	}
 	if req.Agent == "" {
-		req.Agent = "claude"
+		req.Agent = s.insightDefaultAgent()
 	}
 	if !insight.ValidAgents[req.Agent] {
 		return nil, apiError(http.StatusBadRequest,

@@ -311,13 +311,21 @@ func runReplicaPushWatch(
 		context.Background(), os.Interrupt, syscall.SIGTERM,
 	)
 	defer stop()
+	wake, stopLifecycle, err := installReplicaWatchLifecycle(
+		appCfg.DataDir, name, target.Name,
+	)
+	if err != nil {
+		return fmt.Errorf("starting lifecycle notifications: %w", err)
+	}
+	defer stopLifecycle()
+	cfg.LifecycleWake = wake
 
 	log.Printf(
 		"%s watch: starting (machine=%q debounce=%s interval=%s)",
 		name, target.Target.MachineName, debounce, interval,
 	)
 
-	writer, cleanup, err := resolveArchiveWriteBackend(ctx, appCfg)
+	writer, cleanup, err := resolveArchiveWriteBackend(ctx, appCfg, transportIntentLongLived)
 	if err != nil {
 		return fmt.Errorf("opening writer: %w", err)
 	}

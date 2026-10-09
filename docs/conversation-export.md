@@ -14,11 +14,12 @@ across all supported agents and imported archives, including sessions whose
 source files are no longer available. They do not contact an agent, reparse its
 transcripts, start a server, or read the DuckDB mirror.
 
-On the first writable open after upgrading to 0.44.0, AgentsView builds the
-conversation change index from existing database records. Existing session and
-reporting exports keep their current formats. If initialization is interrupted,
-conversation exports fail without returning a checkpoint. Run
-`agentsview daemon restart` to finish initialization.
+The first `changes` call on an archive builds the conversation change index from
+existing database records, so it takes longer than later calls; syncing never
+pays for it. The build runs through the daemon when one owns the archive, and
+directly otherwise. Reading a message before that first call fails without
+returning a checkpoint. Existing session and reporting exports keep their
+current formats.
 
 Version 0.44.0 also corrects how Codex prompts are stored. Existing archives
 need the normal startup resync to refresh those records before read-only exports
@@ -152,12 +153,15 @@ it for analysis.
 
 ## Storage and work per poll
 
-The local archive keeps current message text in its export index, plus compact
-change and deletion metadata. It does not retain each intermediate body as an
-event log or track individual consumers. Changes queries seek by publication
-revision; unchanged polling does not walk transcript bodies. Text fetches are
-bounded independently of message length. A consumer that needs past revisions
-must retain them itself.
+The local archive keeps a digest of each current message in its export index,
+plus compact change and deletion metadata; the text itself stays in the archived
+message and is read back by position. It does not retain each intermediate body
+as an event log or track individual consumers. Changes queries seek by
+publication revision; unchanged polling does not walk transcript bodies. A text
+fetch returns at most the requested bytes but reads and hashes the whole message
+to verify it against the pinned revision. Archives written by this version hold
+no text in the export index, so an older exporter cannot serve their bodies. A
+consumer that needs past revisions must retain them itself.
 
 Activity history uses `agentsview export range` to discover a starting date,
 then the existing hour, day and digest exports. This does not make historical

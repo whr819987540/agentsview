@@ -7,6 +7,7 @@ import (
 	"log"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/assert"
@@ -324,7 +325,7 @@ func TestPushLoop_BurstCoalesces(t *testing.T) {
 	select {
 	case <-pushed:
 		require.FailNow(t, "expected exactly one push for a burst")
-	case <-time.After(100 * time.Millisecond):
+	case <-time.After(100 * time.Millisecond): //nolint:kennlint // absence check; the fake timer fired once, so no second push may follow
 	}
 }
 
@@ -396,7 +397,7 @@ func TestPushLoop_NotifyDirtyWithAckWaitsForSuccessfulRetry(t *testing.T) {
 	select {
 	case err := <-ack:
 		require.Fail(t, "failed push acknowledged dirty generation", "%v", err)
-	case <-time.After(50 * time.Millisecond):
+	case <-time.After(50 * time.Millisecond): //nolint:kennlint // absence check; the failed push must never acknowledge the dirty generation
 	}
 
 	// Failure retains the dirty generation and rearms debounce without a
@@ -419,6 +420,35 @@ func TestPushLoop_NotifyDirtyWithAckIsNonBlockingAndCoalescesWaiters(t *testing.
 	fire <- time.Now()
 	require.NoError(t, <-first)
 	require.NoError(t, <-second)
+}
+
+func TestPushLoop_RunWithWakeQueuesChange(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		wake := make(chan struct{}, 1)
+		var reasons []pushReason
+		loop := &pushLoop{
+			debounce: time.Second,
+			dirty:    make(chan struct{}, 1),
+			floor:    make(chan time.Time),
+			after:    time.After,
+			push: func(
+				_ context.Context, reason pushReason, _ *syncpkg.WatchBatch,
+			) error {
+				reasons = append(reasons, reason)
+				return nil
+			},
+			promotionCounts: make(map[syncpkg.WatchBatchPromotionReason]int),
+		}
+		go loop.RunWithWake(ctx, wake)
+
+		wake <- struct{}{}
+		time.Sleep(time.Second)
+		synctest.Wait()
+
+		require.Equal(t, []pushReason{reasonChange}, reasons)
+	})
 }
 
 func TestPushWatchFallbackCoverageMarksLoopDirty(t *testing.T) {

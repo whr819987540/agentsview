@@ -285,6 +285,8 @@ type Bucket struct {
 	MaxSubagentAgents    int         `json:"max_subagent_agents"`
 	MaxAutomatedAgents   int         `json:"max_automated_agents"`
 	AgentMinutes         float64     `json:"agent_minutes"`
+	UserMessages         int         `json:"user_messages"`
+	AssistantMessages    int         `json:"assistant_messages"`
 	InputTokens          int         `json:"input_tokens,omitempty"`
 	OutputTokens         int         `json:"output_tokens"`
 	Cost                 money.Money `json:"cost"`
@@ -661,9 +663,10 @@ func claudeSnapshotSelectionContext(
 	for i := range canonical {
 		canonical[i] = -1
 	}
-	best := make(map[claudeUsageSnapshotToken]int)
-	earliest := make(map[claudeUsageSnapshotToken]int)
-	maximumWebSearchRequests := make(map[claudeUsageSnapshotToken]int)
+	type snapshotSelection struct {
+		best, earliest, maximumWebSearchRequests int
+	}
+	selection := make(map[claudeUsageSnapshotToken]snapshotSelection)
 	for i, u := range usage {
 		if err := ctx.Err(); err != nil {
 			return nil, nil, nil, nil, err
@@ -682,24 +685,25 @@ func claudeSnapshotSelectionContext(
 			messageID: u.ClaudeMessageID,
 			requestID: u.ClaudeRequestID,
 		}
-		previous, ok := best[key]
-		if first, exists := earliest[key]; !exists ||
-			earlierClaudeSnapshotAttribution(u, usage[first]) {
-			earliest[key] = i
+		selected, ok := selection[key]
+		if !ok || earlierClaudeSnapshotAttribution(u, usage[selected.earliest]) {
+			selected.earliest = i
 		}
-		if !ok || laterClaudeSnapshot(u, usage[previous]) {
-			best[key] = i
+		if !ok || laterClaudeSnapshot(u, usage[selected.best]) {
+			selected.best = i
 		}
-		maximumWebSearchRequests[key] = max(
-			maximumWebSearchRequests[key], u.WebSearchRequests)
+		selected.maximumWebSearchRequests = max(
+			selected.maximumWebSearchRequests, u.WebSearchRequests)
+		selection[key] = selected
 	}
-	for key, i := range best {
+	for _, selected := range selection {
 		if err := ctx.Err(); err != nil {
 			return nil, nil, nil, nil, err
 		}
+		i := selected.best
 		mask[i] = true
-		attribution[i] = usage[earliest[key]].SessionID
-		webSearchRequests[i] = maximumWebSearchRequests[key]
+		attribution[i] = usage[selected.earliest].SessionID
+		webSearchRequests[i] = selected.maximumWebSearchRequests
 	}
 	for i, u := range usage {
 		if err := ctx.Err(); err != nil {
@@ -711,10 +715,10 @@ func claudeSnapshotSelectionContext(
 		if u.ClaudeMessageID == "" || u.ClaudeRequestID == "" {
 			continue
 		}
-		canonical[i] = best[claudeUsageSnapshotToken{
+		canonical[i] = selection[claudeUsageSnapshotToken{
 			messageID: u.ClaudeMessageID,
 			requestID: u.ClaudeRequestID,
-		}]
+		}].best
 	}
 	return mask, attribution, webSearchRequests, canonical, nil
 }

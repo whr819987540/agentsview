@@ -686,3 +686,51 @@ func TestSessionBoundsDAGMainWidenedNotFork(t *testing.T) {
 	// widened.
 	assert.Equal(t, "2024-01-01T10:00:09Z", formatTime(results[1].Session.EndedAt), "fork EndedAt")
 }
+
+func TestHasDAGForkFollowsAbsorbedChunks(t *testing.T) {
+	// A response split across syncs is re-read from its first chunk. The
+	// merged run takes that chunk's parent (u1), and the stored tail (a1)
+	// is one of the chunks it absorbed into a2.
+	merged := dagEntry{uuid: "a2", parentUuid: "u1"}
+	alias := map[string]string{"a1": "a2"}
+	tests := []struct {
+		name    string
+		entries []dagEntry
+		last    string
+		alias   map[string]string
+		want    bool
+	}{
+		{
+			name:    "run absorbing the stored tail continues the chain",
+			entries: []dagEntry{merged, {uuid: "r1", parentUuid: "a2"}},
+			last:    "a1",
+			alias:   alias,
+			want:    false,
+		},
+		{
+			name:    "same run without the alias is a fork",
+			entries: []dagEntry{merged},
+			last:    "a1",
+			want:    true,
+		},
+		{
+			name:    "entry branching off an earlier uuid is still a fork",
+			entries: []dagEntry{merged, {uuid: "r1", parentUuid: "u1"}},
+			last:    "a1",
+			alias:   alias,
+			want:    true,
+		},
+		{
+			name:    "alias of another chunk does not excuse a stored-tail break",
+			entries: []dagEntry{{uuid: "b2", parentUuid: "x"}},
+			last:    "a1",
+			alias:   map[string]string{"b1": "b2"},
+			want:    true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, hasDAGFork(tt.entries, tt.last, tt.alias))
+		})
+	}
+}

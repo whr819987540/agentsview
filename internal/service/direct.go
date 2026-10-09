@@ -2,6 +2,8 @@ package service
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -9,6 +11,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	stdsync "sync"
 	"time"
 
 	"go.kenn.io/agentsview/internal/db"
@@ -32,9 +35,13 @@ import (
 // interface (GetSessionFilePath, Reader). Structural nil checks
 // on local+engine replace runtime type assertions.
 type directBackend struct {
-	db     db.Store
-	local  *db.DB
-	engine *sync.Engine
+	db             db.Store
+	local          *db.DB
+	engine         *sync.Engine
+	evidenceSource string
+	memoryStatusMu stdsync.Mutex
+	memoryStatus   MemoryStatus
+	memoryStatusAt time.Time
 }
 
 // NewDirectBackend returns a full read/write SessionService
@@ -43,17 +50,91 @@ type directBackend struct {
 // work. Use NewReadOnlyBackend for stores that are not *db.DB
 // (e.g. a PostgreSQL reader).
 func NewDirectBackend(d *db.DB, engine *sync.Engine) SessionService {
-	return &directBackend{db: d, local: d, engine: engine}
+	return &directBackend{db: d, local: d, engine: engine, evidenceSource: newEvidenceSource()}
 }
 
 // NewReadOnlyBackend returns a read-only SessionService over any
 // db.Store (e.g. a PostgreSQL reader used by `pg serve`). Sync
 // returns db.ErrReadOnly unconditionally.
 func NewReadOnlyBackend(d db.Store) SessionService {
-	return &directBackend{db: d}
+	return &directBackend{db: d, evidenceSource: newEvidenceSource()}
 }
 
+// newEvidenceSource returns a random ID for this backend instance, so a
+// continuation cannot be replayed against a different archive or server.
+func newEvidenceSource() string { return rand.Text() }
+
 func (b *directBackend) SupportsRecallQueries() bool { return b.local != nil }
+
+func (b *directBackend) MemoryStatus(ctx context.Context) (MemoryStatus, error) {
+	status, err := b.computeMemoryStatus(ctx)
+	if err != nil {
+		return MemoryStatus{}, err
+	}
+	b.memoryStatusMu.Lock()
+	b.memoryStatus = status
+	b.memoryStatusAt = time.Now()
+	b.memoryStatusMu.Unlock()
+	return status, nil
+}
+
+func (b *directBackend) computeMemoryStatus(ctx context.Context) (MemoryStatus, error) {
+	now := time.Now().UTC()
+	backend := "unknown"
+	if named, ok := b.db.(db.MemoryBackendNamer); ok {
+		backend = named.MemoryBackendName()
+	}
+	archive := MemoryArchiveStatus{Backend: backend, ReadOnly: b.db.ReadOnly()}
+	if b.local != nil {
+		identity, err := b.local.GetSyncState(ctx, "artifact_local_installation_id")
+		if err != nil {
+			return MemoryStatus{}, fmt.Errorf("read memory archive identity: %w", err)
+		}
+		archive.Identity = identity
+	}
+	// Every production Store supports bounded substring and terms content
+	// search even when its optional FTS index is absent.
+	lexical := MemoryCapabilityStatus{Status: MemoryReady}
+	semantic := MemoryVectorStatus{Status: MemoryUnknown, Reason: "status_unsupported"}
+	if provider, ok := b.db.(db.SemanticReadinessProvider); ok {
+		status, err := provider.SemanticReadiness(ctx)
+		if err != nil {
+			return MemoryStatus{}, fmt.Errorf("read semantic readiness: %w", err)
+		}
+		semantic = vectorStatusFromDB(status)
+	} else if !b.db.HasSemantic() {
+		semantic = MemoryVectorStatus{Status: MemoryUnavailable, Reason: "not_configured"}
+	}
+	return MemoryStatus{
+		Status:     aggregateMemoryStatus(lexical, semantic),
+		ObservedAt: now,
+		Archive:    archive,
+		Lexical:    lexical,
+		Semantic:   semantic,
+		Sources: MemorySourceStatus{
+			Status: MemoryUnknown, Reason: "source_telemetry_unavailable",
+		},
+	}, nil
+}
+
+const memorySearchStatusTTL = 30 * time.Second
+
+func (b *directBackend) memoryStatusForSearch(
+	ctx context.Context,
+) (MemoryStatus, error) {
+	b.memoryStatusMu.Lock()
+	defer b.memoryStatusMu.Unlock()
+	if !b.memoryStatusAt.IsZero() && time.Since(b.memoryStatusAt) < memorySearchStatusTTL {
+		return b.memoryStatus, nil
+	}
+	status, err := b.computeMemoryStatus(ctx)
+	if err != nil {
+		return MemoryStatus{}, err
+	}
+	b.memoryStatus = status
+	b.memoryStatusAt = time.Now()
+	return status, nil
+}
 
 func (b *directBackend) MachineLabels(
 	ctx context.Context,
@@ -197,6 +278,7 @@ func (b *directBackend) List(
 // transports produce identical SessionFilter values.
 func listFilterToDB(f ListFilter) db.SessionFilter {
 	filter := db.SessionFilter{
+		IDs:                  f.IDs,
 		Project:              f.Project,
 		ExcludeProject:       f.ExcludeProject,
 		Machine:              f.Machine,
@@ -321,11 +403,45 @@ func (b *directBackend) Messages(
 		w.From = &from
 	}
 
+	revision := ""
+	w.ObservedRevision = &revision
 	msgs, err := b.db.GetMessagesWindow(ctx, id, w)
 	if err != nil {
 		return nil, err
 	}
-	list := &MessageList{Messages: msgs, Count: len(msgs)}
+	// Every store reports the revision from the same statement or
+	// snapshot as the rows, so a non-empty page arrives with its revision.
+	// An empty page has no rows for the revision to describe, so it still
+	// answers from one session lookup to tell "no messages" apart from
+	// "session gone" on a bound read.
+	boundRead := f.ExpectedRevision != "" || f.EvidenceSource != ""
+	if revision == "" && (len(msgs) > 0 || boundRead) {
+		before, err := b.db.GetSession(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		if before == nil && boundRead {
+			return nil, fmt.Errorf("%w: cited session no longer exists", ErrSourceChanged)
+		}
+		if before != nil && before.TranscriptRevision != nil {
+			revision = *before.TranscriptRevision
+		}
+		if before != nil && revision == "" && boundRead {
+			return nil, ErrRevisionBoundReadUnavailable
+		}
+	}
+	if f.ExpectedRevision != "" && f.ExpectedRevision != revision {
+		return nil, fmt.Errorf("%w: transcript revision does not match", ErrSourceChanged)
+	}
+	if f.EvidenceSource != "" && f.EvidenceSource != b.evidenceSource {
+		return nil, fmt.Errorf("%w: evidence source does not match", ErrSourceChanged)
+	}
+	list := &MessageList{
+		Messages: msgs, Count: len(msgs), TranscriptRevision: revision,
+	}
+	if revision != "" {
+		list.EvidenceSource = b.evidenceSource
+	}
 	if len(msgs) > 0 {
 		first := msgs[0].Ordinal
 		last := msgs[len(msgs)-1].Ordinal
@@ -385,12 +501,40 @@ const forkBoundarySourceSubtype = "fork_boundary"
 func (b *directBackend) messagesWithForkContext(
 	ctx context.Context, id string, f MessageFilter, limit int, asc bool,
 ) (*MessageList, error) {
+	// The revision is the forked session's own, read before its rows so a
+	// sync that lands in between makes the next bound page fail rather than
+	// mix revisions.
+	sess, err := b.db.GetSession(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	boundRead := f.ExpectedRevision != "" || f.EvidenceSource != ""
+	if sess == nil && boundRead {
+		return nil, fmt.Errorf("%w: cited session no longer exists", ErrSourceChanged)
+	}
+	revision := ""
+	if sess != nil && sess.TranscriptRevision != nil {
+		revision = *sess.TranscriptRevision
+	}
+	if sess != nil && revision == "" && boundRead {
+		return nil, ErrRevisionBoundReadUnavailable
+	}
+	if f.ExpectedRevision != "" && f.ExpectedRevision != revision {
+		return nil, fmt.Errorf("%w: transcript revision does not match", ErrSourceChanged)
+	}
+	if f.EvidenceSource != "" && f.EvidenceSource != b.evidenceSource {
+		return nil, fmt.Errorf("%w: evidence source does not match", ErrSourceChanged)
+	}
 	msgs, err := b.buildForkContextMessages(ctx, id)
 	if err != nil {
 		return nil, err
 	}
+	list := &MessageList{TranscriptRevision: revision}
+	if revision != "" {
+		list.EvidenceSource = b.evidenceSource
+	}
 	if len(msgs) == 0 {
-		return &MessageList{Messages: nil, Count: 0}, nil
+		return list, nil
 	}
 
 	start := 0
@@ -410,7 +554,9 @@ func (b *directBackend) messagesWithForkContext(
 			out = append(out, msgs[i])
 		}
 	}
-	return &MessageList{Messages: out, Count: len(out)}, nil
+	list.Messages = out
+	list.Count = len(out)
+	return list, nil
 }
 
 func findMessagePageStart(
@@ -904,6 +1050,24 @@ func (b *directBackend) Watch(
 				if !ok {
 					return
 				}
+				if identity, ok := b.db.(db.SessionWatchStateStore); ok {
+					state, e := identity.GetSessionWatchState(id)
+					if e != nil {
+						return
+					}
+					payload, e := json.Marshal(state)
+					if e != nil {
+						return
+					}
+					select {
+					case out <- Event{Event: "session.identity", Data: string(payload)}:
+					case <-ctx.Done():
+						return
+					}
+					if state.State != db.SessionWatchResolved {
+						return
+					}
+				}
 				select {
 				case out <- Event{Event: "session_updated", Data: id}:
 				case <-ctx.Done():
@@ -1143,16 +1307,36 @@ func (b *directBackend) SearchContent(
 	if err != nil {
 		return nil, err
 	}
+	revisionBound := true
+	for i := range page.Matches {
+		if page.Matches[i].TranscriptRevision == "" {
+			revisionBound = false
+			break
+		}
+	}
 	if req.Context > 0 {
-		if err := b.enrichContentContext(
+		contextBound, err := b.enrichContentContext(
 			ctx, page.Matches, req.Context, req.Reveal,
-		); err != nil {
+		)
+		if err != nil {
 			return nil, err
+		}
+		revisionBound = revisionBound && contextBound
+	}
+	status, statusErr := b.memoryStatusForSearch(ctx)
+	coverage := status.Coverage()
+	if statusErr != nil {
+		unknown := MemoryCapabilityStatus{Status: MemoryUnknown, Reason: "status_probe_failed"}
+		coverage = MemoryCoverage{
+			Status: MemoryUnknown, Lexical: unknown,
+			Semantic: MemoryVectorStatus{Status: unknown.Status, Reason: unknown.Reason},
 		}
 	}
 	return &ContentSearchResult{
-		Matches:    page.Matches,
-		NextCursor: page.NextCursor,
+		Matches:       page.Matches,
+		NextCursor:    page.NextCursor,
+		RevisionBound: revisionBound,
+		Coverage:      coverage,
 	}, nil
 }
 
@@ -1176,20 +1360,33 @@ func (b *directBackend) SearchContent(
 // adjacent message regardless of transport (HTTP, CLI, MCP all share this
 // path). When reveal is true the raw messages are attached unchanged, same
 // as the snippet path.
+//
+// The context window is read at whatever transcript revision the store
+// holds when the read runs, which can be newer than the revision the match
+// cites when a sync lands between the search and the context read. Each
+// window reports its revision; the returned bool is false when any window
+// came from a different revision than its match, so the caller can drop
+// the revision-bound claim instead of advertising context from a
+// transcript version the citation does not describe.
 func (b *directBackend) enrichContentContext(
 	ctx context.Context, matches []db.ContentMatch, n int, reveal bool,
-) error {
+) (bool, error) {
+	bound := true
 	for i := range matches {
 		m := &matches[i]
 		if m.Ordinal < 0 {
 			continue
 		}
 		anchor := m.Ordinal
+		revision := ""
 		msgs, err := b.db.GetMessagesWindow(ctx, m.SessionID, db.MessageWindow{
-			Around: &anchor, Before: n, After: n,
+			Around: &anchor, Before: n, After: n, ObservedRevision: &revision,
 		})
 		if err != nil {
-			return fmt.Errorf("content search context: %w", err)
+			return false, fmt.Errorf("content search context: %w", err)
+		}
+		if revision != m.TranscriptRevision {
+			bound = false
 		}
 		for _, msg := range msgs {
 			if !reveal {
@@ -1203,7 +1400,7 @@ func (b *directBackend) enrichContentContext(
 			}
 		}
 	}
-	return nil
+	return bound, nil
 }
 
 // redactMessageSecrets returns a copy of m with every secret-shaped span

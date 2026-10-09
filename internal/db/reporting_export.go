@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"sort"
 	"time"
 
@@ -345,23 +346,36 @@ func reportingHoursFromSource(
 	activityIDs := reportingSessionIDSet(ids)
 	activityUsage := reportingActivityUsage(usage, activityIDs)
 	createdAt := source.createdAt
+	gapCap := time.Duration(query.GapCapSeconds) * time.Second
 	firstSeen := buildReportingFirstSeen(
 		date,
 		end,
-		time.Duration(query.GapCapSeconds)*time.Second,
+		gapCap,
 		sessions,
 		createdAt,
 		events,
 		activityUsage,
 	)
+	// Pair once for the whole range. Prior-model inheritance does not depend on
+	// the pruning window, and each hour's window [hourStart-gapCap, hourEnd)
+	// lies inside the daily one, so the start-ordered subslice for an hour
+	// equals pairing that hour on its own.
+	dayCandidates := activity.PairActivityEvents(events, date, end, gapCap)
+	candidateStartsAt := func(c activity.IntervalCandidate, at time.Time) int {
+		return c.Start.Compare(at)
+	}
 	for i := range hours {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
 		hourStart := date.Add(time.Duration(i) * time.Hour)
 		hourEnd := hourStart.Add(time.Hour)
-		gapCap := time.Duration(query.GapCapSeconds) * time.Second
-		candidates := activity.PairActivityEvents(events, hourStart, hourEnd, gapCap)
+		var candidates []activity.IntervalCandidate
+		if len(dayCandidates) > 0 {
+			first, _ := slices.BinarySearchFunc(dayCandidates, hourStart.Add(-gapCap), candidateStartsAt)
+			last, _ := slices.BinarySearchFunc(dayCandidates, hourEnd, candidateStartsAt)
+			candidates = dayCandidates[first:last:last]
+		}
 		aggregate := activity.AggregateCandidates
 		if schemaVersion == export.ReportingJointSchemaVersion {
 			aggregate = activity.AggregateCandidatesWithJointActivity
@@ -514,10 +528,10 @@ func (db *DB) reportingStandaloneUsageCandidatesFrom(
 		)
 	}
 
-	lowerBound := paddedUTCBound(
+	lowerBound := PaddedUTCBound(
 		query.RangeStart.UTC().Format(time.RFC3339), -14,
 	)
-	upperBound := paddedUTCBound(
+	upperBound := PaddedUTCBound(
 		query.RangeEnd.UTC().Format(time.RFC3339), 14,
 	)
 	rows, err := tx.QueryContext(ctx, `
@@ -558,7 +572,7 @@ func (db *DB) reportingStandaloneUsageCandidatesFrom(
 		row.InputTokens,
 			row.OutputTokens,
 			row.CacheCreationTokens,
-			row.CacheReadTokens = usageEventRowTokens(
+			row.CacheReadTokens = UsageEventRowTokens(
 			"cursor",
 			inputTokens,
 			outputTokens,
@@ -759,7 +773,7 @@ func allocateReportingUsageCosts(
 			continue
 		}
 		key := usageCostAllocationKey{
-			date:       localDate(row.Timestamp, time.UTC),
+			date:       LocalDate(row.Timestamp, time.UTC),
 			project:    row.Project,
 			agent:      row.Agent,
 			machine:    row.Machine,
@@ -1261,7 +1275,7 @@ func addReportingUsageBreakdown(
 func reportingUsageBreakdowns(
 	values map[string]*reportingUsageAccum,
 ) []export.ReportingUsageBreakdown {
-	keys := reportingSortedKeys(values)
+	keys := SortedKeys(values)
 	out := make([]export.ReportingUsageBreakdown, 0, len(keys))
 	for _, key := range keys {
 		value := values[key]
@@ -1284,7 +1298,7 @@ func reportingUsageProjectBreakdowns(
 	values map[string]*reportingUsageAccum,
 	projects map[string]export.ProjectMapEntry,
 ) []export.ReportingUsageProjectBreakdown {
-	keys := reportingSortedKeys(values)
+	keys := SortedKeys(values)
 	out := make([]export.ReportingUsageProjectBreakdown, 0, len(keys))
 	for _, project := range keys {
 		value := values[project]
@@ -1310,7 +1324,9 @@ func reportingUsageProjectBreakdowns(
 	return out
 }
 
-func reportingSortedKeys[T any](values map[string]T) []string {
+// SortedKeys returns the map keys sorted; never nil so JSON renders "[]"
+// rather than "null".
+func SortedKeys[T any](values map[string]T) []string {
 	keys := make([]string, 0, len(values))
 	for key := range values {
 		keys = append(keys, key)

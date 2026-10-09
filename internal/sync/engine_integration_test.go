@@ -30,6 +30,7 @@ import (
 	"go.kenn.io/agentsview/internal/sync"
 	"go.kenn.io/agentsview/internal/testjsonl"
 
+	_ "github.com/mattn/go-sqlite3"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -2594,6 +2595,50 @@ func TestReconcileWatchRootsPreservesCodexLiveDuplicatePreference(t *testing.T) 
 	assert.Equal(t, livePath, env.db.GetSessionFilePath(t.Context(), "codex:"+uuid))
 }
 
+func TestOpenClawChangedPathKeepsPreferredLegacyDuplicate(t *testing.T) {
+	first, second := t.TempDir(), t.TempDir()
+	canonical := filepath.Join(first, "main", "sessions", "duplicate.jsonl")
+	older := filepath.Join(second, "main", "sessions", "duplicate.jsonl")
+	content := strings.Join([]string{
+		`{"type":"session","version":3,"id":"duplicate","timestamp":"2026-09-22T10:00:00Z","cwd":"/workspace/project-a"}`,
+		`{"type":"message","id":"m1","timestamp":"2026-09-22T10:00:01Z","message":{"role":"user","content":"canonical question","timestamp":"2026-09-22T10:00:01Z"}}`,
+	}, "\n") + "\n"
+	for _, path := range []string{canonical, older} {
+		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
+		require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+	}
+	newTime := time.Date(2026, 2, 1, 0, 0, 0, 0, time.UTC)
+	oldTime := newTime.Add(-time.Hour)
+	require.NoError(t, os.Chtimes(canonical, newTime, newTime))
+	require.NoError(t, os.Chtimes(older, oldTime, oldTime))
+	database := dbtest.OpenTestDB(t)
+	engine := sync.NewEngine(t.Context(), database, sync.EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{parser.AgentOpenClaw: {second, first}},
+		Machine:   "local",
+	})
+	t.Cleanup(engine.Close)
+	stats := engine.SyncAll(t.Context(), nil)
+	require.False(t, stats.Aborted)
+	assert.Equal(t, canonical, database.GetSessionFilePath(t.Context(), "openclaw:main:duplicate"))
+	assertMessageContent(t, database, "openclaw:main:duplicate", "canonical question")
+	require.NoError(t, os.WriteFile(older, []byte(strings.ReplaceAll(content, "canonical question", "older duplicate update")), 0o600))
+	require.NoError(t, os.Chtimes(older, oldTime, oldTime))
+	require.NoError(t, engine.SyncPathsContext(t.Context(), []string{older}))
+	assert.Equal(t, canonical, database.GetSessionFilePath(t.Context(), "openclaw:main:duplicate"))
+	assertMessageContent(t, database, "openclaw:main:duplicate", "canonical question")
+
+	require.NoError(t, os.Chtimes(older, newTime, newTime))
+	require.NoError(t, engine.SyncPathsContext(t.Context(), []string{older}))
+	assert.Equal(t, canonical, database.GetSessionFilePath(t.Context(), "openclaw:main:duplicate"))
+	assertMessageContent(t, database, "openclaw:main:duplicate", "canonical question")
+
+	newestTime := newTime.Add(time.Hour)
+	require.NoError(t, os.Chtimes(older, newestTime, newestTime))
+	require.NoError(t, engine.SyncPathsContext(t.Context(), []string{older}))
+	assert.Equal(t, older, database.GetSessionFilePath(t.Context(), "openclaw:main:duplicate"))
+	assertMessageContent(t, database, "openclaw:main:duplicate", "older duplicate update")
+}
+
 func TestReconcileWatchRootsOpenClawUsesCanonicalArchiveOrdering(t *testing.T) {
 	root := t.TempDir()
 	sessionsDir := filepath.Join(root, "main", "sessions")
@@ -2627,6 +2672,548 @@ func TestReconcileWatchRootsOpenClawUsesCanonicalArchiveOrdering(t *testing.T) {
 	require.NoError(t, engine.ReconcileWatchRoots(t.Context(), []string{root}, false))
 	assert.Equal(t, filenameNewer,
 		database.GetSessionFilePath(t.Context(), "openclaw:main:archive-order"))
+}
+
+func TestOpenClawSQLiteSyncConsumesMemberHashWarmCache(t *testing.T) {
+	root := t.TempDir()
+	dbPath := createOpenClawSyncSQLiteFixture(t, root, "warm-cache")
+	database := dbtest.OpenTestDB(t)
+	engine := sync.NewEngine(t.Context(), database, sync.EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{parser.AgentOpenClaw: {root}},
+		Machine:   "local",
+	})
+
+	stats := engine.SyncAll(t.Context(), nil)
+	require.False(t, stats.Aborted, "initial sync aborted: %+v", stats)
+	assertMessageContent(t, database, "openclaw:main:warm-cache", "hello", "old response")
+
+	stats = engine.SyncAll(t.Context(), nil)
+	require.False(t, stats.Aborted, "warm sync aborted: %+v", stats)
+	assert.Zero(t, stats.Synced, "unchanged SQLite member should skip")
+
+	info, err := os.Stat(dbPath)
+	require.NoError(t, err)
+	updateOpenClawSyncSQLiteFixture(t, dbPath, "new response")
+	require.NoError(t, os.Chtimes(dbPath, info.ModTime(), info.ModTime()))
+
+	stats = engine.SyncAll(t.Context(), nil)
+	require.False(t, stats.Aborted, "rewritten sync aborted: %+v", stats)
+	assertMessageContent(t, database, "openclaw:main:warm-cache", "hello", "new response")
+	engine.Close()
+}
+
+func TestOpenClawSQLiteSyncConsumesMemberHashFreshEngine(t *testing.T) {
+	root := t.TempDir()
+	dbPath := createOpenClawSyncSQLiteFixture(t, root, "fresh-engine")
+	database := dbtest.OpenTestDB(t)
+	engine := sync.NewEngine(t.Context(), database, sync.EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{parser.AgentOpenClaw: {root}},
+		Machine:   "local",
+	})
+	stats := engine.SyncAll(t.Context(), nil)
+	require.False(t, stats.Aborted, "initial sync aborted: %+v", stats)
+	engine.Close()
+
+	info, err := os.Stat(dbPath)
+	require.NoError(t, err)
+	updateOpenClawSyncSQLiteFixture(t, dbPath, "new response")
+	require.NoError(t, os.Chtimes(dbPath, info.ModTime(), info.ModTime()))
+
+	engine = sync.NewEngine(t.Context(), database, sync.EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{parser.AgentOpenClaw: {root}},
+		Machine:   "local",
+	})
+	stats = engine.SyncAll(t.Context(), nil)
+	require.False(t, stats.Aborted, "fresh-engine sync aborted: %+v", stats)
+	assertMessageContent(t, database, "openclaw:main:fresh-engine", "hello", "new response")
+	engine.Close()
+}
+
+func TestOpenClawSQLiteSyncKeepsValidSourcesWhenSiblingDatabaseIsUnreadable(
+	t *testing.T,
+) {
+	root := t.TempDir()
+	badDB := filepath.Join(root, "aaa", "agent", "openclaw-agent.sqlite")
+	require.NoError(t, os.MkdirAll(filepath.Dir(badDB), 0o755))
+	require.NoError(t, os.WriteFile(badDB, []byte("not sqlite"), 0o600))
+	createOpenClawSyncSQLiteFixture(t, root, "sqlite-valid")
+	legacyPath := filepath.Join(root, "other", "sessions", "legacy-valid.jsonl")
+	require.NoError(t, os.MkdirAll(filepath.Dir(legacyPath), 0o755))
+	legacy := strings.Join([]string{
+		`{"type":"session","version":3,"id":"legacy-valid","timestamp":"2026-09-22T10:00:00Z","cwd":"/workspace/project-a"}`,
+		`{"type":"message","id":"m1","timestamp":"2026-09-22T10:00:01Z","message":{"role":"user","content":"legacy question","timestamp":"2026-09-22T10:00:01Z"}}`,
+		`{"type":"message","id":"m2","timestamp":"2026-09-22T10:00:02Z","message":{"role":"assistant","content":[{"type":"text","text":"legacy response"}],"timestamp":"2026-09-22T10:00:02Z"}}`,
+	}, "\n") + "\n"
+	require.NoError(t, os.WriteFile(legacyPath, []byte(legacy), 0o600))
+	database := dbtest.OpenTestDB(t)
+	engine := sync.NewEngine(t.Context(), database, sync.EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{parser.AgentOpenClaw: {root}},
+		Machine:   "local",
+	})
+	t.Cleanup(engine.Close)
+
+	engine.SyncAll(t.Context(), nil)
+
+	assertMessageContent(t, database, "openclaw:main:sqlite-valid", "hello", "old response")
+	assertMessageContent(t, database, "openclaw:other:legacy-valid",
+		"legacy question", "legacy response")
+}
+
+func TestOpenClawSQLiteSyncStoresSessionProject(t *testing.T) {
+	root := t.TempDir()
+	createOpenClawSyncSQLiteFixture(t, root, "stored-project")
+	database := dbtest.OpenTestDB(t)
+	engine := sync.NewEngine(t.Context(), database, sync.EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{parser.AgentOpenClaw: {root}},
+		Machine:   "local",
+	})
+	t.Cleanup(engine.Close)
+	stats := engine.SyncAll(t.Context(), nil)
+	require.False(t, stats.Aborted, "sync aborted: %+v", stats)
+	session, err := database.GetSessionFull(t.Context(), "openclaw:main:stored-project")
+	require.NoError(t, err)
+	require.NotNil(t, session)
+	assert.Equal(t, "openclaw", session.Agent)
+	assert.Equal(t, "project_a", session.Project)
+	assert.Equal(t, 2, session.MessageCount)
+}
+
+func TestOpenClawSQLiteChangedPathRetainsArchivedMessagesWhenStaleJSONLRemains(
+	t *testing.T,
+) {
+	root := t.TempDir()
+	dbPath := createOpenClawSyncSQLiteFixture(t, root, "deleted")
+	legacyPath := filepath.Join(root, "main", "sessions", "deleted.jsonl")
+	require.NoError(t, os.MkdirAll(filepath.Dir(legacyPath), 0o755))
+	require.NoError(t, os.WriteFile(legacyPath, []byte(strings.Join([]string{
+		`{"type":"session","version":3,"id":"deleted","timestamp":"2026-09-22T10:00:00Z","cwd":"/workspace/project-a"}`,
+		`{"type":"message","id":"m1","timestamp":"2026-09-22T10:00:01Z","message":{"role":"user","content":"legacy question","timestamp":"2026-09-22T10:00:01Z"}}`,
+		`{"type":"message","id":"m2","timestamp":"2026-09-22T10:00:02Z","message":{"role":"assistant","content":[{"type":"text","text":"legacy response"}],"timestamp":"2026-09-22T10:00:02Z"}}`,
+	}, "\n")+"\n"), 0o600))
+	database := dbtest.OpenTestDB(t)
+	engine := sync.NewEngine(t.Context(), database, sync.EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{parser.AgentOpenClaw: {root}},
+		Machine:   "local",
+	})
+	t.Cleanup(engine.Close)
+	stats := engine.SyncAll(t.Context(), nil)
+	require.False(t, stats.Aborted, "initial sync aborted: %+v", stats)
+	deleteOpenClawSyncSQLiteSession(t, dbPath, "deleted")
+
+	require.NoError(t, engine.SyncPathsContext(t.Context(), []string{dbPath}))
+
+	session, err := database.GetSessionFull(t.Context(), "openclaw:main:deleted")
+	require.NoError(t, err)
+	require.NotNil(t, session)
+	assertSourceMissingState(t, session)
+	assertMessageContent(t, database, "openclaw:main:deleted", "hello", "old response")
+}
+
+func TestOpenClawSQLiteChangedJSONLEventRetainsSQLiteArchive(t *testing.T) {
+	root := t.TempDir()
+	dbPath := createOpenClawSyncSQLiteFixture(t, root, "jsonl-event")
+	legacyPath := filepath.Join(root, "main", "sessions", "jsonl-event.jsonl")
+	require.NoError(t, os.MkdirAll(filepath.Dir(legacyPath), 0o755))
+	require.NoError(t, os.WriteFile(legacyPath, []byte(strings.Join([]string{
+		`{"type":"session","version":3,"id":"jsonl-event","timestamp":"2026-09-22T10:00:00Z","cwd":"/workspace/project-a"}`,
+		`{"type":"message","id":"m1","timestamp":"2026-09-22T10:00:01Z","message":{"role":"user","content":"legacy question","timestamp":"2026-09-22T10:00:01Z"}}`,
+		`{"type":"message","id":"m2","timestamp":"2026-09-22T10:00:02Z","message":{"role":"assistant","content":[{"type":"text","text":"legacy response"}],"timestamp":"2026-09-22T10:00:02Z"}}`,
+	}, "\n")+"\n"), 0o600))
+	database := dbtest.OpenTestDB(t)
+	engine := sync.NewEngine(t.Context(), database, sync.EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{parser.AgentOpenClaw: {root}},
+		Machine:   "local",
+	})
+	t.Cleanup(engine.Close)
+	stats := engine.SyncAll(t.Context(), nil)
+	require.False(t, stats.Aborted, "initial sync aborted: %+v", stats)
+	assertMessageContent(t, database, "openclaw:main:jsonl-event", "hello", "old response")
+
+	require.NoError(t, os.Remove(dbPath))
+	require.NoError(t, engine.SyncPathsContext(t.Context(), []string{legacyPath}))
+
+	session, err := database.GetSessionFull(t.Context(), "openclaw:main:jsonl-event")
+	require.NoError(t, err)
+	require.NotNil(t, session)
+	require.NotNil(t, session.FilePath)
+	assert.Equal(t, parser.VirtualSourcePath(dbPath, "main:jsonl-event"), *session.FilePath)
+	assert.Nil(t, session.SourceMissingAt)
+	assertMessageContent(t, database, "openclaw:main:jsonl-event", "hello", "old response")
+}
+
+func TestOpenClawSQLiteFullSyncRetainsSQLiteArchiveOnLookupError(
+	t *testing.T,
+) {
+	root := t.TempDir()
+	dbPath := createOpenClawSyncSQLiteFixture(t, root, "jsonl-error")
+	legacyPath := filepath.Join(root, "main", "sessions", "jsonl-error.jsonl")
+	require.NoError(t, os.MkdirAll(filepath.Dir(legacyPath), 0o755))
+	require.NoError(t, os.WriteFile(legacyPath, []byte(strings.Join([]string{
+		`{"type":"session","version":3,"id":"jsonl-error","timestamp":"2026-09-22T10:00:00Z","cwd":"/workspace/project-a"}`,
+		`{"type":"message","id":"m1","timestamp":"2026-09-22T10:00:01Z","message":{"role":"user","content":"legacy question","timestamp":"2026-09-22T10:00:01Z"}}`,
+		`{"type":"message","id":"m2","timestamp":"2026-09-22T10:00:02Z","message":{"role":"assistant","content":[{"type":"text","text":"legacy response"}],"timestamp":"2026-09-22T10:00:02Z"}}`,
+	}, "\n")+"\n"), 0o600))
+	database := dbtest.OpenTestDB(t)
+	engine := sync.NewEngine(t.Context(), database, sync.EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{parser.AgentOpenClaw: {root}},
+		Machine:   "local",
+	})
+	t.Cleanup(engine.Close)
+	stats := engine.SyncAll(t.Context(), nil)
+	require.False(t, stats.Aborted, "initial sync aborted: %+v", stats)
+	assertMessageContent(t, database, "openclaw:main:jsonl-error", "hello", "old response")
+
+	require.NoError(t, os.WriteFile(dbPath, []byte("not sqlite"), 0o600))
+	provider, ok := parser.NewProvider(parser.AgentOpenClaw, parser.ProviderConfig{
+		Roots: []string{root},
+	})
+	require.True(t, ok)
+	resolver, ok := provider.(parser.ReconciliationSourceResolver)
+	require.True(t, ok)
+	_, found, err := resolver.SourceForReconciliation(
+		t.Context(), parser.VirtualSourcePath(dbPath, "main:jsonl-error"), "main",
+	)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "file is not a database")
+	assert.False(t, found)
+
+	stats = engine.SyncAll(t.Context(), nil)
+	assert.False(t, stats.Aborted, "lookup-error sync aborted: %+v", stats)
+	assert.Positive(t, stats.Failed, "lookup error should fail the stale JSONL admission")
+
+	session, err := database.GetSessionFull(t.Context(), "openclaw:main:jsonl-error")
+	require.NoError(t, err)
+	require.NotNil(t, session)
+	require.NotNil(t, session.FilePath)
+	assert.Equal(t, parser.VirtualSourcePath(dbPath, "main:jsonl-error"), *session.FilePath)
+	assert.Nil(t, session.SourceMissingAt)
+	assert.Nil(t, session.DeletedAt)
+	assertMessageContent(t, database, "openclaw:main:jsonl-error", "hello", "old response")
+}
+
+func TestReconcileWatchRootsOpenClawRetainsArchivedMessagesWhenStaleJSONLRemains(
+	t *testing.T,
+) {
+	root := t.TempDir()
+	dbPath := createOpenClawSyncSQLiteFixture(t, root, "watch-delete")
+	legacyPath := filepath.Join(root, "main", "sessions", "watch-delete.jsonl")
+	require.NoError(t, os.MkdirAll(filepath.Dir(legacyPath), 0o755))
+	require.NoError(t, os.WriteFile(legacyPath, []byte(strings.Join([]string{
+		`{"type":"session","version":3,"id":"watch-delete","timestamp":"2026-09-22T10:00:00Z","cwd":"/workspace/project-a"}`,
+		`{"type":"message","id":"m1","timestamp":"2026-09-22T10:00:01Z","message":{"role":"user","content":"legacy question","timestamp":"2026-09-22T10:00:01Z"}}`,
+		`{"type":"message","id":"m2","timestamp":"2026-09-22T10:00:02Z","message":{"role":"assistant","content":[{"type":"text","text":"legacy response"}],"timestamp":"2026-09-22T10:00:02Z"}}`,
+	}, "\n")+"\n"), 0o600))
+	database := dbtest.OpenTestDB(t)
+	engine := sync.NewEngine(t.Context(), database, sync.EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{parser.AgentOpenClaw: {root}},
+		Machine:   "local",
+	})
+	t.Cleanup(engine.Close)
+	stats := engine.SyncAll(t.Context(), nil)
+	require.False(t, stats.Aborted, "initial sync aborted: %+v", stats)
+	deleteOpenClawSyncSQLiteSession(t, dbPath, "watch-delete")
+
+	require.NoError(t, engine.ReconcileWatchRoots(t.Context(), []string{root}, false))
+
+	session, err := database.GetSessionFull(t.Context(), "openclaw:main:watch-delete")
+	require.NoError(t, err)
+	require.NotNil(t, session)
+	assertSourceMissingState(t, session)
+	assertMessageContent(t, database, "openclaw:main:watch-delete", "hello", "old response")
+}
+
+func TestOpenClawSQLiteChangedPathTombstonesOnlyDeletedMember(t *testing.T) {
+	root := t.TempDir()
+	dbPath := createOpenClawSyncSQLiteFixture(t, root, "keep")
+	addOpenClawSyncSQLiteSession(t, dbPath, "drop")
+	database := dbtest.OpenTestDB(t)
+	engine := sync.NewEngine(t.Context(), database, sync.EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{parser.AgentOpenClaw: {root}},
+		Machine:   "local",
+	})
+	t.Cleanup(engine.Close)
+	stats := engine.SyncAll(t.Context(), nil)
+	require.False(t, stats.Aborted, "initial sync aborted: %+v", stats)
+	deleteOpenClawSyncSQLiteSession(t, dbPath, "drop")
+
+	require.NoError(t, engine.SyncPathsContext(t.Context(), []string{dbPath}))
+
+	dropped, err := database.GetSessionFull(t.Context(), "openclaw:main:drop")
+	require.NoError(t, err)
+	require.NotNil(t, dropped)
+	assertSourceMissingState(t, dropped)
+	assertMessageContent(t, database, "openclaw:main:keep", "hello", "old response")
+}
+
+func TestOpenClawSQLiteChangedPathReplacesValidSiblingBesideMalformedMember(
+	t *testing.T,
+) {
+	root := t.TempDir()
+	dbPath := createOpenClawSyncSQLiteFixture(t, root, "good")
+	addOpenClawSyncSQLiteSession(t, dbPath, "bad")
+	database := dbtest.OpenTestDB(t)
+	engine := sync.NewEngine(t.Context(), database, sync.EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{parser.AgentOpenClaw: {root}},
+		Machine:   "local",
+	})
+	t.Cleanup(engine.Close)
+	stats := engine.SyncAll(t.Context(), nil)
+	require.False(t, stats.Aborted, "initial sync aborted: %+v", stats)
+	updateOpenClawSyncSQLiteFixture(t, dbPath, "new response")
+	databaseHandle, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	_, err = databaseHandle.ExecContext(t.Context(), `
+		UPDATE transcript_events SET event_json = '{'
+		WHERE session_id = 'bad' AND seq = 1
+	`)
+	require.NoError(t, err)
+	require.NoError(t, databaseHandle.Close())
+
+	_ = engine.SyncPathsContext(t.Context(), []string{dbPath})
+
+	assertMessageContent(t, database, "openclaw:main:good", "hello", "new response")
+}
+
+func TestOpenClawSQLiteFullSyncRetainsArchivedMessagesWhenStaleJSONLRemains(
+	t *testing.T,
+) {
+	root := t.TempDir()
+	dbPath := createOpenClawSyncSQLiteFixture(t, root, "fallback")
+	legacyPath := filepath.Join(root, "main", "sessions", "fallback.jsonl")
+	require.NoError(t, os.MkdirAll(filepath.Dir(legacyPath), 0o755))
+	legacy := strings.Join([]string{
+		`{"type":"session","version":3,"id":"fallback","timestamp":"2026-09-22T10:00:00Z","cwd":"/workspace/project-a"}`,
+		`{"type":"message","id":"m1","timestamp":"2026-09-22T10:00:01Z","message":{"role":"user","content":"legacy question","timestamp":"2026-09-22T10:00:01Z"}}`,
+		`{"type":"message","id":"m2","timestamp":"2026-09-22T10:00:02Z","message":{"role":"assistant","content":[{"type":"text","text":"legacy response"}],"timestamp":"2026-09-22T10:00:02Z"}}`,
+	}, "\n") + "\n"
+	require.NoError(t, os.WriteFile(legacyPath, []byte(legacy), 0o600))
+	database := dbtest.OpenTestDB(t)
+	engine := sync.NewEngine(t.Context(), database, sync.EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{parser.AgentOpenClaw: {root}},
+		Machine:   "local",
+	})
+	t.Cleanup(engine.Close)
+	stats := engine.SyncAll(t.Context(), nil)
+	require.False(t, stats.Aborted, "initial sync aborted: %+v", stats)
+	assertMessageContent(t, database, "openclaw:main:fallback", "hello", "old response")
+	require.NoError(t, os.Remove(dbPath))
+
+	stats = engine.SyncAll(t.Context(), nil)
+	require.False(t, stats.Aborted, "fallback sync aborted: %+v", stats)
+
+	messages, err := database.GetMessages(
+		t.Context(), "openclaw:main:fallback", 0, 100, true,
+	)
+	require.NoError(t, err)
+	require.Len(t, messages, 2)
+	assert.Equal(t, "hello", messages[0].Content)
+	assert.Equal(t, "old response", messages[1].Content)
+	session, err := database.GetSessionFull(t.Context(), "openclaw:main:fallback")
+	require.NoError(t, err)
+	require.NotNil(t, session)
+	require.NotNil(t, session.FilePath)
+	assert.Equal(t, parser.VirtualSourcePath(dbPath, "main:fallback"), *session.FilePath)
+	assert.Nil(t, session.SourceMissingAt)
+}
+
+func TestOpenClawSQLiteRemoteFullSyncRetainsArchivedMessagesWhenStaleJSONLRemains(
+	t *testing.T,
+) {
+	root := t.TempDir()
+	dbPath := createOpenClawSyncSQLiteFixture(t, root, "remote-retain")
+	legacyPath := filepath.Join(root, "main", "sessions", "remote-retain.jsonl")
+	require.NoError(t, os.MkdirAll(filepath.Dir(legacyPath), 0o755))
+	legacy := strings.Join([]string{
+		`{"type":"session","version":3,"id":"remote-retain","timestamp":"2026-09-22T10:00:00Z","cwd":"/workspace/project-a"}`,
+		`{"type":"message","id":"m1","timestamp":"2026-09-22T10:00:01Z","message":{"role":"user","content":"legacy question","timestamp":"2026-09-22T10:00:01Z"}}`,
+		`{"type":"message","id":"m2","timestamp":"2026-09-22T10:00:02Z","message":{"role":"assistant","content":[{"type":"text","text":"legacy response"}],"timestamp":"2026-09-22T10:00:02Z"}}`,
+	}, "\n") + "\n"
+	require.NoError(t, os.WriteFile(legacyPath, []byte(legacy), 0o600))
+
+	const logicalRoot = "host:/openclaw"
+	rewrite := func(path string) string {
+		rel, err := filepath.Rel(root, path)
+		if err != nil || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			return path
+		}
+		return logicalRoot + "/" + filepath.ToSlash(rel)
+	}
+	resolve := func(path string) (string, bool) {
+		rel, ok := strings.CutPrefix(path, logicalRoot+"/")
+		if !ok || rel == "" {
+			return "", false
+		}
+		return filepath.Join(root, filepath.FromSlash(rel)), true
+	}
+	database := dbtest.OpenTestDB(t)
+	engine := sync.NewEngine(t.Context(), database, sync.EngineConfig{
+		AgentDirs:          map[parser.AgentType][]string{parser.AgentOpenClaw: {root}},
+		Machine:            "host",
+		IDPrefix:           "host~",
+		PathRewriter:       rewrite,
+		StoredPathResolver: resolve,
+	})
+	t.Cleanup(engine.Close)
+
+	stats := engine.SyncAll(t.Context(), nil)
+	require.False(t, stats.Aborted, "initial sync aborted: %+v", stats)
+	const sessionID = "host~openclaw:main:remote-retain"
+	storedPath := rewrite(parser.VirtualSourcePath(dbPath, "main:remote-retain"))
+	assertMessageContent(t, database, sessionID, "hello", "old response")
+	session, err := database.GetSessionFull(t.Context(), sessionID)
+	require.NoError(t, err)
+	require.NotNil(t, session)
+	require.NotNil(t, session.FilePath)
+	assert.Equal(t, storedPath, *session.FilePath)
+	assert.Nil(t, session.SourceMissingAt)
+
+	require.NoError(t, os.Remove(dbPath))
+	stats = engine.SyncAll(t.Context(), nil)
+	require.False(t, stats.Aborted, "fallback sync aborted: %+v", stats)
+
+	messages, err := database.GetMessages(t.Context(), sessionID, 0, 100, true)
+	require.NoError(t, err)
+	require.Len(t, messages, 2)
+	assert.Equal(t, "hello", messages[0].Content)
+	assert.Equal(t, "old response", messages[1].Content)
+	session, err = database.GetSessionFull(t.Context(), sessionID)
+	require.NoError(t, err)
+	require.NotNil(t, session)
+	require.NotNil(t, session.FilePath)
+	assert.Equal(t, storedPath, *session.FilePath)
+	assert.Nil(t, session.SourceMissingAt)
+}
+
+func TestOpenClawSQLiteChangedPathArbitratesConfiguredRoots(t *testing.T) {
+	firstRoot := t.TempDir()
+	firstDB := createOpenClawSyncSQLiteFixture(t, firstRoot, "duplicate")
+	secondRoot := t.TempDir()
+	secondDB := createOpenClawSyncSQLiteFixture(t, secondRoot, "duplicate")
+	addOpenClawSyncSQLiteSession(t, secondDB, "later-only")
+	database := dbtest.OpenTestDB(t)
+	engine := sync.NewEngine(t.Context(), database, sync.EngineConfig{
+		AgentDirs: map[parser.AgentType][]string{
+			parser.AgentOpenClaw: {firstRoot, secondRoot},
+		},
+		Machine: "local",
+	})
+	t.Cleanup(engine.Close)
+
+	stats := engine.SyncAll(t.Context(), nil)
+	require.False(t, stats.Aborted, "initial sync aborted: %+v", stats)
+	assertMessageContent(t, database, "openclaw:main:duplicate", "hello", "old response")
+	assert.Equal(t,
+		parser.VirtualSourcePath(firstDB, "main:duplicate"),
+		database.GetSessionFilePath(t.Context(), "openclaw:main:duplicate"),
+	)
+
+	updateOpenClawSyncSQLiteFixture(t, secondDB, "later response")
+	for _, suffix := range []string{"", "-wal", "-journal"} {
+		t.Run("event "+suffix, func(t *testing.T) {
+			require.NoError(t, engine.SyncPathsContext(
+				t.Context(), []string{secondDB + suffix},
+			))
+			assertMessageContent(t, database, "openclaw:main:duplicate", "hello", "old response")
+			assert.Equal(t,
+				parser.VirtualSourcePath(firstDB, "main:duplicate"),
+				database.GetSessionFilePath(t.Context(), "openclaw:main:duplicate"),
+			)
+			assertMessageContent(t, database, "openclaw:main:later-only", "hello", "later response")
+			assert.Equal(t,
+				parser.VirtualSourcePath(secondDB, "main:later-only"),
+				database.GetSessionFilePath(t.Context(), "openclaw:main:later-only"),
+			)
+		})
+	}
+
+	deleteOpenClawSyncSQLiteSession(t, secondDB, "duplicate")
+	require.NoError(t, engine.SyncPathsContext(t.Context(), []string{secondDB}))
+	assertMessageContent(t, database, "openclaw:main:duplicate", "hello", "old response")
+	assert.Equal(t,
+		parser.VirtualSourcePath(firstDB, "main:duplicate"),
+		database.GetSessionFilePath(t.Context(), "openclaw:main:duplicate"),
+	)
+	session, err := database.GetSessionFull(t.Context(), "openclaw:main:duplicate")
+	require.NoError(t, err)
+	require.NotNil(t, session)
+	assert.Nil(t, session.SourceMissingAt)
+}
+
+func createOpenClawSyncSQLiteFixture(
+	t *testing.T, root, sessionID string,
+) string {
+	t.Helper()
+	dbPath := filepath.Join(root, "main", "agent", "openclaw-agent.sqlite")
+	require.NoError(t, os.MkdirAll(filepath.Dir(dbPath), 0o755))
+	database, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	_, err = database.ExecContext(t.Context(), `
+		CREATE TABLE transcript_events (
+			session_id TEXT NOT NULL,
+			seq INTEGER NOT NULL,
+			event_json TEXT NOT NULL,
+			created_at INTEGER NOT NULL,
+			PRIMARY KEY (session_id, seq)
+		) STRICT;
+	`)
+	require.NoError(t, err)
+	events := []string{
+		`{"type":"session","version":3,"id":"` + sessionID + `","timestamp":"2026-09-22T10:00:00Z","cwd":"/workspace/project-a"}`,
+		`{"type":"message","id":"m1","timestamp":"2026-09-22T10:00:01Z","message":{"role":"user","content":"hello","timestamp":"2026-09-22T10:00:01Z"}}`,
+		`{"type":"message","id":"m2","timestamp":"2026-09-22T10:00:02Z","message":{"role":"assistant","content":[{"type":"text","text":"old response"}],"timestamp":"2026-09-22T10:00:02Z"}}`,
+	}
+	for seq, event := range events {
+		_, err = database.ExecContext(t.Context(),
+			`INSERT INTO transcript_events(session_id, seq, event_json, created_at) VALUES (?, ?, ?, ?)`,
+			sessionID, seq, event, 1_700_000_000_000+seq,
+		)
+		require.NoError(t, err)
+	}
+	require.NoError(t, database.Close())
+	return dbPath
+}
+
+func updateOpenClawSyncSQLiteFixture(t *testing.T, dbPath, content string) {
+	t.Helper()
+	database, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	defer database.Close()
+	_, err = database.ExecContext(t.Context(), `
+		UPDATE transcript_events
+		SET event_json = REPLACE(event_json, 'old response', ?)
+		WHERE event_json LIKE '%old response%'
+	`, content)
+	require.NoError(t, err)
+}
+
+func addOpenClawSyncSQLiteSession(t *testing.T, dbPath, sessionID string) {
+	t.Helper()
+	database, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	events := []string{
+		`{"type":"session","version":3,"id":"` + sessionID + `","timestamp":"2026-09-22T10:00:00Z","cwd":"/workspace/project-a"}`,
+		`{"type":"message","id":"m1","timestamp":"2026-09-22T10:00:01Z","message":{"role":"user","content":"hello","timestamp":"2026-09-22T10:00:01Z"}}`,
+		`{"type":"message","id":"m2","timestamp":"2026-09-22T10:00:02Z","message":{"role":"assistant","content":[{"type":"text","text":"old response"}],"timestamp":"2026-09-22T10:00:02Z"}}`,
+	}
+	for seq, event := range events {
+		_, err = database.ExecContext(t.Context(),
+			`INSERT INTO transcript_events(session_id, seq, event_json, created_at) VALUES (?, ?, ?, ?)`,
+			sessionID, seq, event, 1_700_000_000_000+seq,
+		)
+		require.NoError(t, err)
+	}
+	require.NoError(t, database.Close())
+}
+
+func deleteOpenClawSyncSQLiteSession(t *testing.T, dbPath, sessionID string) {
+	t.Helper()
+	database, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	_, err = database.ExecContext(t.Context(),
+		`DELETE FROM transcript_events WHERE session_id = ?`, sessionID,
+	)
+	require.NoError(t, err)
+	require.NoError(t, database.Close())
 }
 
 func TestReconcileWatchRootsOpenCodeHybridPrefersCanonicalStorageSource(t *testing.T) {
@@ -3720,7 +4307,7 @@ func TestRunExclusiveSerializesWorktreeReclassification(t *testing.T) {
 	select {
 	case applyErr := <-applyDone:
 		require.Failf(t, "apply overlapped exclusive work", "error: %v", applyErr)
-	case <-time.After(25 * time.Millisecond):
+	case <-time.After(25 * time.Millisecond): //nolint:kennlint // absence check; the held exclusive work keeps the apply waiting
 	}
 	close(release)
 	require.NoError(t, <-firstDone)
@@ -4928,6 +5515,8 @@ func TestSyncEngineProgress(t *testing.T) {
 		"Finalizing sync: checking database-backed sessions",
 		"Finalizing sync: linking all subagent sessions",
 		"Finalizing sync: saving the skip cache",
+		"Checkpointing rebuilt database",
+		"Closing rebuilt database",
 	}, finalizingDetails)
 
 	if env.db.HasFTS(t.Context()) {
@@ -10256,7 +10845,7 @@ func TestSyncEngineConcurrentSerialization(t *testing.T) {
 		require.FailNow(t,
 			"ResyncAll entered while SyncAll held mutex",
 		)
-	case <-time.After(50 * time.Millisecond):
+	case <-time.After(50 * time.Millisecond): //nolint:kennlint // absence check; the held SyncAll mutex keeps ResyncAll out
 		// Expected: ResyncAll is blocked.
 	}
 
@@ -11057,9 +11646,16 @@ func TestResyncAllConsumesCopiedHierarchyRepairs(t *testing.T) {
 		[]string{"queued-cleanup"},
 	))
 
-	stats := env.engine.ResyncAll(t.Context(), nil)
+	var repairCounts [][2]int
+	stats := env.engine.ResyncAll(t.Context(), func(p sync.Progress) {
+		if p.Phase == sync.PhaseFinalizing && p.SessionsTotal > 0 {
+			assert.True(t, p.Resync)
+			repairCounts = append(repairCounts, [2]int{p.SessionsDone, p.SessionsTotal})
+		}
+	})
 
 	require.False(t, stats.Aborted, "resync aborted: %v", stats.Warnings)
+	assert.Equal(t, [][2]int{{0, 2}, {2, 2}}, repairCounts)
 	for _, table := range []string{
 		"subagent_parent_repair_queue",
 		"subagent_parent_cleanup_queue",
@@ -12583,6 +13179,9 @@ func TestSyncAllSincePositronWorkspaceMetadataRefreshesProject(t *testing.T) {
 		t, jsonlPath,
 		[]byte(`{"kind":0,"v":`+session+`}`),
 	)
+	initialTime := time.Now().Add(-time.Minute).Truncate(time.Second)
+	require.NoError(t, os.Chtimes(jsonlPath, initialTime, initialTime))
+	require.NoError(t, os.Chtimes(workspacePath, initialTime, initialTime))
 
 	engine.SyncAll(t.Context(), nil)
 	assertSessionState(
@@ -12598,6 +13197,8 @@ func TestSyncAllSincePositronWorkspaceMetadataRefreshesProject(t *testing.T) {
 	cutoff := time.Now().Add(-1 * time.Hour)
 
 	writeWorkspace("two")
+	// Equal composite size and mtime must still expose changed workspace content.
+	require.NoError(t, os.Chtimes(workspacePath, initialTime, initialTime))
 	stats := engine.SyncAllSince(t.Context(), cutoff, nil)
 	assert.Equal(t, 1, stats.Synced, "synced = %d, want 1", stats.Synced)
 
@@ -12914,6 +13515,38 @@ func TestIncrementalSync_ClaudeAITitleAppendPersistsSessionName(t *testing.T) {
 	afterMessages := fetchMessages(t, env.db, "ai-title-append")
 	require.Len(t, afterMessages, len(beforeMessages))
 	assert.Equal(t, beforeMessages[0].Content, afterMessages[0].Content)
+}
+
+func TestIncrementalSync_ClaudeCustomTitleAppendReplacesSessionName(t *testing.T) {
+	env := setupTestEnv(t)
+	initial := testjsonl.JoinJSONL(
+		testjsonl.ClaudeUserJSON("First question", tsZero),
+		testjsonl.ClaudeAssistantJSON("First answer", tsZeroS1),
+		`{"type":"ai-title","aiTitle":"Generated title"}`,
+	)
+	path := env.writeClaudeSession(t, "proj", "custom-title-append.jsonl", initial)
+	require.Equal(t, 1, env.engine.SyncAll(t.Context(), nil).Synced)
+	before, err := env.db.GetSessionFull(t.Context(), "custom-title-append")
+	require.NoError(t, err)
+	require.NotNil(t, before)
+	require.NotNil(t, before.SessionName)
+	assert.Equal(t, "Generated title", *before.SessionName)
+
+	appendFile, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	require.NoError(t, err)
+	_, err = appendFile.WriteString(
+		`{"type":"custom-title","customTitle":"Renamed","sessionId":"custom-title-append"}` + "\n",
+	)
+	require.NoError(t, err)
+	require.NoError(t, appendFile.Close())
+	env.engine.SyncPaths([]string{path})
+
+	after, err := env.db.GetSessionFull(t.Context(), "custom-title-append")
+	require.NoError(t, err)
+	require.NotNil(t, after)
+	require.NotNil(t, after.SessionName)
+	assert.Equal(t, "Renamed", *after.SessionName)
+	assert.Equal(t, 2, after.MessageCount)
 }
 
 func TestIncrementalSync_ClaudeAITitleAndMessageAppendPersistsSessionName(
@@ -13730,9 +14363,10 @@ func TestIncrementalSync_ClaudeSameSizeSameMtimeInPlaceRewriteUsesFullParse(
 // the cross-sync split case: the first sync stores a partial assistant
 // snapshot (one of several streaming snapshots) and the next sync
 // appends a later snapshot of the SAME response (same message.id).
-// The engine must detect the shared id and fall back to a full parse
-// so the chunk merge collapses both snapshots into one assistant
-// message instead of two.
+// The engine must detect the shared id and collapse both snapshots into
+// one assistant message instead of two. The split path re-parses the run
+// from its first record; when the run cannot be located it still falls
+// back to a whole-transcript parse, which force-replaces every row.
 func TestIncrementalSync_ClaudeMidStreamSplitFallsBackToFullParse(t *testing.T) {
 	env := setupSingleAgentTestEnv(t, parser.AgentClaude)
 
@@ -13916,6 +14550,12 @@ func (b *lockedLogBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.buf.String()
+}
+
+func (b *lockedLogBuffer) Reset() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.buf.Reset()
 }
 
 // A Codex incremental decline must be logged with a provider-agnostic
@@ -14465,12 +15105,22 @@ func TestSyncPathsCodexSameStatInPlaceRewriteRejectedByCheckpoint(t *testing.T) 
 	beforeHash := *before.FileHash
 	beforeInfo, err := os.Stat(path)
 	require.NoError(t, err)
+	beforeChangeTime, ok := sync.FileChangeTime(path, beforeInfo)
+	require.True(t, ok)
 	env.engine.InjectSkipCache(map[string]int64{
 		path: beforeInfo.ModTime().UnixNano(),
 	})
 
 	require.NoError(t, os.WriteFile(path, []byte(rewritten), 0o644))
-	require.NoError(t, os.Chtimes(path, beforeInfo.ModTime(), beforeInfo.ModTime()))
+	// Establish a distinct change time even when Windows writes share a clock tick.
+	require.EventuallyWithT(t, func(c *assert.CollectT) {
+		require.NoError(c, os.Chtimes(path, beforeInfo.ModTime(), beforeInfo.ModTime()))
+		info, err := os.Stat(path)
+		require.NoError(c, err)
+		changeTime, ok := sync.FileChangeTime(path, info)
+		require.True(c, ok)
+		assert.NotEqual(c, beforeChangeTime, changeTime)
+	}, 2*time.Second, time.Millisecond)
 	afterInfo, err := os.Stat(path)
 	require.NoError(t, err)
 	require.Equal(t, beforeInfo.Size(), afterInfo.Size(), "rewrite must keep file size")
@@ -16415,6 +17065,15 @@ func TestSyncSingleSessionIncrementalAppendLinksSpawnedChild(t *testing.T) {
 }
 
 func TestSyncChangedPathPlanIncrementalAppendLinksSpawnedChild(t *testing.T) {
+	for _, watcher := range []bool{false, true} {
+		t.Run(fmt.Sprintf("watcher=%t", watcher), func(t *testing.T) {
+			syncChangedPathPlanIncrementalAppendLinksSpawnedChild(t, watcher)
+		})
+	}
+}
+
+func syncChangedPathPlanIncrementalAppendLinksSpawnedChild(t *testing.T, watcher bool) {
+	t.Helper()
 	env := setupTestEnv(t)
 	env.writeClaudeSession(
 		t, "changed-path-link", "main-changed-path.jsonl",
@@ -16462,13 +17121,15 @@ func TestSyncChangedPathPlanIncrementalAppendLinksSpawnedChild(t *testing.T) {
 	require.NoError(t, file.Close())
 	require.NoError(t, writeErr)
 
-	plan, err := env.engine.PlanChangedPathsContext(
-		t.Context(), []string{orchestratorPath},
-	)
-	require.NoError(t, err)
-	result, err := env.engine.SyncChangedPathPlanContext(t.Context(), plan, nil)
-	require.NoError(t, err)
-	assert.Equal(t, 1, result.Stats.Synced)
+	if watcher {
+		require.NoError(t, env.engine.SyncPathsContext(t.Context(), []string{orchestratorPath}))
+	} else {
+		plan, err := env.engine.PlanChangedPathsContext(t.Context(), []string{orchestratorPath})
+		require.NoError(t, err)
+		result, err := env.engine.SyncChangedPathPlanContext(t.Context(), plan, nil)
+		require.NoError(t, err)
+		assert.Equal(t, 1, result.Stats.Synced)
+	}
 
 	var gotFirstMessageID int64
 	require.NoError(t, env.db.Reader().QueryRow(t.Context(), `
@@ -16484,7 +17145,18 @@ func TestSyncChangedPathPlanIncrementalAppendLinksSpawnedChild(t *testing.T) {
 }
 
 func TestSyncChangedPathPlanLinkFailureQueuesDurableRepair(t *testing.T) {
-	env := setupTestEnv(t)
+	for _, watcher := range []bool{false, true} {
+		t.Run(fmt.Sprintf("watcher=%t", watcher), func(t *testing.T) {
+			syncChangedPathPlanLinkFailureQueuesDurableRepair(t, watcher)
+		})
+	}
+}
+
+// writeChangedPathLinkRetryFixture syncs a main session with an orchestrator
+// and a child subagent, then appends a spawn edge from the orchestrator to the
+// child so the next changed-path sync must relink the child.
+func writeChangedPathLinkRetryFixture(t *testing.T, env *testEnv) string {
+	t.Helper()
 	env.writeClaudeSession(
 		t, "changed-path-link-retry", "main-changed-path-retry.jsonl",
 		testjsonl.JoinJSONL(
@@ -16524,6 +17196,14 @@ func TestSyncChangedPathPlanLinkFailureQueuesDurableRepair(t *testing.T) {
 	require.NoError(t, file.Close())
 	require.NoError(t, writeErr)
 
+	return orchestratorPath
+}
+
+func syncChangedPathPlanLinkFailureQueuesDurableRepair(t *testing.T, watcher bool) {
+	t.Helper()
+	env := setupTestEnv(t)
+	orchestratorPath := writeChangedPathLinkRetryFixture(t, env)
+
 	raw, err := sql.Open("sqlite3", env.db.Path())
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, raw.Close()) })
@@ -16537,11 +17217,14 @@ func TestSyncChangedPathPlanLinkFailureQueuesDurableRepair(t *testing.T) {
 		END`)
 	require.NoError(t, err)
 
-	plan, err := env.engine.PlanChangedPathsContext(
-		t.Context(), []string{orchestratorPath},
-	)
-	require.NoError(t, err)
-	_, err = env.engine.SyncChangedPathPlanContext(t.Context(), plan, nil)
+	if watcher {
+		err = env.engine.SyncPathsContext(t.Context(), []string{orchestratorPath})
+	} else {
+		var plan sync.ChangedPathPlan
+		plan, err = env.engine.PlanChangedPathsContext(t.Context(), []string{orchestratorPath})
+		require.NoError(t, err)
+		_, err = env.engine.SyncChangedPathPlanContext(t.Context(), plan, nil)
+	}
 	require.ErrorContains(t, err, "injected changed-path link failure")
 
 	var queued int
@@ -16557,6 +17240,66 @@ func TestSyncChangedPathPlanLinkFailureQueuesDurableRepair(t *testing.T) {
 	require.NoError(t, env.db.RepairQueuedSubagentParents())
 	assert.Equal(t, "agent-orchestrator-retry",
 		parentSessionIDOf(t, env, "agent-child-retry"))
+}
+
+// TestChangedPathLinkAndQueueFailureRetriesOnUnchangedPoll covers a
+// changed-path batch whose scoped link and durable repair queue both fail.
+// The retried sources are unchanged, so the next poll finds no session
+// changes; it must still run the global link pass the failed batch owes.
+func TestChangedPathLinkAndQueueFailureRetriesOnUnchangedPoll(t *testing.T) {
+	for _, watcher := range []bool{false, true} {
+		t.Run(fmt.Sprintf("watcher=%t", watcher), func(t *testing.T) {
+			env := setupTestEnv(t)
+			orchestratorPath := writeChangedPathLinkRetryFixture(t, env)
+
+			raw, err := sql.Open("sqlite3", env.db.Path())
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, raw.Close()) })
+			_, err = raw.ExecContext(t.Context(), `
+				CREATE TRIGGER fail_changed_path_child_link
+				BEFORE UPDATE OF parent_session_id ON sessions
+				WHEN NEW.id = 'agent-child-retry'
+				  AND NEW.parent_session_id = 'agent-orchestrator-retry'
+				BEGIN
+					SELECT RAISE(FAIL, 'injected changed-path link failure');
+				END`)
+			require.NoError(t, err)
+			_, err = raw.ExecContext(t.Context(), `
+				CREATE TRIGGER fail_changed_path_repair_queue
+				BEFORE INSERT ON subagent_parent_repair_queue
+				BEGIN
+					SELECT RAISE(FAIL, 'injected repair queue failure');
+				END`)
+			require.NoError(t, err)
+
+			if watcher {
+				err = env.engine.SyncPathsContext(t.Context(), []string{orchestratorPath})
+			} else {
+				var plan sync.ChangedPathPlan
+				plan, err = env.engine.PlanChangedPathsContext(
+					t.Context(), []string{orchestratorPath},
+				)
+				require.NoError(t, err)
+				_, err = env.engine.SyncChangedPathPlanContext(t.Context(), plan, nil)
+			}
+			require.ErrorContains(t, err, "injected repair queue failure")
+			require.Equal(t, "main-changed-path-retry",
+				parentSessionIDOf(t, env, "agent-child-retry"))
+
+			_, err = raw.ExecContext(t.Context(), "DROP TRIGGER fail_changed_path_child_link")
+			require.NoError(t, err)
+			_, err = raw.ExecContext(t.Context(), "DROP TRIGGER fail_changed_path_repair_queue")
+			require.NoError(t, err)
+			require.NoError(t, env.engine.ReconcileProviderRootsGrouped(
+				t.Context(), []sync.ProviderRootsGroup{{
+					Agent: parser.AgentClaude, Roots: []string{env.claudeDir},
+				}},
+			))
+			assert.Equal(t, "agent-orchestrator-retry",
+				parentSessionIDOf(t, env, "agent-child-retry"),
+				"an unchanged poll must retry the failed changed-path link")
+		})
+	}
 }
 
 // TestSyncSingleSessionNewEdgeLinkFailureRetriesFromDurableQueue covers the
@@ -17524,29 +18267,42 @@ func TestSyncAllTombstonesStaleClaudeForkAfterZeroResultParse(t *testing.T) {
 		"the unchanged original and rowless replay should both use source freshness")
 }
 
-func TestFullSyncEntryPointsEmitForZeroResultClaudeForkTombstone(t *testing.T) {
+func TestSyncEntryPointsEmitForZeroResultClaudeForkTombstone(t *testing.T) {
 	tests := []struct {
 		name string
-		run  func(*testEnv, context.Context) sync.SyncStats
+		run  func(*testing.T, *testEnv, context.Context) sync.SyncStats
 	}{
 		{
 			name: "SyncAll",
-			run: func(env *testEnv, ctx context.Context) sync.SyncStats {
+			run: func(_ *testing.T, env *testEnv, ctx context.Context) sync.SyncStats {
 				return env.engine.SyncAll(ctx, nil)
 			},
 		},
 		{
 			name: "SyncAllSince",
-			run: func(env *testEnv, ctx context.Context) sync.SyncStats {
+			run: func(_ *testing.T, env *testEnv, ctx context.Context) sync.SyncStats {
 				return env.engine.SyncAllSince(ctx, time.Time{}, nil)
 			},
 		},
 		{
 			name: "SyncRootsSince",
-			run: func(env *testEnv, ctx context.Context) sync.SyncStats {
+			run: func(_ *testing.T, env *testEnv, ctx context.Context) sync.SyncStats {
 				return env.engine.SyncRootsSince(
 					ctx, []string{env.claudeDir}, time.Time{}, nil,
 				)
+			},
+		},
+		{
+			name: "ReconcileWatchRoots",
+			run: func(t *testing.T, env *testEnv, ctx context.Context) sync.SyncStats {
+				t.Helper()
+				stats, _, err := env.engine.ReconcileWatchRootsWithStats(
+					ctx, []string{env.claudeDir}, false, nil,
+				)
+				require.NoError(t, err)
+				assert.Zero(t, env.engine.LastReconciliationResult().Metrics.GlobalLinkPasses,
+					"source-missing metadata must not request global parent linking")
+				return stats
 			},
 		},
 	}
@@ -17590,7 +18346,7 @@ func TestFullSyncEntryPointsEmitForZeroResultClaudeForkTombstone(t *testing.T) {
 				[]db.SessionSourcePath{{Agent: "claude", FilePath: forkPath}},
 			))
 
-			stats := tt.run(env, t.Context())
+			stats := tt.run(t, env, t.Context())
 			assert.Zero(t, stats.Synced,
 				"the replay tombstone must not count as an ordinary sync write")
 			assert.Equal(t, []string{"sessions"}, emitter.got(),

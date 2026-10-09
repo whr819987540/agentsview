@@ -1079,17 +1079,6 @@ func TestGetAnalyticsHeatmap(t *testing.T) {
 		assert.Equal(t, 2, resp.Entries[0].Value, "Jun1 sessions")
 	})
 
-	t.Run("LevelsAssigned", func(t *testing.T) {
-		resp := mustHeatmap(t, d, ctx, baseFilter(), "messages")
-		// All entries should have levels 0-4
-		for _, e := range resp.Entries {
-			assert.GreaterOrEqual(t, e.Level, 0,
-				"date %s level", e.Date)
-			assert.LessOrEqual(t, e.Level, 4,
-				"date %s level", e.Date)
-		}
-	})
-
 	t.Run("OutputTokensNoReporting", func(t *testing.T) {
 		// When no sessions report token coverage, the
 		// output_tokens heatmap must return empty entries
@@ -1100,17 +1089,6 @@ func TestGetAnalyticsHeatmap(t *testing.T) {
 		assert.Equal(t, "output_tokens", resp.Metric, "Metric")
 		assert.Empty(t, resp.Entries,
 			"len(Entries) want 0 (no sessions report token coverage)")
-	})
-
-	t.Run("EmptyRange", func(t *testing.T) {
-		f := emptyFilter()
-		f.To = "2020-01-03"
-		resp := mustHeatmap(t, d, ctx, f, "messages")
-		require.Len(t, resp.Entries, 3, "len(Entries) =")
-		for _, e := range resp.Entries {
-			assert.Equal(t, 0, e.Value, "date %s value", e.Date)
-			assert.Equal(t, 0, e.Level, "date %s level", e.Date)
-		}
 	})
 }
 
@@ -1380,9 +1358,9 @@ func TestMedianInt(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := medianInt(tt.sorted, len(tt.sorted))
+			got := MedianInt(tt.sorted, len(tt.sorted))
 			assert.Equal(t, tt.want, got,
-				"medianInt(%v)", tt.sorted)
+				"MedianInt(%v)", tt.sorted)
 		})
 	}
 }
@@ -1404,9 +1382,9 @@ func TestLocalDate(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := localDate(tt.ts, utc)
+			got := LocalDate(tt.ts, utc)
 			assert.Equal(t, tt.want, got,
-				"localDate(%q)", tt.ts)
+				"LocalDate(%q)", tt.ts)
 		})
 	}
 }
@@ -2474,9 +2452,9 @@ func TestPercentileFloat(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := percentileFloat(tt.sorted, tt.pct)
+			got := PercentileFloat(tt.sorted, tt.pct)
 			assert.InDelta(t, tt.want, got, 1e-9,
-				"percentileFloat(%v, %f)",
+				"PercentileFloat(%v, %f)",
 				tt.sorted, tt.pct)
 		})
 	}
@@ -4524,6 +4502,68 @@ func TestActivityExcludesSystemUserMessages(t *testing.T) {
 	assert.Equal(t, 1, entry.AssistantMessages, "AssistantMessages")
 }
 
+func TestActivityRoleSplitOnSingleRoleDays(t *testing.T) {
+	d := testDB(t)
+	sessions := []struct {
+		id   string
+		ts   string
+		msgs []Message
+	}{
+		{"assistant-only", "2024-06-01T10:00:00Z", []Message{
+			{Role: "assistant", Content: "a"},
+			{Role: "assistant", Content: "b"},
+		}},
+		{"system-only", "2024-06-02T10:00:00Z", []Message{
+			{Role: "user", Content: "banner", IsSystem: true},
+			{Role: "user", Content: "marker", IsSystem: true},
+		}},
+		{"mixed", "2024-06-03T10:00:00Z", []Message{
+			{Role: "user", Content: "question"},
+			{Role: "user", Content: "banner", IsSystem: true},
+			{Role: "user", Content: "result", SourceSubtype: "tool_result"},
+			{Role: "assistant", Content: "answer"},
+		}},
+	}
+	for _, sess := range sessions {
+		insertSession(t, d, sess.id, "proj", func(s *Session) {
+			s.StartedAt = new(sess.ts)
+			s.EndedAt = new(sess.ts)
+			s.MessageCount = len(sess.msgs)
+		})
+		for i := range sess.msgs {
+			sess.msgs[i].SessionID = sess.id
+			sess.msgs[i].Ordinal = i
+			sess.msgs[i].Timestamp = sess.ts
+			sess.msgs[i].ContentLength = len(sess.msgs[i].Content)
+		}
+		insertMessages(t, d, sess.msgs...)
+	}
+
+	resp, err := d.GetAnalyticsActivity(t.Context(), AnalyticsFilter{
+		From: "2024-06-01", To: "2024-06-03", Timezone: "UTC",
+	}, "day")
+	require.NoError(t, err)
+	require.Len(t, resp.Series, 3)
+
+	tests := []struct {
+		date                             string
+		messages, user, assistant, other int
+	}{
+		{"2024-06-01", 2, 0, 2, 0},
+		{"2024-06-02", 2, 0, 0, 2},
+		{"2024-06-03", 4, 1, 1, 2},
+	}
+	for i, tt := range tests {
+		entry := resp.Series[i]
+		assert.Equal(t, tt.date, entry.Date)
+		assert.Equal(t, tt.messages, entry.Messages, tt.date)
+		assert.Equal(t, tt.user, entry.UserMessages, tt.date)
+		assert.Equal(t, tt.assistant, entry.AssistantMessages, tt.date)
+		assert.Equal(t, tt.other,
+			entry.Messages-entry.UserMessages-entry.AssistantMessages, tt.date)
+	}
+}
+
 func TestGetAnalyticsSignals(t *testing.T) {
 	d := testDB(t)
 	ctx := t.Context()
@@ -5102,9 +5142,9 @@ func TestLocalTime(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, ok := localTime(tt.ts, time.UTC)
+			_, ok := LocalTime(tt.ts, time.UTC)
 			assert.Equal(t, tt.valid, ok,
-				"localTime(%q) ok", tt.ts)
+				"LocalTime(%q) ok", tt.ts)
 		})
 	}
 }

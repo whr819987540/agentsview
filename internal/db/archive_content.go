@@ -79,27 +79,23 @@ func (db *DB) requireDerivedTextStorage(kind string) error {
 }
 
 func (db *DB) sessionForStorage(session Session) Session {
-	if !db.usageOnlyStorage() {
-		return session
-	}
-	// Derive automation while the parser/importer preview is still present.
-	// The retained session row is authoritative after transcript text is gone.
-	session.IsAutomated = sessionIsAutomated(session)
-	session.PreserveStoredAutomation = session.FirstMessage == nil &&
-		session.UserMessageCount <= 1
-	session.FirstMessage = nil
-	session.DisplayName = nil
-	session.SessionName = nil
-	session.PreserveSessionName = false
-	session.SecretLeakCount = 0
-	session.SecretsRulesVersion = ""
-	return session
+	return sessionForStoragePolicy(session, db.ArchiveContent())
 }
 
 func (db *DB) sessionAndMessagesForStorage(
 	session Session, messages []Message,
 ) (Session, []Message) {
-	switch db.ArchiveContent() {
+	return ProjectSessionForStoragePolicy(
+		session, messages, db.ArchiveContent(),
+	)
+}
+
+// ProjectSessionForStoragePolicy applies an explicit storage policy without a
+// database handle. Hosted and local ingestion use this same projection.
+func ProjectSessionForStoragePolicy(
+	session Session, messages []Message, policy config.ArchiveContent,
+) (Session, []Message) {
+	switch policy {
 	case config.ArchiveContentUsage:
 		// Some importers do not precompute IsAutomated. Classify from the raw
 		// messages before the storage projection drops user text.
@@ -107,12 +103,35 @@ func (db *DB) sessionAndMessagesForStorage(
 			IsAutomatedTranscript(
 				session.UserMessageCount, messages, session.FirstMessage,
 			)
-		return db.sessionForStorage(session), usageOnlyMessages(messages)
+		return sessionForStoragePolicy(session, policy), usageOnlyMessages(messages)
 	case config.ArchiveContentTranscripts:
 		return session, transcriptMessages(messages)
 	default:
 		return session, messages
 	}
+}
+
+func sessionForStoragePolicy(
+	session Session, policy config.ArchiveContent,
+) Session {
+	if !policy.UsageOnly() {
+		return session
+	}
+	// Derive automation while the parser/importer preview is still present.
+	// The retained session row is authoritative after transcript text is gone.
+	session.IsAutomated = sessionIsAutomated(session)
+	if !session.UsageAutomationProjected {
+		session.PreserveStoredAutomation = session.FirstMessage == nil &&
+			session.UserMessageCount <= 1
+		session.UsageAutomationProjected = true
+	}
+	session.FirstMessage = nil
+	session.DisplayName = nil
+	session.SessionName = nil
+	session.PreserveSessionName = false
+	session.SecretLeakCount = 0
+	session.SecretsRulesVersion = ""
+	return session
 }
 
 // ProjectSessionForStorage applies this database handle's storage policy to a
@@ -283,6 +302,11 @@ func transcriptSubagentLinks(
 	stored := slices.Clone(links)
 	for i := range stored {
 		stored[i].ResultContent = ""
+		stored[i].ResultEvents = slices.Clone(stored[i].ResultEvents)
+		for j := range stored[i].ResultEvents {
+			PrepareToolResultEvent(&stored[i].ResultEvents[j])
+			stored[i].ResultEvents[j].Content = ""
+		}
 	}
 	return stored
 }
@@ -467,12 +491,16 @@ func messagesForSession(messages []Message, sessionID string) []Message {
 // The SQL mirrors usageOnlyMessages and transcriptMessages column for column.
 func applyArchiveContentToCopiedSessionsTx(
 	ctx context.Context, tx *sql.Tx, tempIDsTable string,
-	policy config.ArchiveContent,
+	policy config.ArchiveContent, sourceVersion int,
 ) error {
 	var err error
 	switch policy {
 	case config.ArchiveContentFull:
-		// The copied content already matches the policy.
+		// Sanitized content and its conversation projection were copied
+		// together. Neither needs to be read and rewritten when unchanged.
+		if sourceVersion >= sanitizedSourceDataVersion {
+			return nil
+		}
 	case config.ArchiveContentTranscripts:
 		err = dropCopiedToolContentTx(ctx, tx, tempIDsTable)
 	case config.ArchiveContentUsage:
@@ -481,7 +509,14 @@ func applyArchiveContentToCopiedSessionsTx(
 	if err != nil {
 		return err
 	}
-	return refreshConversationMessagesFromArchiveTx(ctx, tx, "session_id IN (SELECT id FROM "+tempIDsTable+")")
+	if active, err := conversationExportActiveTx(contextTransaction{ctx: ctx, tx: tx}); err != nil || !active {
+		return err
+	}
+	where := "session_id IN (SELECT id FROM " + tempIDsTable + ")"
+	if err := refreshConversationMessagesFromArchiveTx(ctx, tx, where); err != nil {
+		return err
+	}
+	return applyConversationPolicyGapsTx(ctx, tx, where)
 }
 
 // toolOutputMarkerDataVersion is the first data version whose parsers mark

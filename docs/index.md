@@ -10,8 +10,8 @@ sessions. A background server imports recorded sessions into a SQLite database
 on your machine. The web interface, desktop app, command line, and APIs read
 that archive.
 
-New here? The [product overview](/) explains what AgentsView is for, and the
-[five-minute guide](/guide/) walks the whole loop with screenshots. The pages
+New here? The [product overview](/){target=_self} explains what AgentsView is for, and the
+[five-minute guide](/guide/){target=_self} walks the whole loop with screenshots. The pages
 here explain how to use and maintain each feature.
 
 These guides follow `main` and may include changes newer than the latest
@@ -66,8 +66,9 @@ Session data stays on your machine by default. The server binds to `127.0.0.1`
 unless you explicitly configure [remote access](/docs/remote-access/). Data
 leaves the machine only for features you choose, such as hosted raw sync, a
 PostgreSQL or ClickHouse target, remote DuckDB access, Generated Insights, or
-publishing a session to GitHub. An anonymous, content-free daemon liveness ping
-is the only telemetry, and `AGENTSVIEW_TELEMETRY_ENABLED=0` disables it.
+publishing a session to GitHub. Telemetry is an anonymous, content-free daemon
+liveness ping plus app-open and core-action events the web UI reports through
+the server, and `AGENTSVIEW_TELEMETRY_ENABLED=0` disables all of them.
 
 ## Human and machine-readable pages
 

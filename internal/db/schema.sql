@@ -736,7 +736,10 @@ CREATE TABLE IF NOT EXISTS starred_sessions (
 -- deleted by the user so the sync engine does not re-import them.
 CREATE TABLE IF NOT EXISTS excluded_sessions (
     id         TEXT PRIMARY KEY,
-    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    -- Source file of the deleted session, so another file sharing its id
+    -- does not take it over.
+    file_path  TEXT
 );
 -- Skipped files cache: persists skip decisions for files that
 -- produced no session (non-interactive, parse errors) so they
@@ -769,8 +772,16 @@ CREATE TABLE IF NOT EXISTS local_session_source_baselines (
 CREATE INDEX IF NOT EXISTS idx_local_source_baselines_ownership
     ON local_session_source_baselines(machine, agent, file_path, session_id);
 
+-- Local provenance for archived Claude subagent messages. A missing
+-- contributor must not turn a full refresh into a partial replacement.
+CREATE TABLE IF NOT EXISTS claude_subagent_sources (
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    file_path  TEXT NOT NULL,
+    PRIMARY KEY (session_id, file_path)
+);
+
 -- Remote skip cache: tracks file mtimes per remote host
--- for SSH sync incremental optimization.
+-- for remote sync incremental optimization.
 CREATE TABLE IF NOT EXISTS remote_skipped_files (
     host       TEXT NOT NULL,
     path       TEXT NOT NULL,
@@ -1339,6 +1350,7 @@ CREATE TABLE IF NOT EXISTS artifact_checkpoint_landings (
     checkpoint_size   INTEGER NOT NULL
 );
 
+-- Unused; kept because builds up to v0.44 require it for read-only opens.
 CREATE TABLE IF NOT EXISTS artifact_checkpoint_landing_sessions (
     origin        TEXT NOT NULL,
     gid           TEXT NOT NULL,
@@ -1450,7 +1462,8 @@ CREATE TABLE IF NOT EXISTS session_signal_state (
 );
 
 -- SQLite-only parser-proven conversation projection and compact latest changes.
--- Bodies are stored once here; removed rows retain metadata, not old text.
+-- Text lives in messages and is read back by ordinal; body is retired and
+-- stays NULL. Removed rows retain metadata, not old text.
 CREATE TABLE IF NOT EXISTS conversation_messages (
     session_id TEXT NOT NULL, message_id TEXT NOT NULL,
     ordinal INTEGER NOT NULL, role TEXT NOT NULL, timestamp TEXT NOT NULL DEFAULT '',
@@ -1462,6 +1475,8 @@ CREATE TABLE IF NOT EXISTS conversation_messages (
 );
 CREATE INDEX IF NOT EXISTS idx_conversation_messages_revision ON conversation_messages(revision);
 CREATE INDEX IF NOT EXISTS idx_conversation_messages_source ON conversation_messages(session_id, source_id);
+CREATE INDEX IF NOT EXISTS idx_conversation_messages_ordinal
+    ON conversation_messages(session_id, ordinal) WHERE removed = 0;
 CREATE TABLE IF NOT EXISTS conversation_session_changes (
     session_id TEXT PRIMARY KEY,
     revision INTEGER NOT NULL,

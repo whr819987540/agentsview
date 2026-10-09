@@ -39,7 +39,7 @@ func TestOpenUsageOnlyPreservesStoredAutomationClassification(t *testing.T) {
 }
 
 func TestUsageOnlyUpsertsPreserveAutomationWithoutPreview(t *testing.T) {
-	for _, writeKind := range []string{"direct", "identity", "batch"} {
+	for _, writeKind := range []string{"direct", "identity", "batch", "prepared"} {
 		t.Run(writeKind, func(t *testing.T) {
 			for _, tc := range []struct {
 				name      string
@@ -75,6 +75,9 @@ func TestUsageOnlyUpsertsPreserveAutomationWithoutPreview(t *testing.T) {
 							export.ProjectIdentityObservation{SessionID: session.ID, Project: "project", Machine: "local"}, "project")
 					case "batch":
 						_, err = database.WriteSessionBatch([]SessionBatchWrite{{Session: session}})
+					case "prepared":
+						session, _ = ProjectSessionForStoragePolicy(session, nil, tc.policy)
+						err = database.UpsertSession(t.Context(), session)
 					}
 					require.NoError(t, err)
 					stored, err = database.GetSessionFull(t.Context(), session.ID)
@@ -233,7 +236,8 @@ func TestUsageOnlyStoragePreservesContentFreeIncrementalSubagentEdge(
 			SubagentLinks: []ToolCallSubagentLink{{
 				ToolUseID: "tool-use-1", SubagentSessionID: "child",
 				ResultContent: "private subagent result", ResultContentLen: 23,
-				HasResult: true,
+				ResultEvents: []ToolResultEvent{{Content: "private subagent result", ContentLength: 23, Status: "errored"}},
+				HasResult:    true,
 			}},
 		},
 	)
@@ -457,7 +461,8 @@ func TestTranscriptsArchiveContentKeepsTextAndDropsToolPayloads(t *testing.T) {
 			SubagentLinks: []ToolCallSubagentLink{{
 				ToolUseID: "tool-use-2", SubagentSessionID: "child",
 				ResultContent: "subagent result", ResultContentLen: 15,
-				HasResult: true,
+				ResultEvents: []ToolResultEvent{{Content: "subagent result", ContentLength: 15, Status: "errored"}},
+				HasResult:    true,
 			}},
 		},
 	)
@@ -472,6 +477,10 @@ func TestTranscriptsArchiveContentKeepsTextAndDropsToolPayloads(t *testing.T) {
 	assert.Empty(t, link.InputJSON)
 	assert.Empty(t, link.ResultContent)
 	assert.Equal(t, 15, link.ResultContentLength)
+	require.Len(t, link.ResultEvents, 1)
+	assert.Empty(t, link.ResultEvents[0].Content)
+	assert.Equal(t, 15, link.ResultEvents[0].ContentLength)
+	assert.Equal(t, "errored", link.ResultEvents[0].Status)
 }
 
 func TestTranscriptArchiveRedactsOverlappingToolRenderings(t *testing.T) {

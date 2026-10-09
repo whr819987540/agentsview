@@ -19,6 +19,7 @@ import (
 var (
 	_ db.Store = (*db.DB)(nil)
 	_ db.Store = (*postgresstore.Store)(nil)
+	_ db.Store = (*postgresstore.HostedStore)(nil)
 	_ db.Store = (*duckdbstore.Store)(nil)
 	_ db.Store = (*clickhousestore.Store)(nil)
 )
@@ -31,6 +32,14 @@ var (
 	_ storage.Replica      = clickhousestore.Backend{}
 	_ storage.Pusher       = (*clickhousestore.Sync)(nil)
 	_ storage.ReplicaStore = (*clickhousestore.Store)(nil)
+)
+
+// Replicas that serve semantic search over pushed embeddings.
+var (
+	_ storage.VectorSearchProvider = postgresstore.Backend{}
+	_ storage.VectorSearchStore    = (*postgresstore.Store)(nil)
+	_ storage.VectorSearchProvider = clickhousestore.Backend{}
+	_ storage.VectorSearchStore    = (*clickhousestore.Store)(nil)
 )
 
 // Derived mirror: local rebuild and Quack serve.

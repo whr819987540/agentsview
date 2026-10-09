@@ -12,14 +12,19 @@ import (
 	"io"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"go.kenn.io/agentsview/internal/config"
 	"go.kenn.io/agentsview/internal/db"
+	"go.kenn.io/agentsview/internal/export"
+	"golang.org/x/sync/singleflight"
 )
 
 // Compile-time check: *Store satisfies db.Store.
 var _ db.Store = (*Store)(nil)
+
+func (s *Store) MemoryBackendName() string { return "clickhouse" }
 
 // errNotImplemented marks db.Store methods the ClickHouse reader does not
 // serve yet. The HTTP layer surfaces it as a server error; later tasks
@@ -34,12 +39,75 @@ type Store struct {
 	cursorMu      sync.RWMutex
 	cursorSecret  []byte
 	customPricing map[string]config.CustomModelRate
-	closeOnce     sync.Once
-	closeErr      error
+
+	// vectorMu guards the searcher and reason installed by the serve gate.
+	vectorMu                  sync.RWMutex
+	vectorSearcher            db.VectorSearcher
+	semanticUnavailableReason string
+	closeOnce                 sync.Once
+	closeErr                  error
+	probeCache                activityProbeCache
+	// frustrationMarkers memoizes signals marker counts per session version.
+	frustrationMarkers frustrationMarkerMemo
+	// pricing memoizes the pricing catalog per set of active pricing parts.
+	pricing pricingCache
+	// coverageCache memoizes complete usage snapshot coverage per parts.
+	coverageCache usageCoverageCache
+	// deltaCache keeps the prepared rows of changed snapshots.
+	deltaCache usageDeltaCache
+	// The usage row memos keep recent range reads per parts and filter.
+	dailyUsageRows       usageRowMemo[chDailyUsageGroupRow]
+	sessionAggregateRows usageRowMemo[chUsageAggregateRow]
+	usageSessionRows     usageRowMemo[chUsageSessionRow]
+	// topSessionTotals keeps each session's totals per top-sessions read.
+	topSessionTotals usageRowMemo[db.TopSessionEntry]
+	// analyticsSessionRows keeps recent analytics session listings.
+	analyticsSessionRows usageRowMemo[chAnalyticsSession]
+	// analyticsListings shares one listing read among concurrent requests.
+	analyticsListings singleflight.Group
+	// background runs the kept reports' sweep until Close.
+	background storeBackground
+	// activitySessions keeps activity pairing inputs per session version.
+	activitySessions activitySessionMemo
+	// activityInputQueries counts pairing input reads that reached ClickHouse.
+	activityInputQueries atomic.Int64
+	// activityUsageRows keeps activity usage reads per source, set, and range.
+	activityUsageRows usageRowMemo[*activityUsageKept]
+	// activityUsageRanges keeps every session's prepared usage rows per
+	// range in progress; see activityUsageRange.
+	activityUsageRanges usageRowMemo[activityUsageRange]
+	// readinessLog holds the last prepared usage readiness logged.
+	readinessLog struct {
+		sync.Mutex
+		last string
+	}
+	// keeping tracks the encodes of activity usage reads being kept; see
+	// activityReportUsage. Close waits for them.
+	keeping sync.WaitGroup
+	// activitySessionListings keeps candidate listings per parts and predicate.
+	activitySessionListings usageRowMemo[activitySessionListing]
+	projectIdentityMaps     usageRowMemo[map[string]export.ProjectMapEntry]
+	// activityReports keeps the reports of ended ranges per the rows they read.
+	activityReports usageRowMemo[activityReportEntry]
+	// diskReports keeps the few latest reports that are also on disk. A
+	// load from disk costs about what a memory hit does, so the rest are
+	// read back from there.
+	diskReports usageRowMemo[activityReportEntry]
+	// activityChecks records per selection the parts its kept report was
+	// last checked against.
+	activityChecks usageRowMemo[string]
+	// reportDisk keeps ended ranges' reports on disk; see
+	// openActivityReportDisk. Empty, reports are kept in memory only.
+	reportDisk           activityReportDisk
+	activityUsageQueries atomic.Int64
+	// activityUsageRowsRead counts the activity usage rows scanned.
+	activityUsageRowsRead  atomic.Int64
+	activitySessionQueries atomic.Int64
 }
 
 // NewStore connects to the mirror named by t and refuses schemas or data
-// versions this binary cannot serve.
+// versions this binary cannot serve, or accounts that cannot read Activity
+// report metadata.
 func NewStore(ctx context.Context, t Target) (*Store, error) {
 	conn, err := Open(ctx, t)
 	if err != nil {
@@ -53,20 +121,47 @@ func NewStore(ctx context.Context, t Target) (*Store, error) {
 		conn.Close()
 		return nil, err
 	}
+	var parts uint64
+	if err := conn.QueryRowContext(ctx,
+		`SELECT count() FROM system.parts WHERE database = currentDatabase() AND active`,
+	).Scan(&parts); err != nil {
+		conn.Close()
+		if IsPermissionError(err) {
+			return nil, fmt.Errorf("clickhouse Activity reports require SELECT ON system.parts; ask an administrator to run GRANT SELECT ON system.parts TO <serve_user>, or add <query>GRANT SELECT ON system.parts</query> to the XML user's grants and reload users: %w", err)
+		}
+		return nil, fmt.Errorf("checking clickhouse Activity metadata access: %w", err)
+	}
 	return NewStoreFromDB(conn), nil
 }
 
 // NewStoreFromDB wraps an already open connection. The caller owns the
 // connection's compatibility checks.
 func NewStoreFromDB(conn *sql.DB) *Store {
-	return &Store{conn: conn}
+	s := &Store{conn: conn}
+	s.dailyUsageRows.size, s.dailyUsageRows.maxBytes = dailyUsageRowBytes, dailyUsageRowsBytes
+	s.sessionAggregateRows.size = aggregateRowBytes
+	s.usageSessionRows.size = usageSessionRowBytes
+	s.topSessionTotals.size = topSessionBytes
+	s.analyticsSessionRows.size = analyticsSessionBytes
+	s.activityUsageRows.size, s.activityUsageRows.maxBytes = keptUsageBytes, activityUsageRowsBytes
+	s.activityUsageRanges.size, s.activityUsageRanges.maxBytes = usageRangeBytes, activityUsageRangeBytes
+	s.activityUsageRanges.limit = activityUsageRangeLimit
+	s.activitySessionListings.size = sessionListingBytes
+	s.activityReports.size, s.activityReports.maxBytes = reportEntryBytes, activityReportMemoBytes
+	s.diskReports.size, s.diskReports.maxBytes = reportEntryBytes, activityReportMemoBytes
+	s.diskReports.limit = activityDiskReportMemoLimit
+	return s
 }
 
 // DB exposes the underlying connection for tests and status commands.
 func (s *Store) DB() *sql.DB { return s.conn }
 
 func (s *Store) Close() error {
-	s.closeOnce.Do(func() { s.closeErr = s.conn.Close() })
+	s.closeOnce.Do(func() {
+		s.stopBackground()
+		s.keeping.Wait()
+		s.closeErr = s.conn.Close()
+	})
 	return s.closeErr
 }
 
@@ -82,9 +177,8 @@ func (s *Store) ReadOnly() bool { return true }
 
 func (s *Store) HasFTS(_ context.Context) bool { return true }
 
-// HasSemantic returns false: the ClickHouse store has no vector search seam.
-func (s *Store) HasSemantic() bool { return false }
-
+// SetCustomPricing installs the operator's model rates. Call it before
+// StartBackground: the background work caches the pricing catalog.
 func (s *Store) SetCustomPricing(p map[string]config.CustomModelRate) {
 	s.customPricing = p
 }
@@ -177,6 +271,12 @@ func (s *Store) ListRecallEntries(_ context.Context, _ db.RecallQuery) ([]db.Rec
 
 func (s *Store) GetRecallEntry(_ context.Context, _ string) (*db.RecallEntry, error) {
 	return nil, db.ErrReadOnly
+}
+
+func (s *Store) ReviewRecallEntry(
+	_ context.Context, _ string, _ db.RecallReviewAction,
+) (db.RecallEntry, error) {
+	return db.RecallEntry{}, db.ErrReadOnly
 }
 
 func (s *Store) QueryRecallEntries(_ context.Context, _ db.RecallQuery) (db.RecallPage, error) {

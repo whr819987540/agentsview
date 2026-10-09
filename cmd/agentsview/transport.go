@@ -36,6 +36,8 @@ type transportIntent int
 const (
 	transportIntentRead transportIntent = iota
 	transportIntentArchiveWrite
+	// Long-lived clients reconnect but never replace an existing daemon.
+	transportIntentLongLived
 )
 
 var errLocalDaemonUnreachable = errors.New(
@@ -56,6 +58,7 @@ var (
 // ensureBackgroundServe directly.
 func autoStartBackgroundServe(
 	ctx context.Context, cfg *config.Config, waitTimeout time.Duration,
+	allowReplacement bool,
 ) (*DaemonRuntime, error) {
 	if testing.Testing() {
 		return nil, errors.New(
@@ -63,7 +66,7 @@ func autoStartBackgroundServe(
 				"stub startBackgroundServeForTransport or set AGENTSVIEW_NO_DAEMON=1",
 		)
 	}
-	return ensureBackgroundServe(ctx, cfg, waitTimeout)
+	return ensureBackgroundServe(ctx, cfg, waitTimeout, allowReplacement)
 }
 
 // transport captures how to reach the session-data layer from a
@@ -90,6 +93,20 @@ var openPGReadStore = func(
 	pgCfg config.PGConfig,
 ) (db.Store, func(), error) {
 	applyClassifierConfig(cfg)
+	if err := pgCfg.ValidateRawDerivation(cfg.RequireAuth); err != nil {
+		return nil, nil, err
+	}
+	if pgCfg.RawTenant != "" {
+		store, err := postgres.NewHostedStore(pgCfg.URL, pgCfg.Schema, pgCfg.RawTenant, pgCfg.AllowInsecure)
+		if err != nil {
+			return nil, nil, err
+		}
+		if err = applyRequiredCursorSecret(store, cfg); err != nil {
+			store.Close()
+			return nil, nil, err
+		}
+		return store, func() { _ = store.Close() }, nil
+	}
 	backend := pgReplica{}
 	store, err := backend.OpenStore(postgres.ReplicaTarget(pgCfg))
 	if err != nil {
@@ -200,6 +217,10 @@ func ensureTransportContext(
 	intent transportIntent,
 	waitTimeout time.Duration,
 ) (transport, error) {
+	allowReplacement := intent != transportIntentLongLived
+	if intent == transportIntentLongLived {
+		intent = transportIntentArchiveWrite
+	}
 	if cfg == nil {
 		return transport{}, errors.New("nil config")
 	}
@@ -240,13 +261,14 @@ func ensureTransportContext(
 		}
 	}
 	if tr.Mode == transportHTTP {
-		if (intent == transportIntentRead ||
+		if allowReplacement && (intent == transportIntentRead ||
 			intent == transportIntentArchiveWrite) &&
-			shouldUpgradeDaemonRuntime(tr.Runtime, version) {
+			shouldReplaceDaemonRuntime(tr.Runtime, version) {
 			if daemonAutostartDisabled() {
 				if intent == transportIntentRead {
-					return transport{}, appendDaemonRestartUpgradeHint(
-						errors.New("daemon restart required: running daemon is older than this client"),
+					return transport{}, errors.New(
+						"daemon restart required: running daemon version differs from this client; " +
+							"run `agentsview daemon restart` or unset AGENTSVIEW_NO_DAEMON to allow automatic replacement",
 					)
 				}
 				return tr, nil
@@ -256,7 +278,7 @@ func ensureTransportContext(
 			}
 			cfg.NoSync = cfg.NoSync || tr.Runtime.NoSync
 			rt, err := startBackgroundServeForTransport(
-				ctx, cfg, waitTimeout,
+				ctx, cfg, waitTimeout, allowReplacement,
 			)
 			if err != nil {
 				return transport{}, err
@@ -265,18 +287,21 @@ func ensureTransportContext(
 		}
 		return tr, nil
 	}
-	if (intent == transportIntentRead || intent == transportIntentArchiveWrite) &&
+	if !allowReplacement && tr.DirectIncompatible {
+		return transport{}, longLivedDaemonCompatibilityError(errors.New(tr.DirectReason))
+	}
+	if allowReplacement && (intent == transportIntentRead || intent == transportIntentArchiveWrite) &&
 		!daemonAutostartDisabled() {
 		if rt, err := FindIncompatibleDaemonRuntime(
 			cfg.DataDir, cfg.AuthToken,
 		); err != nil && rt != nil &&
-			shouldUpgradeIncompatibleDaemonRuntime(rt, version) {
+			shouldReplaceIncompatibleDaemonRuntime(rt, version) {
 			if err := guardDaemonAutoStartConfig(*cfg); err != nil {
 				return transport{}, err
 			}
 			cfg.NoSync = cfg.NoSync || rt.NoSync
 			rt, err := startBackgroundServeForTransport(
-				ctx, cfg, waitTimeout,
+				ctx, cfg, waitTimeout, allowReplacement,
 			)
 			if err != nil {
 				return transport{}, err
@@ -307,7 +332,7 @@ func ensureTransportContext(
 		if err := guardDaemonAutoStartConfig(*cfg); err != nil {
 			return transport{}, err
 		}
-		rt, err := startBackgroundServeForTransport(ctx, cfg, waitTimeout)
+		rt, err := startBackgroundServeForTransport(ctx, cfg, waitTimeout, allowReplacement)
 		if err != nil {
 			return transport{}, err
 		}
@@ -341,7 +366,7 @@ func ensureTransportContext(
 	if err := guardDaemonAutoStartConfig(*cfg); err != nil {
 		return transport{}, err
 	}
-	rt, err := startBackgroundServeForTransport(ctx, cfg, waitTimeout)
+	rt, err := startBackgroundServeForTransport(ctx, cfg, waitTimeout, allowReplacement)
 	if err != nil {
 		return transport{}, err
 	}
@@ -414,41 +439,49 @@ var rollingBuildRepo = update.RollingRepo
 // isRollingDaemonUpgradeVersion reports whether this binary is a rolling
 // build whose version orders against daemon versions. Rolling builds embed
 // `git describe` output such as v0.44.0-40-g1a2b3c4d, which
-// IsDevBuildVersion treats as a dev build, but their installers rely on
-// serve replacing an older daemon. A dirty or unparsable rolling version
-// stays a dev build.
+// IsDevBuildVersion treats as a dev build. A dirty or unparsable rolling
+// version stays a dev build.
 func isRollingDaemonUpgradeVersion(currentVersion string) bool {
 	return rollingBuildRepo() != "" &&
 		update.IsRollingBuildVersion(currentVersion)
 }
 
-func shouldUpgradeDaemonRuntime(rt *DaemonRuntime, currentVersion string) bool {
-	if rt == nil || rt.ReadOnly {
+func shouldReplaceDaemonRuntime(rt *DaemonRuntime, currentVersion string) bool {
+	if rt == nil || rt.ReadOnly || rt.Record.Version == currentVersion {
 		return false
 	}
-	rolling := isRollingDaemonUpgradeVersion(currentVersion)
-	if !rolling && update.IsDevBuildVersion(currentVersion) {
-		return false
-	}
-	if rt.Record.Version == "" {
-		return true
-	}
-	if rolling {
+	// A rolling build orders against releases and other rolling builds by
+	// commit count, so it only moves a daemon forward, as releases do.
+	if isRollingDaemonUpgradeVersion(currentVersion) &&
+		update.IsRollingBuildVersion(rt.Record.Version) {
 		return update.IsNewerRollingBuild(currentVersion, rt.Record.Version)
+	}
+	// Development versions cannot reliably be ordered across branches.
+	if update.IsDevBuildVersion(currentVersion) || update.IsDevBuildVersion(rt.Record.Version) ||
+		strings.HasSuffix(currentVersion, "-dirty") || strings.HasSuffix(rt.Record.Version, "-dirty") {
+		return true
 	}
 	return update.IsNewer(currentVersion, rt.Record.Version)
 }
 
-func shouldUpgradeIncompatibleDaemonRuntime(
+func longLivedDaemonCompatibilityError(err error) error {
+	return fmt.Errorf("%w\n\nThis long-running client cannot use the running daemon and will not replace it. "+
+		"Restart this command with the current agentsview binary (`mcp`, `pg push --watch`, "+
+		"`duckdb push --watch`, or the installed push service). If the daemon still needs "+
+		"replacement, run `agentsview daemon restart` from that install", err)
+}
+
+func shouldReplaceIncompatibleDaemonRuntime(
 	rt *DaemonRuntime, currentVersion string,
 ) bool {
 	if rt == nil {
 		return false
 	}
-	if !shouldUpgradeDaemonRuntime(rt, currentVersion) {
+	if !shouldReplaceDaemonRuntime(rt, currentVersion) {
 		return false
 	}
-	if rt.API > daemonAPIVersion || rt.Data > db.CurrentDataVersion() {
+	// Restarting replaces the HTTP API, but cannot downgrade the archive.
+	if rt.Data > db.CurrentDataVersion() {
 		return false
 	}
 	return true
@@ -588,7 +621,7 @@ func appendDaemonCompatibilityHint(tr transport, err error) error {
 // configured PostgreSQL sync store. It shares the same store
 // construction path as pg serve, but leaves schema repair/migration
 // to pg push/serve because CLI read commands never mutate PG. Like
-// pg serve, it runs the PG vector gate so `session search --pg
+// pg serve, it runs the replica vector gate so `session search --pg
 // --semantic|--hybrid` and `mcp --pg` get the same semantic search
 // the SQLite direct path wires via installDirectVectorSearcher.
 func newPGReadService(
@@ -606,6 +639,6 @@ func newPGReadService(
 			priced.SetCustomPricing(cfg.CustomModelPricing)
 		}
 	}
-	wirePGReadVectorSearchFn(cfg, store)
+	wireReplicaReadVectorSearchFn(cfg, pgReplica{}, store)
 	return service.NewReadOnlyBackend(store), cleanup, nil
 }

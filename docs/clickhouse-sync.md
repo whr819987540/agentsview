@@ -14,8 +14,9 @@ disposable local file like [DuckDB](/docs/duckdb/).
 
 The UI includes the session browser, search, analytics, usage, activity, recent
 edits, and project inventory. Rename, trash, insights, stars, and pins stay on
-the SQLite archive; the ClickHouse UI does not write them. Semantic search
-vectors and hosted raw sync are not part of this path.
+the SQLite archive; the ClickHouse UI does not write them. Semantic search works
+when `[vector]` is enabled locally and the push includes vectors (see
+[Vector Push](#vector-push)). Hosted raw sync is not part of this path.
 
 ## Quick Start
 
@@ -103,6 +104,7 @@ agentsview clickhouse push [target] [flags]
 | `--watch`            | `false` | Run continuously, pushing on change plus a periodic floor                 |
 | `--debounce`         | `30s`   | Coalesce window after a filesystem change before pushing (`--watch` only) |
 | `--interval`         | `15m`   | Periodic floor push interval (`--watch` only)                             |
+| `--no-vectors`       | `false` | Skip the semantic-search vector phase for this run                        |
 
 Without `--watch`, push is on-demand. With `--watch`, the command stays in the
 foreground and keeps pushing until interrupted.
@@ -119,6 +121,8 @@ to fan out across every configured target. `--all --watch` is rejected.
 1. Rewrites changed sessions: dependent rows first (messages, tool calls, usage,
    secrets, pins), then a version-bounded delete of stale rows, then the
    session rows.
+1. Pushes the machine's embedding generation when `[vector]` is enabled: see
+   [Vector Push](#vector-push).
 1. Advances this archive's cursor in the mirror's `sync_metadata` only when
    every session succeeded.
 
@@ -190,6 +194,105 @@ projects = ["alpha", "beta"]
 CLI flags override config values. Use
 [`agentsview projects`](/docs/commands/#agentsview-projects) to list available
 project names.
+
+#### Vector Push
+
+When `[vector]` is enabled locally, `clickhouse push` runs a vector phase after
+the session phase, copying the machine's active embedding generation from
+`vectors.db` into ClickHouse so `clickhouse serve` can answer
+`--semantic`/`--hybrid`. Only changed sessions are re-sent; a session's vectors
+follow its session row, so a session that leaves the push scope loses its
+vectors with it. A watch push scoped to changed sessions widens itself to the
+whole generation until this machine has completed one clean generation-wide
+pass, so an interrupted first push finishes on the next push. Skip the phase for
+one run with `--no-vectors`, or disable it persistently with
+`push_vectors = false` under `[clickhouse]`. The push summary reports the phase
+as `Vectors: N session(s) pushed, ...` or `Vectors: skipped (<reason>)`. See
+[semantic search: ClickHouse](/docs/semantic-search/#clickhouse) for how serve
+matches a pushed generation.
+
+#### Enabling Semantic Search
+
+Follow these steps on the machine that owns the sessions. Every step names the
+output that confirms it, so an operator or an agent can run the sequence
+unattended and stop at the first step that does not confirm.
+
+1. Enable vectors in `~/.agentsview/config.toml`. `model`, `dimension`, and one
+   `[vector.embeddings.servers.<name>]` entry with an `endpoint` are required;
+   the full key list is in
+   [Enabling `[vector]`](/docs/semantic-search/#enabling-vector).
+
+    ```toml
+    [vector]
+    enabled = true
+
+    [vector.embeddings]
+    model = "nomic-embed-text"
+    dimension = 768
+    default_server = "local"
+
+    [vector.embeddings.servers.local]
+    endpoint = "http://localhost:11434/v1"
+    ```
+
+1. Build the local index and confirm an active generation exists:
+
+    ```bash
+    agentsview embeddings build --yes
+    agentsview embeddings list
+    ```
+
+    `embeddings list` prints one row per generation with a `STATE` column; the
+    generation to push shows `active` with `MISSING` at `0`. Note its
+    `FINGERPRINT` prefix.
+
+1. Push to ClickHouse and confirm the vector phase ran:
+
+    ```bash
+    agentsview clickhouse push
+    ```
+
+    The summary ends with
+    `Vectors: N session(s) pushed, M unchanged, D docs, C chunks`.
+    `Vectors: skipped (<reason>)` means the phase did not run; the reason names
+    the cause (`[vector]` disabled, no active local generation, or the local
+    index not ready). A `Warning: deferred vectors` line means the next push
+    finishes the remaining sessions.
+
+1. Serve and confirm the searcher attached. Run this on the machine that will
+   serve; its `[vector]` and `[vector.embeddings]` config must match the
+   pushing machine's, and its embeddings endpoint must be reachable because
+   queries are embedded at search time.
+
+    ```bash
+    agentsview clickhouse serve --no-browser
+    ```
+
+    The startup log contains
+    `clickhouse serve: semantic search enabled (fingerprint <fp>, model <model>)`.
+    A line starting
+    `clickhouse serve: semantic search: ClickHouse has no embedding generation matching fingerprint`
+    means the serving config differs from the pushed one; the same line lists
+    the fingerprints ClickHouse does hold, and serve still starts with lexical
+    search only.
+
+1. Run one semantic search against the server:
+
+    ```bash
+    agentsview session search --server http://127.0.0.1:8080 --semantic "your query"
+    ```
+
+    Ranked hits confirm the setup. An HTTP 501 carrying the reason from the
+    previous step means the searcher did not attach.
+
+Keeping vectors current is two jobs. Embedding new sessions happens locally: the
+`agentsview` daemon does it after each sync while `[vector.embed]`
+`run_after_sync` is on (the default), and without a running daemon you run
+`agentsview embeddings build --yes` before each push. Replicating the result is
+the vector phase inside every `clickhouse push`, so the same watcher or service
+as the session push (`clickhouse push --watch` or `clickhouse service install`)
+carries new vectors once they exist locally. There is no separate vector command
+to schedule, and the watcher never generates embeddings itself.
 
 ### `agentsview clickhouse status`
 
@@ -272,6 +375,28 @@ read-only serve role fails the compatibility check with a message naming the
 missing fill; run `agentsview clickhouse push` with a role that can create
 tables to finish it.
 
+The serve role also needs `GRANT SELECT ON system.parts`. The Activity report
+checks whether the mirror changed by hashing the active parts of its source
+tables before it rescans them. With the default server setting
+`select_from_system_db_requires_grant`, a role granted only
+`SELECT ON <database>.*` can read `system.columns` but not `system.parts`, and
+serve refuses to start with an error naming the missing grant. An administrator
+must grant it to the serve user. For users managed in XML, add
+`<query>GRANT SELECT ON system.parts</query>` to that user's `<grants>` in the
+deployment configuration and run `SYSTEM RELOAD USERS`. SQL `GRANT` cannot
+modify XML-managed users, and schema upgrades cannot grant a permission the
+application account lacks.
+
+`clickhouse serve` keeps the Activity report of each past day a client opens on
+disk, so reopening it is quick, including after a restart. Days no one opens are
+never written. A report no one has opened for 30 days is removed. The files live
+under the service cache directory: `$CACHE_DIRECTORY` when the service manager
+sets it, otherwise the user cache directory under
+`agentsview/clickhouse-activity-reports`. They are derived data; deleting them
+only makes the next open of those days slower. A new binary rebuilds them on its
+own. If the directory cannot be created, serve logs a warning and keeps reports
+in memory only.
+
 When `require_auth` is enabled, a bearer token is generated if needed and
 printed on startup. Pass it via `Authorization: Bearer <token>` on API requests.
 
@@ -291,6 +416,7 @@ ______________________________________________________________________
 | `allow_insecure`     | Allow plaintext or unverified TLS to a non-loopback host              |
 | `projects`           | Inclusive project filter                                              |
 | `exclude_projects`   | Exclusive project filter                                              |
+| `push_vectors`       | Run the vector phase on push; default `true`                          |
 | `default_clickhouse` | Named target used when more than one `[clickhouse.NAME]` block exists |
 
 Environment overrides for the effective default target:
@@ -343,7 +469,9 @@ ______________________________________________________________________
 
 - ClickHouse has no schema name; tables live in a database (`database` key or
   the DSN path).
-- There is no vector / pgvector phase and no hosted raw-sync control plane.
+- Vectors live in shared `Array(Float32)` tables keyed by config fingerprint
+  rather than per-generation pgvector tables, and search is an exact cosine
+  scan. There is no hosted raw-sync control plane.
 - `clickhouse serve` does not run PostgreSQL-style migrations beyond
   `CREATE TABLE IF NOT EXISTS`, `ADD COLUMN IF NOT EXISTS`, and the one-time
   fill of derived usage and terminal-event tables described above.
@@ -369,4 +497,4 @@ The mirror is designed for MergeTree, not copied from PostgreSQL SQL.
 - **No `FINAL` in queries.** The connection setting covers every statement.
   Putting `FINAL` in query text is rejected by this design.
 - **Lightweight deletes** need ClickHouse 23.3+; the integration suite pins
-  `clickhouse/clickhouse-server:25.8`.
+  `clickhouse/clickhouse-server:26.8`.

@@ -36,11 +36,8 @@ const sessionCols = `id, project, project_assigned, machine, agent,
 	secret_leak_count, secrets_rules_version,
 	deleted_at, deletion_cause, termination_status, transcript_revision`
 
-// sessionFullCols is the GetSessionFull list. It adds file_path the way
-// PostgreSQL serve does, and omits volatile fingerprint columns
-// (file_size, file_mtime, file_hash, local_modified_at).
-const sessionFullCols = sessionCols + `,
-	file_path`
+// sessionFullCols retains the detail route's path-only source projection.
+const sessionFullCols = sessionCols + `, file_path`
 
 // sessionActivityExpr orders sessions by their most recent activity.
 const sessionActivityExpr = "COALESCE(ended_at, started_at, created_at)"
@@ -52,8 +49,14 @@ func scanSession(rs interface{ Scan(...any) error }) (db.Session, error) {
 func scanSessionWithSource(
 	rs interface{ Scan(...any) error }, includeSource bool,
 ) (db.Session, error) {
+	return scanSessionProjection(rs, includeSource, includeSource)
+}
+
+func scanSessionProjection(
+	rs interface{ Scan(...any) error }, includeSource, includeComparison bool,
+) (db.Session, error) {
 	var s db.Session
-	var createdAt, startedAt, endedAt, deletedAt any
+	var createdAt, startedAt, endedAt, deletedAt, localModifiedAt any
 	targets := []any{
 		&s.ID, &s.Project, &s.ProjectAssigned, &s.Machine, &s.Agent,
 		&s.AgentLabel, &s.Entrypoint, &s.SessionKind,
@@ -87,10 +90,16 @@ func scanSessionWithSource(
 	if includeSource {
 		targets = append(targets, &s.FilePath)
 	}
+	if includeComparison {
+		targets = append(targets, &s.FileSize, &localModifiedAt)
+	}
 	if err := rs.Scan(targets...); err != nil {
 		return s, err
 	}
 	s.CreatedAt = formatDBTime(createdAt)
+	if v := formatDBTime(localModifiedAt); v != "" {
+		s.LocalModifiedAt = &v
+	}
 	if v := formatDBTime(startedAt); v != "" {
 		s.StartedAt = &v
 	}
@@ -120,9 +129,7 @@ func scanSessionRowsWithSource(rows *sql.Rows, includeSource bool) ([]db.Session
 }
 
 func (s *Store) ListSessions(ctx context.Context, f db.SessionFilter) (db.SessionPage, error) {
-	if f.Limit <= 0 || f.Limit > db.MaxSessionLimit {
-		f.Limit = db.DefaultSessionLimit
-	}
+	f.Limit = db.NormalizeSessionLimit(f.Limit)
 	dialect := db.ClickHouseQueryDialect()
 	where, args := db.BuildSessionFilterSQL(f, dialect)
 	rs := db.ResolveSort(f)
@@ -155,7 +162,7 @@ func (s *Store) ListSessions(ctx context.Context, f db.SessionFilter) (db.Sessio
 	}
 	columns := sessionCols
 	if f.IncludeSource {
-		columns += ", file_path"
+		columns += ", file_path, file_size, local_modified_at"
 	}
 	query := "SELECT " + columns +
 		" FROM sessions WHERE " + cursorWhere + " " +
@@ -171,13 +178,7 @@ func (s *Store) ListSessions(ctx context.Context, f db.SessionFilter) (db.Sessio
 	if err != nil {
 		return db.SessionPage{}, err
 	}
-	page := db.SessionPage{Sessions: sessions, Total: total}
-	if len(sessions) > f.Limit {
-		page.Sessions = sessions[:f.Limit]
-		last := page.Sessions[f.Limit-1]
-		page.NextCursor = s.EncodeCursor(db.NextSessionCursor(&last, rs, total, f))
-	}
-	return page, nil
+	return db.BuildSessionPage(sessions, total, f, rs, s.EncodeCursor), nil
 }
 
 func (s *Store) GetSidebarSessionIndex(ctx context.Context, f db.SessionFilter) (db.SidebarSessionIndex, error) {
@@ -261,7 +262,7 @@ func (s *Store) GetSidebarSessionIndex(ctx context.Context, f db.SessionFilter) 
 
 func (s *Store) GetSession(ctx context.Context, id string) (*db.Session, error) {
 	row := s.queryRowContext(ctx,
-		"SELECT "+sessionCols+" FROM sessions WHERE id = ? AND deleted_at IS NULL", id)
+		"SELECT "+sessionCols+" FROM sessions PREWHERE id = ? WHERE deleted_at IS NULL", id)
 	sess, err := scanSession(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -273,8 +274,8 @@ func (s *Store) GetSession(ctx context.Context, id string) (*db.Session, error) 
 }
 
 func (s *Store) GetSessionFull(ctx context.Context, id string) (*db.Session, error) {
-	row := s.queryRowContext(ctx, "SELECT "+sessionFullCols+" FROM sessions WHERE id = ?", id)
-	sess, err := scanSessionWithSource(row, true)
+	row := s.queryRowContext(ctx, "SELECT "+sessionFullCols+" FROM sessions PREWHERE id = ?", id)
+	sess, err := scanSessionProjection(row, true, false)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}

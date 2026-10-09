@@ -1,5 +1,6 @@
 import { m } from "../i18n/index.js";
 import { queryStepFrom, type QueryStep } from "../utils/refresh.js";
+import { LiveQuery } from "../utils/liveQuery.svelte.js";
 import type { UsagePairwiseDimension } from "../api/types/usage.js";
 import {
   UsageService,
@@ -55,7 +56,7 @@ export interface UsageProjectFilterItem {
 }
 
 export type GroupBy = "project" | "model" | "agent";
-export type TimeSeriesView = "stacked-area" | "bars" | "lines";
+export type TimeSeriesView = "smooth" | "lines" | "bars";
 export type AttributionView = "treemap" | "list" | "bars";
 
 interface Toggles {
@@ -67,13 +68,17 @@ const TOGGLES_KEY = "usage-toggles";
 
 function defaultToggles(): Toggles {
   return {
-    timeSeries: { groupBy: "project", view: "stacked-area" },
+    timeSeries: { groupBy: "project", view: "smooth" },
     attribution: { groupBy: "project", view: "treemap" },
   };
 }
 
 function isGroupBy(value: unknown): value is GroupBy {
   return value === "project" || value === "model" || value === "agent";
+}
+
+function isTimeSeriesView(value: unknown): value is TimeSeriesView {
+  return value === "smooth" || value === "lines" || value === "bars";
 }
 
 function isUnknownProjectKeyError(error: unknown): boolean {
@@ -97,7 +102,9 @@ function loadToggles(): Toggles {
       return {
         timeSeries: {
           groupBy: sharedGroupBy,
-          view: parsed.timeSeries?.view ?? defaults.timeSeries.view,
+          view: isTimeSeriesView(parsed.timeSeries?.view)
+            ? parsed.timeSeries.view
+            : defaults.timeSeries.view,
         },
         attribution: {
           groupBy: sharedGroupBy,
@@ -367,6 +374,8 @@ class UsageStore {
   // relative to refreshStartedAt.
   private stepTimings = new Map<UsageStep, QueryStep>();
   private refreshStartedAt = 0;
+  // The full refresh running now, drawn live by the refresh control.
+  readonly liveQuery = new LiveQuery();
   hasNewData: boolean = $state(false);
 
   loading = $state({
@@ -831,6 +840,15 @@ class UsageStore {
     const startedAt = performance.now();
     this.stepTimings.clear();
     this.refreshStartedAt = startedAt;
+    const live = this.liveQuery.begin(startedAt);
+    try {
+      return await this.fetchAllSteps(startedAt, options);
+    } finally {
+      this.liveQuery.end(live);
+    }
+  }
+
+  private async fetchAllSteps(startedAt: number, options: FetchAllOptions): Promise<FetchResult> {
     const selectedRangeAtStart = this.selectedTimeRange ? { ...this.selectedTimeRange } : null;
     if (!options.preserveTimeRange && this.selectedTimeRange !== null) {
       this.selectedTimeRange = null;
@@ -932,6 +950,10 @@ class UsageStore {
     // error state in place until we have a definitive result.
     if (isFirstLoad) this.errors.summary = null;
     const started = performance.now();
+    const liveStep = this.liveQuery.start("summary", started);
+    const liveContextStep = options.contextParams
+      ? this.liveQuery.start("contextSummary", started)
+      : 0;
     let status: Extract<PerfEntryStatus, "ok" | "error" | "aborted"> = "ok";
     try {
       const params = options.params ?? this.baseParams();
@@ -955,9 +977,9 @@ class UsageStore {
           .map((body) => responseTimingOf(body)?.bodyAt)
           .filter((at): at is number => at !== undefined);
         const applyStartedAt = bodies.length > 0 ? Math.max(...bodies) : undefined;
-        this.noteStep("summary", started, data, applyStartedAt);
+        this.noteStep("summary", liveStep, started, data, applyStartedAt);
         if (contextData !== null) {
-          this.noteStep("contextSummary", started, contextData, applyStartedAt);
+          this.noteStep("contextSummary", liveContextStep, started, contextData, applyStartedAt);
         }
         this.isTimeRangeSummaryProvisional = false;
         if (contextData !== null) {
@@ -1033,6 +1055,8 @@ class UsageStore {
       }
     } finally {
       this.recordStep("summary", started, status);
+      this.liveQuery.abandon(liveStep);
+      this.liveQuery.abandon(liveContextStep);
       this.clearAbortSignal("summary", signal);
       if (this.versions.summary === v) {
         this.loading.summary = false;
@@ -1049,6 +1073,7 @@ class UsageStore {
     if (this.versions.summary !== summaryVersion) return "aborted";
     const signal = this.nextAbortSignal("comparison");
     const started = performance.now();
+    const liveStep = this.liveQuery.start("comparison", started);
     let status: Extract<PerfEntryStatus, "ok" | "error" | "aborted"> = "ok";
     try {
       const comparison = await UsageService.getApiV1UsageComparison(
@@ -1060,7 +1085,7 @@ class UsageStore {
       );
       if (this.versions.summary === summaryVersion) {
         this.summary = { ...summary, comparison };
-        this.noteStep("comparison", started, comparison);
+        this.noteStep("comparison", liveStep, started, comparison);
         return "ok";
       }
       return "aborted";
@@ -1076,6 +1101,7 @@ class UsageStore {
       return "error";
     } finally {
       this.recordStep("comparison", started, status);
+      this.liveQuery.abandon(liveStep);
       this.clearAbortSignal("comparison", signal);
     }
   }
@@ -1110,13 +1136,14 @@ class UsageStore {
     if (isFirstLoad) this.loading.pairwise = true;
     if (isFirstLoad) this.errors.pairwise = null;
     const started = performance.now();
+    const liveStep = this.liveQuery.start("pairwise", started);
     let status: Extract<PerfEntryStatus, "ok" | "error" | "aborted"> = "ok";
     try {
       const comparison = await UsageService.getApiV1UsagePairwiseComparison(request, { signal });
       if (this.versions.summary === summaryVersion && this.versions.pairwise === pairwiseVersion) {
         this.pairwiseComparison = comparison;
         this.errors.pairwise = null;
-        this.noteStep("pairwise", started, comparison);
+        this.noteStep("pairwise", liveStep, started, comparison);
         return "ok";
       }
       return "aborted";
@@ -1136,6 +1163,7 @@ class UsageStore {
       return "error";
     } finally {
       this.recordStep("pairwise", started, status);
+      this.liveQuery.abandon(liveStep);
       this.clearAbortSignal("pairwise", signal);
       if (this.versions.summary === summaryVersion && this.versions.pairwise === pairwiseVersion) {
         this.loading.pairwise = false;
@@ -1150,6 +1178,7 @@ class UsageStore {
     if (isFirstLoad) this.loading.topSessions = true;
     if (isFirstLoad) this.errors.topSessions = null;
     const started = performance.now();
+    const liveStep = this.liveQuery.start("topSessions", started);
     let status: Extract<PerfEntryStatus, "ok" | "error" | "aborted"> = "ok";
     try {
       const data = await UsageService.getApiV1UsageTopSessions(
@@ -1166,7 +1195,7 @@ class UsageStore {
       if (this.versions.topSessions === v) {
         this.topSessions = data;
         this.errors.topSessions = null;
-        this.noteStep("topSessions", started, data);
+        this.noteStep("topSessions", liveStep, started, data);
         return "ok";
       }
       return "aborted";
@@ -1186,6 +1215,7 @@ class UsageStore {
       return "error";
     } finally {
       this.recordStep("topSessions", started, status);
+      this.liveQuery.abandon(liveStep);
       this.clearAbortSignal("topSessions", signal);
       if (this.versions.topSessions === v) {
         this.loading.topSessions = false;
@@ -1226,6 +1256,7 @@ class UsageStore {
 
   cancelInFlightReads(): void {
     this.fetchAllVersion++;
+    this.liveQuery.end();
     this.versions.summary++;
     this.versions.pairwise++;
     this.versions.topSessions++;
@@ -1261,23 +1292,24 @@ class UsageStore {
 
   // Called once a request's data is applied: the step spans request sent to
   // data applied and carries the request's wait/download/apply phases.
+  // `liveStep` is the handle the live query gave the request when it began.
   private noteStep(
     step: UsageStep,
+    liveStep: number,
     startedAt: number,
     data: unknown,
     applyStartedAt?: number,
   ): void {
-    this.stepTimings.set(
+    const timing = queryStepFrom(
       step,
-      queryStepFrom(
-        step,
-        responseTimingOf(data),
-        startedAt,
-        performance.now(),
-        this.refreshStartedAt,
-        applyStartedAt,
-      ),
+      responseTimingOf(data),
+      startedAt,
+      performance.now(),
+      this.refreshStartedAt,
+      applyStartedAt,
     );
+    this.stepTimings.set(step, timing);
+    this.liveQuery.settle(liveStep, timing);
   }
 }
 

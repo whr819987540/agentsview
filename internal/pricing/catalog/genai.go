@@ -9,9 +9,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/dlclark/regexp2/v2"
@@ -36,6 +38,18 @@ type GenAIPrices struct {
 	providers []genAIProvider
 	raw       []byte
 	version   string
+	// resolved memoizes provider and model matching per (provider, model)
+	// identifier. Matching runs pattern lists that include regular
+	// expressions, and a usage report resolves the same few models for
+	// every row; only the price version depends on the timestamp.
+	resolved sync.Map
+	// fingerprints memoizes ModelFingerprint per (provider, model) lookup.
+	fingerprints sync.Map
+}
+
+type genAIResolvedModel struct {
+	provider *genAIProvider
+	model    *genAIModel
 }
 
 type genAIProvider struct {
@@ -524,6 +538,12 @@ func parseRequiredGenAIMatch(raw jsontext.Value) (genAIMatch, error) {
 		return genAIMatch{}, errors.New("match clause must contain exactly one operation")
 	}
 	match := matches[0]
+	// Scalar substring rules are case-insensitive. Normalize their immutable
+	// patterns once; equality and regex keep their own case semantics.
+	if match.kind == genAIMatchStartsWith || match.kind == genAIMatchEndsWith ||
+		match.kind == genAIMatchContains {
+		match.value = strings.ToLower(match.value)
+	}
 	if match.kind == genAIMatchRegex {
 		compiled, err := regexp2.Compile(match.value, regexp2.RE2)
 		if err != nil {
@@ -535,26 +555,28 @@ func parseRequiredGenAIMatch(raw jsontext.Value) (genAIMatch, error) {
 	return match, nil
 }
 
-func (m genAIMatch) matches(text string) bool {
+// matches reports whether text satisfies the rule. lowerText must be
+// strings.ToLower(text); callers compute it once per lookup.
+func (m genAIMatch) matches(text, lowerText string) bool {
 	switch m.kind {
 	case genAIMatchEquals:
 		return strings.EqualFold(text, m.value)
 	case genAIMatchStartsWith:
-		return strings.HasPrefix(strings.ToLower(text), strings.ToLower(m.value))
+		return strings.HasPrefix(lowerText, m.value)
 	case genAIMatchEndsWith:
-		return strings.HasSuffix(strings.ToLower(text), strings.ToLower(m.value))
+		return strings.HasSuffix(lowerText, m.value)
 	case genAIMatchContains:
-		return strings.Contains(strings.ToLower(text), strings.ToLower(m.value))
+		return strings.Contains(lowerText, m.value)
 	case genAIMatchRegex:
 		matched, err := m.regex.MatchString(text)
 		return err == nil && matched
 	case genAIMatchOr:
 		return slices.ContainsFunc(m.clauses, func(clause genAIMatch) bool {
-			return clause.matches(text)
+			return clause.matches(text, lowerText)
 		})
 	case genAIMatchAnd:
 		return !slices.ContainsFunc(m.clauses, func(clause genAIMatch) bool {
-			return !clause.matches(text)
+			return !clause.matches(text, lowerText)
 		})
 	default:
 		return false
@@ -571,40 +593,94 @@ func (p *GenAIPrices) Resolve(
 	if p == nil || modelID == "" {
 		return ModelPricing{}, false
 	}
-	provider := p.findProvider(providerID, modelID)
-	if provider == nil {
+	resolved := p.resolveModel(providerID, modelID)
+	if resolved.model == nil {
 		return ModelPricing{}, false
 	}
-	model := provider.findModel(modelID)
-	if model == nil {
-		for _, fallbackID := range provider.fallbackModelProviders {
-			fallback := p.providerByID(fallbackID)
-			if fallback != nil {
-				model = fallback.findModel(modelID)
-			}
-			if model != nil {
-				break
-			}
-		}
-	}
-	if model == nil {
-		return ModelPricing{}, false
-	}
-	selected := model.activePrices(timestamp)
-	rates, ok := genAIModelPricing(provider.id+"/"+model.id, selected)
+	selected := resolved.model.activePrices(timestamp)
+	rates, ok := genAIModelPricing(resolved.provider.id+"/"+resolved.model.id, selected)
 	return rates, ok
 }
 
+// ModelFingerprint hashes the matched model and every conditional price Resolve can select.
+func (p *GenAIPrices) ModelFingerprint(providerID, modelID string) string {
+	if p == nil || modelID == "" {
+		return "none"
+	}
+	key := providerID + "\x00" + modelID
+	if cached, ok := p.fingerprints.Load(key); ok {
+		return cached.(string)
+	}
+	fingerprint := "none"
+	if resolved := p.resolveModel(providerID, modelID); resolved.model != nil {
+		digest := sha256.New()
+		writeField := func(value string) {
+			_, _ = fmt.Fprintf(digest, "%d:%s", len(value), value)
+		}
+		writeField(resolved.provider.id)
+		writeField(resolved.model.id)
+		for _, conditional := range resolved.model.prices {
+			constraint := conditional.constraint
+			_, _ = fmt.Fprintf(digest, "|%d,%d.%d,%d,%d",
+				constraint.kind, constraint.startDate.Unix(), constraint.startDate.Nanosecond(),
+				constraint.startTime, constraint.endTime)
+			units := slices.Sorted(maps.Keys(conditional.prices))
+			_, _ = fmt.Fprintf(digest, "|%d", len(units))
+			for _, unit := range units {
+				rate := conditional.prices[unit]
+				writeField(unit)
+				_, _ = fmt.Fprintf(digest, "%d,%d", rate.base.Microdollars, len(rate.tiers))
+				for _, tier := range rate.tiers {
+					_, _ = fmt.Fprintf(digest, ",%d:%d", tier.start, tier.price.Microdollars)
+				}
+			}
+		}
+		fingerprint = hex.EncodeToString(digest.Sum(nil))
+	}
+	actual, _ := p.fingerprints.LoadOrStore(key, fingerprint)
+	return actual.(string)
+}
+
+func (p *GenAIPrices) resolveModel(providerID, modelID string) genAIResolvedModel {
+	key := providerID + "\x00" + modelID
+	if cached, ok := p.resolved.Load(key); ok {
+		return cached.(genAIResolvedModel)
+	}
+	var resolved genAIResolvedModel
+	lowerModelID := strings.ToLower(modelID)
+	provider := p.findProvider(providerID, modelID, lowerModelID)
+	if provider != nil {
+		model := provider.findModel(modelID, lowerModelID)
+		if model == nil {
+			for _, fallbackID := range provider.fallbackModelProviders {
+				fallback := p.providerByID(fallbackID)
+				if fallback != nil {
+					model = fallback.findModel(modelID, lowerModelID)
+				}
+				if model != nil {
+					break
+				}
+			}
+		}
+		if model != nil {
+			resolved = genAIResolvedModel{provider: provider, model: model}
+		}
+	}
+	p.resolved.Store(key, resolved)
+	return resolved
+}
+
 func (p *GenAIPrices) findProvider(
-	providerID, modelID string,
+	providerID, modelID, lowerModelID string,
 ) *genAIProvider {
 	if providerID != "" {
 		normalized := strings.ToLower(strings.TrimSpace(providerID))
 		if exact := p.providerByID(normalized); exact != nil {
 			return exact
 		}
+		// normalized is already lowercase and strings.ToLower is idempotent.
 		for i := range p.providers {
-			if p.providers[i].providerMatch.matches(normalized) {
+			if p.providers[i].providerMatch.matches(normalized, normalized) {
 				return &p.providers[i]
 			}
 		}
@@ -613,7 +689,7 @@ func (p *GenAIPrices) findProvider(
 		}
 	}
 	for i := range p.providers {
-		if p.providers[i].modelMatch.matches(modelID) {
+		if p.providers[i].modelMatch.matches(modelID, lowerModelID) {
 			return &p.providers[i]
 		}
 	}
@@ -629,9 +705,9 @@ func (p *GenAIPrices) providerByID(id string) *genAIProvider {
 	return nil
 }
 
-func (p *genAIProvider) findModel(modelID string) *genAIModel {
+func (p *genAIProvider) findModel(modelID, lowerModelID string) *genAIModel {
 	for i := range p.models {
-		if p.models[i].match.matches(modelID) {
+		if p.models[i].match.matches(modelID, lowerModelID) {
 			return &p.models[i]
 		}
 	}

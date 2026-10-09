@@ -38,6 +38,14 @@ export type GetApiV1SessionsByIdMessagesParams = {
    */
   roles?: string;
   /**
+   * Reject the read when the transcript revision no longer matches
+   */
+  expected_revision?: string;
+  /**
+   * Opaque archive binding returned by an earlier evidence read
+   */
+  evidence_source?: string;
+  /**
    * Include inherited parent context before fork sessions
    */
   include_fork_context?: boolean;

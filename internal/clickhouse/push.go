@@ -46,7 +46,6 @@ func (s *Sync) PushWithOptions(
 ) (storage.PushResult, error) {
 	start := time.Now()
 	var result storage.PushResult
-	result.Vectors.Skipped = true
 	if err := s.EnsureSchema(ctx); err != nil {
 		return result, err
 	}
@@ -66,6 +65,8 @@ func (s *Sync) PushWithOptions(
 		s.archiveKey(deletionRevisionKeyBase),
 		s.archiveKey(identityRevisionKeyBase),
 		s.archiveKey(mappingRevisionKeyBase),
+		s.archiveKey(usageSnapshotReadyKeyBase),
+		s.archiveKey(storedCountRepairKeyBase),
 	)
 	if err != nil {
 		return result, err
@@ -77,6 +78,29 @@ func (s *Sync) PushWithOptions(
 	storedMapping, _ := strconv.ParseInt(meta[s.archiveKey(mappingRevisionKeyBase)], 10, 64)
 
 	full, reason := s.decideFull(opts, storedCutoff, storedScope)
+	if !full && meta[s.archiveKey(usageSnapshotReadyKeyBase)] == "" {
+		full, reason = true, "preparing complete usage snapshots"
+	}
+	// Rows from before stored_message_count, or from an older writer, read as unknown until a full push republishes them.
+	repairing := meta[s.archiveKey(storedCountRepairKeyBase)] != ""
+	if !repairing {
+		var unknown uint64
+		if err := conn.QueryRowContext(ctx,
+			"SELECT count() FROM sessions WHERE source_archive_id = ? AND stored_message_count IS NULL", s.archiveID,
+		).Scan(&unknown); err != nil {
+			return result, fmt.Errorf("reading clickhouse sessions without stored message counts: %w", err)
+		}
+		if unknown > 0 {
+			// Republishing fills the NULLs before every session lands, so keep repairing until a push finishes cleanly.
+			if err := writeMetadata(ctx, conn, map[string]string{s.archiveKey(storedCountRepairKeyBase): "1"}); err != nil {
+				return result, err
+			}
+			repairing = true
+		}
+	}
+	if !full && repairing {
+		full, reason = true, "publishing stored message counts"
+	}
 	localDeletion, err := s.local.SessionDeletionPublicationRevision(ctx)
 	if err != nil {
 		return result, fmt.Errorf("reading local deletion revision: %w", err)
@@ -133,11 +157,13 @@ func (s *Sync) PushWithOptions(
 		}
 	}
 
+	failed := map[string]struct{}{}
 	for offset := 0; offset < len(changed); offset += sessionPushBatchSize {
 		end := min(offset+sessionPushBatchSize, len(changed))
 		if err := s.pushBatchWithRetry(
 			ctx, changed[offset:end], fingerprints, version,
 			offset, len(changed), &result, onProgress,
+			failed,
 		); err != nil {
 			return result, err
 		}
@@ -150,6 +176,15 @@ func (s *Sync) PushWithOptions(
 	}
 	if err := s.refreshCurationIfChanged(ctx, version); err != nil {
 		return result, err
+	}
+
+	var vectorScope []string
+	if opts.ScopeVectorsToChangedSessions {
+		vectorScope = sessionIDs(changed)
+	}
+	result.Vectors, err = s.pushVectors(ctx, full, vectorScope, failed, onProgress)
+	if err != nil {
+		return result, fmt.Errorf("vector push: %w", err)
 	}
 
 	identityRevision := storedIdentity
@@ -173,7 +208,7 @@ func (s *Sync) PushWithOptions(
 	}
 
 	if result.Errors == 0 {
-		if err := writeMetadata(ctx, conn, map[string]string{
+		pushed := map[string]string{
 			s.archiveKey(lastPushCutoffKeyBase):   cutoff,
 			s.archiveKey(lastPushAtKeyBase):       time.Now().UTC().Format(time.RFC3339),
 			s.archiveKey(lastPushMachineKeyBase):  s.machine,
@@ -183,8 +218,25 @@ func (s *Sync) PushWithOptions(
 			s.archiveKey(mappingRevisionKeyBase):  strconv.FormatInt(mappingRevision, 10),
 			schemaVersionKey:                      strconv.Itoa(SchemaVersion),
 			sourceDataVersionKey:                  strconv.Itoa(db.CurrentDataVersion()),
-		}); err != nil {
+		}
+		if meta[s.archiveKey(usageSnapshotReadyKeyBase)] == "" {
+			var completed string
+			if err := conn.QueryRowContext(ctx, "SELECT toString(toUnixTimestamp(now()))").Scan(&completed); err != nil {
+				return result, fmt.Errorf("reading usage snapshot completion time: %w", err)
+			}
+			pushed[s.archiveKey(usageSnapshotReadyKeyBase)] = completed
+		}
+		if repairing {
+			pushed[s.archiveKey(storedCountRepairKeyBase)] = ""
+		}
+		if err := writeMetadata(ctx, conn, pushed); err != nil {
 			return result, err
+		}
+		// Prepared usage serves reads only while it reflects the current
+		// snapshot set, so start the refresh now instead of waiting for the
+		// schedule. The scheduled refresh still covers a failed trigger.
+		if _, err := conn.ExecContext(ctx, "SYSTEM REFRESH VIEW prepare_usage"); err != nil {
+			log.Printf("clickhouse push: scheduling prepared usage refresh: %v", err)
 		}
 	}
 	result.Duration = time.Since(start)
@@ -215,20 +267,13 @@ func (s *Sync) partitionPushScope(candidates []db.Session) (inScope, outOfScope 
 		return candidates, nil
 	}
 	for _, sess := range candidates {
-		if projectMatchesPushScope(sess.Project, s.projects, s.excludeProjects) {
+		if db.ProjectMatchesPushScope(sess.Project, s.projects, s.excludeProjects) {
 			inScope = append(inScope, sess)
 		} else {
 			outOfScope = append(outOfScope, sess)
 		}
 	}
 	return inScope, outOfScope
-}
-
-func projectMatchesPushScope(project string, projects, excludeProjects []string) bool {
-	if len(projects) > 0 && !slices.Contains(projects, project) {
-		return false
-	}
-	return !slices.Contains(excludeProjects, project)
 }
 
 func sessionIDs(sessions []db.Session) []string {
@@ -292,14 +337,16 @@ func (s *Sync) readMirrorFingerprints(ctx context.Context, ids []string) (map[st
 	return out, nil
 }
 
-// residentSessionIDs reports which ids currently have a session row.
+// residentSessionIDs includes complete snapshots whose final fingerprint
+// insert failed, so scope changes can remove them too.
 func (s *Sync) residentSessionIDs(ctx context.Context, ids []string) (map[string]bool, error) {
 	resident := make(map[string]bool, len(ids))
 	for batch := range idBatches(uniqueIDs(ids)) {
 		placeholders, args := inArgs(batch)
 		if err := func() error {
 			rows, err := s.conn.QueryContext(ctx,
-				"SELECT id FROM sessions WHERE id IN ("+placeholders+")", args...)
+				"SELECT id FROM (SELECT id FROM sessions UNION ALL SELECT id FROM "+
+					usageSessionSnapshotTable+") WHERE id IN ("+placeholders+")", args...)
 			if err != nil {
 				return fmt.Errorf("reading clickhouse resident sessions: %w", err)
 			}
@@ -391,9 +438,11 @@ func (s *Sync) deleteMirrorSessions(ctx context.Context, ids []string) error {
 				return fmt.Errorf("deleting clickhouse %s rows: %w", table, err)
 			}
 		}
-		if _, err := s.conn.ExecContext(ctx,
-			"DELETE FROM sessions WHERE id IN ("+placeholders+")", args...); err != nil {
-			return fmt.Errorf("deleting clickhouse sessions: %w", err)
+		for _, table := range []string{usageSessionSnapshotTable, "sessions"} {
+			if _, err := s.conn.ExecContext(ctx,
+				"DELETE FROM "+table+" WHERE id IN ("+placeholders+")", args...); err != nil {
+				return fmt.Errorf("deleting clickhouse %s: %w", table, err)
+			}
 		}
 	}
 	return nil
@@ -417,7 +466,7 @@ func (s *Sync) applyDeletionDelta(ctx context.Context, after, through int64, res
 		if t.SessionID == "" {
 			continue
 		}
-		if projectMatchesPushScope(t.Project, s.projects, s.excludeProjects) {
+		if db.ProjectMatchesPushScope(t.Project, s.projects, s.excludeProjects) {
 			inScope = append(inScope, t.SessionID)
 		} else {
 			outOfScope = append(outOfScope, t.SessionID)
@@ -435,7 +484,8 @@ func (s *Sync) applyDeletionDelta(ctx context.Context, after, through int64, res
 // a full push did not see locally.
 func (s *Sync) deleteSessionsMissingLocally(ctx context.Context, keep []string, result *storage.PushResult) error {
 	rows, err := s.conn.QueryContext(ctx,
-		"SELECT id FROM sessions WHERE source_archive_id = ?", s.archiveID)
+		"SELECT id FROM (SELECT id, source_archive_id FROM sessions UNION ALL SELECT id, source_archive_id FROM "+
+			usageSessionSnapshotTable+") WHERE source_archive_id = ?", s.archiveID)
 	if err != nil {
 		return fmt.Errorf("listing clickhouse sessions for archive: %w", err)
 	}
@@ -473,8 +523,12 @@ func (s *Sync) pushBatchWithRetry(
 	ctx context.Context, batch []db.Session, fingerprints map[string]string,
 	version uint64, offset, total int, result *storage.PushResult,
 	onProgress func(storage.PushProgress),
+	failed map[string]struct{},
 ) error {
-	counts, err := s.pushSessionBatch(ctx, batch, fingerprints, version)
+	// Keep each session's payload unchanged across retries of this version,
+	// even if the local archive changes after the batch attempt.
+	payloads := make(map[string]sessionPayload, len(batch))
+	counts, err := s.pushSessionBatch(ctx, batch, fingerprints, version, payloads)
 	if err == nil {
 		for i := range batch {
 			result.SessionsPushed++
@@ -492,7 +546,7 @@ func (s *Sync) pushBatchWithRetry(
 			result.Errors += len(batch) - i
 			return err
 		}
-		counts, err := s.pushSessionBatch(ctx, batch[i:i+1], fingerprints, version)
+		counts, err := s.pushSessionBatch(ctx, batch[i:i+1], fingerprints, version, payloads)
 		switch {
 		case err == nil:
 			result.SessionsPushed++
@@ -502,6 +556,7 @@ func (s *Sync) pushBatchWithRetry(
 			return err
 		default:
 			result.Errors++
+			failed[sess.ID] = struct{}{}
 			log.Printf("clickhouse push: skipping session %s after error: %v", sess.ID, err)
 		}
 		reportProgress(offset+i+1, total, result, onProgress)
@@ -531,29 +586,33 @@ func reportProgress(done, total int, result *storage.PushResult, onProgress func
 
 // sessionPayload is everything one session contributes to the mirror.
 type sessionPayload struct {
-	session  db.Session
-	messages []db.Message
-	usage    []db.UsageEvent
-	findings []db.SecretFinding
-	pins     []db.PinnedMessage
+	session     db.Session
+	messages    []db.Message
+	usage       []db.UsageEvent
+	findings    []db.SecretFinding
+	pins        []db.PinnedMessage
+	fingerprint string
 }
 
 func (s *Sync) loadPayload(ctx context.Context, sess db.Session) (sessionPayload, error) {
-	p := sessionPayload{session: sess}
-	var err error
-	if p.messages, err = s.local.GetAllMessages(ctx, sess.ID); err != nil {
-		return p, fmt.Errorf("reading local messages for %s: %w", sess.ID, err)
+	snapshot, err := s.local.LoadSessionMirrorSnapshot(ctx, sess.ID)
+	if err != nil {
+		return sessionPayload{}, fmt.Errorf("reading local session snapshot %s: %w", sess.ID, err)
 	}
-	if p.usage, err = s.local.GetUsageEvents(ctx, sess.ID); err != nil {
-		return p, fmt.Errorf("reading local usage events for %s: %w", sess.ID, err)
+	if snapshot == nil {
+		return sessionPayload{}, fmt.Errorf("session %s was removed before its snapshot was loaded", sess.ID)
 	}
-	if p.findings, err = s.local.SessionSecretFindings(ctx, sess.ID); err != nil {
-		return p, fmt.Errorf("reading local secret findings for %s: %w", sess.ID, err)
+	if !db.ProjectMatchesPushScope(snapshot.Session.Project, s.projects, s.excludeProjects) {
+		return sessionPayload{}, fmt.Errorf("session %s moved outside the push scope before its snapshot was loaded", sess.ID)
 	}
-	if p.pins, err = s.local.ListPinnedMessages(ctx, sess.ID, ""); err != nil {
-		return p, fmt.Errorf("reading local pins for %s: %w", sess.ID, err)
+	fingerprint, err := s.snapshotFingerprint(snapshot)
+	if err != nil {
+		return sessionPayload{}, err
 	}
-	return p, nil
+	return sessionPayload{
+		session: snapshot.Session, messages: snapshot.Messages, usage: snapshot.Usage,
+		findings: snapshot.Findings, pins: snapshot.Pins, fingerprint: fingerprint,
+	}, nil
 }
 
 // pushSessionBatch writes one batch in the order the consistency design
@@ -562,15 +621,21 @@ func (s *Sync) loadPayload(ctx context.Context, sess db.Session) (sessionPayload
 // session.
 func (s *Sync) pushSessionBatch(
 	ctx context.Context, batch []db.Session, fingerprints map[string]string,
-	version uint64,
+	version uint64, loaded map[string]sessionPayload,
 ) ([]int, error) {
 	payloads := make([]sessionPayload, 0, len(batch))
 	counts := make([]int, 0, len(batch))
 	for _, sess := range batch {
-		p, err := s.loadPayload(ctx, sess)
-		if err != nil {
-			return nil, err
+		p, ok := loaded[sess.ID]
+		if !ok {
+			var err error
+			p, err = s.loadPayload(ctx, sess)
+			if err != nil {
+				return nil, err
+			}
+			loaded[sess.ID] = p
 		}
+		fingerprints[sess.ID] = p.fingerprint
 		payloads = append(payloads, p)
 		counts = append(counts, len(p.messages))
 	}
@@ -594,7 +659,9 @@ func (s *Sync) pushSessionBatch(
 	}
 	for batchIDs := range idBatches(ids) {
 		placeholders, args := inArgs(batchIDs)
-		for _, table := range dependentTables {
+		// The usage_messages view never sees deletes, so a shorter republished
+		// session would leave its removed ordinals behind at the old version.
+		for _, table := range slices.Concat(dependentTables, []string{"usage_messages"}) {
 			if _, err := s.conn.ExecContext(ctx,
 				"DELETE FROM "+table+" WHERE session_id IN ("+placeholders+") AND push_version < ?",
 				append(args, version)...); err != nil {
@@ -606,6 +673,9 @@ func (s *Sync) pushSessionBatch(
 		if err := s.hooks.beforeSessionRows(batch); err != nil {
 			return nil, err
 		}
+	}
+	if err := s.insertUsageSessionSnapshots(ctx, payloads, version); err != nil {
+		return nil, err
 	}
 	if err := s.insertSessions(ctx, payloads, fingerprints, version); err != nil {
 		return nil, err
@@ -673,6 +743,11 @@ func insertRows(ctx context.Context, conn *sql.DB, table string, rows [][]any) e
 	if !ok {
 		return fmt.Errorf("clickhouse table %s has no spec", table)
 	}
+	return insertRowsSpec(ctx, conn, spec, rows)
+}
+
+func insertRowsSpec(ctx context.Context, conn *sql.DB, spec tableSpec, rows [][]any) error {
+	table := spec.name
 	tx, err := conn.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("starting clickhouse %s insert: %w", table, err)
@@ -709,27 +784,18 @@ func insertSQL(spec tableSpec) string {
 	return "INSERT INTO " + spec.name + " (" + strings.Join(names, ", ") + ")"
 }
 
-// mirroredSessionMachine keeps the recorded machine key except for the
-// local-only sentinels, which take the machine configured for this push.
-func mirroredSessionMachine(sess db.Session, fallback string) string {
-	if sess.Machine != "" && sess.Machine != "local" {
-		return sess.Machine
-	}
-	return fallback
-}
-
 func (s *Sync) sessionRow(p sessionPayload, fingerprint string, version uint64) []any {
 	sess := p.session
 	return []any{
 		sess.ID, sess.Project, sess.ProjectAssigned,
-		mirroredSessionMachine(sess, s.machine), sess.Agent,
+		db.MirroredSessionMachine(sess, s.machine), sess.Agent,
 		sess.AgentLabel, sess.Entrypoint, sess.SessionKind,
 		nullString(sess.FirstMessage), nullString(sess.DisplayName), nullString(sess.SessionName),
 		nullTime(sess.StartedAt), nullTime(sess.EndedAt),
 		int64(sess.MessageCount), int64(sess.UserMessageCount),
 		nullString(sess.FilePath), nullInt64(sess.FileSize), nullInt64(sess.FileMtime),
 		nullInt64(sess.FileInode), nullInt64(sess.FileDevice), nullString(sess.FileHash),
-		nullTime(sess.LocalModifiedAt), transcriptRevisionValue(sess.TranscriptRevision),
+		nullTime(sess.LocalModifiedAt), db.TranscriptRevisionValue(sess.TranscriptRevision),
 		nullString(sess.ParentSessionID), sess.RelationshipType,
 		int64(sess.TotalOutputTokens), int64(sess.PeakContextTokens),
 		sess.HasTotalOutputTokens, sess.HasPeakContextTokens, sess.IsAutomated,
@@ -750,7 +816,7 @@ func (s *Sync) sessionRow(p sessionPayload, fingerprint string, version uint64) 
 		nullString(sess.TerminationStatus),
 		int64(sess.SecretLeakCount), sess.SecretsRulesVersion,
 		lastMessageAt(p.messages), fingerprint, s.archiveID,
-		version,
+		int64(len(p.messages)), version,
 	}
 }
 
@@ -788,8 +854,8 @@ func toolCallRow(m db.Message, tc db.ToolCall, callIndex int, version uint64) []
 	if length == 0 {
 		if stored != "" {
 			length = len(stored)
-		} else if len(tc.ResultEvents) == 1 {
-			length = len(tc.ResultEvents[0].Content)
+		} else if sole, ok := db.SoleToolResultContent(tc.ResultEvents); ok {
+			length = len(sole.Content)
 		}
 	}
 	return []any{
@@ -858,13 +924,6 @@ func nullIntPtr(v *int) *int64 {
 	}
 	n := int64(*v)
 	return &n
-}
-
-func transcriptRevisionValue(v *string) string {
-	if v == nil || *v == "" {
-		return "0"
-	}
-	return *v
 }
 
 func nullTime(v *string) *time.Time {

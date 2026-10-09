@@ -6,6 +6,9 @@ components:
         agent_minutes:
           format: double
           type: number
+        assistant_messages:
+          format: int64
+          type: integer
         automated_at_peak:
           format: int64
           type: integer
@@ -39,6 +42,9 @@ components:
         subagent_at_peak:
           format: int64
           type: integer
+        user_messages:
+          format: int64
+          type: integer
       required:
         - start
         - end
@@ -47,6 +53,8 @@ components:
         - max_subagent_agents
         - max_automated_agents
         - agent_minutes
+        - user_messages
+        - assistant_messages
         - output_tokens
         - cost
         - subagent_at_peak
@@ -410,9 +418,15 @@ components:
           type: string
         error:
           type: string
+        state:
+          type: string
         upload_offset:
           format: int64
           type: integer
+        variants:
+          items:
+            type: string
+          type: array
       required:
         - error
       type: object
@@ -624,17 +638,25 @@ components:
         interval:
           format: int64
           type: integer
-        port:
-          format: int64
-          type: integer
         transport:
           type: string
         url:
           type: string
-        user:
-          type: string
       required:
         - host
+      type: object
+    ConversationExportInitializeResponse:
+      additionalProperties: false
+      properties:
+        database_id:
+          description: Archive generation that now serves conversation exports
+          type: string
+        initialized:
+          description: Whether this request built the projection
+          type: boolean
+      required:
+        - database_id
+        - initialized
       type: object
     DaemonPushRequest:
       additionalProperties: false
@@ -1121,9 +1143,15 @@ components:
           items:
             $ref: "#/components/schemas/DbMessage"
           type: array
+        display_name:
+          type:
+            - string
+            - "null"
         is_sidechain:
           type: boolean
         location:
+          type: string
+        machine:
           type: string
         ordinal:
           format: int64
@@ -1156,12 +1184,16 @@ components:
           type: string
         tool_name:
           type: string
+        transcript_revision:
+          type: string
         web_url:
           type: string
       required:
         - session_id
         - project
         - agent
+        - machine
+        - display_name
         - location
         - role
         - ordinal
@@ -1683,6 +1715,8 @@ components:
         message_id:
           format: int64
           type: integer
+        message_key:
+          type: string
         note:
           type: string
         ordinal:
@@ -1700,6 +1734,8 @@ components:
           type: string
         session_project:
           type: string
+        unresolved:
+          type: boolean
       required:
         - id
         - session_id
@@ -2309,6 +2345,8 @@ components:
       properties:
         agent:
           type: string
+        machine:
+          type: string
         name:
           type: string
         ordinal:
@@ -2331,6 +2369,7 @@ components:
         - session_id
         - project
         - agent
+        - machine
         - name
         - ordinal
         - session_ended_at
@@ -2479,6 +2518,10 @@ components:
           type: string
         parent_session_id:
           type: string
+        parent_session_ids:
+          items:
+            type: string
+          type: array
         parser_malformed_lines:
           format: int64
           type: integer
@@ -2811,6 +2854,10 @@ components:
           type: integer
         parent_session_id:
           type: string
+        parent_session_ids:
+          items:
+            type: string
+          type: array
         project:
           type: string
         project_assigned:
@@ -3461,6 +3508,20 @@ components:
       required:
         - by_tokens
       type: object
+    DbStatsOutcomeSkippedRepo:
+      additionalProperties: false
+      properties:
+        op:
+          type: string
+        reason:
+          type: string
+        repo:
+          type: string
+      required:
+        - repo
+        - op
+        - reason
+      type: object
     DbStatsOutcomeStats:
       additionalProperties: false
       properties:
@@ -3485,6 +3546,10 @@ components:
         repos_active:
           format: int64
           type: integer
+        skipped:
+          items:
+            $ref: "#/components/schemas/DbStatsOutcomeSkippedRepo"
+          type: array
       required:
         - repos_active
         - commits
@@ -4672,6 +4737,22 @@ components:
       required:
         - configured
       type: object
+    ImporterImportRefusal:
+      additionalProperties: false
+      properties:
+        reason:
+          enum:
+            - diverged
+            - shorter_export
+            - trashed
+            - transient
+          type: string
+        session_id:
+          type: string
+      required:
+        - session_id
+        - reason
+      type: object
     ImporterImportStats:
       additionalProperties: false
       properties:
@@ -4681,6 +4762,10 @@ components:
         imported:
           format: int64
           type: integer
+        refusals:
+          items:
+            $ref: "#/components/schemas/ImporterImportRefusal"
+          type: array
         skipped:
           format: int64
           type: integer
@@ -5063,6 +5148,165 @@ components:
         - length
         - objects
       type: object
+    RawsyncExpiredLease:
+      additionalProperties: false
+      properties:
+        attempt_count:
+          format: int64
+          type: integer
+        configured_root_id:
+          type: string
+        device_id:
+          type: string
+        job_id:
+          format: int64
+          type: integer
+        lease_expires_at:
+          format: date-time
+          type: string
+        manifest_id:
+          type: string
+        processing_version:
+          type: string
+        provider:
+          type: string
+        source_key_sha256:
+          type: string
+        updated_at:
+          format: date-time
+          type: string
+      required:
+        - job_id
+        - device_id
+        - manifest_id
+        - processing_version
+        - provider
+        - configured_root_id
+        - source_key_sha256
+        - attempt_count
+        - lease_expires_at
+        - updated_at
+      type: object
+    RawsyncJobAttemptWarning:
+      additionalProperties: false
+      properties:
+        attempt_count:
+          format: int64
+          type: integer
+        available_at:
+          format: date-time
+          type: string
+        configured_root_id:
+          type: string
+        device_id:
+          type: string
+        job_id:
+          format: int64
+          type: integer
+        last_error_class:
+          type: string
+        manifest_id:
+          type: string
+        processing_version:
+          type: string
+        provider:
+          type: string
+        source_key_sha256:
+          type: string
+        updated_at:
+          format: date-time
+          type: string
+      required:
+        - job_id
+        - device_id
+        - manifest_id
+        - processing_version
+        - provider
+        - configured_root_id
+        - source_key_sha256
+        - attempt_count
+        - available_at
+        - updated_at
+        - last_error_class
+      type: object
+    RawsyncJobFailureClass:
+      additionalProperties: false
+      properties:
+        error_class:
+          type: string
+        job_count:
+          format: int64
+          type: integer
+        latest_failure_at:
+          format: date-time
+          type: string
+      required:
+        - error_class
+        - job_count
+        - latest_failure_at
+      type: object
+    RawsyncJobHealthReport:
+      additionalProperties: false
+      properties:
+        expired_lease_count:
+          format: int64
+          type: integer
+        expired_leases:
+          items:
+            $ref: "#/components/schemas/RawsyncExpiredLease"
+          type: array
+        failed_job_count:
+          format: int64
+          type: integer
+        failed_jobs_by_error_class:
+          items:
+            $ref: "#/components/schemas/RawsyncJobFailureClass"
+          type: array
+        max_attempts:
+          format: int32
+          type: integer
+        observed_at:
+          format: date-time
+          type: string
+        orphaned_manifest_count:
+          format: int64
+          type: integer
+        orphaned_manifests:
+          items:
+            $ref: "#/components/schemas/RawsyncOrphanedManifest"
+          type: array
+        retrying_near_limit:
+          items:
+            $ref: "#/components/schemas/RawsyncJobAttemptWarning"
+          type: array
+        retrying_near_limit_count:
+          format: int64
+          type: integer
+        stale_after_seconds:
+          format: int32
+          type: integer
+        stale_source_head_count:
+          format: int64
+          type: integer
+        stale_source_heads:
+          items:
+            $ref: "#/components/schemas/RawsyncStaleSourceHead"
+          type: array
+      required:
+        - observed_at
+        - max_attempts
+        - stale_after_seconds
+        - orphaned_manifests
+        - orphaned_manifest_count
+        - expired_leases
+        - expired_lease_count
+        - failed_jobs_by_error_class
+        - failed_job_count
+        - retrying_near_limit
+        - retrying_near_limit_count
+        - stale_source_heads
+        - stale_source_head_count
+      type: object
     RawsyncManifest:
       additionalProperties: false
       properties:
@@ -5123,6 +5367,37 @@ components:
       type:
         - object
         - "null"
+    RawsyncOrphanedManifest:
+      additionalProperties: false
+      properties:
+        accepted_at:
+          format: date-time
+          type: string
+        configured_root_id:
+          type: string
+        device_id:
+          type: string
+        generation:
+          format: int64
+          type: integer
+        kind:
+          type: string
+        manifest_id:
+          type: string
+        provider:
+          type: string
+        source_key_sha256:
+          type: string
+      required:
+        - manifest_id
+        - device_id
+        - provider
+        - configured_root_id
+        - source_key_sha256
+        - generation
+        - kind
+        - accepted_at
+      type: object
     RawsyncParseJobCounts:
       additionalProperties: false
       properties:
@@ -5167,6 +5442,11 @@ components:
           type:
             - string
             - "null"
+        last_parse_completed_at:
+          format: date-time
+          type:
+            - string
+            - "null"
         parse_failed:
           type: boolean
         parse_leased:
@@ -5184,9 +5464,41 @@ components:
         - source_key
         - generation
         - last_accepted_at
+        - last_parse_completed_at
         - parse_pending
         - parse_leased
         - parse_failed
+      type: object
+    RawsyncStaleSourceHead:
+      additionalProperties: false
+      properties:
+        accepted_at:
+          format: date-time
+          type: string
+        configured_root_id:
+          type: string
+        device_id:
+          type: string
+        generation:
+          format: int64
+          type: integer
+        kind:
+          type: string
+        manifest_id:
+          type: string
+        provider:
+          type: string
+        source_key_sha256:
+          type: string
+      required:
+        - device_id
+        - provider
+        - configured_root_id
+        - source_key_sha256
+        - manifest_id
+        - generation
+        - kind
+        - accepted_at
       type: object
     RawsyncStatus:
       additionalProperties: false
@@ -5609,6 +5921,17 @@ components:
         - launched
         - command
       type: object
+    ReviewRecallEntryRequest:
+      additionalProperties: false
+      properties:
+        action:
+          enum:
+            - approve
+            - archive
+          type: string
+      required:
+        - action
+      type: object
     SearchResponse:
       additionalProperties: false
       properties:
@@ -5633,6 +5956,8 @@ components:
     ServiceContentSearchResult:
       additionalProperties: false
       properties:
+        coverage:
+          $ref: "#/components/schemas/ServiceMemoryCoverage"
         matches:
           items:
             $ref: "#/components/schemas/DbContentMatch"
@@ -5640,8 +5965,12 @@ components:
         next_cursor:
           format: int64
           type: integer
+        revision_bound:
+          type: boolean
       required:
         - matches
+        - revision_bound
+        - coverage
       type: object
     ServiceInputOutline:
       additionalProperties: false
@@ -5674,12 +6003,130 @@ components:
         - preview
         - is_shell
       type: object
+    ServiceMemoryArchiveStatus:
+      additionalProperties: false
+      properties:
+        backend:
+          type: string
+        identity:
+          type: string
+        read_only:
+          type: boolean
+      required:
+        - backend
+        - read_only
+      type: object
+    ServiceMemoryCapabilityStatus:
+      additionalProperties: false
+      properties:
+        reason:
+          type: string
+        status:
+          enum:
+            - ready
+            - partial
+            - unavailable
+            - unknown
+          type: string
+      required:
+        - status
+      type: object
+    ServiceMemoryCoverage:
+      additionalProperties: false
+      properties:
+        lexical:
+          $ref: "#/components/schemas/ServiceMemoryCapabilityStatus"
+        semantic:
+          $ref: "#/components/schemas/ServiceMemoryVectorStatus"
+        status:
+          enum:
+            - ready
+            - partial
+            - unavailable
+            - unknown
+          type: string
+      required:
+        - status
+        - lexical
+        - semantic
+      type: object
+    ServiceMemorySourceStatus:
+      additionalProperties: false
+      properties:
+        reason:
+          type: string
+        status:
+          enum:
+            - ready
+            - partial
+            - unavailable
+            - unknown
+          type: string
+      required:
+        - status
+      type: object
+    ServiceMemoryStatus:
+      additionalProperties: false
+      properties:
+        archive:
+          $ref: "#/components/schemas/ServiceMemoryArchiveStatus"
+        lexical:
+          $ref: "#/components/schemas/ServiceMemoryCapabilityStatus"
+        observed_at:
+          format: date-time
+          type: string
+        semantic:
+          $ref: "#/components/schemas/ServiceMemoryVectorStatus"
+        server_version:
+          type: string
+        sources:
+          $ref: "#/components/schemas/ServiceMemorySourceStatus"
+        status:
+          enum:
+            - ready
+            - partial
+            - unavailable
+            - unknown
+          type: string
+      required:
+        - status
+        - observed_at
+        - archive
+        - lexical
+        - semantic
+        - sources
+      type: object
+    ServiceMemoryVectorStatus:
+      additionalProperties: false
+      properties:
+        embedded:
+          format: int64
+          type: integer
+        generation:
+          type: string
+        missing:
+          format: int64
+          type: integer
+        reason:
+          type: string
+        status:
+          enum:
+            - ready
+            - partial
+            - unavailable
+            - unknown
+          type: string
+      required:
+        - status
+      type: object
     ServiceMessageList:
       additionalProperties: false
       properties:
         count:
           format: int64
           type: integer
+        evidence_source:
+          type: string
         first_ordinal:
           format: int64
           type: integer
@@ -5690,6 +6137,8 @@ components:
           items:
             $ref: "#/components/schemas/DbMessage"
           type: array
+        transcript_revision:
+          type: string
       required:
         - messages
         - count
@@ -6064,6 +6513,10 @@ components:
           type: string
         parent_session_id:
           type: string
+        parent_session_ids:
+          items:
+            type: string
+          type: array
         parser_malformed_lines:
           format: int64
           type: integer
@@ -6403,6 +6856,143 @@ components:
         - homes_supported
         - homes
       type: object
+    SessionToolSequence:
+      additionalProperties: false
+      properties:
+        calls:
+          items:
+            $ref: "#/components/schemas/SessionToolSequenceCall"
+          type: array
+        ending:
+          enum:
+            - recovered
+            - abandoned
+            - open
+            - unknown
+          type: string
+        identical:
+          type: boolean
+        near_identical:
+          type: boolean
+        omitted_calls:
+          format: int64
+          type: integer
+        tool_changed:
+          type: boolean
+        total_calls:
+          format: int64
+          type: integer
+      required:
+        - ending
+        - identical
+        - near_identical
+        - tool_changed
+        - total_calls
+        - omitted_calls
+        - calls
+      type: object
+    SessionToolSequenceCall:
+      additionalProperties: false
+      properties:
+        call_index:
+          format: int64
+          type: integer
+        input_bytes:
+          format: int64
+          type: integer
+        input_omitted_bytes:
+          format: int64
+          type: integer
+        input_preview:
+          type: string
+        ordinal:
+          format: int64
+          type: integer
+        outcome:
+          enum:
+            - errored
+            - empty
+            - content
+            - unknown
+          type: string
+        repeat:
+          enum:
+            - none
+            - identical
+            - near_identical
+          type: string
+        result_bytes:
+          format: int64
+          type:
+            - integer
+            - "null"
+        result_content_unknown:
+          type: boolean
+        result_omitted_bytes:
+          format: int64
+          type:
+            - integer
+            - "null"
+        result_preview:
+          type: string
+        tool_changed:
+          type: boolean
+        tool_name:
+          type: string
+        tool_use_id:
+          type: string
+      required:
+        - ordinal
+        - call_index
+        - tool_use_id
+        - tool_name
+        - outcome
+        - repeat
+        - tool_changed
+        - input_preview
+        - input_bytes
+        - input_omitted_bytes
+        - result_preview
+        - result_bytes
+        - result_omitted_bytes
+        - result_content_unknown
+      type: object
+    SessionToolSequencesResponse:
+      additionalProperties: false
+      properties:
+        omitted_calls:
+          format: int64
+          type: integer
+        omitted_sequences:
+          format: int64
+          type: integer
+        sequences:
+          items:
+            $ref: "#/components/schemas/SessionToolSequence"
+          type: array
+        session_id:
+          type: string
+        total_sequence_calls:
+          format: int64
+          type: integer
+        total_sequences:
+          format: int64
+          type: integer
+        total_tool_calls:
+          format: int64
+          type: integer
+        transcript_revision:
+          type: string
+      required:
+        - session_id
+        - transcript_revision
+        - total_tool_calls
+        - total_sequences
+        - omitted_sequences
+        - total_sequence_calls
+        - omitted_calls
+        - sequences
+      type: object
     SessionTreeNode:
       additionalProperties: false
       properties:
@@ -6609,6 +7199,9 @@ components:
           type: boolean
         host:
           type: string
+        insight_default_agent:
+          description: Agent CLI used when an insight generation request does not choose one
+          type: string
         port:
           format: int64
           type: integer
@@ -6654,6 +7247,7 @@ components:
         - port
         - chart_palette
         - tool_result_images
+        - insight_default_agent
         - require_auth
         - read_only
       type: object
@@ -6880,6 +7474,11 @@ components:
           format: int64
           type: integer
         failed:
+          format: int64
+          type: integer
+        links_pending:
+          type: boolean
+        links_updated:
           format: int64
           type: integer
         orphaned_copied:
@@ -7256,6 +7855,8 @@ components:
           type: boolean
         read_only:
           type: boolean
+        session_stats_available:
+          type: boolean
         version:
           type: string
       required:
@@ -7263,6 +7864,7 @@ components:
         - commit
         - build_date
         - insight_generation_available
+        - session_stats_available
         - api_version
         - data_version
       type: object
@@ -12236,6 +12838,79 @@ paths:
       summary: Watch server events
       tags:
         - Sessions
+  /api/v1/export/conversations/initialize:
+    post:
+      operationId: post-api-v1-export-conversations-initialize
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConversationExportInitializeResponse"
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Bad Request
+        "401":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Unauthorized
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Forbidden
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Not Found
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Conflict
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Internal Server Error
+        "501":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Not Implemented
+        "502":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Bad Gateway
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Service Unavailable
+        "504":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Gateway Timeout
+      summary: Initialize conversation export
+      tags:
+        - Export
   /api/v1/import/chatgpt:
     post:
       operationId: post-api-v1-import-chatgpt
@@ -12246,6 +12921,15 @@ paths:
           schema:
             description: Use text/event-stream to stream progress
             type: string
+        - description: Session IDs whose archived messages this import may replace when the default import refuses the export; the previous version moves to the trash. Repeatable
+          explode: true
+          in: query
+          name: replace
+          schema:
+            description: Session IDs whose archived messages this import may replace when the default import refuses the export; the previous version moves to the trash. Repeatable
+            items:
+              type: string
+            type: array
       requestBody:
         content:
           multipart/form-data:
@@ -12351,6 +13035,15 @@ paths:
           schema:
             description: Use text/event-stream to stream progress
             type: string
+        - description: Session IDs whose archived messages this import may replace when the default import refuses the export; the previous version moves to the trash. Repeatable
+          explode: true
+          in: query
+          name: replace
+          schema:
+            description: Session IDs whose archived messages this import may replace when the default import refuses the export; the previous version moves to the trash. Repeatable
+            items:
+              type: string
+            type: array
       requestBody:
         content:
           multipart/form-data:
@@ -13211,6 +13904,79 @@ paths:
       summary: List machines
       tags:
         - Metadata
+  /api/v1/memory/status:
+    get:
+      operationId: get-api-v1-memory-status
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ServiceMemoryStatus"
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Bad Request
+        "401":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Unauthorized
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Forbidden
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Not Found
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Conflict
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Internal Server Error
+        "501":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Not Implemented
+        "502":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Bad Gateway
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Service Unavailable
+        "504":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Gateway Timeout
+      summary: Get memory readiness
+      tags:
+        - Metadata
   /api/v1/openers:
     get:
       operationId: get-api-v1-openers
@@ -13729,6 +14495,108 @@ paths:
       summary: Push to PostgreSQL
       tags:
         - Push
+  /api/v1/raw-sync/health:
+    get:
+      operationId: get-api-v1-raw-sync-health
+      parameters:
+        - in: header
+          name: Authorization
+          schema:
+            type: string
+        - explode: false
+          in: query
+          name: max_attempts
+          required: true
+          schema:
+            format: int32
+            maximum: 2147483647
+            minimum: 1
+            type: integer
+        - explode: false
+          in: query
+          name: stale_after_seconds
+          required: true
+          schema:
+            format: int32
+            maximum: 2147483647
+            minimum: 1
+            type: integer
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RawsyncJobHealthReport"
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Bad Request
+        "401":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Unauthorized
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Forbidden
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Not Found
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Conflict
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Unprocessable Entity
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Internal Server Error
+        "501":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Not Implemented
+        "502":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Bad Gateway
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Service Unavailable
+        "504":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Gateway Timeout
+      summary: Report raw parse-job health
+      tags:
+        - RawSync
   /api/v1/raw-sync/manifests:
     post:
       operationId: post-api-v1-raw-sync-manifests
@@ -14603,6 +15471,85 @@ paths:
                 $ref: "#/components/schemas/ApiErrorResponse"
           description: API error
       summary: Get recall entry
+      tags:
+        - Recall
+  /api/v1/recall/entries/{id}/review:
+    post:
+      operationId: post-api-v1-recall-entries-id-review
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ReviewRecallEntryRequest"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DbRecallEntry"
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: API error
+        "401":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: API error
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: API error
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: API error
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: API error
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: API error
+        "501":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: API error
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: API error
+        "504":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: API error
+      summary: Review recall entry
       tags:
         - Recall
   /api/v1/recall/extraction/activate:
@@ -16598,12 +17545,12 @@ paths:
           schema:
             description: Include child sessions
             type: boolean
-        - description: Include source file paths
+        - description: Include available source file path, size, and archive-row update time on /sessions; accepted but ignored by /sessions/sidebar-index
           explode: false
           in: query
           name: include_source
           schema:
-            description: Include source file paths
+            description: Include available source file path, size, and archive-row update time on /sessions; accepted but ignored by /sessions/sidebar-index
             type: boolean
         - description: Filter by detected outcome
           explode: false
@@ -16680,6 +17627,13 @@ paths:
           schema:
             description: Default sort direction for keys in order_by that carry no explicit :asc/:desc suffix
             type: boolean
+        - description: Comma-separated list of 1 to 100 session IDs. Quote IDs containing commas or line breaks with RFC 4180 CSV quoting; IDs containing CRLF are rejected. Raw IDs include host copies; tilde-qualified IDs match exactly. Explicit filters intersect the selection; discovery exclusions do not apply.
+          explode: false
+          in: query
+          name: ids
+          schema:
+            description: Comma-separated list of 1 to 100 session IDs. Quote IDs containing commas or line breaks with RFC 4180 CSV quoting; IDs containing CRLF are rejected. Raw IDs include host copies; tilde-qualified IDs match exactly. Explicit filters intersect the selection; discovery exclusions do not apply.
+            type: string
       responses:
         "200":
           content:
@@ -16963,12 +17917,12 @@ paths:
           schema:
             description: Include child sessions
             type: boolean
-        - description: Include source file paths
+        - description: Include available source file path, size, and archive-row update time on /sessions; accepted but ignored by /sessions/sidebar-index
           explode: false
           in: query
           name: include_source
           schema:
-            description: Include source file paths
+            description: Include available source file path, size, and archive-row update time on /sessions; accepted but ignored by /sessions/sidebar-index
             type: boolean
         - description: Filter by detected outcome
           explode: false
@@ -18138,6 +19092,20 @@ paths:
           schema:
             description: Comma-separated roles to include, e.g. user,assistant
             type: string
+        - description: Reject the read when the transcript revision no longer matches
+          explode: false
+          in: query
+          name: expected_revision
+          schema:
+            description: Reject the read when the transcript revision no longer matches
+            type: string
+        - description: Opaque archive binding returned by an earlier evidence read
+          explode: false
+          in: query
+          name: evidence_source
+          schema:
+            description: Opaque archive binding returned by an earlier evidence read
+            type: string
         - description: Include inherited parent context before fork sessions
           explode: false
           in: query
@@ -18588,6 +19556,92 @@ paths:
       summary: Permanently delete session
       tags:
         - Sessions
+  /api/v1/sessions/{id}/pin-references/{messageKey}:
+    delete:
+      operationId: delete-api-v1-sessions-id-pin-references-messagekey
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: messageKey
+          required: true
+          schema:
+            type: string
+      responses:
+        "204":
+          description: No Content
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Bad Request
+        "401":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Unauthorized
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Forbidden
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Not Found
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Conflict
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Unprocessable Entity
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Internal Server Error
+        "501":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Not Implemented
+        "502":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Bad Gateway
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Service Unavailable
+        "504":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Gateway Timeout
+      summary: Remove retained pin
+      tags:
+        - Pins
   /api/v1/sessions/{id}/pins:
     get:
       operationId: get-api-v1-sessions-id-pins
@@ -19469,6 +20523,93 @@ paths:
                 $ref: "#/components/schemas/ApiErrorResponse"
           description: Gateway Timeout
       summary: List session tool calls
+      tags:
+        - Sessions
+  /api/v1/sessions/{id}/tool-sequences:
+    get:
+      operationId: get-api-v1-sessions-id-tool-sequences
+      parameters:
+        - description: Session ID
+          in: path
+          name: id
+          required: true
+          schema:
+            description: Session ID
+            type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionToolSequencesResponse"
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Bad Request
+        "401":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Unauthorized
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Forbidden
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Not Found
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Conflict
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Unprocessable Entity
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Internal Server Error
+        "501":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Not Implemented
+        "502":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Bad Gateway
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Service Unavailable
+        "504":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Gateway Timeout
+      summary: Get session tool sequences
       tags:
         - Sessions
   /api/v1/sessions/{id}/tree:

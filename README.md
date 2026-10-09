@@ -1,3 +1,7 @@
+---
+last_edited: 2026-09-11
+---
+
 # agentsview
 
 Browse, search, and track costs across your AI coding agents. Your session
@@ -71,6 +75,11 @@ follow the upstream stable releases, and `agentsview update` keeps them there.
 Or download the **desktop app** (macOS / Windows) from
 [GitHub Releases](https://github.com/kenn-io/agentsview/releases) or via
 homebrew: `brew install --cask agentsview`
+
+On macOS, see
+[Use the bundled CLI](https://agentsview.io/docs/quickstart/#macos-use-the-bundled-cli)
+for terminal setup and the required first launch. For Macs managed over SSH, use
+the standalone CLI installer above.
 
 Or run the published Docker image:
 
@@ -390,7 +399,7 @@ local Amp thread JSON files.
 | Amp (deprecated)      | `~/.local/share/amp/threads/` (historical local thread JSON only)                                                                                                                                                                                    |
 | Augure Code           | `~/.augure/sessions/`                                                                                                                                                                                                                                |
 | Augure Desktop        | `~/.augure-desktop/` (macOS/Linux), `%LOCALAPPDATA%\augure-desktop\` (Windows)                                                                                                                                                                       |
-| Antigravity           | `~/.gemini/antigravity/`                                                                                                                                                                                                                             |
+| Antigravity           | `~/.gemini/antigravity/`, `~/.gemini/antigravity-ide/`                                                                                                                                                                                               |
 | Antigravity CLI       | `~/.gemini/antigravity-cli/` (see note below)                                                                                                                                                                                                        |
 | Cline CLI             | `~/.cline/data/sessions/` (CLI sessions only)                                                                                                                                                                                                        |
 | Claude Code           | `~/.claude/projects/`                                                                                                                                                                                                                                |
@@ -410,8 +419,9 @@ local Amp thread JSON files.
 | Crush                 | `~/.local/share/crush/projects.json` registry pointing at per-project `~/<project>/.crush/crush.db` stores (macOS and Linux), `%LOCALAPPDATA%\\crush\\projects.json` (Windows)                                                                       |
 | gptme                 | `~/.local/share/gptme/logs/`                                                                                                                                                                                                                         |
 | Grok                  | `~/.grok/sessions/`                                                                                                                                                                                                                                  |
-| Hermes Agent          | `~/.hermes/sessions/`                                                                                                                                                                                                                                |
+| Hermes Agent          | `~/.hermes/sessions/` (macOS and Linux), `~/AppData/Local/hermes/sessions/` (Windows)                                                                                                                                                                |
 | iFlow                 | `~/.iflow/projects/`                                                                                                                                                                                                                                 |
+| Junie                 | `~/.junie/sessions/` (CLI `SessionStore`; IDE-only conversations are not exposed by current JetBrains artifacts)                                                                                                                                     |
 | Kilo                  | `~/.local/share/kilo/`                                                                                                                                                                                                                               |
 | Kilo (legacy)         | `~/Library/Application Support/Code/User/globalStorage/kilocode.kilo-code/` (macOS), `~/.config/Code/User/globalStorage/kilocode.kilo-code/` (Linux)                                                                                                 |
 | Kimi                  | `~/.kimi/sessions/`                                                                                                                                                                                                                                  |
@@ -424,11 +434,13 @@ local Amp thread JSON files.
 | OpenCode              | `~/.local/share/opencode/`                                                                                                                                                                                                                           |
 | Open Code Review      | `~/.opencodereview/sessions/`                                                                                                                                                                                                                        |
 | OpenHands CLI         | `~/.openhands/conversations/`                                                                                                                                                                                                                        |
+| OMO                   | `~/.omo/agent/sessions/`                                                                                                                                                                                                                             |
 | OhMyPi                | `~/.omp/agent/sessions/`                                                                                                                                                                                                                             |
 | Omnigent              | `~/.omnigent/chat.db`                                                                                                                                                                                                                                |
 | Pi                    | `~/.pi/agent/sessions/`                                                                                                                                                                                                                              |
 | Tau                   | `~/.tau/sessions/`                                                                                                                                                                                                                                   |
 | Prime Agent           | `~/.prime/agent/sessions/`                                                                                                                                                                                                                           |
+| StepCode              | `~/.stepcode/agent/sessions/`                                                                                                                                                                                                                        |
 | Poolside              | `~/Library/Application Support/poolside/trajectories/` (macOS), `~/.local/state/poolside/trajectories/` (Linux), `%APPDATA%\\poolside\\trajectories\\` (Windows)                                                                                     |
 | Piebald               | `~/.local/share/piebald/`                                                                                                                                                                                                                            |
 | Posit Assistant       | `~/.posit/assistant/workspaces/`                                                                                                                                                                                                                     |
@@ -631,6 +643,11 @@ agentsview pg status --all     # show status for every configured PG target
 agentsview pg serve            # serve web UI from the default PG target (read-only)
 ```
 
+Opt-in [hosted raw processing](docs/hosted-raw-sync.md) lets `pg serve` parse
+uploaded sources directly into PostgreSQL. It requires explicit tenant/schema
+provisioning, a restricted runtime role, authentication and Linux isolation.
+Ordinary PG serving remains read-only; `pg push` refuses hosted-owned schemas.
+
 Single-target configs still use the legacy `[pg]` block. To manage more than one
 PostgreSQL destination, define named `[pg.NAME]` blocks and set `default_pg`
 when more than one target exists:
@@ -648,7 +665,9 @@ exclude_projects = ["scratch"]
 
 Named target names are normalized case-insensitively. `all`, `local`, and the
 legacy `[pg]` field names `url`, `schema`, `machine_name`, `allow_insecure`,
-`projects`, and `exclude_projects` cannot be used for `[pg.NAME]`.
+`projects`, `exclude_projects`, `raw_tenant`, `raw_derivation`,
+`raw_poll_seconds`, `raw_attempt_seconds`, and `raw_max_attempts` cannot be used
+for `[pg.NAME]`.
 
 `AGENTSVIEW_PG_URL`, `AGENTSVIEW_PG_SCHEMA`, and `AGENTSVIEW_PG_MACHINE` still
 work, but in named-target mode they apply only to the effective default target.
@@ -799,9 +818,14 @@ Troubleshooting:
 
 ## Privacy
 
-agentsview sends a limited anonymous `daemon_active` telemetry ping to PostHog
-when the server starts and every 24 hours while it runs, using a stable random
-install ID as the event `DistinctId`. The event includes
+agentsview sends limited anonymous telemetry to PostHog: a `daemon_active` ping
+at most once per UTC day while the server runs, and an `app_opened` event when
+the web UI loads and on the first focus of a later UTC day. The web UI also
+reports searches (search mode), session views (the session's agent type), screen
+views (screen name, once per install per UTC day), exports (format), generated
+insights (insight kind) and analytics page views (page name), each with one
+value from a fixed list in the server that drops anything else. All events use a
+stable random install ID as the event `DistinctId`. The events include
 `application=agentsview`, app version, commit, OS, and CPU architecture, with
 `$process_person_profile=false` and `$geoip_disable=true`. It does not include
 session, project, prompt, file path, account, or machine identity. Disable

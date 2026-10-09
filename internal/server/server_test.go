@@ -4010,6 +4010,26 @@ func TestSettingsToolResultImagesRoundTrip(t *testing.T) {
 	assert.Equal(t, config.ToolResultImagesKeep, loadedPolicy(t))
 }
 
+func TestSettingsInsightDefaultAgent(t *testing.T) {
+	readDefaultAgent := func(t *testing.T, te *testEnv) string {
+		t.Helper()
+		w := te.get(t, "/api/v1/settings")
+		assertStatus(t, w, http.StatusOK)
+		var body struct {
+			InsightDefaultAgent string `json:"insight_default_agent"`
+		}
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+		return body.InsightDefaultAgent
+	}
+
+	assert.Equal(t, "claude", readDefaultAgent(t, setup(t)))
+
+	configured := setup(t, func(c *config.Config) {
+		c.Insights.DefaultAgent = "codex"
+	})
+	assert.Equal(t, "codex", readDefaultAgent(t, configured))
+}
+
 func TestSettingsRejectsOutOfEnumToolResultImages(t *testing.T) {
 	te := setup(t)
 	putSettings := func(body string) *httptest.ResponseRecorder {
@@ -5556,6 +5576,36 @@ func TestGetVersion(t *testing.T) {
 	assert.Equal(t, db.CurrentDataVersion(), resp.DataVersion)
 }
 
+func TestGetVersionSessionStatsAvailability(t *testing.T) {
+	database := dbtest.OpenTestDB(t)
+	reader, err := db.OpenReadOnly(t.Context(), database.Path())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = reader.Close() })
+	for _, tc := range []struct {
+		name      string
+		store     db.Store
+		available bool
+		status    int
+	}{
+		{"sqlite", database, true, http.StatusOK},
+		{"read-only sqlite", reader, true, http.StatusOK},
+		{"mirror", readOnlyTestStore{database}, false, http.StatusNotImplemented},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := config.Config{Host: "127.0.0.1", Port: 0}
+			handler := wrapTestHandler(cfg, server.New(cfg, tc.store, nil).Handler())
+			version := httptest.NewRecorder()
+			handler.ServeHTTP(version, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1/version", nil))
+			assertStatus(t, version, http.StatusOK)
+			assert.Equal(t, tc.available, decode[map[string]any](t, version)["session_stats_available"])
+
+			stats := httptest.NewRecorder()
+			handler.ServeHTTP(stats, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/v1/session-stats?include_git_outcomes=true", nil))
+			assertStatus(t, stats, tc.status)
+		})
+	}
+}
+
 func TestGetVersion_Default(t *testing.T) {
 	te := setup(t)
 
@@ -5568,6 +5618,26 @@ func TestGetVersion_Default(t *testing.T) {
 	}
 	assert.Equal(t, server.APIVersion, resp.APIVersion)
 	assert.Equal(t, db.CurrentDataVersion(), resp.DataVersion)
+}
+
+func TestGetMemoryStatus(t *testing.T) {
+	te := setupWithServerOpts(t, []server.Option{
+		server.WithVersion(server.VersionInfo{Version: "v-memory"}),
+	}, func(c *config.Config) {
+		c.InstallationID = "archive-test"
+	})
+
+	w := te.get(t, "/api/v1/memory/status")
+	assertStatus(t, w, http.StatusOK)
+	status := decode[service.MemoryStatus](t, w)
+	assert.Equal(t, "v-memory", status.ServerVersion)
+	assert.Equal(t, "archive-test", status.Archive.Identity)
+	assert.Equal(t, "sqlite", status.Archive.Backend)
+	assert.False(t, status.Archive.ReadOnly)
+	assert.Equal(t, service.MemoryReady, status.Lexical.Status)
+	assert.Equal(t, service.MemoryUnavailable, status.Semantic.Status)
+	assert.Equal(t, service.MemoryPartial, status.Status)
+	assert.Equal(t, service.MemoryUnknown, status.Sources.Status)
 }
 
 func TestFindAvailablePortSkipsOccupied(t *testing.T) {
@@ -5953,4 +6023,83 @@ func TestMarkdownSessionExportPreservesOffloadedImages(t *testing.T) {
 	assert.Contains(t, w.Body.String(), "asset://")
 	assert.Contains(t, w.Body.String(), "agentsview_image")
 	assert.NotContains(t, w.Body.String(), "base64,AAEC")
+}
+
+func TestSettingsProviderChangesApplyThroughIngestionReloader(t *testing.T) {
+	reloadedDir := filepath.Join(t.TempDir(), "claude-work", "projects")
+	reloads := 0
+	reloadErr := error(nil)
+	reloader := func(context.Context) (config.Config, error) {
+		reloads++
+		return config.Config{
+			AgentDirs: map[parser.AgentType][]string{
+				parser.AgentClaude: {"/sessions/claude", reloadedDir},
+			},
+			DisabledAgents: []parser.AgentType{parser.AgentGemini},
+		}, reloadErr
+	}
+	te := setupWithServerOpts(t,
+		[]server.Option{server.WithIngestionReloader(reloader)},
+		func(cfg *config.Config) {
+			cfg.AgentDirs = map[parser.AgentType][]string{
+				parser.AgentClaude: {"/sessions/claude"},
+			}
+		})
+	put := func(body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodPut,
+			"/api/v1/settings", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		te.handler.ServeHTTP(w, req)
+		return w
+	}
+	claudeDirs := func(w *httptest.ResponseRecorder) []string {
+		var got struct {
+			SessionProviders []struct {
+				ID   parser.AgentType `json:"id"`
+				Dirs []string         `json:"dirs"`
+			} `json:"session_providers"`
+		}
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
+		for _, provider := range got.SessionProviders {
+			if provider.ID == parser.AgentClaude {
+				return provider.Dirs
+			}
+		}
+		return nil
+	}
+
+	w := put(`{"zoom_level":110}`)
+	assertStatus(t, w, http.StatusOK)
+	assert.Zero(t, reloads, "unrelated settings must not reload ingestion")
+
+	w = put(`{"agent_homes":{"claude":["~/.claude-work"]}}`)
+	assertStatus(t, w, http.StatusOK)
+	assert.Equal(t, 1, reloads)
+	assert.Equal(t, []string{"/sessions/claude", reloadedDir}, claudeDirs(w),
+		"the response reports the roots the daemon now syncs")
+
+	w = put(`{"disabled_agents":["gemini"]}`)
+	assertStatus(t, w, http.StatusOK)
+	assert.Equal(t, 2, reloads)
+
+	reloadErr = errors.New("config file is invalid")
+	w = put(`{"disabled_agents":[]}`)
+	assertStatus(t, w, http.StatusInternalServerError)
+	assert.Equal(t, 3, reloads)
+
+	// A failed reload restores the previous selection everywhere.
+	w = te.get(t, "/api/v1/settings")
+	assertStatus(t, w, http.StatusOK)
+	var got struct {
+		DisabledAgents []parser.AgentType `json:"disabled_agents"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &got))
+	assert.Equal(t, []parser.AgentType{parser.AgentGemini}, got.DisabledAgents)
+	var persisted struct {
+		DisabledAgents []parser.AgentType `toml:"disabled_agents"`
+	}
+	_, err := toml.DecodeFile(filepath.Join(te.dataDir, "config.toml"), &persisted)
+	require.NoError(t, err)
+	assert.Equal(t, []parser.AgentType{parser.AgentGemini}, persisted.DisabledAgents)
 }

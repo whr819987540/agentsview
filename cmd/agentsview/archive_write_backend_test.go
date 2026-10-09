@@ -990,7 +990,7 @@ func TestDaemonPGPushWatchSuppressesRepeatedOpenCodeSHMOnlyBatches(t *testing.T)
 		case reason := <-pushes:
 			require.Failf(t, "SHM-only batches must not schedule a push",
 				"received %q", reason)
-		case <-time.After(50 * time.Millisecond):
+		case <-time.After(50 * time.Millisecond): //nolint:kennlint // absence check; an SHM-only batch must never schedule a push
 		}
 	}
 	pending, _ := pushLoopPendingState(loop)
@@ -1364,8 +1364,7 @@ func TestResolveArchiveWriteBackendCopiesNoSyncRuntime(t *testing.T) {
 	t.Cleanup(func() { RemoveDaemonRuntime(dataDir) })
 
 	backend, cleanup, err := resolveArchiveWriteBackend(
-		t.Context(), config.Config{DataDir: dataDir},
-	)
+		t.Context(), config.Config{DataDir: dataDir}, transportIntentArchiveWrite)
 	require.NoError(t, err)
 	t.Cleanup(cleanup)
 

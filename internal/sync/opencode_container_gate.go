@@ -126,7 +126,7 @@ func (e *Engine) captureSQLiteContainerStates(
 	for _, rawPath := range changedPaths {
 		path := filepath.Clean(rawPath)
 		for _, agent := range openCodeFamilySQLiteAgents {
-			for _, dir := range e.agentDirs[agent] {
+			for _, dir := range e.sources().agentDirs[agent] {
 				if dir == "" || strings.HasPrefix(dir, "s3://") {
 					continue
 				}
@@ -182,7 +182,7 @@ func (e *Engine) captureAgentSQLiteContainerStates(
 	roots []string,
 	states map[string]parser.SQLiteContainerState,
 ) {
-	for _, dir := range e.agentDirs[agent] {
+	for _, dir := range e.sources().agentDirs[agent] {
 		if dir == "" || strings.HasPrefix(dir, "s3://") {
 			continue
 		}
@@ -280,7 +280,7 @@ func openCodeContainerPathForChangedPathEvent(
 // contract is documented in docs/internal/session-format-sources.md and
 // pinned by TestOpenCodeWatcherPassDefersChildOnlyEditToFullDiscovery.
 func (e *Engine) storedMemberFreshnessPager(
-	container string,
+	container, idPrefix string,
 ) parser.StoredMemberFreshnessPager {
 	current := db.CurrentDataVersion()
 	return func(
@@ -295,12 +295,19 @@ func (e *Engine) storedMemberFreshnessPager(
 		// member past the first all-stale page.
 		for {
 			page, done, err := e.db.ListVirtualContainerMemberFreshnessPage(
-				ctx, container, afterPath, limit,
+				ctx, container, idPrefix, afterPath, limit,
 			)
 			if err != nil {
 				return nil, false, err
 			}
 			for _, row := range page {
+				// Trashed and excluded members are never rewritten, so their version and hash stay stale.
+				if row.Trashed || row.Excluded {
+					rows = append(rows, parser.StoredMemberFreshness{
+						Path: row.Path, Suppressed: true,
+					})
+					continue
+				}
 				if row.DataVersion < current {
 					continue
 				}
@@ -309,6 +316,7 @@ func (e *Engine) storedMemberFreshnessPager(
 					CoveredThroughNS: storedSessionRowWatermarkNS(
 						row.VirtualContainerMemberFreshness,
 					),
+					FingerprintHash: row.Hash,
 				})
 			}
 			if done || len(rows) > 0 {

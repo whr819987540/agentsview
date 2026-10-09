@@ -31,7 +31,7 @@ func TestServeDaemonReplacementDecisionAutoReplacesOlderRelease(t *testing.T) {
 
 	require.NotNil(t, decision.Runtime)
 	assert.Equal(t, serveReplacementAuto, decision.Action)
-	assert.Contains(t, decision.Reason, "older")
+	assert.Contains(t, decision.Reason, "differs")
 }
 
 func TestPrepareForegroundServeDaemonAutoReplacesOlderDaemon(t *testing.T) {
@@ -41,7 +41,7 @@ func TestPrepareForegroundServeDaemonAutoReplacesOlderDaemon(t *testing.T) {
 	writeRuntimeRecordFixture(t, dir, daemonRuntimeRecord(
 		host, port, withRuntimeVersion("1.0.0"),
 	))
-	setTestVersion(t, "1.1.0")
+	setTestVersion(t, "v1.1.0-3-gabcdef")
 
 	var stoppedPID int
 	stubStopDaemonRuntimeForUpgrade(t, func(ctx context.Context,
@@ -381,47 +381,27 @@ func TestPrepareForegroundServeDaemonUsesExistingCompatibleDaemon(t *testing.T) 
 	assert.Contains(t, out, "http://")
 }
 
-func TestServeDaemonReplacementDecisionRefusesCompatibleDowngrade(t *testing.T) {
-	dir := runtimeTestDir(t)
-	host, port := testPingServer(t)
-	writeRuntimeRecordFixture(t, dir, daemonRuntimeRecord(
-		host, port, withRuntimeVersion("1.1.0"),
-	))
-	setTestVersion(t, "1.0.0")
-	forbidStopDaemonRuntimeForUpgrade(t, "downgrade needs --replace")
-
-	decision := decideServeDaemonReplacement(
-		config.Config{DataDir: dir}, serveReplacementOptions{},
-	)
-
-	require.NotNil(t, decision.Runtime)
-	assert.Equal(t, serveReplacementRefuse, decision.Action)
-	assert.Contains(t, decision.Reason, "newer")
-	assert.Contains(t, strings.Join(serveDaemonConflictLines(decision), "\n"),
-		"--replace")
-}
-
-func TestServeDaemonReplacementDecisionRefusesGitDescribeDevBuild(
-	t *testing.T,
-) {
-	dir := runtimeTestDir(t)
-	host, port := testPingServer(t)
-	writeRuntimeRecordFixture(t, dir, daemonRuntimeRecord(
-		host, port, withRuntimeVersion("1.0.0"),
-	))
-	setTestVersion(t, "v1.1.0-2-gabcdef")
-	forbidStopDaemonRuntimeForUpgrade(t,
-		"git-describe dev build needs --replace")
-
-	decision := decideServeDaemonReplacement(
-		config.Config{DataDir: dir}, serveReplacementOptions{},
-	)
-
-	require.NotNil(t, decision.Runtime)
-	assert.Equal(t, serveReplacementRefuse, decision.Action)
-	assert.Contains(t, decision.Reason, "dev build")
-	assert.Contains(t, strings.Join(serveDaemonConflictLines(decision), "\n"),
-		"--replace")
+func TestServeDaemonReplacementDecisionReplacesDifferentVersions(t *testing.T) {
+	for _, tt := range []struct{ name, client, daemon string }{
+		{"git describe", "v1.1.0-3-gabcdef", "v1.1.0-2-g123456"},
+		{"non semver daemon", "1.1.0", "local-build"},
+		{"development CLI", "dev", "1.0.0"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := runtimeTestDir(t)
+			host, port := testPingServer(t)
+			writeRuntimeRecordFixture(t, dir, daemonRuntimeRecord(
+				host, port, withRuntimeVersion(tt.daemon),
+			))
+			setTestVersion(t, tt.client)
+			decision := decideServeDaemonReplacement(
+				config.Config{DataDir: dir}, serveReplacementOptions{},
+			)
+			require.NotNil(t, decision.Runtime)
+			assert.Equal(t, serveReplacementAuto, decision.Action)
+			assert.Contains(t, decision.Reason, "differs")
+		})
+	}
 }
 
 func TestServeDaemonReplacementDecisionAutoReplacesOlderRollingBuild(
@@ -442,7 +422,7 @@ func TestServeDaemonReplacementDecisionAutoReplacesOlderRollingBuild(
 	require.NotNil(t, decision.Runtime)
 	assert.Equal(t, serveReplacementAuto, decision.Action)
 	assert.Equal(t,
-		"daemon version v0.44.0-39-g0f0f0f0f is older than current binary "+
+		"daemon version v0.44.0-39-g0f0f0f0f differs from current binary "+
 			"version v0.44.0-40-g1a2b3c4d",
 		decision.Reason)
 }
@@ -461,7 +441,7 @@ func TestServeDaemonReplacementDecisionRollingBuilds(t *testing.T) {
 			name:          "older rolling daemon",
 			daemonVersion: "v0.44.0-39-g0f0f0f0f",
 			wantAction:    serveReplacementAuto,
-			wantReason: "daemon version v0.44.0-39-g0f0f0f0f is older than " +
+			wantReason: "daemon version v0.44.0-39-g0f0f0f0f differs from " +
 				"current binary version " + current,
 		},
 		{
@@ -473,40 +453,37 @@ func TestServeDaemonReplacementDecisionRollingBuilds(t *testing.T) {
 		{
 			name:          "newer rolling daemon",
 			daemonVersion: "v0.44.0-41-g0f0f0f0f",
-			wantAction:    serveReplacementRefuse,
-			wantReason: "daemon version v0.44.0-41-g0f0f0f0f is newer than " +
-				"current binary version " + current,
+			wantAction:    serveReplacementUseExisting,
+			wantReason:    "compatible writable daemon is already running",
 		},
 		{
 			name:          "newer stable daemon",
 			daemonVersion: "v0.45.0",
-			wantAction:    serveReplacementRefuse,
-			wantReason: "daemon version v0.45.0 is newer than current binary " +
-				"version " + current,
+			wantAction:    serveReplacementUseExisting,
+			wantReason:    "compatible writable daemon is already running",
 		},
 		{
 			name:          "unordered daemon version",
 			daemonVersion: "local-build",
-			wantAction:    serveReplacementRefuse,
-			wantReason: "current binary version " + current + " is not newer " +
-				"than daemon version local-build",
+			wantAction:    serveReplacementAuto,
+			wantReason: "daemon version local-build differs from current " +
+				"binary version " + current,
 		},
 		{
 			name:          "older incompatible rolling daemon",
 			daemonVersion: "v0.44.0-39-g0f0f0f0f",
 			compatErr:     compatErr,
 			wantAction:    serveReplacementAuto,
-			wantReason: "daemon version v0.44.0-39-g0f0f0f0f is older than " +
+			wantReason: "daemon version v0.44.0-39-g0f0f0f0f differs from " +
 				"current binary version " + current,
 		},
 		{
-			name:          "unordered incompatible daemon",
-			daemonVersion: "local-build",
+			name:          "newer incompatible rolling daemon",
+			daemonVersion: "v0.44.0-41-g0f0f0f0f",
 			compatErr:     compatErr,
 			wantAction:    serveReplacementRefuse,
-			wantReason: "current binary version " + current + " is not newer " +
-				"than daemon version local-build and cannot automatically " +
-				"replace the incompatible daemon: " + compatErr.Error(),
+			wantReason: "daemon version v0.44.0-41-g0f0f0f0f cannot serve " +
+				"current binary version " + current + ": " + compatErr.Error(),
 		},
 	}
 	for _, tt := range tests {
@@ -536,60 +513,17 @@ func TestServeDaemonReplacementDecisionRollingBuilds(t *testing.T) {
 	}
 }
 
-func TestServeDaemonReplacementDecisionRefusesDirtyRollingBuild(
-	t *testing.T,
-) {
-	stubRollingBuildRepo(t, "example/agentsview")
-	setTestVersion(t, "v0.44.0-41-g1a2b3c4d-dirty")
-	rt := &DaemonRuntime{API: daemonAPIVersion, Data: db.CurrentDataVersion()}
-	rt.Record.Version = "v0.44.0-40-g0f0f0f0f"
-
-	decision := decideCompatibleServeDaemonReplacement(
-		rt, serveReplacementOptions{},
-	)
-
-	assert.Equal(t, serveReplacementRefuse, decision.Action)
-	assert.Contains(t, decision.Reason, "dev builds do not replace")
-}
-
-func TestServeDaemonReplacementDecisionRefusesCompatibleNonSemver(t *testing.T) {
+func TestServeDaemonReplacementDoesNotDowngradeRelease(t *testing.T) {
 	dir := runtimeTestDir(t)
 	host, port := testPingServer(t)
 	writeRuntimeRecordFixture(t, dir, daemonRuntimeRecord(
-		host, port, withRuntimeVersion("local-build"),
+		host, port, withRuntimeVersion("1.1.0"),
 	))
-	setTestVersion(t, "1.1.0")
-	forbidStopDaemonRuntimeForUpgrade(t, "non-semver daemon needs --replace")
-
-	decision := decideServeDaemonReplacement(
-		config.Config{DataDir: dir}, serveReplacementOptions{},
-	)
-
-	require.NotNil(t, decision.Runtime)
-	assert.Equal(t, serveReplacementRefuse, decision.Action)
-	assert.Contains(t, decision.Reason, "not newer")
-	assert.Contains(t, strings.Join(serveDaemonConflictLines(decision), "\n"),
-		"--replace")
-}
-
-func TestPrepareForegroundServeDaemonRefusesDevWithoutReplace(t *testing.T) {
-	dir := runtimeTestDir(t)
-	host, port := testPingServer(t)
-	writeRuntimeRecordFixture(t, dir, daemonRuntimeRecord(
-		host, port, withRuntimeVersion("1.0.0"),
-	))
-	setTestVersion(t, "dev")
-	forbidStopDaemonRuntimeForUpgrade(t, "dev build needs --replace")
-
-	cont, release, err := prepareForegroundServeDaemon(t.Context(),
-		&config.Config{DataDir: dir}, serveReplacementOptions{},
-	)
-	t.Cleanup(release)
-
-	assert.False(t, cont)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "dev builds")
-	assert.Contains(t, err.Error(), "--replace")
+	setTestVersion(t, "1.0.0")
+	decision := decideServeDaemonReplacement(config.Config{DataDir: dir}, serveReplacementOptions{})
+	assert.Equal(t, serveReplacementUseExisting, decision.Action)
+	decision = decideServeDaemonReplacement(config.Config{DataDir: dir}, serveReplacementOptions{Replace: true})
+	assert.Equal(t, serveReplacementExplicit, decision.Action)
 }
 
 func TestPrepareForegroundServeDaemonReplaceStopsWritableDevConflict(t *testing.T) {
@@ -840,25 +774,6 @@ func TestPrepareForegroundServeDaemonReplaceLeavesReadOnlyDaemon(t *testing.T) {
 	rt, compatErr := FindIncompatibleDaemonRuntime(dir)
 	require.NotNil(t, rt)
 	require.Error(t, compatErr)
-}
-
-func TestServeDaemonReplacementDecisionRefusesDevBuild(t *testing.T) {
-	dir := runtimeTestDir(t)
-	host, port := testPingServer(t)
-	writeRuntimeRecordFixture(t, dir, daemonRuntimeRecord(
-		host, port, withRuntimeVersion("1.0.0"),
-	))
-	setTestVersion(t, "dev")
-
-	decision := decideServeDaemonReplacement(
-		config.Config{DataDir: dir}, serveReplacementOptions{},
-	)
-
-	require.NotNil(t, decision.Runtime)
-	assert.Equal(t, serveReplacementRefuse, decision.Action)
-	assert.Contains(t, decision.Reason, "dev builds")
-	assert.Contains(t, strings.Join(serveDaemonConflictLines(decision), "\n"),
-		"--replace")
 }
 
 func TestServeDaemonReplacementDecisionReplaceOverridesForwardData(t *testing.T) {

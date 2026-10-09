@@ -9,14 +9,16 @@ import (
 
 // PinnedMessage represents a row in the pinned_messages table.
 type PinnedMessage struct {
-	ID        int64   `json:"id"`
-	SessionID string  `json:"session_id"`
-	MessageID int64   `json:"message_id"`
-	Ordinal   int     `json:"ordinal"`
-	Note      *string `json:"note,omitempty"`
-	Content   *string `json:"content,omitempty"`
-	Role      *string `json:"role,omitempty"`
-	CreatedAt string  `json:"created_at"`
+	MessageKey string  `json:"message_key,omitempty"`
+	Unresolved bool    `json:"unresolved,omitempty"`
+	ID         int64   `json:"id"`
+	SessionID  string  `json:"session_id"`
+	MessageID  int64   `json:"message_id"`
+	Ordinal    int     `json:"ordinal"`
+	Note       *string `json:"note,omitempty"`
+	Content    *string `json:"content,omitempty"`
+	Role       *string `json:"role,omitempty"`
+	CreatedAt  string  `json:"created_at"`
 
 	// Session metadata — populated only for the "all pins" query.
 	SessionProject      *string `json:"session_project,omitempty"`
@@ -112,6 +114,10 @@ func (db *DB) UnpinMessage(ctx context.Context, sessionID string, messageID int6
 func (db *DB) ListPinnedMessages(
 	ctx context.Context, sessionID string, project string,
 ) ([]PinnedMessage, error) {
+	return pinnedMessagesWithQuerier(ctx, db.getReader(), sessionID, project)
+}
+
+func pinnedMessagesWithQuerier(ctx context.Context, q messageRowsQuerier, sessionID, project string) ([]PinnedMessage, error) {
 	var query string
 	var args []any
 	if sessionID != "" {
@@ -136,7 +142,7 @@ func (db *DB) ListPinnedMessages(
 		query += " ORDER BY p.created_at DESC LIMIT 500"
 	}
 
-	rows, err := db.getReader().QueryContext(ctx, query, args...)
+	rows, err := q.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("listing pinned messages: %w", err)
 	}
@@ -232,4 +238,9 @@ func (db *DB) GetPinnedMessageIDs(
 		ids[id] = true
 	}
 	return ids, rows.Err()
+}
+
+// PinReferenceStore removes a retained normalized anchor after its message disappears.
+type PinReferenceStore interface {
+	RemovePinReference(ctx context.Context, sessionID, messageKey string) error
 }

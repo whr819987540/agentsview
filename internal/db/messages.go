@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"slices"
 	"strings"
 	"time"
@@ -83,6 +84,8 @@ type ToolCall struct {
 // ToolResult holds a tool_result content block for pairing.
 type ToolResult struct {
 	ToolUseID     string
+	Source        string
+	Status        string
 	ContentLength int
 	ContentRaw    string // raw JSON of the content field; decode lazily
 }
@@ -604,6 +607,10 @@ type MessageWindow struct {
 	Before int // used only with Around; default handled by caller
 	After  int
 	Roles  []string // empty = all roles
+	// ObservedRevision, when non-nil, receives the session transcript
+	// revision from the same statement as the message rows. An empty
+	// result leaves it unset; the caller does not pay for a second query.
+	ObservedRevision *string
 }
 
 // GetMessagesWindow returns messages for a session using either linear
@@ -623,47 +630,40 @@ func (db *DB) GetMessagesWindow(
 	if w.From != nil {
 		from = *w.From
 	}
-	if len(w.Roles) == 0 {
+	if w.ObservedRevision == nil && len(w.Roles) == 0 {
 		return db.GetMessages(ctx, sessionID, from, w.Limit, w.Asc)
 	}
-	return db.getMessagesLinearRoleFiltered(
-		ctx, sessionID, from, w.Limit, w.Asc, w.Roles,
-	)
+	return db.getMessagesLinear(ctx, sessionID, from, w)
 }
 
-// getMessagesLinearRoleFiltered is GetMessages plus an "AND role IN (...)"
-// predicate, used when MessageWindow.Roles is non-empty.
-func (db *DB) getMessagesLinearRoleFiltered(
-	ctx context.Context,
-	sessionID string, from, limit int, asc bool, roles []string,
+// getMessagesLinear is GetMessages plus an optional "AND role IN (...)"
+// predicate. It reads the session transcript revision in the same
+// statement as the page.
+func (db *DB) getMessagesLinear(
+	ctx context.Context, sessionID string, from int, w MessageWindow,
 ) ([]Message, error) {
+	limit := w.Limit
 	if limit <= 0 || limit > MaxMessageLimit {
 		limit = DefaultMessageLimit
 	}
-	dir := "ASC"
-	op := ">="
-	if !asc {
-		dir = "DESC"
-		op = "<="
+	dir, op := "ASC", ">="
+	if !w.Asc {
+		dir, op = "DESC", "<="
 	}
-	roleClause, roleArgs := roleFilterClause(roles)
+	roleClause, roleArgs := roleFilterClause(w.Roles)
 	query := fmt.Sprintf(`
-		SELECT %s
+		SELECT %s, %s
 		FROM messages
 		WHERE session_id = ? AND ordinal %s ?%s
 		ORDER BY ordinal %s
-		LIMIT ?`, selectMessageCols, op, roleClause, dir)
-	args := append([]any{sessionID, from}, roleArgs...)
+		LIMIT ?`, sqliteRevisionCol, selectMessageCols, op, roleClause, dir)
+	args := append([]any{sessionID, sessionID, from}, roleArgs...)
 	args = append(args, limit)
-
-	rows, err := db.getReader().QueryContext(ctx, query, args...)
+	msgs, err := QueryMessagesWithRevision(
+		ctx, db.getReader().QueryContext, scanMessages, w.ObservedRevision, query, args...,
+	)
 	if err != nil {
-		return nil, fmt.Errorf("querying role-filtered messages: %w", err)
-	}
-	defer rows.Close()
-	msgs, err := scanMessages(rows)
-	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("querying messages: %w", err)
 	}
 	if err := db.attachToolCalls(ctx, msgs); err != nil {
 		return nil, err
@@ -671,71 +671,56 @@ func (db *DB) getMessagesLinearRoleFiltered(
 	return msgs, nil
 }
 
-// getMessagesAroundAnchor implements MessageWindow's Around mode: three
-// queries (before/anchor/after) merged into one ascending slice. The
-// anchor query has no role predicate so the anchor row is always present;
+// sqliteRevisionCol selects the session transcript revision as a window
+// statement's first column; it binds the session ID once more, ahead of
+// the statement's other arguments.
+const sqliteRevisionCol = `(SELECT COALESCE(transcript_revision,'') FROM sessions WHERE id = ?)`
+
+// getMessagesAroundAnchor implements MessageWindow's Around mode: the
+// before, anchor, and after rows merged into one ascending slice. The
+// anchor rows have no role predicate so the anchor row is always present;
 // before/after apply the role filter (when set) before taking Before/After
 // rows, so the counts reflect role-matching messages, not raw ordinals.
+//
+// The window runs as one statement that also selects the session
+// transcript revision, so a sync that replaces the session's messages
+// lands entirely before or after the read, and the reported revision
+// describes every returned row.
 func (db *DB) getMessagesAroundAnchor(
 	ctx context.Context, sessionID string, w MessageWindow,
 ) ([]Message, error) {
 	anchor := *w.Around
-	beforeLimit := max(w.Before, 0)
-	afterLimit := max(w.After, 0)
 	roleClause, roleArgs := roleFilterClause(w.Roles)
-
-	beforeQuery := fmt.Sprintf(`
-		SELECT %s FROM messages
-		WHERE session_id = ? AND ordinal < ?%s
-		ORDER BY ordinal DESC LIMIT ?`, selectMessageCols, roleClause)
-	beforeArgs := append([]any{sessionID, anchor}, roleArgs...)
-	beforeArgs = append(beforeArgs, beforeLimit)
-	before, err := db.queryMessageRows(ctx, beforeQuery, beforeArgs...)
+	query := fmt.Sprintf(`
+		SELECT %[1]s, w.*
+		FROM (
+			SELECT * FROM (
+				SELECT %[2]s FROM messages
+				WHERE session_id = ? AND ordinal < ?%[3]s
+				ORDER BY ordinal DESC LIMIT ?)
+			UNION ALL
+			SELECT %[2]s FROM messages WHERE session_id = ? AND ordinal = ?
+			UNION ALL
+			SELECT * FROM (
+				SELECT %[2]s FROM messages
+				WHERE session_id = ? AND ordinal > ?%[3]s
+				ORDER BY ordinal ASC LIMIT ?)
+		) AS w
+		ORDER BY w.ordinal`, sqliteRevisionCol, selectMessageCols, roleClause)
+	args := append([]any{sessionID, sessionID, anchor}, roleArgs...)
+	args = append(args, max(w.Before, 0), sessionID, anchor, sessionID, anchor)
+	args = append(args, roleArgs...)
+	args = append(args, max(w.After, 0))
+	msgs, err := QueryMessagesWithRevision(
+		ctx, db.getReader().QueryContext, scanMessages, w.ObservedRevision, query, args...,
+	)
 	if err != nil {
-		return nil, fmt.Errorf("querying before-window messages: %w", err)
+		return nil, fmt.Errorf("querying around-window messages: %w", err)
 	}
-	slices.Reverse(before)
-
-	anchorQuery := fmt.Sprintf(`
-		SELECT %s FROM messages WHERE session_id = ? AND ordinal = ?`,
-		selectMessageCols)
-	anchorMsgs, err := db.queryMessageRows(ctx, anchorQuery, sessionID, anchor)
-	if err != nil {
-		return nil, fmt.Errorf("querying anchor message: %w", err)
-	}
-
-	afterQuery := fmt.Sprintf(`
-		SELECT %s FROM messages
-		WHERE session_id = ? AND ordinal > ?%s
-		ORDER BY ordinal ASC LIMIT ?`, selectMessageCols, roleClause)
-	afterArgs := append([]any{sessionID, anchor}, roleArgs...)
-	afterArgs = append(afterArgs, afterLimit)
-	after, err := db.queryMessageRows(ctx, afterQuery, afterArgs...)
-	if err != nil {
-		return nil, fmt.Errorf("querying after-window messages: %w", err)
-	}
-
-	msgs := make([]Message, 0, len(before)+len(anchorMsgs)+len(after))
-	msgs = append(msgs, before...)
-	msgs = append(msgs, anchorMsgs...)
-	msgs = append(msgs, after...)
 	if err := db.attachToolCalls(ctx, msgs); err != nil {
 		return nil, err
 	}
 	return msgs, nil
-}
-
-// queryMessageRows runs query and scans the resulting message rows,
-// without attaching tool calls (callers batch that across the merged set).
-func (db *DB) queryMessageRows(
-	ctx context.Context, query string, args ...any,
-) ([]Message, error) {
-	rows, err := db.getReader().QueryContext(ctx, query, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	return scanMessages(rows)
 }
 
 // roleFilterClause returns an "AND role IN (...)" clause and its bind
@@ -758,7 +743,11 @@ func (db *DB) GetAllMessages(
 	ctx context.Context, sessionID string,
 ) ([]Message, error) {
 	db.messagesLoadCount.Add(1)
-	rows, err := db.getReader().QueryContext(ctx, fmt.Sprintf(`
+	return allMessagesWithQuerier(ctx, db.getReader(), sessionID)
+}
+
+func allMessagesWithQuerier(ctx context.Context, q messageRowsQuerier, sessionID string) ([]Message, error) {
+	rows, err := q.QueryContext(ctx, fmt.Sprintf(`
 		SELECT %s
 		FROM messages
 		WHERE session_id = ?
@@ -771,7 +760,7 @@ func (db *DB) GetAllMessages(
 	if err != nil {
 		return nil, err
 	}
-	if err := db.attachToolCalls(ctx, msgs); err != nil {
+	if err := attachToolCallsWithQuerier(ctx, q, msgs); err != nil {
 		return nil, err
 	}
 	return msgs, nil
@@ -897,13 +886,36 @@ func (db *DB) ScanEmbeddableUnits(
 	ctx context.Context, since string, includeAutomated bool,
 	fn func(EmbeddableUnit) error,
 ) (maxEnded string, err error) {
-	args := []any{}
+	return db.scanEmbeddableUnits(ctx, since, "", includeAutomated, fn)
+}
+
+// ScanEmbeddableUnitsForSession streams all embeddable units for one session,
+// without applying an ended_at watermark.
+func (db *DB) ScanEmbeddableUnitsForSession(
+	ctx context.Context, sessionID string, includeAutomated bool,
+	fn func(EmbeddableUnit) error,
+) error {
+	if sessionID == "" {
+		return errors.New("session ID is required")
+	}
+	_, err := db.scanEmbeddableUnits(ctx, "", sessionID, includeAutomated, fn)
+	return err
+}
+
+func (db *DB) scanEmbeddableUnits(
+	ctx context.Context, since, sessionID string, includeAutomated bool,
+	fn func(EmbeddableUnit) error,
+) (maxEnded string, err error) {
+	args := make([]any, 0, 2)
+	if sessionID != "" {
+		args = append(args, sessionID)
+	}
 	if since != "" {
 		args = append(args, since)
 	}
 
 	rows, err := db.getReader().QueryContext(
-		ctx, embeddableUnitsQuery(since, includeAutomated), args...)
+		ctx, embeddableUnitsQuery(since, sessionID, includeAutomated), args...)
 	if err != nil {
 		return "", fmt.Errorf("scanning embeddable units: %w", err)
 	}
@@ -1096,10 +1108,11 @@ func runUnit(members []unitRow) EmbeddableUnit {
 	}
 }
 
-// embeddableUnitsQuery builds ScanEmbeddableUnits' statement. It takes one
-// bound argument (since) when since is set and none otherwise, and always
-// emits rows in (session_id, ordinal) order, which unitReducer depends on.
-func embeddableUnitsQuery(since string, includeAutomated bool) string {
+// embeddableUnitsQuery builds the embeddable-unit scan statement. A scoped
+// scan takes sessionID first; an incremental scan takes since after it. The
+// query always emits rows in (session_id, ordinal) order, which unitReducer
+// depends on.
+func embeddableUnitsQuery(since, sessionID string, includeAutomated bool) string {
 	preds := []string{
 		"m.role IN ('user', 'assistant')",
 		"m.is_system = 0",
@@ -1108,6 +1121,9 @@ func embeddableUnitsQuery(since string, includeAutomated bool) string {
 	}
 	if !includeAutomated {
 		preds = append(preds, automatedScopePredicate("human", "s.is_automated"))
+	}
+	if sessionID != "" {
+		preds = append(preds, "m.session_id = ?")
 	}
 	return `
 		SELECT m.session_id, m.role, m.source_uuid, m.ordinal, m.content,
@@ -1316,7 +1332,7 @@ func insertToolCallsChunkTx(
 			nilIfEmpty(tc.ToolUseID),
 			nilIfEmpty(tc.InputJSON),
 			nilIfEmpty(tc.SkillName),
-			nilIfZero(tc.ResultContentLength),
+			NilIfZero(tc.ResultContentLength),
 			nilIfEmpty(tc.ResultContent),
 			nilIfEmpty(tc.SubagentSessionID),
 			nilIfEmpty(tc.FilePath),
@@ -1424,7 +1440,8 @@ func nilIfEmpty(s string) any {
 	return s
 }
 
-func nilIfZero(n int) any {
+// NilIfZero returns nil for zero so the value is stored as SQL NULL.
+func NilIfZero(n int) any {
 	if n == 0 {
 		return nil
 	}
@@ -1485,16 +1502,19 @@ func (db *DB) insertMessages(ctx context.Context,
 		return nil
 	}
 	t := time.Now()
+	var lockWait time.Duration
 	defer func() {
 		if d := time.Since(t); d > slowOpThreshold {
 			log.Printf(
-				"db: InsertMessages (%d msgs): %s",
+				"db: InsertMessages (%d msgs): %s (lock wait %s)",
 				len(msgs), d.Round(time.Millisecond),
+				lockWait.Round(time.Millisecond),
 			)
 		}
 	}()
 
 	db.mu.Lock()
+	lockWait = time.Since(t)
 	defer db.mu.Unlock()
 
 	tx, err := db.getWriter().Begin(ctx)
@@ -1724,16 +1744,19 @@ func (db *DB) writeSessionIncremental(ctx context.Context,
 	}
 
 	t := time.Now()
+	var lockWait time.Duration
 	defer func() {
 		if d := time.Since(t); d > slowOpThreshold {
 			log.Printf(
-				"db: WriteSessionIncremental (%d msgs): %s",
+				"db: WriteSessionIncremental (%d msgs): %s (lock wait %s)",
 				len(msgs), d.Round(time.Millisecond),
+				lockWait.Round(time.Millisecond),
 			)
 		}
 	}()
 
 	db.mu.Lock()
+	lockWait = time.Since(t)
 	defer db.mu.Unlock()
 
 	tx, err := db.getWriter().Begin(ctx)
@@ -1742,11 +1765,27 @@ func (db *DB) writeSessionIncremental(ctx context.Context,
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	if err := reconcileConversationMessagesTx(tx, sessionID, msgs, false, db.usageOnlyStorage()); err != nil {
-		return false, err
-	}
-	if err := writeMessagesTx(tx, msgs); err != nil {
-		return false, err
+	var replaced *messageRangeTotals
+	var pendingRecallRevocations recallEvidenceRevocationEvents
+	if from := update.ReplaceFromOrdinal; from != nil {
+		if err := reconcileConversationRangeTx(tx, sessionID, msgs, true, db.usageOnlyStorage(), *from); err != nil {
+			return false, err
+		}
+		removed, err := messageRangeTotalsTx(ctx, tx, sessionID, *from)
+		if err != nil {
+			return false, err
+		}
+		if err := replaceSessionMessagesFromTx(ctx, tx, sessionID, *from, msgs); err != nil {
+			return false, err
+		}
+		replaced = &removed
+	} else {
+		if err := reconcileConversationMessagesTx(tx, sessionID, msgs, false, db.usageOnlyStorage()); err != nil {
+			return false, err
+		}
+		if err := writeMessagesTx(tx, msgs); err != nil {
+			return false, err
+		}
 	}
 	transcriptChanged := len(msgs) > 0
 	var updatedMessageUsageOrdinals map[int]struct{}
@@ -1799,7 +1838,21 @@ func (db *DB) writeSessionIncremental(ctx context.Context,
 			return false, err
 		}
 	}
-	if err := updateSessionIncrementalTx(ctx, tx, sessionID, update); err != nil {
+	if replaced != nil {
+		// The rewritten rows may sit inside trusted recall evidence, so
+		// re-verify it as the whole-session replacement does. Links and
+		// result updates above can change covered tool calls, so the
+		// check runs on the final rows.
+		if err := reconcileRecallEvidenceForSessionTx(
+			ctx, tx, sessionID, &pendingRecallRevocations,
+		); err != nil {
+			return false, err
+		}
+		err = replaceSessionIncrementalTx(ctx, tx, sessionID, update, *replaced)
+	} else {
+		err = updateSessionIncrementalTx(ctx, tx, sessionID, update)
+	}
+	if err != nil {
 		return false, err
 	}
 	if update.Checkpoint != nil && update.CheckpointBlobs != nil {
@@ -1850,6 +1903,7 @@ func (db *DB) writeSessionIncremental(ctx context.Context,
 	if err := tx.Commit(); err != nil {
 		return false, fmt.Errorf("committing incremental write tx: %w", err)
 	}
+	pendingRecallRevocations.flush()
 	db.notifyUsageSessions([]string{sessionID})
 	return signalsMaintained, nil
 }
@@ -1908,6 +1962,29 @@ func (db *DB) LastClaudeMessageID(ctx context.Context, sessionID string) string 
 	return s.String
 }
 
+// LastClaudeAssistantOrdinal returns the ordinal of the message
+// LastClaudeMessageID describes. The sync engine uses it to place a
+// re-parsed streaming run at the ordinal the stored partial run already
+// occupies.
+func (db *DB) LastClaudeAssistantOrdinal(
+	ctx context.Context, sessionID string,
+) (int, bool) {
+	var ordinal sql.NullInt64
+	err := db.getReader().QueryRow(ctx,
+		`SELECT ordinal FROM messages
+		 WHERE session_id = ?
+		   AND role = 'assistant'
+		   AND claude_message_id != ''
+		 ORDER BY ordinal DESC
+		 LIMIT 1`,
+		sessionID,
+	).Scan(&ordinal)
+	if err != nil || !ordinal.Valid {
+		return 0, false
+	}
+	return int(ordinal.Int64), true
+}
+
 // savedPin captures the message identity needed to re-attach a pin
 // after a full message replacement. source_uuid is preferred because
 // it survives ordinal shifts. Role and content, together with the
@@ -1959,17 +2036,20 @@ func (db *DB) replaceSessionMessages(ctx context.Context,
 	msgs = db.messagesForStorage(msgs)
 
 	t := time.Now()
+	var lockWait time.Duration
 	defer func() {
 		if d := time.Since(t); d > slowOpThreshold {
 			log.Printf(
-				"db: ReplaceSessionMessages %s (%d msgs): %s",
+				"db: ReplaceSessionMessages %s (%d msgs): %s (lock wait %s)",
 				sessionID, len(msgs),
 				d.Round(time.Millisecond),
+				lockWait.Round(time.Millisecond),
 			)
 		}
 	}()
 
 	db.mu.Lock()
+	lockWait = time.Since(t)
 	defer db.mu.Unlock()
 
 	// Prefer an in-place diff (append/merge shapes from streaming
@@ -2067,6 +2147,52 @@ func (db *DB) replaceSessionMessages(ctx context.Context,
 	db.notifyUsageSessions([]string{sessionID})
 	pendingRecallRevocations.flush()
 	return nil
+}
+
+// replaceSessionMessagesFromTx replaces only the session's rows at or
+// after fromOrdinal with msgs, leaving earlier rows, their tool calls,
+// result events, and FTS entries untouched. Pins on replaced rows are
+// re-attached by the same identity rules as the full replace.
+func replaceSessionMessagesFromTx(ctx context.Context,
+	tx *sql.Tx, sessionID string, fromOrdinal int, msgs []Message,
+) error {
+	pins, err := savePinsFromTx(tx, sessionID, fromOrdinal)
+	if err != nil {
+		return err
+	}
+	for _, stmt := range []struct{ query, what string }{
+		{
+			`DELETE FROM tool_calls WHERE message_id IN (
+			SELECT id FROM messages WHERE session_id = ? AND ordinal >= ?)`,
+			"tool_calls",
+		},
+		{
+			`DELETE FROM tool_result_events
+			WHERE session_id = ? AND tool_call_message_ordinal >= ?`,
+			"tool_result_events",
+		},
+		{
+			`DELETE FROM tool_call_occurrence_agent_state
+			WHERE session_id = ? AND message_ordinal >= ?`,
+			"tool call agent state",
+		},
+		{
+			`DELETE FROM messages WHERE session_id = ? AND ordinal >= ?`,
+			"messages",
+		},
+	} {
+		if _, err := tx.ExecContext(
+			ctx, stmt.query, sessionID, fromOrdinal,
+		); err != nil {
+			return fmt.Errorf(
+				"deleting %s from ordinal %d: %w", stmt.what, fromOrdinal, err,
+			)
+		}
+	}
+	if err := writeMessagesTx(tx, msgs); err != nil {
+		return err
+	}
+	return restorePinsTx(tx, sessionID, pins)
 }
 
 // replaceSessionMessagesTx performs the full message-replace sequence within
@@ -2567,6 +2693,14 @@ func setSessionAutomationTx(
 }
 
 func savePinsTx(tx transactionQueries, sessionID string) ([]savedPin, error) {
+	return savePinsFromTx(tx, sessionID, math.MinInt)
+}
+
+// savePinsFromTx saves the pins whose message sits at or after
+// fromOrdinal, the rows a ranged replacement deletes.
+func savePinsFromTx(
+	tx transactionQueries, sessionID string, fromOrdinal int,
+) ([]savedPin, error) {
 	// Save existing pins before deletion. The ON DELETE CASCADE on
 	// pinned_messages.message_id would otherwise wipe them when
 	// messages are deleted below. source_uuid comes from the joined
@@ -2624,8 +2758,8 @@ func savePinsTx(tx transactionQueries, sessionID string) ([]savedPin, error) {
 			p.note, p.created_at
 		FROM pinned_messages p
 		LEFT JOIN messages m ON m.id = p.message_id
-		WHERE p.session_id = ?`,
-		sessionID,
+		WHERE p.session_id = ? AND (m.id IS NULL OR m.ordinal >= ?)`,
+		sessionID, fromOrdinal,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("saving pins: %w", err)
@@ -3043,7 +3177,7 @@ func attachToolResultEventsBatch(
 	return rows.Err()
 }
 
-func scanMessages(rows *sql.Rows) ([]Message, error) {
+func scanMessages(rows MessageRows) ([]Message, error) {
 	var msgs []Message
 	for rows.Next() {
 		var m Message
@@ -3068,6 +3202,59 @@ func scanMessages(rows *sql.Rows) ([]Message, error) {
 		msgs = append(msgs, m)
 	}
 	return msgs, rows.Err()
+}
+
+// RevisionRows prepends a revision destination to every Scan so a message
+// statement whose first column is the session transcript revision can be
+// consumed by a scanner that only knows the message columns. The mirror
+// stores use it to read the revision from the same statement as the rows.
+type RevisionRows struct {
+	*sql.Rows
+	Revision *string
+}
+
+// Scan scans the leading revision column into Revision and the rest of the
+// row into dest.
+func (r RevisionRows) Scan(dest ...any) error {
+	return r.Rows.Scan(append([]any{r.Revision}, dest...)...)
+}
+
+// MessageRows is the row iterator the message scanners read. *sql.Rows
+// and RevisionRows both satisfy it.
+type MessageRows interface {
+	Next() bool
+	Scan(dest ...any) error
+	Err() error
+}
+
+// QueryMessagesWithRevision runs a window statement whose first column is
+// the session transcript revision and scans the remaining columns with
+// scan. It reports the revision through observed when observed is
+// non-nil; an empty result leaves observed untouched. Every store uses it
+// so the revision comes from the same statement as the rows.
+func QueryMessagesWithRevision(
+	ctx context.Context,
+	query func(context.Context, string, ...any) (*sql.Rows, error),
+	scan func(MessageRows) ([]Message, error),
+	observed *string, stmt string, args ...any,
+) ([]Message, error) {
+	rows, err := query(ctx, stmt, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var revision string
+	msgs, err := scan(RevisionRows{Rows: rows, Revision: &revision})
+	if err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if observed != nil && len(msgs) > 0 {
+		*observed = revision
+	}
+	return msgs, nil
 }
 
 // MessageCount returns the number of messages for a session.
@@ -3111,6 +3298,9 @@ func (db *DB) MessageContentFingerprint(ctx context.Context, sessionID string) (
 // raw NUL must be removed before strings.ToValidUTF8 (which treats it
 // as valid).
 func SanitizeUTF8(s string) string {
+	if isCleanText(s) {
+		return s
+	}
 	s = strings.ReplaceAll(s, "\x00", "")
 	s = strings.ToValidUTF8(s, "")
 	// Fast path: skip the rune scan and allocation when the string
@@ -3124,6 +3314,52 @@ func SanitizeUTF8(s string) string {
 		}
 		return r
 	}, s)
+}
+
+// isCleanText reports whether SanitizeUTF8 would return s unchanged:
+// valid UTF-8 with no NUL or strippable control rune. Most transcript
+// text needs no repair, so one pass that skips ASCII decoding avoids
+// the separate NUL, UTF-8 and control scans of the repair path.
+func isCleanText(s string) bool {
+	const (
+		spaces = 0x2020202020202020
+		ones   = 0x0101010101010101
+		highs  = 0x8080808080808080
+	)
+	for i := 0; i < len(s); {
+		if len(s)-i >= 8 {
+			// Skip 8 bytes of printable ASCII (0x20..0x7e) at once.
+			// Subtracting spaces sets the high bit of a byte below 0x20
+			// or at 0xa0 and above; adding ones sets it for DEL and
+			// 0x80..0xfe. A borrow or carry only starts at a byte that
+			// is already flagged, so a clean block always yields zero; a
+			// false positive only sends bytes to the check below. Keep
+			// this inline: the compiler does not inline it as a separate
+			// function, which adds a call for every non-ASCII rune.
+			b := s[i : i+8]
+			word := uint64(b[0]) | uint64(b[1])<<8 | uint64(b[2])<<16 |
+				uint64(b[3])<<24 | uint64(b[4])<<32 | uint64(b[5])<<40 |
+				uint64(b[6])<<48 | uint64(b[7])<<56
+			if ((word-spaces)|(word+ones))&highs == 0 {
+				i += 8
+				continue
+			}
+		}
+		c := s[i]
+		if c < utf8.RuneSelf {
+			if c == 0x7f || c < 0x20 && c != '\n' && c != '\t' && c != '\r' {
+				return false
+			}
+			i++
+			continue
+		}
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if r == utf8.RuneError && size == 1 || isStrippableControl(r) {
+			return false
+		}
+		i += size
+	}
+	return true
 }
 
 // isStrippableControl reports whether r is a control rune that
@@ -3414,11 +3650,11 @@ func (db *DB) SetToolCallSubagentSession(ctx context.Context,
 
 // soleToolResultEventTx returns a one-element slice when the call
 // identified by (session, owning message ordinal, call index) has exactly
-// one stored result event, and nil for every other count, which never
+// one content-bearing result event, and nil for every other count, which never
 // dedups. The key is the same triple attachToolResultEvents and
 // ToolCallResultContentSQL use, so every site agrees on which event a
-// summary is compared against. Inspect at most two index entries before
-// loading content so repeated appends do not rescan the event history.
+// summary is compared against. Inspect at most two payload rows before
+// loading content so repeated appends do not load the event history.
 func soleToolResultEventTx(ctx context.Context,
 	tx *sql.Tx, sessionID string, messageOrdinal, callIndex int,
 	imagePolicy config.ToolResultImages,
@@ -3430,6 +3666,7 @@ func soleToolResultEventTx(ctx context.Context,
 			SELECT 1 FROM tool_result_events
 			WHERE session_id = ? AND tool_call_message_ordinal = ?
 			  AND call_index = ?
+			  AND COALESCE(content, '') <> ''
 			LIMIT 2
 		)`,
 		sessionID, messageOrdinal, callIndex,
@@ -3445,7 +3682,7 @@ func soleToolResultEventTx(ctx context.Context,
 	if err := tx.QueryRowContext(ctx,
 		`SELECT content FROM tool_result_events
 		 WHERE session_id = ? AND tool_call_message_ordinal = ?
-		   AND call_index = ?`,
+		   AND call_index = ? AND COALESCE(content, '') <> ''`,
 		sessionID, messageOrdinal, callIndex,
 	).Scan(&content); err != nil {
 		return nil, fmt.Errorf(
@@ -3502,6 +3739,28 @@ func applyToolCallSubagentLinkTx(ctx context.Context,
 			return false, nil
 		}
 		_, err := tx.ExecContext(ctx,
+			`UPDATE tool_calls SET subagent_session_id = ?
+			 WHERE session_id = ? AND tool_use_id = ?`,
+			nilIfEmpty(currentSubagent), sessionID, link.ToolUseID,
+		)
+		return err == nil, err
+	}
+	if len(link.ResultEvents) > 0 {
+		events := slices.Clone(link.ResultEvents)
+		for i := range events {
+			if events[i].SubagentSessionID == "" {
+				events[i].SubagentSessionID = currentSubagent
+			}
+		}
+		changed, _, err := applyToolCallResultUpdateTx(ctx, tx, sessionID, ToolCallResultUpdate{
+			ToolUseID: link.ToolUseID,
+			Position:  ToolCallPosition{MessageOrdinal: messageOrdinal, CallIndex: callIndex},
+			Events:    events,
+		}, blockedResultCategories, imagePolicy, assetsDir)
+		if err != nil || currentSubagent == storedSubagent {
+			return changed, err
+		}
+		_, err = tx.ExecContext(ctx,
 			`UPDATE tool_calls SET subagent_session_id = ?
 			 WHERE session_id = ? AND tool_use_id = ?`,
 			nilIfEmpty(currentSubagent), sessionID, link.ToolUseID,
@@ -3649,6 +3908,7 @@ func applyToolCallResultUpdateTx(ctx context.Context,
 
 	insertRows := make([]toolResultEventRow, 0, len(incoming))
 	var inserted []ToolResultEvent
+	var metadataChanged bool
 	for _, candidate := range incoming {
 		stored := candidate
 		if blocked {
@@ -3665,6 +3925,28 @@ func applyToolCallResultUpdateTx(ctx context.Context,
 			nilIfEmpty(stored.AgentID), stored.Status, stored.RawContentDigest,
 		).Scan(&exists)
 		if err == nil {
+			if stored.SubagentSessionID != "" {
+				result, err := tx.ExecContext(ctx,
+					`UPDATE tool_result_events SET subagent_session_id = ?
+					 WHERE session_id = ? AND tool_call_message_ordinal = ?
+					   AND call_index = ? AND agent_id IS ? AND status = ?
+					   AND raw_content_digest = ?
+					   AND COALESCE(subagent_session_id, '') = ''`,
+					stored.SubagentSessionID,
+					sessionID, position.MessageOrdinal, position.CallIndex,
+					nilIfEmpty(stored.AgentID), stored.Status, stored.RawContentDigest,
+				)
+				if err != nil {
+					return false, nil, fmt.Errorf("linking existing tool result for %s/%s: %w",
+						sessionID, update.ToolUseID, err)
+				}
+				count, err := result.RowsAffected()
+				if err != nil {
+					return false, nil, fmt.Errorf("counting linked tool results for %s/%s: %w",
+						sessionID, update.ToolUseID, err)
+				}
+				metadataChanged = metadataChanged || count > 0
+			}
 			continue // equivalent event already stored
 		}
 		if !errors.Is(err, sql.ErrNoRows) {
@@ -3684,7 +3966,7 @@ func applyToolCallResultUpdateTx(ctx context.Context,
 		})
 	}
 	if len(insertRows) == 0 {
-		return false, nil, nil
+		return metadataChanged, nil, nil
 	}
 	if err := insertToolResultEventsTx(tx, insertRows); err != nil {
 		return false, nil, err
@@ -3780,7 +4062,11 @@ func (db *DB) ToolCallContentFingerprint(ctx context.Context, sessionID string) 
 // tool-call count. Used by PG push fast-paths to avoid skipping parser
 // changes that only affect tool metadata or inputs.
 func (db *DB) ToolCallFingerprint(ctx context.Context, sessionID string) (string, error) {
-	rows, err := db.getReader().Query(ctx,
+	return toolCallFingerprintWithQuerier(ctx, db.getReader(), sessionID)
+}
+
+func toolCallFingerprintWithQuerier(ctx context.Context, q messageRowsQuerier, sessionID string) (string, error) {
+	rows, err := q.QueryContext(ctx,
 		`SELECT m.ordinal, tc.tool_name, tc.category,
 			COALESCE(tc.tool_use_id, ''), COALESCE(tc.input_json, ''),
 			COALESCE(tc.skill_name, ''),
