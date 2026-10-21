@@ -3,6 +3,7 @@ import {
   getAlignedOffsetScrollAlign,
   getLatestDisplayIndex,
   isAtLatestEdge,
+  isAtListStart,
 } from "./message-scroll.js";
 
 describe("message scroll helpers", () => {
@@ -28,6 +29,12 @@ describe("message scroll helpers", () => {
     expect(isAtLatestEdge({ scrollTop: 20, scrollHeight: 500, clientHeight: 100 }, true)).toBe(
       false,
     );
+  });
+
+  it("treats the first 8 pixels as the start of the list", () => {
+    expect(isAtListStart({ scrollTop: 0 })).toBe(true);
+    expect(isAtListStart({ scrollTop: 8 })).toBe(true);
+    expect(isAtListStart({ scrollTop: 9 })).toBe(false);
   });
 
   it("uses direct offset semantics for already-aligned offsets", () => {

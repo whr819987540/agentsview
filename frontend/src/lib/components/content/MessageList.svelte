@@ -28,6 +28,7 @@
   import {
     getLatestDisplayIndex,
     isAtLatestEdge,
+    isAtListStart,
     type ScrollAlign,
   } from "./message-scroll.js";
   import { m } from "../../i18n/index.js";
@@ -1019,14 +1020,17 @@
 
   // The list keeps its scroll offset when rows change above the reader,
   // such as older history loading or, newest first, new messages arriving,
-  // so the reader would land among the new rows. Read the row at the top
+  // and when a filter, the transcript mode, or the sort order rebuilds the
+  // rows, so the reader would land somewhere else. Read the row at the top
   // before the change lands and put it back where it was once the list has
   // laid the new rows out.
   let heldPosition:
     | { sessionId: string; ordinal: number; offsetPx: number }
     | null = null;
-  // The session whose rows the list last laid out.
+  // The session whose rows the list last laid out, and the session whose
+  // filters, transcript mode, and sort order it last laid out.
   let laidOutSessionId: string | null = null;
+  let laidOutViewSessionId: string | null = null;
 
   /** Whether a jump, a search reveal, a position restore, or follow latest
    *  owns the viewport, so a change must not hold the reader's place. */
@@ -1115,6 +1119,24 @@
       ) {
         return;
       }
+      holdReadingPosition(sessionId);
+    });
+  });
+
+  // A filter, the transcript mode, or the sort order rebuilds the rows on
+  // screen. The message being read stays put; a reader at the start of the
+  // list stays at the start of the rebuilt one, so flipping the order there
+  // shows its other end.
+  $effect.pre(() => {
+    const sessionId = messages.sessionId;
+    void ui.visibleBlocks;
+    void ui.transcriptMode;
+    void ui.sortNewestFirst;
+    untrack(() => {
+      const sameSession =
+        sessionId !== null && sessionId === laidOutViewSessionId;
+      laidOutViewSessionId = sessionId;
+      if (!sameSession || !containerRef || isAtListStart(containerRef)) return;
       holdReadingPosition(sessionId);
     });
   });

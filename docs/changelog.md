@@ -253,6 +253,12 @@ The latest published release is
 
 **Bug fixes**
 
+- Hiding a block type, switching between Normal and Focused, or flipping the
+  sort order keeps the message you were reading in view. Before, the transcript
+  kept its scroll position while its rows changed, so you landed far from that
+  message, and flipping the order twice did not bring you back. If the message
+  you were reading is hidden, the next visible one takes its place. At the very
+  start of the list, flipping the order still shows the other end.
 - An open session shows messages that synced while it was opening, such as the
   final reply of an agent that had just finished. Before, they stayed hidden
   until the session changed again. The live-update connection now refreshes

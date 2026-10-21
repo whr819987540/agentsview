@@ -13,8 +13,7 @@ import {
 } from "./helpers/transcript-fixture";
 
 // Each test pairs an event that changes the transcript with a way of reading
-// it, per docs/agents/testing.md. Tests marked test.fail() reproduce a known
-// defect on main; the fix for that defect removes the marker.
+// it, per docs/agents/testing.md.
 
 // More than 3,000 messages, so the list loads the newest 1,000 first.
 const PROGRESSIVE_SESSION = "test-session-xlarge-5500";
@@ -264,9 +263,6 @@ test.describe("filter and sort changes", () => {
   test("keeps the message being read at the top when a block filter hides others", async ({
     page,
   }) => {
-    // The list keeps its scrollTop while the rows above shrink away, so the
-    // reader lands far past the message they were reading.
-    test.fail();
     const fake = FakeTranscript.withRows(LIVE_SESSION, 200);
     await fake.install(page);
     const scroller = await openTranscript(page, `/sessions/${LIVE_SESSION}`);
@@ -296,9 +292,6 @@ test.describe("filter and sort changes", () => {
   test("keeps the message being read in view when the sort order flips and back", async ({
     page,
   }) => {
-    // Flipping the order keeps the scroll offset, which now points into the
-    // mirrored half of the transcript.
-    test.fail();
     const fake = FakeTranscript.withRows(LIVE_SESSION, 200);
     await fake.install(page);
     const scroller = await openTranscript(page, `/sessions/${LIVE_SESSION}`);
@@ -318,6 +311,20 @@ test.describe("filter and sort changes", () => {
       })
       .toBe(true);
     await expectSamePosition(scroller, before);
+  });
+
+  test("shows the other end when the sort order flips at the start of the list", async ({
+    page,
+  }) => {
+    const fake = FakeTranscript.withRows(LIVE_SESSION, 200);
+    await fake.install(page);
+    const scroller = await openTranscript(page, `/sessions/${LIVE_SESSION}`);
+    expect((await visibleOrdinals(scroller))[0]).toBe(0);
+
+    await setNewestFirst(page, scroller);
+    await settledReadingPosition(scroller);
+    expect((await visibleOrdinals(scroller))[0]).toBe(199);
+    expect(await scroller.evaluate((el) => el.scrollTop)).toBe(0);
   });
 });
 
