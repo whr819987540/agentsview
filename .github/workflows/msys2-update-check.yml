@@ -13,9 +13,14 @@ on:
     - cron: "0 9 * * 1"  # Every Monday at 09:00 UTC
   workflow_dispatch:
 
+# This fork skips this check. It tells upstream when to update the MSYS2
+# pins in ci.yml, a workflow the fork does not run, and the fork takes those
+# updates when it merges upstream. See docs/fork/upstream-merge.md before
+# removing the guard.
 jobs:
   windows-update-check:
     name: MSYS2 Update Check (${{ matrix.name }})
+    if: github.repository == 'kenn-io/agentsview'
     strategy:
       fail-fast: false
       matrix:

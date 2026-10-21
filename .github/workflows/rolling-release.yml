@@ -1,17 +1,20 @@
 name: Rolling Release
 
-# Build directly-usable Linux and Windows binaries on every branch push.
-# A manual run (workflow_dispatch) builds the current tip of the chosen
-# branch, for when a push did not start a run.
+# Build directly-usable Linux and Windows binaries on every push to main.
+# Other branches build only on request: a manual run (workflow_dispatch)
+# builds the current tip of the chosen branch. Pull requests are merged with
+# a merge commit, so main builds every merged change anyway, and building
+# each branch push as well would compile the same source twice. Fork Checks
+# runs the frontend production build on pull requests instead.
 #
 # Each build is published as a permanent snapshot prerelease tagged
 # "build-YYYYMMDD-<sha8>", where the date is the commit's committer date in
 # UTC, so re-runs of a commit reuse its tag. A complete snapshot is never
-# modified, so a commit built on a branch and later fast-forwarded onto main
-# reuses its snapshot. Only builds of main then update the rolling "latest"
-# prerelease in place, with byte-identical copies of the snapshot's assets
-# plus the installers. Clients follow "latest", so a branch snapshot reaches
-# only someone who downloads it by its tag.
+# modified, so a commit built on a branch by a manual run and later
+# fast-forwarded onto main reuses its snapshot. Only builds of main then
+# update the rolling "latest" prerelease in place, with byte-identical copies
+# of the snapshot's assets plus the installers. Clients follow "latest", so a
+# branch snapshot reaches only someone who downloads it by its tag.
 #
 # Assets on both releases:
 #   agentsview-linux-amd64, agentsview-windows-amd64.exe, SHA256SUMS
@@ -23,24 +26,24 @@ name: Rolling Release
 # snapshot. Older clients read latest/VERSION, latest/SHA256SUMS, and
 # latest/<binary>.
 #
-# Job graph: metadata -> build-linux + build-windows -> snapshot -> latest
-# (main only)
+# Job graph: metadata + frontend -> build-linux + build-windows -> snapshot
+# -> latest (main only)
 
 on:
   push:
-    # Branches only; tag pushes, including the ones this workflow creates,
-    # do not build.
+    # Only main; tag pushes, including the ones this workflow creates, do
+    # not build.
     branches:
-      - "**"
+      - main
   workflow_dispatch:
 
 permissions:
   contents: read
 
-# There is deliberately no workflow-level concurrency group. Every push must
-# build and get its own snapshot, even when newer pushes follow quickly, so
-# superseded runs are not cancelled. This spends more CI minutes than
-# cancelling them did. Only the update of "latest" is serialized; see the
+# There is deliberately no workflow-level concurrency group. Every push to
+# main must build and get its own snapshot, even when newer pushes follow
+# quickly, so superseded runs are not cancelled. This spends more CI minutes
+# than cancelling them did. Only the update of "latest" is serialized; see the
 # latest job.
 
 jobs:
@@ -94,8 +97,32 @@ jobs:
             echo "subject=$SUBJECT"
           } >> "$GITHUB_OUTPUT"
 
+  # The embedded frontend is the same on every platform, so it is built once
+  # and both binary builds embed this one copy.
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
+        with:
+          node-version: "24"
+
+      - name: Build frontend
+        run: npm ci && npm run build
+        working-directory: frontend
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: frontend-dist
+          path: frontend/dist
+          if-no-files-found: error
+          retention-days: 1
+
   build-linux:
-    needs: metadata
+    needs: [metadata, frontend]
     runs-on: ubuntu-latest
     # manylinux_2_28 keeps the glibc requirement low so the binary runs on
     # older distributions, matching the tagged release builds.
@@ -116,19 +143,15 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
-        with:
-          node-version: "24"
-
-      - name: Build frontend
-        run: npm ci && npm run build
-        working-directory: frontend
+      - name: Clear the embed directory
+        shell: bash
+        run: rm -rf internal/web/dist
 
       - name: Embed frontend
-        shell: bash
-        run: |
-          rm -rf internal/web/dist
-          cp -r frontend/dist internal/web/dist
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: frontend-dist
+          path: internal/web/dist
 
       # `make pricing-snapshot` also stages the go-sqlite3 amalgamation
       # header that the sqlite-vec cgo bindings include, which a bare
@@ -186,7 +209,7 @@ jobs:
           path: dist/agentsview-linux-amd64
 
   build-windows:
-    needs: metadata
+    needs: [metadata, frontend]
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
@@ -198,19 +221,15 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6.4.0
-        with:
-          node-version: "24"
-
-      - name: Build frontend
-        run: npm ci && npm run build
-        working-directory: frontend
+      - name: Clear the embed directory
+        shell: bash
+        run: rm -rf internal/web/dist
 
       - name: Embed frontend
-        shell: bash
-        run: |
-          rm -rf internal/web/dist
-          cp -r frontend/dist internal/web/dist
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: frontend-dist
+          path: internal/web/dist
 
       # `make pricing-snapshot` also stages the go-sqlite3 amalgamation
       # header that the sqlite-vec cgo bindings include, which a bare
@@ -293,6 +312,9 @@ jobs:
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
         with:
+          # The binaries only; the frontend-dist artifact is not a release
+          # asset.
+          pattern: rolling-*-amd64
           path: artifacts
           merge-multiple: true
 
