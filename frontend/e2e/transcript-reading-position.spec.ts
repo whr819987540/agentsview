@@ -64,10 +64,6 @@ test.describe("older history", () => {
   test("keeps the reader on the same message when older history loads above it", async ({
     page,
   }) => {
-    // Rows prepended above the viewport keep their scrollTop, so the reader
-    // lands about a thousand messages back, near the top again, and the next
-    // older page loads, until the whole history has loaded.
-    test.fail();
     const fake = FakeTranscript.withRows(PROGRESSIVE_SESSION, 5500);
     await fake.install(page);
     const olderPage = fake.holdNext(isOlderPage);

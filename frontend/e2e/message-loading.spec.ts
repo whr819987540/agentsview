@@ -423,10 +423,16 @@ test.describe("Message loading", () => {
       ).__followRaf.restore();
     });
 
-    await expect
-      .poll(() => sp.scroller.evaluate((el) => el.scrollTop), {
-        timeout: 2_000,
-      })
-      .toBeLessThanOrEqual(8);
+    // Scrolling to the top loads older history above the first row, and the
+    // reader stays on that row, so the list has moved, but not to the newest
+    // message. Give a leaked follow scroll a few frames to land.
+    await page.evaluate(async () => {
+      for (let i = 0; i < 10; i++) {
+        await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+      }
+    });
+    expect(
+      await sp.scroller.evaluate((el) => el.scrollHeight - el.clientHeight - el.scrollTop),
+    ).toBeGreaterThan(8);
   });
 });

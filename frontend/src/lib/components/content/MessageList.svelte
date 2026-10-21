@@ -50,6 +50,8 @@
   let destroyed = false;
   let activeFollowScrollRequest: number | null = null;
   let activeRestoreRequest: number | null = null;
+  // The jump or search reveal that is scrolling the list right now.
+  let activeScrollWork: number | null = null;
   let restoreTarget:
     | { sessionId: string; anchor: ScrollAnchor }
     | null = null;
@@ -628,62 +630,59 @@
     return new Promise((r) => requestAnimationFrame(() => r()));
   }
 
-  async function scrollToOrdinalInternal(ordinal: number, call?: ScrollCall) {
-    const reqId = ++lastScrollRequest;
-    activeFollowScrollRequest = null;
-    // A rewrite can renumber messages, so a jump to a tool call stops once its ordinal holds a different message.
-    const targetHolds = () => {
-      if (call === undefined) return true;
-      // Without a tool ID, a position can name another call after a rewrite, so the revision must still match.
-      if (!call.toolUseId && call.revision !== undefined && messages.loadedRevision !== call.revision) {
-        return false;
-      }
-      const message = messages.messages.find((m) => m.ordinal === ordinal);
-      if (message === undefined) return true;
-      const held = message.tool_calls?.[call.index];
-      return held !== undefined && (held.tool_use_id ?? "") === call.toolUseId;
-    };
-    const abandon = () => {
-      if (ui.selectedOrdinal === ordinal) ui.selectedOrdinal = null;
-    };
-    if (!targetHolds()) return abandon();
-
+  /** Display index of the row holding `ordinal`, or -1 when no row holds it. */
+  function displayIndexOf(ordinal: number) {
     const idxAsc = displayItemsAsc.findIndex((item) =>
       item.ordinals.includes(ordinal),
     );
-    if (idxAsc >= 0) {
-      const idx = ui.sortNewestFirst
-        ? displayItemsAsc.length - 1 - idxAsc
-        : idxAsc;
-      void scrollToDisplayIndex(idx, 0, 0, reqId, "start", targetHolds).then(() => {
-        if (reqId === lastScrollRequest && !targetHolds()) abandon();
-      });
-      return;
-    }
+    if (idxAsc < 0) return -1;
+    return ui.sortNewestFirst ? displayItemsAsc.length - 1 - idxAsc : idxAsc;
+  }
 
-    await messages.ensureOrdinalLoaded(ordinal);
-    if (reqId !== lastScrollRequest) return;
-    if (!targetHolds()) return abandon();
+  async function scrollToOrdinalInternal(ordinal: number, call?: ScrollCall) {
+    const reqId = ++lastScrollRequest;
+    activeFollowScrollRequest = null;
+    activeScrollWork = reqId;
+    try {
+      // A rewrite can renumber messages, so a jump to a tool call stops once its ordinal holds a different message.
+      const targetHolds = () => {
+        if (call === undefined) return true;
+        // Without a tool ID, a position can name another call after a rewrite, so the revision must still match.
+        if (!call.toolUseId && call.revision !== undefined && messages.loadedRevision !== call.revision) {
+          return false;
+        }
+        const message = messages.messages.find((m) => m.ordinal === ordinal);
+        if (message === undefined) return true;
+        const held = message.tool_calls?.[call.index];
+        return held !== undefined && (held.tool_use_id ?? "") === call.toolUseId;
+      };
+      const abandon = () => {
+        if (ui.selectedOrdinal === ordinal) ui.selectedOrdinal = null;
+      };
+      if (!targetHolds()) return abandon();
 
-    // Let Svelte re-derive displayItemsAsc and the
-    // virtualizer update its count after loading.
-    // Two frames: one for Svelte reactivity, one for
-    // virtualizer resize observation.
-    await raf();
-    await raf();
-    if (reqId !== lastScrollRequest) return;
-    if (!targetHolds()) return abandon();
+      if (displayIndexOf(ordinal) < 0) {
+        await messages.ensureOrdinalLoaded(ordinal);
+        if (reqId !== lastScrollRequest) return;
+        if (!targetHolds()) return abandon();
 
-    const loadedIdxAsc = displayItemsAsc.findIndex(
-      (item) => item.ordinals.includes(ordinal),
-    );
-    if (loadedIdxAsc < 0) return;
-    const loadedIdx = ui.sortNewestFirst
-      ? displayItemsAsc.length - 1 - loadedIdxAsc
-      : loadedIdxAsc;
-    void scrollToDisplayIndex(loadedIdx, 0, 0, reqId, "start", targetHolds).then(() => {
+        // Let Svelte re-derive displayItemsAsc and the
+        // virtualizer update its count after loading.
+        // Two frames: one for Svelte reactivity, one for
+        // virtualizer resize observation.
+        await raf();
+        await raf();
+        if (reqId !== lastScrollRequest) return;
+        if (!targetHolds()) return abandon();
+      }
+
+      const idx = displayIndexOf(ordinal);
+      if (idx < 0) return;
+      await scrollToDisplayIndex(idx, 0, 0, reqId, "start", targetHolds);
       if (reqId === lastScrollRequest && !targetHolds()) abandon();
-    });
+    } finally {
+      if (activeScrollWork === reqId) activeScrollWork = null;
+    }
   }
 
   export function scrollToOrdinal(ordinal: number, call?: ScrollCall) {
@@ -879,11 +878,16 @@
       }
       const reqId = ++lastScrollRequest;
       activeFollowScrollRequest = null;
+      activeScrollWork = reqId;
       ui.selectOrdinal(match.ordinal);
       ui.setFollowLatest(false);
-      void revealSearchMatch(match, sessionId, reqId).catch((error: unknown) => {
-        if (reqId === lastScrollRequest) console.warn("Could not reveal search occurrence", error);
-      });
+      void revealSearchMatch(match, sessionId, reqId)
+        .catch((error: unknown) => {
+          if (reqId === lastScrollRequest) console.warn("Could not reveal search occurrence", error);
+        })
+        .finally(() => {
+          if (activeScrollWork === reqId) activeScrollWork = null;
+        });
       return () => {
         if (reqId === lastScrollRequest) lastScrollRequest++;
       };
@@ -992,6 +996,104 @@
       void restoreScrollAnchor(target.anchor);
     });
   });
+
+  // The list keeps its scroll offset when rows are laid out above the
+  // reader, such as older history loading, so the reader would land among
+  // the new rows. Read the row at the top before the change lands and put
+  // it back where it was once the list has laid the new rows out.
+  let heldPosition:
+    | { sessionId: string; ordinal: number; offsetPx: number }
+    | null = null;
+  let laidOutOldest: {
+    sessionId: string | null;
+    ordinal: number | undefined;
+  } = { sessionId: null, ordinal: undefined };
+
+  /** Whether a jump, a search reveal, a position restore, or follow latest
+   *  owns the viewport, so a change must not hold the reader's place. */
+  function scrollWorkActive() {
+    return (
+      ui.followLatest ||
+      ui.pendingScrollOrdinal !== null ||
+      restoreTarget?.sessionId === messages.sessionId ||
+      isRestoring() ||
+      (activeScrollWork !== null && activeScrollWork === lastScrollRequest)
+    );
+  }
+
+  /** The topmost row on screen and how far the viewport top sits below its
+   *  top, in the list's offsets. It is read from the rows the browser laid
+   *  out, so it is what the reader sees even while the rows are changing. */
+  function readOnScreenPosition(root: HTMLElement) {
+    const sizer = root.firstElementChild;
+    if (!(sizer instanceof HTMLElement)) return null;
+    const viewTop = root.getBoundingClientRect().top;
+    const sizerTop = sizer.getBoundingClientRect().top;
+    let top: { ordinal: number; start: number } | null = null;
+    for (const row of sizer.children) {
+      if (!(row instanceof HTMLElement)) continue;
+      const rect = row.getBoundingClientRect();
+      const ordinal = Number(row.dataset.ordinal);
+      if (rect.bottom <= viewTop || !Number.isInteger(ordinal)) continue;
+      const start = rect.top - sizerTop;
+      if (top === null || start < top.start) top = { ordinal, start };
+    }
+    if (top === null) return null;
+    return { ordinal: top.ordinal, offsetPx: root.scrollTop - top.start };
+  }
+
+  function holdReadingPosition(sessionId: string) {
+    // A burst of changes keeps the place read before the first of them.
+    if (heldPosition !== null || !containerRef) return;
+    // Rows from the session shown before a switch are not a place to hold.
+    if (containerRef.dataset.messagesSessionId !== sessionId) return;
+    if (scrollWorkActive()) return;
+    const onScreen = readOnScreenPosition(containerRef);
+    if (!onScreen) return;
+    heldPosition = { sessionId, ...onScreen };
+    void tick().then(restoreHeldPosition);
+  }
+
+  function restoreHeldPosition() {
+    const held = heldPosition;
+    heldPosition = null;
+    if (!held || destroyed || messages.sessionId !== held.sessionId) return;
+    if (scrollWorkActive()) return;
+    const holdsRow =
+      displayItemsAsc[findAnchorIndexAsc(displayItemsAsc, held.ordinal)]
+        ?.ordinals.includes(held.ordinal) ?? false;
+    const reqId = ++lastScrollRequest;
+    // Rows that enter the viewport are measured over the next frames, so
+    // keep the reader's row in place until the layout holds still.
+    void settleScrollAnchor({
+      resolveIndex: () => anchorDisplayIndex(held.ordinal),
+      offsetPx: holdsRow ? held.offsetPx : 0,
+      getVirtualizer: () => virtualizer.instance,
+      getScrollTop: () =>
+        containerRef?.scrollTop ?? virtualizer.instance?.scrollOffset ?? 0,
+      isCurrent: () => !destroyed && reqId === lastScrollRequest,
+      nextFrame: raf,
+    });
+  }
+
+  // Runs before the rows render, while the screen still shows the old ones.
+  $effect.pre(() => {
+    const sessionId = messages.sessionId;
+    const oldest = messages.messages[0]?.ordinal;
+    untrack(() => {
+      const previous = laidOutOldest;
+      laidOutOldest = { sessionId, ordinal: oldest };
+      if (sessionId === null || previous.sessionId !== sessionId) return;
+      if (
+        oldest === undefined ||
+        previous.ordinal === undefined ||
+        oldest >= previous.ordinal
+      ) {
+        return;
+      }
+      holdReadingPosition(sessionId);
+    });
+  });
 </script>
 
 {#if !sessions.activeSessionId}
@@ -1043,6 +1145,7 @@
             class:selected={ui.selectedOrdinal !== null &&
               item.ordinals.includes(ui.selectedOrdinal)}
             data-index={row.index}
+            data-ordinal={item.ordinals[0]}
             style="position: absolute; top: 0; left: 0; width: 100%; transform: translateY({row.start}px);"
             use:measureElement={virtualizer.instance}
             onclick={() => {

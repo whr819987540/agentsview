@@ -253,6 +253,11 @@ The latest published release is
 
 **Bug fixes**
 
+- Scrolling up through a long session keeps you on the message you were
+  reading while older messages load above it. Before, in a session with more
+  than 3,000 messages, reaching the top of the loaded messages moved the view
+  about a thousand messages back, and loading continued until the view reached
+  the start of the session.
 - Find in a session no longer pulls the transcript back to the current match
   when new messages arrive. Before, while find was open on a running session,
   each live update could scroll you back to the match, even after you had
