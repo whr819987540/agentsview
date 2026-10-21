@@ -666,7 +666,9 @@ agents still collapses to its prompts and final answers.
 
 Toggle between Normal and Focused mode using the transcript mode button in the
 session header. The header adjusts responsively to fit the available space. The
-mode preference is saved in localStorage.
+mode preference is saved in localStorage. Switching modes keeps the message you
+are reading at the top of the transcript; if Focused mode hides it, the next
+message it shows takes its place.
 
 ### Message Display
 
@@ -810,12 +812,16 @@ unaffected.
 
 All categories are visible by default. When any are hidden, a badge on the
 filter button shows the count of hidden types. Click **Show all** to restore
-visibility.
+visibility. Hiding or showing a category keeps the message you are reading at
+the top of the transcript; if that message is hidden, the next visible one takes
+its place.
 
 ### Sorting
 
 Toggle between newest-first and oldest-first with the `o` key or the sort button
-in the header. The arrow icon indicates the current direction.
+in the header. The arrow icon indicates the current direction. Flipping the order
+keeps the message you are reading in view. At the very start of the list,
+flipping it shows the other end, so newest-first opens on the newest message.
 
 ### Message Navigation
 
@@ -973,15 +979,23 @@ Very short calls floor at 4% width to remain visible.
 ### Progressive Loading
 
 Sessions with more than 3,000 messages load the most recent 1,000 messages
-first. Older pages load automatically as you scroll up. Smaller sessions load
-all messages at once.
+first. Older pages load automatically as you scroll up, and the message you are
+reading stays where it is while they load. Smaller sessions load all messages at
+once.
 
 ### Live Updates
 
 When viewing an active session, AgentsView uses Server-Sent Events to stream new
 messages in real time. The message list updates incrementally — only new
 activity is fetched, rather than reloading the entire session — so updates
-arrive faster and with less overhead.
+arrive faster and with less overhead. When the stream connects or reconnects,
+the session refreshes once to pick up anything that synced in between.
+
+New messages do not move the message you are reading. In oldest-first order
+they arrive below it. In newest-first order they arrive above it, and a reader
+at the top of the list sees them arrive. Turn on
+[Follow Latest Message](#follow-latest-message) to keep the newest message in
+view.
 
 ### Follow Latest Message
 
