@@ -13,6 +13,8 @@
   import {
     ChevronDownIcon,
     ChevronRightIcon,
+    ChevronsDownUpIcon,
+    ChevronsUpDownIcon,
     FolderIcon,
     FolderPlusIcon,
     UserRoundIcon,
@@ -34,6 +36,7 @@
     assignGroupFolders,
     buildGroupSections,
     buildDisplayItems,
+    bulkExpandKeys,
     computeTotalSize,
     findStart,
     isSubagentDescendant,
@@ -67,9 +70,11 @@
   let paintedTotalSize = $state(0);
 
   let groupMode: GroupMode = $state(getInitialGroupMode());
-  let manualExpanded: Set<string> = $state(new Set());
-  // Start all collapsed when grouping is first enabled.
-  let collapseAll = $state(getInitialGroupMode() !== "none");
+  // Sections start collapsed when grouping is enabled. "Expand all" makes
+  // open the default, so sections that load later open too. The labels in
+  // toggledSections differ from the default.
+  let sectionsExpanded = $state(false);
+  let toggledSections: Set<string> = $state(new Set());
   // Track which continuation chains are expanded.
   let expandedGroups: Set<string> = $state(new Set());
   // Folders start collapsed; the expanded ones are remembered per browser.
@@ -146,13 +151,11 @@
   // render is already collapsed (no flicker).
   let collapsed = $derived.by(() => {
     if (groupMode === "none") return new Set<string>();
-    if (collapseAll) {
-      return new Set(groupSections.map((s) => s.label));
-    }
-    // Invert: all labels minus the manually expanded ones.
-    const all = new Set(groupSections.map((s) => s.label));
-    for (const a of manualExpanded) all.delete(a);
-    return all;
+    return new Set(
+      groupSections
+        .map((s) => s.label)
+        .filter((label) => toggledSections.has(label) === sectionsExpanded),
+    );
   });
 
   // Folders show in project sections, or when the list is filtered to
@@ -175,6 +178,17 @@
       ),
       expanded: expandedFolders,
     };
+  });
+
+  /** The folders of the projects the list shows. */
+  let viewFolderIds = $derived.by(() => {
+    const view = folderView;
+    if (!view) return [];
+    const projects =
+      view.project !== null ? [view.project] : groupSections.map((s) => s.label);
+    return projects.flatMap((project) =>
+      (view.foldersByProject.get(project) ?? []).map((f) => f.id),
+    );
   });
 
   // Build flat display items for virtual scrolling.
@@ -224,8 +238,8 @@
 
   function setGroupMode(mode: GroupMode) {
     groupMode = mode;
-    collapseAll = mode !== "none";
-    manualExpanded = new Set();
+    sectionsExpanded = false;
+    toggledSections = new Set();
   }
 
   function toggleGroupByAgent() {
@@ -237,25 +251,23 @@
   }
 
   function toggleGroup(label: string) {
-    if (collapseAll) {
-      collapseAll = false;
-      manualExpanded = new Set([label]);
+    const next = new Set(toggledSections);
+    if (next.has(label)) {
+      next.delete(label);
     } else {
-      const next = new Set(manualExpanded);
-      if (next.has(label)) {
-        next.delete(label);
-      } else {
-        next.add(label);
-      }
-      manualExpanded = next;
+      next.add(label);
     }
+    toggledSections = next;
   }
 
-  function setFolderExpanded(folderId: number, expanded: boolean) {
-    if (expandedFolders.has(folderId) === expanded) return;
+  function setFoldersExpanded(folderIds: readonly number[], expanded: boolean) {
+    const changed = folderIds.filter((id) => expandedFolders.has(id) !== expanded);
+    if (changed.length === 0) return;
     const next = new Set(expandedFolders);
-    if (expanded) next.add(folderId);
-    else next.delete(folderId);
+    for (const id of changed) {
+      if (expanded) next.add(id);
+      else next.delete(id);
+    }
     expandedFolders = next;
     try {
       localStorage?.setItem(EXPANDED_FOLDERS_KEY, JSON.stringify([...next]));
@@ -386,6 +398,58 @@
     }
     expandedGroups = next;
   }
+
+  // "Expand all" and "Collapse all" act on sections, folders, and session
+  // chains, but never on subagents: a chain whose only children are
+  // subagents stays closed, and each Subagents sub-group keeps its state.
+  function expandAll() {
+    sectionsExpanded = true;
+    toggledSections = new Set();
+    setFoldersExpanded(viewFolderIds, true);
+    const next = new Set(expandedGroups);
+    for (const g of groups) {
+      for (const key of bulkExpandKeys(g)) next.add(key);
+    }
+    expandedGroups = next;
+  }
+
+  function collapseAll() {
+    sectionsExpanded = false;
+    toggledSections = new Set();
+    setFoldersExpanded(viewFolderIds, false);
+    expandedGroups = new Set(
+      [...expandedGroups].filter((key) => key.startsWith("subagent:")),
+    );
+  }
+
+  function isRowOpen(item: DisplayItem): boolean {
+    if (item.type === "header") return !collapsed.has(item.label);
+    if (item.type === "folder") return !!item.folder && expandedFolders.has(item.folder.id);
+    return (
+      item.type === "session" &&
+      !item.isChild &&
+      !!item.group &&
+      item.group.sessions.length > 1 &&
+      expandedGroups.has(item.group.key)
+    );
+  }
+
+  function canRowOpen(item: DisplayItem): boolean {
+    if (item.type === "header" || item.type === "folder") return true;
+    return (
+      item.type === "session" &&
+      !item.isChild &&
+      !!item.group &&
+      bulkExpandKeys(item.group).length > 0
+    );
+  }
+
+  // One header button: "Collapse all" while any listed row is open,
+  // otherwise "Expand all" when a row can open.
+  let bulkAction: "collapse" | "expand" | null = $derived.by(() => {
+    if (renderDisplayItems.some(isRowOpen)) return "collapse";
+    return renderDisplayItems.some(canRowOpen) ? "expand" : null;
+  });
 
   function effectiveViewportHeight(): number {
     // ResizeObserver/clientHeight normally reports before hydration starts.
@@ -638,7 +702,7 @@
         );
         const folderId = owner && folderView.groupFolder.get(owner.key);
         if (folderId !== undefined && !expandedFolders.has(folderId)) {
-          setFolderExpanded(folderId, true);
+          setFoldersExpanded([folderId], true);
           return;
         }
       }
@@ -701,6 +765,22 @@
   <div class="header-actions">
     {#if sessions.loading}
       <span class="loading-indicator">{m.sidebar_loading()}</span>
+    {/if}
+    {#if bulkAction}
+      {@const bulkLabel =
+        bulkAction === "collapse" ? m.sidebar_collapse_all() : m.sidebar_expand_all()}
+      <button
+        class="select-toggle-btn"
+        onclick={bulkAction === "collapse" ? collapseAll : expandAll}
+        title={bulkLabel}
+        aria-label={bulkLabel}
+      >
+        {#if bulkAction === "collapse"}
+          <ChevronsDownUpIcon size="12" strokeWidth="2" aria-hidden="true" />
+        {:else}
+          <ChevronsUpDownIcon size="12" strokeWidth="2" aria-hidden="true" />
+        {/if}
+      </button>
     {/if}
     <button
       class="select-toggle-btn"
@@ -827,7 +907,7 @@
             editable={sessionFolders.editable}
             renaming={renamingFolderId === folderId}
             dropActive={dropTarget === folderId}
-            onToggle={() => setFolderExpanded(folderId, !expandedFolders.has(folderId))}
+            onToggle={() => setFoldersExpanded([folderId], !expandedFolders.has(folderId))}
             onRenameStart={() => (renamingFolderId = folderId)}
             onRenameEnd={() => {
               if (renamingFolderId === folderId) renamingFolderId = null;

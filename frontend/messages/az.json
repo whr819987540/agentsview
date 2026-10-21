@@ -514,6 +514,8 @@
   "sidebar_unclean_title": "Alət çağırışının gedişində sonlandırılıb (1 saatdan çox boşdayanma)",
   "sidebar_expand_group": "{name} qrupunu genişləndir",
   "sidebar_collapse_group": "{name} qrupunu yığ",
+  "sidebar_expand_all": "Hamısını genişləndir",
+  "sidebar_collapse_all": "Hamısını yığ",
   "sidebar_expand_folder": "{name} qovluğunu aç",
   "sidebar_collapse_folder": "{name} qovluğunu yığ",
   "sidebar_folder_create": "Yeni qovluq",

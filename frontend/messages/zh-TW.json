@@ -430,6 +430,8 @@
   "sidebar_unclean_title": "Tool call 中途終止（閒置超過 1 小時）",
   "sidebar_expand_group": "展開 {name} 分組",
   "sidebar_collapse_group": "摺疊 {name} 分組",
+  "sidebar_expand_all": "全部展開",
+  "sidebar_collapse_all": "全部摺疊",
   "sidebar_expand_folder": "展開 {name} 目錄",
   "sidebar_collapse_folder": "摺疊 {name} 目錄",
   "sidebar_folder_create": "新增目錄",

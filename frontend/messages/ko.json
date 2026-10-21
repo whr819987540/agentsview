@@ -501,6 +501,8 @@
   "sidebar_unclean_title": "도구 호출 도중 종료됨 (1시간 이상 유휴)",
   "sidebar_expand_group": "{name} 그룹 펼치기",
   "sidebar_collapse_group": "{name} 그룹 접기",
+  "sidebar_expand_all": "모두 펼치기",
+  "sidebar_collapse_all": "모두 접기",
   "sidebar_expand_folder": "{name} 폴더 펼치기",
   "sidebar_collapse_folder": "{name} 폴더 접기",
   "sidebar_folder_create": "새 폴더",

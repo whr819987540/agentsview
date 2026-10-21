@@ -419,6 +419,8 @@
   "sidebar_unclean_title": "Tool call 中途终止（闲置超过 1 小时）",
   "sidebar_expand_group": "展开 {name} 分组",
   "sidebar_collapse_group": "折叠 {name} 分组",
+  "sidebar_expand_all": "全部展开",
+  "sidebar_collapse_all": "全部折叠",
   "sidebar_expand_folder": "展开 {name} 目录",
   "sidebar_collapse_folder": "折叠 {name} 目录",
   "sidebar_folder_create": "新建目录",
