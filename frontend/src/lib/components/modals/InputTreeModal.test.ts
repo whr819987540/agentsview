@@ -14,6 +14,7 @@ vi.mock("../../api/inputTree.js", () => ({
 
 import { m } from "../../i18n/index.js";
 import { router } from "../../stores/router.svelte.js";
+import { messages } from "../../stores/messages.svelte.js";
 import { ui } from "../../stores/ui.svelte.js";
 // @ts-ignore
 import InputTreeModal from "./InputTreeModal.svelte";
@@ -160,6 +161,7 @@ describe("InputTreeModal", () => {
     }
     ui.activeModal = null;
     ui.clearScrollState();
+    messages.clear();
     vi.restoreAllMocks();
     document.body.innerHTML = "";
   });
@@ -210,6 +212,29 @@ describe("InputTreeModal", () => {
     // The open session's path: shared start -> fork input -> its session.
     expect(document.querySelectorAll(".graph-edges path.on-path")).toHaveLength(2);
     expect(document.querySelectorAll(".graph-edges path")).toHaveLength(4);
+  });
+
+  it("draws the inputs a sync adds when the transcript moves to a new revision", async () => {
+    messages.sessionId = "child";
+    messages.loadedRevision = "1";
+    await open();
+    expect(document.body.textContent).not.toContain("fork follow-up");
+
+    const withFollowUp = makeInputTree([
+      ...makeInputTree().nodes,
+      inputNode(2, "child", 2, "fork follow-up", {
+        on_active_path: true,
+        active_ordinal: 2,
+        end_session_ids: ["child"],
+      }),
+    ]);
+    mocks.fetchSessionInputTree.mockResolvedValue(withFollowUp);
+    messages.loadedRevision = "2";
+    await flush();
+    await flush();
+
+    expect(mocks.fetchSessionInputTree).toHaveBeenCalledTimes(2);
+    expect(document.body.textContent).toContain("fork follow-up");
   });
 
   it("jumps within the open session to an input on its path and closes", async () => {

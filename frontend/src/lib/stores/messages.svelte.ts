@@ -86,6 +86,17 @@ export class MessagesStore {
   private hasPendingSessionToken: boolean = false;
   private pendingSessionUnreadOrdinal: number | null = null;
 
+  /**
+   * The transcript revision the list shows for `sessionId`: null when it shows
+   * another session or the backend reports no revision, and undefined while the
+   * list is replacing its rows for that session.
+   */
+  revisionShownFor(sessionId: string): string | null | undefined {
+    if (this.sessionId !== sessionId) return null;
+    if (this.loadedRevision === null && this.loading) return undefined;
+    return this.loadedRevision;
+  }
+
   resumeModelFor(sessionId: string): string {
     return this.sessionId === sessionId &&
       this.historyComplete &&

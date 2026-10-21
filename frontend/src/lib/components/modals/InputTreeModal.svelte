@@ -18,6 +18,7 @@
     layoutInputGraph,
     type InputGraphItem,
   } from "../content/input-graph.js";
+  import { TranscriptRead } from "../content/transcript-read.svelte.js";
 
   interface Props {
     sessionId: string;
@@ -31,11 +32,20 @@
   // Blue marks the open session's path, so sessions take the other colours.
   const SESSION_COLORS = PROJECT_PALETTE.slice(1);
 
-  let tree = $state<ServiceInputTree | null>(null);
-  let loading = $state(false);
-  let error = $state(false);
+  const read = new TranscriptRead<ServiceInputTree>(
+    () => sessionId,
+    (id, signal) =>
+      fetchSessionInputTree(id, { signal }).catch((err: unknown) => {
+        if (!signal.aborted) console.error("failed to load input tree", err);
+        throw err;
+      }),
+  );
+  const tree = $derived(read.data);
+  const hasTree = $derived(tree !== null);
   let fold = $state(true);
-  // Folded runs the reader opened, by the index of their first input.
+  // Folded runs the reader opened, by the index of their first input. A
+  // re-read only adds inputs after them, so they stay open until the session
+  // changes.
   let expandedRuns = $state<ReadonlySet<number>>(new Set());
   let zoom = $state(1);
   // The card under the pointer or keyboard focus; its path is highlighted.
@@ -51,27 +61,8 @@
   } | null = null;
 
   $effect(() => {
-    const id = sessionId;
-    const controller = new AbortController();
-    tree = null;
-    loading = true;
-    error = false;
+    void sessionId;
     expandedRuns = new Set();
-
-    fetchSessionInputTree(id, { signal: controller.signal })
-      .then((next) => {
-        tree = next;
-      })
-      .catch((err: unknown) => {
-        if (controller.signal.aborted) return;
-        error = true;
-        console.error("failed to load input tree", err);
-      })
-      .finally(() => {
-        if (!controller.signal.aborted) loading = false;
-      });
-
-    return () => controller.abort();
   });
 
   const nodes = $derived(tree?.nodes ?? []);
@@ -112,13 +103,13 @@
   const hoverPath = $derived(inputGraphPathTo(layout, hoverKey));
   const hoverEdges = $derived(layout.edges.filter((edge) => hoverPath.has(edge.to)));
 
-  // Centre the focused card once the tree loads.
+  // Centre the focused card once the tree loads. A re-read after new inputs
+  // arrive leaves the reader's pan and zoom alone.
   $effect(() => {
     const view = viewport;
-    const loaded = tree;
-    if (!view || !loaded) return;
+    if (!view || !hasTree) return;
     void tick().then(() => {
-      if (viewport === view && tree === loaded) centerOn(focusItem);
+      if (viewport === view && hasTree) centerOn(focusItem);
     });
   });
 
@@ -399,9 +390,9 @@
       </span>
     </div>
 
-    {#if loading}
+    {#if read.loading}
       <div class="graph-state">{m.session_input_tree_loading()}</div>
-    {:else if error}
+    {:else if read.failed}
       <div class="graph-state error">{m.session_input_tree_error()}</div>
     {:else if tree && nodes.length === 0}
       <div class="graph-state">{m.session_input_tree_empty()}</div>
