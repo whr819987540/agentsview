@@ -5,9 +5,8 @@ import { currentRangeForBlock, searchBlock } from "./search-block.svelte.js";
 
 const cleanups: (() => void)[] = [];
 
-function setup(mounted = true) {
-  const root = document.createElement("div");
-  document.body.append(root);
+/** A rendered searchable block whose current range reports `readRect`. */
+function searchableBlock(readRect: () => DOMRect) {
   const block = document.createElement("pre");
   block.textContent = "needle";
   const cleanup = searchBlock("7:tool-output:0", () => ({
@@ -17,8 +16,15 @@ function setup(mounted = true) {
     occurrence: 0,
   }))(block)!;
   cleanups.push(cleanup);
-  const readRect = vi.fn(() => new DOMRect(80, 150, 100, 20));
   Object.defineProperty(currentRangeForBlock(block)!, "getBoundingClientRect", { value: readRect });
+  return { block, cleanup };
+}
+
+function setup(mounted = true) {
+  const root = document.createElement("div");
+  document.body.append(root);
+  const readRect = vi.fn(() => new DOMRect(80, 150, 100, 20));
+  const { block, cleanup } = searchableBlock(readRect);
   if (mounted) root.append(block);
   Object.defineProperties(root, {
     clientHeight: { value: 300 },
@@ -133,6 +139,35 @@ describe("revealMatch", () => {
     readRect.mockImplementation(() => new DOMRect(80, 150 - root.scrollTop, 100, 20));
     expect(await revealMatch(options)).toBe(true);
     expect(root.scrollTop).toBe(0);
+  });
+
+  it("mounts the row again when first measurements carry it out of the overscan", async () => {
+    const { root, block, options } = setup();
+    let frame = 0;
+    // TanStack compensates freshly measured rows against estimated starts, so
+    // the offset can run past the row right after the first pass reveals it.
+    options.nextFrame = vi.fn(async () => {
+      if (++frame === 2) block.remove();
+    });
+    const remounted = searchableBlock(() => new DOMRect(80, 150, 100, 20)).block;
+    options.mountMessage = vi.fn(async () => {
+      root.append(remounted);
+      return true;
+    });
+    expect(await revealMatch(options)).toBe(true);
+    expect(options.mountMessage).toHaveBeenCalledTimes(1);
+    expect(findSearchBlock(root, options.blockKey)).toBe(remounted);
+  });
+
+  it("abandons the reveal when the remounted row is still missing", async () => {
+    const { block, options } = setup();
+    let frame = 0;
+    options.nextFrame = vi.fn(async () => {
+      if (++frame === 2) block.remove();
+    });
+    options.mountMessage = vi.fn().mockResolvedValue(true);
+    expect(await revealMatch(options)).toBe(false);
+    expect(options.mountMessage).toHaveBeenCalledTimes(1);
   });
 
   it("stops correcting after the bounded settle budget expires", async () => {

@@ -253,6 +253,13 @@ The latest published release is
 
 **Bug fixes**
 
+- Find in a session no longer pulls the transcript back to the current match
+  when new messages arrive. Before, while find was open on a running session,
+  each live update could scroll you back to the match, even after you had
+  scrolled away to read the newest messages or turned on **Follow latest
+  messages**, so the page kept jumping. Find also lands on its first match in a
+  long transcript reliably; before, the page could reach the match and then
+  slide past it.
 - New messages in the open session appear as soon as they sync, whether the
   live update or the **Sync** button brings them in. Before, with **Follow
   latest messages** off, the transcript kept its old length until you scrolled
