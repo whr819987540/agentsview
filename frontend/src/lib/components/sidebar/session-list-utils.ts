@@ -5,6 +5,7 @@ export const ITEM_HEIGHT = 42;
 const CHILD_ITEM_HEIGHT = 34;
 const TEAM_HEADER_HEIGHT = 28;
 export const HEADER_HEIGHT = 28;
+export const FOLDER_HEADER_HEIGHT = 28;
 export const OVERSCAN = 10;
 export const STORAGE_KEY = "agentsview-group-by-agent";
 export const STORAGE_KEY_GROUP = "agentsview-group-mode";
@@ -19,12 +20,43 @@ export interface GroupSection {
 /** @deprecated Use GroupSection */
 export type AgentSection = GroupSection;
 
+/** A sidebar folder that groups one project's sessions. */
+export interface SidebarFolder {
+  id: number;
+  project: string;
+  name: string;
+}
+
+/**
+ * Where folders apply. In "project" mode every project section shows its
+ * folders; otherwise only a list filtered to one project does.
+ */
+export interface FolderView {
+  /** The filtered project when the list shows a single project. */
+  project: string | null;
+  /** Folders of each project in display order. */
+  foldersByProject: ReadonlyMap<string, readonly SidebarFolder[]>;
+  /** Folder of each filed session group, keyed by group key. */
+  groupFolder: ReadonlyMap<string, number>;
+  /** Folders whose sessions are shown. */
+  expanded: ReadonlySet<number>;
+}
+
 export interface DisplayItem {
   id: string;
-  type: "header" | "session" | "team-group" | "subagent-group";
+  type: "header" | "folder" | "session" | "team-group" | "subagent-group";
   label: string;
   count: number;
   group?: SessionGroup;
+  /** The folder a "folder" row stands for. */
+  folder?: SidebarFolder;
+  /** Extra indent levels: 1 for rows inside a folder. */
+  inset?: number;
+  /** Drop target for dragged sessions: a folder ID, or null for the
+   *  project's top level. Undefined where folders do not apply. */
+  dropFolderId?: number | null;
+  /** Project of the drop target, so a drop from another project is refused. */
+  dropProject?: string;
   /** Session groups represented by a collapsible section header. */
   sectionGroups?: SessionGroup[];
   /** Sessions represented by a collapsible child-group header. */
@@ -55,6 +87,35 @@ export function getInitialGroupMode(): GroupMode {
   // Legacy migration
   if (localStorage.getItem(STORAGE_KEY) === "true") return "agent";
   return "none";
+}
+
+/**
+ * Find the folder of each session group. A group follows the folder of its
+ * primary session, else of the first filed member. Folders of another
+ * project are ignored, so a session moved to a new project leaves its old
+ * project's folder.
+ */
+export function assignGroupFolders(
+  groups: SessionGroup[],
+  folderIdBySession: ReadonlyMap<string, number>,
+  folderProjects: ReadonlyMap<number, string>,
+): Map<string, number> {
+  const out = new Map<string, number>();
+  if (folderIdBySession.size === 0) return out;
+  for (const g of groups) {
+    const members = g.allSessions ?? g.sessions;
+    const primary = members.find((s) => s.id === g.primarySessionId) ?? g.sessions[0];
+    if (!primary) continue;
+    const candidates = [primary, ...members.filter((s) => s !== primary)];
+    for (const s of candidates) {
+      const folderId = folderIdBySession.get(s.id);
+      if (folderId !== undefined && folderProjects.get(folderId) === primary.project) {
+        out.set(g.key, folderId);
+        break;
+      }
+    }
+  }
+  return out;
 }
 
 /** Same head and status rules as buildSessionGroups. */
@@ -303,7 +364,9 @@ function emitGroupItems(
  * When mode is "none", produces a simple flat list.
  * Otherwise, interleaves header rows and session rows,
  * respecting collapsed groups. Continuation chains expand
- * inline when their group key is in expandedGroups.
+ * inline when their group key is in expandedGroups. Where folders
+ * apply, a project's folders come first, each followed by its
+ * sessions when expanded, then the project's unfiled sessions.
  */
 export function buildDisplayItems(
   groups: SessionGroup[],
@@ -311,11 +374,16 @@ export function buildDisplayItems(
   mode: GroupMode,
   collapsed: Set<string>,
   expandedGroups: Set<string>,
+  folders?: FolderView,
 ): DisplayItem[] {
   const y = { value: 0 };
 
   if (mode === "none") {
     const items: DisplayItem[] = [];
+    if (folders?.project) {
+      emitFolderedGroups(groups, folders.project, "", folders, expandedGroups, items, y);
+      return items;
+    }
     for (const g of groups) {
       emitGroupItems(g, "", expandedGroups, items, y);
     }
@@ -336,12 +404,96 @@ export function buildDisplayItems(
     y.value += HEADER_HEIGHT;
 
     if (!collapsed.has(section.label)) {
+      if (mode === "project" && folders) {
+        emitFolderedGroups(
+          section.groups,
+          section.label,
+          section.label,
+          folders,
+          expandedGroups,
+          items,
+          y,
+        );
+        continue;
+      }
       for (const g of section.groups) {
         emitGroupItems(g, section.label, expandedGroups, items, y);
       }
     }
   }
   return items;
+}
+
+/** Placement of a session group's rows in a folder-aware list. */
+interface FolderPlace {
+  inset?: number;
+  dropFolderId: number | null;
+  dropProject: string;
+}
+
+function emitPlacedGroupItems(
+  g: SessionGroup,
+  label: string,
+  expandedGroups: Set<string>,
+  items: DisplayItem[],
+  y: { value: number },
+  place: FolderPlace,
+): void {
+  const start = items.length;
+  emitGroupItems(g, label, expandedGroups, items, y);
+  for (let i = start; i < items.length; i++) Object.assign(items[i]!, place);
+}
+
+function emitFolderedGroups(
+  groups: SessionGroup[],
+  project: string,
+  label: string,
+  view: FolderView,
+  expandedGroups: Set<string>,
+  items: DisplayItem[],
+  y: { value: number },
+): void {
+  const projectFolders = view.foldersByProject.get(project) ?? [];
+  const byFolder = new Map<number, SessionGroup[]>(projectFolders.map((f) => [f.id, []]));
+  const unfiled: SessionGroup[] = [];
+  for (const g of groups) {
+    const folderId = view.groupFolder.get(g.key);
+    const bucket = folderId === undefined ? undefined : byFolder.get(folderId);
+    if (bucket) bucket.push(g);
+    else unfiled.push(g);
+  }
+
+  for (const folder of projectFolders) {
+    const folderGroups = byFolder.get(folder.id)!;
+    items.push({
+      id: `folder:${folder.id}`,
+      type: "folder",
+      label: folder.name,
+      count: folderGroups.length,
+      folder,
+      sectionGroups: folderGroups,
+      dropFolderId: folder.id,
+      dropProject: project,
+      height: FOLDER_HEADER_HEIGHT,
+      top: y.value,
+    });
+    y.value += FOLDER_HEADER_HEIGHT;
+    if (!view.expanded.has(folder.id)) continue;
+    for (const g of folderGroups) {
+      emitPlacedGroupItems(g, label, expandedGroups, items, y, {
+        inset: 1,
+        dropFolderId: folder.id,
+        dropProject: project,
+      });
+    }
+  }
+
+  for (const g of unfiled) {
+    emitPlacedGroupItems(g, label, expandedGroups, items, y, {
+      dropFolderId: null,
+      dropProject: project,
+    });
+  }
 }
 
 function displaySessionId(item: DisplayItem): string | null {
@@ -376,7 +528,7 @@ export function adjacentVisibleSessionId(
   if (current < 0) {
     current = displayItems.findIndex(
       (item) =>
-        item.type === "header" &&
+        (item.type === "header" || item.type === "folder") &&
         item.sectionGroups?.some((group) =>
           group.sessions.some((session) => session.id === activeSessionId),
         ),

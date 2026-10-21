@@ -6,6 +6,7 @@ import {
   HEADER_HEIGHT,
   STORAGE_KEY,
   adjacentVisibleSessionId,
+  assignGroupFolders,
   buildGroupSections,
   buildDisplayItems,
   computeTotalSize,
@@ -14,7 +15,7 @@ import {
   selectLiveId,
   selectPrimaryId,
 } from "./session-list-utils.js";
-import type { DisplayItem } from "./session-list-utils.js";
+import type { DisplayItem, FolderView, SidebarFolder } from "./session-list-utils.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -1057,5 +1058,171 @@ describe("selectLiveId", () => {
       ended_at: undefined,
     });
     expect(selectLiveId([a, b], "key")).toBe("b");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Folders
+// ---------------------------------------------------------------------------
+
+function projectGroup(id: string, project: string, extra: Session[] = []): SessionGroup {
+  const root = makeSession({ id, project });
+  const sessions = [root, ...extra];
+  return {
+    key: id,
+    project,
+    sessions,
+    primarySessionId: id,
+    liveSessionId: id,
+    totalMessages: 0,
+    firstMessage: root.first_message,
+    startedAt: root.started_at,
+    endedAt: root.ended_at,
+  };
+}
+
+function folderView(
+  folders: SidebarFolder[],
+  groupFolder: Record<string, number>,
+  options: { project?: string | null; expanded?: number[] } = {},
+): FolderView {
+  const foldersByProject = new Map<string, SidebarFolder[]>();
+  for (const f of folders) {
+    foldersByProject.set(f.project, [...(foldersByProject.get(f.project) ?? []), f]);
+  }
+  return {
+    project: options.project ?? null,
+    foldersByProject,
+    groupFolder: new Map(Object.entries(groupFolder)),
+    expanded: new Set(options.expanded ?? []),
+  };
+}
+
+/** Rows as short strings: "folder:Name(count)" or "session:id+inset". */
+function rowSummary(items: DisplayItem[]): string[] {
+  return items.map((item) => {
+    if (item.type === "folder") return `folder:${item.label}(${item.count})`;
+    if (item.type === "header") return `header:${item.label}`;
+    return `session:${item.group?.primarySessionId}+${item.inset ?? 0}`;
+  });
+}
+
+describe("assignGroupFolders", () => {
+  const folderProjects = new Map([
+    [1, "alpha"],
+    [2, "alpha"],
+    [3, "beta"],
+  ]);
+
+  it("places a group by its primary session before other members", () => {
+    const child = makeSession({ id: "a1-cont", project: "alpha" });
+    const groups = [projectGroup("a1", "alpha", [child])];
+    const bySession = new Map([
+      ["a1-cont", 2],
+      ["a1", 1],
+    ]);
+    expect(assignGroupFolders(groups, bySession, folderProjects)).toEqual(new Map([["a1", 1]]));
+  });
+
+  it("falls back to a filed member when the primary is unfiled", () => {
+    const child = makeSession({ id: "a1-cont", project: "alpha" });
+    const groups = [projectGroup("a1", "alpha", [child])];
+    expect(assignGroupFolders(groups, new Map([["a1-cont", 2]]), folderProjects)).toEqual(
+      new Map([["a1", 2]]),
+    );
+  });
+
+  it("ignores a folder from another project", () => {
+    const groups = [projectGroup("a1", "alpha")];
+    expect(assignGroupFolders(groups, new Map([["a1", 3]]), folderProjects)).toEqual(new Map());
+  });
+});
+
+describe("buildDisplayItems (folders)", () => {
+  const docs: SidebarFolder = { id: 1, project: "alpha", name: "Docs" };
+  const empty: SidebarFolder = { id: 2, project: "alpha", name: "Empty" };
+  const betaNotes: SidebarFolder = { id: 3, project: "beta", name: "Notes" };
+
+  it("lists a filtered project's folders before its unfiled sessions", () => {
+    const groups = [
+      projectGroup("a1", "alpha"),
+      projectGroup("a2", "alpha"),
+      projectGroup("a3", "alpha"),
+    ];
+    const view = folderView([docs, empty], { a2: 1 }, { project: "alpha" });
+
+    const items = buildDisplayItems(groups, [], "none", new Set(), new Set(), view);
+
+    expect(rowSummary(items)).toEqual([
+      "folder:Docs(1)",
+      "folder:Empty(0)",
+      "session:a1+0",
+      "session:a3+0",
+    ]);
+    expect(items.map((i) => i.dropFolderId)).toEqual([1, 2, null, null]);
+    expect(items.map((i) => i.dropProject)).toEqual(["alpha", "alpha", "alpha", "alpha"]);
+    expect(items.map((i) => i.top)).toEqual([0, 28, 56, 56 + ITEM_HEIGHT]);
+  });
+
+  it("shows an expanded folder's sessions indented inside it", () => {
+    const child = makeSession({ id: "a2-cont", project: "alpha" });
+    const groups = [projectGroup("a1", "alpha"), projectGroup("a2", "alpha", [child])];
+    const view = folderView([docs], { a2: 1 }, { project: "alpha", expanded: [1] });
+
+    const items = buildDisplayItems(groups, [], "none", new Set(), new Set(["a2"]), view);
+
+    expect(items.map((i) => [i.id, i.inset ?? 0, i.dropFolderId])).toEqual([
+      ["folder:1", 0, 1],
+      ["session:a2", 1, 1],
+      ["child:a2:a2-cont", 1, 1],
+      ["session:a1", 0, null],
+    ]);
+  });
+
+  it("puts each project's own folders inside its section", () => {
+    const groups = [projectGroup("a1", "alpha"), projectGroup("b1", "beta")];
+    const sections = buildGroupSections(groups, "project");
+    const view = folderView([docs, betaNotes], { a1: 1, b1: 3 }, { expanded: [3] });
+
+    const items = buildDisplayItems(
+      groups,
+      sections,
+      "project",
+      new Set(["alpha"]),
+      new Set(),
+      view,
+    );
+
+    expect(rowSummary(items)).toEqual([
+      "header:alpha",
+      "header:beta",
+      "folder:Notes(1)",
+      "session:b1+1",
+    ]);
+  });
+
+  it("leaves agent sections and an unfiltered list without folders", () => {
+    const groups = [projectGroup("a1", "alpha")];
+    const view = folderView([docs], { a1: 1 });
+
+    const flat = buildDisplayItems(groups, [], "none", new Set(), new Set(), view);
+    expect(rowSummary(flat)).toEqual(["session:a1+0"]);
+    expect(flat[0]!.dropFolderId).toBeUndefined();
+
+    const sections = buildGroupSections(groups, "agent");
+    const byAgent = buildDisplayItems(groups, sections, "agent", new Set(), new Set(), view);
+    expect(rowSummary(byAgent)).toEqual(["header:claude", "session:a1+0"]);
+  });
+
+  it("steps from a session hidden in a collapsed folder to the next row", () => {
+    const groups = [
+      projectGroup("a1", "alpha"),
+      projectGroup("a2", "alpha"),
+      projectGroup("a3", "alpha"),
+    ];
+    const view = folderView([docs], { a1: 1, a2: 1 }, { project: "alpha" });
+    const items = buildDisplayItems(groups, [], "none", new Set(), new Set(), view);
+
+    expect(adjacentVisibleSessionId(items, "a2", 1)).toBe("a3");
   });
 });

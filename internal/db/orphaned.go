@@ -1053,9 +1053,10 @@ func (d *DB) CopyExcludedSessionsFrom(
 
 // CopySessionMetadataFrom merges user-managed data from the
 // source DB into sessions that were re-synced into this DB.
-// This preserves display_name, deleted_at, starred_sessions, pinned_messages,
-// archive metadata, project identity observations, worktree project mappings,
-// and explicit session project assignments across full DB rebuilds. Immutable
+// This preserves display_name, deleted_at, starred_sessions, session folders,
+// pinned_messages, archive metadata, project identity observations, worktree
+// project mappings, and explicit session project assignments across full DB
+// rebuilds. Immutable
 // project snapshots are restored only from source versions that recorded
 // parser-source labels reliably.
 func (d *DB) CopySessionMetadataFrom(
@@ -1161,6 +1162,29 @@ func (d *DB) CopySessionMetadataFrom(
 				SELECT id FROM main.sessions
 			)`); err != nil {
 			return fmt.Errorf("copying starred sessions: %w", err)
+		}
+	}
+
+	// Copy sidebar folders with their IDs, then the memberships of sessions
+	// the fresh DB still holds (tables may not exist in older DBs).
+	if oldDBHasTable(ctx, tx, "session_folders") {
+		if _, err := tx.ExecContext(ctx, `
+			INSERT OR IGNORE INTO main.session_folders
+				(id, project, name, created_at, updated_at)
+			SELECT id, project, name, created_at, updated_at
+			FROM old_db.session_folders`); err != nil {
+			return fmt.Errorf("copying session folders: %w", err)
+		}
+		if oldDBHasTable(ctx, tx, "session_folder_members") {
+			if _, err := tx.ExecContext(ctx, `
+				INSERT OR IGNORE INTO main.session_folder_members
+					(session_id, folder_id, created_at)
+				SELECT session_id, folder_id, created_at
+				FROM old_db.session_folder_members
+				WHERE session_id IN (SELECT id FROM main.sessions)
+				  AND folder_id IN (SELECT id FROM main.session_folders)`); err != nil {
+				return fmt.Errorf("copying session folder members: %w", err)
+			}
 		}
 	}
 

@@ -11,6 +11,13 @@ The latest published release is
 
 **New features**
 
+- Sort a project's sessions into folders in the sidebar. Filter the sidebar to a
+  project or group it by project, create a folder with the **New folder**
+  button or a project header's right-click menu, then drag sessions onto it or
+  choose **Move to folder…**. Rename or delete a folder from its right-click
+  menu; deleting one returns its sessions to the project's list. Folders change
+  only how the sidebar lists sessions. They are saved in the local archive and
+  are not shown when serving from a PostgreSQL, ClickHouse, or DuckDB replica.
 - See where a conversation branched. When a session has forks or
   continuations, the session tree in the analysis panel has an **Inputs** view
   that shows every prompt in the fork family as one tree. Prompts the sessions share appear once, the tree

@@ -28,6 +28,7 @@ func (s *Server) registerTypedAPIRoutes() {
 	s.registerConfigRoutes()
 	s.registerSettingsRoutes()
 	s.registerStarredRoutes()
+	s.registerSessionFolderRoutes()
 	s.registerPinRoutes()
 	s.registerImportRoutes()
 	s.registerConversationExportRoutes()
