@@ -207,9 +207,9 @@ test.describe("live updates", () => {
   test("keeps a reader past the first thousand rows of a forked session in place", async ({
     page,
   }) => {
-    // A fork's reload starts over and publishes its first 1,000 rows before
-    // the rest arrive, which clamps the scroll position of a reader below them.
-    test.fail();
+    // A fork's reload starts over from its first row. Publishing the first
+    // 1,000 rows before the rest arrive would clamp the scroll position of a
+    // reader below them.
     const inherited = Array.from({ length: 600 }, (_, i) => transcriptRow(FORK_PARENT, i - 601));
     const boundary = {
       ...transcriptRow(FORK_SESSION, -1),

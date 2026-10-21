@@ -253,6 +253,12 @@ The latest published release is
 
 **Bug fixes**
 
+- Reading far down a forked session no longer throws you back when a new
+  message arrives. Before, each update briefly cut the transcript to its first
+  1,000 messages, so a reader below them landed near the 1,000th one instead.
+  The same could happen in a busy session when two syncs landed close together.
+  The transcript now keeps what you see until the updated copy has arrived in
+  full.
 - Jumping to a message puts it at the top of the transcript, whether you open
   a link to it, a search result, or a pin, use a list in the session analysis
   panel, or step through prompts with the keyboard. Before, the view could stop

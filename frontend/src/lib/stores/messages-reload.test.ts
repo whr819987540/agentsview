@@ -37,6 +37,13 @@ interface PageParams {
   expected_revision?: string;
 }
 
+/** What the list showed when the store made a request. */
+interface Shown {
+  rows: number;
+  first: number | undefined;
+  last: number | undefined;
+}
+
 function row(sessionId: string, ordinal: number): Message {
   return {
     has_context_tokens: false,
@@ -65,27 +72,30 @@ function ordinals(from: number, to: number): number[] {
 /**
  * A session served the way the backend pages it: ascending reads start at
  * `from` or the first row, every page names the transcript revision, and a
- * read bound to an older revision is refused with 409.
+ * read bound to an older revision is refused with 409. Every request also
+ * records what the store's list shows at that moment, so a test can check
+ * the list between the steps of a reload whichever requests the store makes.
  */
-function serve(rows: Message[], meta: { message_count: number; relationship_type?: string }) {
+function serve(
+  store: MessagesStore,
+  rows: Message[],
+  meta: { message_count: number; relationship_type?: string },
+) {
   const state = { rows, revision: 1, meta };
-  let hold: {
-    matches: (params: PageParams) => boolean;
-    arrived: () => void;
-    gate: Promise<void>;
-  } | null = null;
-  api.getSession.mockImplementation(async (id: string) => ({
-    id,
-    ...state.meta,
-    transcript_revision: String(state.revision),
-  }));
+  const shown: Shown[] = [];
+  const servedOrdinals: number[] = [];
+  const record = () =>
+    shown.push({
+      rows: store.messages.length,
+      first: store.messages[0]?.ordinal,
+      last: store.messages.at(-1)?.ordinal,
+    });
+  api.getSession.mockImplementation(async (id: string) => {
+    record();
+    return { id, ...state.meta, transcript_revision: String(state.revision) };
+  });
   api.getMessages.mockImplementation(async (_id: string, params: PageParams = {}) => {
-    if (hold?.matches(params)) {
-      const current = hold;
-      hold = null;
-      current.arrived();
-      await current.gate;
-    }
+    record();
     if (params.expected_revision && params.expected_revision !== String(state.revision)) {
       throw new ApiError(409, "transcript revision does not match");
     }
@@ -93,18 +103,17 @@ function serve(rows: Message[], meta: { message_count: number; relationship_type
     const page = state.rows
       .filter((message) => params.from === undefined || message.ordinal >= params.from)
       .slice(0, limit);
+    servedOrdinals.push(...page.map((message) => message.ordinal));
     return { messages: page, count: page.length, transcript_revision: String(state.revision) };
   });
   return {
     state,
-    /** Hold the next page request that matches until release is called. */
-    holdNext(matches: (params: PageParams) => boolean) {
-      let arrived!: () => void;
-      const arrival = new Promise<void>((resolve) => (arrived = resolve));
-      let release!: () => void;
-      const gate = new Promise<void>((resolve) => (release = resolve));
-      hold = { matches, arrived, gate };
-      return { arrived: arrival, release };
+    shown,
+    servedOrdinals,
+    /** Forget what earlier requests recorded. */
+    reset() {
+      shown.length = 0;
+      servedOrdinals.length = 0;
     },
   };
 }
@@ -125,11 +134,12 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-describe("a reload that has to start over", () => {
-  // The fallback reloads from the first page and publishes each page as it
-  // lands, so the list drops to 1,000 rows between pages and a reader below
-  // them loses their place (see e2e/transcript-reading-position.spec.ts).
-  it.fails("keeps a forked transcript whole while the fork's rows reload", async () => {
+describe("a reload of a transcript already on screen", () => {
+  // A reload that starts over reads the transcript from its first page. Showing
+  // each page as it lands would drop the list to 1,000 rows between pages, and
+  // a reader below them would lose their place (see
+  // e2e/transcript-reading-position.spec.ts).
+  it("keeps a forked transcript whole while the fork's rows reload", async () => {
     const inherited = ordinals(-601, -2).map((ordinal) => row("parent", ordinal));
     const boundary = {
       ...row("fork", -1),
@@ -138,55 +148,75 @@ describe("a reload that has to start over", () => {
       source_subtype: "fork_boundary",
     };
     const own = ordinals(0, 899).map((ordinal) => row("fork", ordinal));
-    const backend = serve([...inherited, boundary, ...own], {
+    const store = newStore();
+    const backend = serve(store, [...inherited, boundary, ...own], {
       message_count: 900,
       relationship_type: "fork",
     });
-    const store = newStore();
     await store.loadSession("fork");
     expect(store.messages).toHaveLength(1501);
 
-    // One new message syncs; every fork reload starts from the first page.
+    // One new message syncs, and the fork reloads.
     backend.state.rows = [...backend.state.rows, row("fork", 900)];
     backend.state.meta = { ...backend.state.meta, message_count: 901 };
     backend.state.revision++;
-    const secondPage = backend.holdNext((params) => params.from === 399);
-    const reload = store.reload();
-    await secondPage.arrived;
+    backend.reset();
+    await store.reload();
 
-    expect(store.messages.length, "rows on screen between pages").toBeGreaterThanOrEqual(1501);
-
-    secondPage.release();
-    await reload;
+    expect(backend.shown.length, "requests the reload made").toBeGreaterThan(1);
+    expect(
+      backend.shown.filter((s) => s.rows < 1501 || s.first !== -601 || s.last! < 899),
+      "requests that found the list cut short",
+    ).toEqual([]);
     expect(store.messages.map((message) => message.ordinal)).toEqual(ordinals(-601, 900));
   });
 
-  it.fails("keeps the transcript whole when the session count trails its rows", async () => {
+  it("keeps the transcript whole when the session count trails its rows", async () => {
+    const store = newStore();
     const backend = serve(
+      store,
       ordinals(0, 1499).map((ordinal) => row("live", ordinal)),
       { message_count: 1500 },
     );
-    const store = newStore();
     await store.loadSession("live");
     expect(store.messages).toHaveLength(1500);
 
     // The metadata read sees one new message and the row read sees two,
-    // because another sync landed between them. The refreshed window then
-    // ends past the count, and the store falls back to a full reload.
+    // because another sync landed between them.
     backend.state.rows = [...backend.state.rows, row("live", 1500), row("live", 1501)];
     backend.state.meta = { message_count: 1501 };
     backend.state.revision++;
-    let fromThousand = 0;
-    const fullReloadSecondPage = backend.holdNext(
-      (params) => params.from === 1000 && ++fromThousand === 2,
-    );
-    const reload = store.reload();
-    await fullReloadSecondPage.arrived;
+    backend.reset();
+    await store.reload();
 
-    expect(store.messages.length, "rows on screen between pages").toBeGreaterThanOrEqual(1500);
-
-    fullReloadSecondPage.release();
-    await reload;
+    expect(backend.shown.length, "requests the reload made").toBeGreaterThan(1);
+    expect(
+      backend.shown.filter((s) => s.rows < 1500 || s.first !== 0 || s.last! < 1499),
+      "requests that found the list cut short",
+    ).toEqual([]);
     expect(store.messages.map((message) => message.ordinal)).toEqual(ordinals(0, 1501));
+  });
+
+  it("takes rows that run past the session count without reading them again", async () => {
+    const store = newStore();
+    const backend = serve(
+      store,
+      ordinals(0, 1499).map((ordinal) => row("live", ordinal)),
+      { message_count: 1500 },
+    );
+    await store.loadSession("live");
+
+    backend.state.rows = [...backend.state.rows, row("live", 1500), row("live", 1501)];
+    backend.state.meta = { message_count: 1501 };
+    backend.state.revision++;
+    backend.reset();
+    await store.reload();
+
+    expect(store.messages.map((message) => message.ordinal)).toEqual(ordinals(0, 1501));
+    expect(store.messageCount, "count taken from the rows").toBe(1502);
+    // Starting over would read every row a second time.
+    expect(backend.servedOrdinals.length, "rows the reload read").toBe(
+      new Set(backend.servedOrdinals).size,
+    );
   });
 });
