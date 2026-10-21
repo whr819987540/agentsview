@@ -242,6 +242,48 @@ export async function wheel(page: Page, scroller: Locator, steps: number, deltaY
   for (let i = 0; i < steps; i++) await page.mouse.wheel(0, deltaY);
 }
 
+type HeldFrames = {
+  callbacks: Map<number, FrameRequestCallback>;
+  request: typeof requestAnimationFrame;
+  cancel: typeof cancelAnimationFrame;
+};
+
+/** Queue animation frame callbacks instead of running them, so work that
+ *  waits for a frame cannot go on until releaseAnimationFrames. */
+export async function holdAnimationFrames(page: Page) {
+  await page.evaluate(() => {
+    const win = window as Window & { __heldFrames?: HeldFrames };
+    const held: HeldFrames = {
+      callbacks: new Map(),
+      request: window.requestAnimationFrame.bind(window),
+      cancel: window.cancelAnimationFrame.bind(window),
+    };
+    let next = 1;
+    win.__heldFrames = held;
+    window.requestAnimationFrame = (callback) => {
+      const id = next++;
+      held.callbacks.set(id, callback);
+      return id;
+    };
+    window.cancelAnimationFrame = (id) => {
+      held.callbacks.delete(id);
+    };
+  });
+}
+
+/** Restore animation frames and run the callbacks held since holdAnimationFrames. */
+export async function releaseAnimationFrames(page: Page) {
+  await page.evaluate(() => {
+    const win = window as Window & { __heldFrames?: HeldFrames };
+    const held = win.__heldFrames;
+    if (!held) return;
+    delete win.__heldFrames;
+    window.requestAnimationFrame = held.request;
+    window.cancelAnimationFrame = held.cancel;
+    for (const callback of held.callbacks.values()) callback(performance.now());
+  });
+}
+
 /** Let late scroll work from an update land before checking it did not. */
 export async function frames(page: Page, count: number) {
   await page.evaluate(async (n) => {

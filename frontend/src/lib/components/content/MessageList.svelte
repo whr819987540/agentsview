@@ -32,7 +32,11 @@
     type ScrollAlign,
   } from "./message-scroll.js";
   import { m } from "../../i18n/index.js";
-  import { settleScrollAnchor, settleVirtualScroll } from "./staged-scroll.js";
+  import {
+    anchorScrollOffset,
+    settleScrollAnchor,
+    settleVirtualScroll,
+  } from "./staged-scroll.js";
   import { revealMatch } from "../../search/reveal.js";
   import type { Match } from "../../search/session-index.js";
   import {
@@ -1085,12 +1089,20 @@
     const holdsRow =
       displayItemsAsc[findAnchorIndexAsc(displayItemsAsc, held.ordinal)]
         ?.ordinals.includes(held.ordinal) ?? false;
+    const offsetPx = holdsRow ? held.offsetPx : 0;
+    const v = virtualizer.instance;
+    const target = v
+      ? anchorScrollOffset(v, anchorDisplayIndex(held.ordinal), offsetPx)
+      : null;
+    // A change that left the row in place, such as rows added below the
+    // reader, needs no hold, so nothing else scrolling now is pulled back.
+    if (target === null || Math.abs(currentScrollTop() - target) <= 1) return;
     const reqId = ++lastScrollRequest;
     // Rows that enter the viewport are measured over the next frames, so
     // keep the reader's row in place until the layout holds still.
     void settleScrollAnchor({
       resolveIndex: () => anchorDisplayIndex(held.ordinal),
-      offsetPx: holdsRow ? held.offsetPx : 0,
+      offsetPx,
       getVirtualizer: () => virtualizer.instance,
       getScrollTop: currentScrollTop,
       isCurrent: () => !destroyed && reqId === lastScrollRequest,

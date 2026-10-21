@@ -2,8 +2,11 @@ import { expect, test, type Locator, type Page, type Route } from "@playwright/t
 import {
   FakeTranscript,
   frames,
+  holdAnimationFrames,
   laidOutHeight,
   openTranscript,
+  readingPosition,
+  releaseAnimationFrames,
   routeSessionWatch,
   settledReadingPosition,
   transcriptRow,
@@ -189,6 +192,36 @@ test.describe("live updates", () => {
     await expect.poll(async () => (await visibleOrdinals(scroller))[0]).toBe(81);
   });
 
+  test("leaves the scroll position alone after an update that did not move the reader", async ({
+    page,
+  }) => {
+    const fake = FakeTranscript.withRows(LIVE_SESSION, 80);
+    await fake.install(page);
+    const watch = await routeSessionWatch(page, LIVE_SESSION);
+    const scroller = await openTranscript(page, `/sessions/${LIVE_SESSION}`);
+    await wheel(page, scroller, 10);
+    await settledReadingPosition(scroller);
+    const heightBefore = await laidOutHeight(scroller);
+
+    // With frames held, nothing that waits for a frame can run before the
+    // scroll below; rows appended below the reader leave them in place.
+    await holdAnimationFrames(page);
+    fake.append(3);
+    await watch.notifyUpdated();
+    await expect.poll(() => laidOutHeight(scroller)).toBeGreaterThan(heightBefore + 100);
+    // Something other than a reader gesture, such as find in page, moves the
+    // transcript back over rows that are already measured.
+    await scroller.evaluate((el) => {
+      el.scrollTop -= 1500;
+      el.dispatchEvent(new Event("scroll"));
+    });
+    const moved = await readingPosition(scroller);
+
+    await releaseAnimationFrames(page);
+    await frames(page, 10);
+    await expectSamePosition(scroller, moved);
+  });
+
   test("shows a message that synced before the watch connected", async ({ page }) => {
     // The server's watch reports changes after the moment it subscribes, so
     // a sync that lands between the transcript read and the subscription
@@ -204,13 +237,18 @@ test.describe("live updates", () => {
     await expect.poll(() => watches.length).toBe(1);
 
     fake.append(1);
+    const heightBefore = await laidOutHeight(scroller);
     // The real server subscribes now and sees no later change.
     await watches[0]!.continue();
+    await expect
+      .poll(() => laidOutHeight(scroller), { timeout: 10_000 })
+      .toBeGreaterThan(heightBefore + 50);
+    await frames(page, 10);
     await scroller.evaluate((el) => {
       el.scrollTop = el.scrollHeight;
       el.dispatchEvent(new Event("scroll"));
     });
-    await expect(scroller.getByText("Scroll anchor row 80.")).toBeVisible({ timeout: 10_000 });
+    await expect(scroller.getByText("Scroll anchor row 80.")).toBeVisible();
   });
 
   test("keeps a reader past the first thousand rows of a forked session in place", async ({

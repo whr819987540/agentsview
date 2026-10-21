@@ -78,6 +78,18 @@ export interface AnchorSettleOptions {
   maxFrames?: number;
 }
 
+/** The scroll offset that puts the viewport top `offsetPx` below the top of
+ *  the row at `index`, clamped to the scrollable range; null without a row. */
+export function anchorScrollOffset(
+  virtualizer: AnchorScrollTarget,
+  index: number,
+  offsetPx: number,
+): number | null {
+  const row = index >= 0 ? virtualizer.getOffsetForIndex(index, "start") : undefined;
+  if (!row) return null;
+  return Math.round(virtualizer.getOffsetForAlignment(row[0] + offsetPx, "start"));
+}
+
 /** Hold the viewport top `offsetPx` below the anchor row's top while row
  *  measurements land. Rows measured for the first time near the viewport move
  *  scrollTop, because TanStack compensates them against estimated starts, so a
@@ -91,13 +103,10 @@ export async function settleScrollAnchor(options: AnchorSettleOptions): Promise<
   for (let frame = 0; frame < maxFrames; frame++) {
     if (!options.isCurrent()) return false;
     const virtualizer = options.getVirtualizer();
-    const index = options.resolveIndex();
-    const row =
-      virtualizer && index >= 0 ? virtualizer.getOffsetForIndex(index, "start") : undefined;
-    if (!virtualizer || !row) return false;
-    const target = Math.round(
-      virtualizer.getOffsetForAlignment(row[0] + options.offsetPx, "start"),
-    );
+    const target = virtualizer
+      ? anchorScrollOffset(virtualizer, options.resolveIndex(), options.offsetPx)
+      : null;
+    if (!virtualizer || target === null) return false;
     if (Math.abs(options.getScrollTop() - target) > 1) {
       virtualizer.scrollToOffset(target, { align: "start" });
       stable = 0;
