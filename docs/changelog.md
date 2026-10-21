@@ -258,6 +258,12 @@ The latest published release is
   sidebar, and the transcript caught up only after you switched to another
   session and back. Messages that synced during a shorter outage could also be
   missed until the next change.
+- The **User inputs** list in the session analysis panel, the session tree's
+  **Inputs** view, and the full input tree diagram show new prompts as soon as
+  the transcript shows them, from a live update or **Sync**. Before, they kept
+  the inputs from when you opened the session until you switched to another
+  session and back or reloaded the page. The lists keep their scroll position,
+  and the diagram keeps its pan and zoom, when new inputs arrive.
 - Switching between sessions in one tab returns you to the line you were
   reading in each one. Before, each return could land several messages further
   down, and the gap grew with every switch. A session you open for the first

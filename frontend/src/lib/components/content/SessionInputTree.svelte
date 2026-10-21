@@ -11,6 +11,7 @@
   import { ui } from "../../stores/ui.svelte.js";
   import { formatNumber } from "../../utils/format.js";
   import { layoutInputTree } from "./input-tree.js";
+  import { TranscriptRead } from "./transcript-read.svelte.js";
 
   interface Props {
     sessionId: string;
@@ -18,34 +19,24 @@
 
   let { sessionId }: Props = $props();
 
-  let tree = $state<ServiceInputTree | null>(null);
-  let loading = $state(false);
-  let error = $state(false);
-  // Folded runs the reader opened, by the index of their first input.
+  const read = new TranscriptRead<ServiceInputTree>(
+    () => sessionId,
+    (id, signal) =>
+      fetchSessionInputTree(id, { signal }).catch((err: unknown) => {
+        if (!signal.aborted) console.error("failed to load input tree", err);
+        throw err;
+      }),
+  );
+  const tree = $derived(read.data);
+  const hasTree = $derived(tree !== null);
+  // Folded runs the reader opened, by the index of their first input. A
+  // re-read only adds inputs after them, so they stay open until the session
+  // changes.
   let expandedRuns = $state<ReadonlySet<number>>(new Set());
 
   $effect(() => {
-    const id = sessionId;
-    const controller = new AbortController();
-    tree = null;
-    loading = true;
-    error = false;
+    void sessionId;
     expandedRuns = new Set();
-
-    fetchSessionInputTree(id, { signal: controller.signal })
-      .then((next) => {
-        tree = next;
-      })
-      .catch((err: unknown) => {
-        if (controller.signal.aborted) return;
-        error = true;
-        console.error("failed to load input tree", err);
-      })
-      .finally(() => {
-        if (!controller.signal.aborted) loading = false;
-      });
-
-    return () => controller.abort();
   });
 
   const nodes = $derived(tree?.nodes ?? []);
@@ -75,15 +66,15 @@
 
   let listElement = $state<HTMLElement | null>(null);
 
-  // Bring the focused input into view when the tree loads or the selected
-  // input changes; opening a folded run leaves the scroll position alone.
+  // Bring the focused input into view when the tree loads or the focused
+  // input changes; opening a folded run or a re-read that keeps the focus
+  // leaves the scroll position alone.
   $effect(() => {
     const list = listElement;
-    const loaded = tree;
     const index = focusIndex;
-    if (!list || !loaded || index < 0) return;
+    if (!list || !hasTree || index < 0) return;
     void tick().then(() => {
-      if (listElement === list && tree === loaded && focusIndex === index) {
+      if (listElement === list && hasTree && focusIndex === index) {
         scrollFocusedIntoView(list);
       }
     });
@@ -176,9 +167,9 @@
   }
 </script>
 
-{#if loading}
+{#if read.loading}
   <div class="input-state">{m.session_input_tree_loading()}</div>
-{:else if error}
+{:else if read.failed}
   <div class="input-state error">{m.session_input_tree_error()}</div>
 {:else if tree && nodes.length === 0}
   <div class="input-state">{m.session_input_tree_empty()}</div>

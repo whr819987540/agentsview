@@ -17,6 +17,7 @@ vi.mock("../../api/inputOutline.js", () => ({
   fetchSessionInputOutline: mocks.fetchSessionInputOutline,
 }));
 
+import { messages } from "../../stores/messages.svelte.js";
 import { ui } from "../../stores/ui.svelte.js";
 import { m } from "../../i18n/index.js";
 // @ts-ignore
@@ -26,6 +27,14 @@ async function flush() {
   await tick();
   await Promise.resolve();
   await tick();
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((res) => {
+    resolve = res;
+  });
+  return { promise, resolve };
 }
 
 function makeItems(count: number) {
@@ -105,6 +114,7 @@ describe("SessionInputOutline", () => {
       component = undefined;
     }
     ui.setSessionInputOutlineHeight(240);
+    messages.clear();
     vi.restoreAllMocks();
     document.body.innerHTML = "";
   });
@@ -197,6 +207,104 @@ describe("SessionInputOutline", () => {
     expect(ui.selectedOrdinal).toBe(7);
     expect(ui.pendingScrollOrdinal).toBe(7);
     expect(ui.followLatest).toBe(false);
+  });
+
+  describe("following the transcript", () => {
+    beforeEach(() => {
+      messages.sessionId = "sess-1";
+      messages.loadedRevision = "1";
+    });
+
+    function mountOutline() {
+      component = mount(SessionInputOutline, {
+        target: document.body,
+        props: { sessionId: "sess-1" },
+      });
+    }
+
+    it("shows the inputs a sync adds when the transcript moves to a new revision", async () => {
+      mocks.fetchSessionInputOutline.mockResolvedValueOnce({
+        items: makeItems(1),
+        count: 1,
+      });
+      mountOutline();
+      await flush();
+      expect(document.body.textContent).toContain("prompt 0");
+      expect(document.body.textContent).not.toContain("prompt 1");
+
+      const reread = deferred<{ items: ReturnType<typeof makeItems>; count: number }>();
+      mocks.fetchSessionInputOutline.mockReturnValueOnce(reread.promise);
+      messages.loadedRevision = "2";
+      await flush();
+
+      // The current inputs stay on screen while the re-read is in flight.
+      expect(mocks.fetchSessionInputOutline).toHaveBeenCalledTimes(2);
+      expect(document.body.textContent).toContain("prompt 0");
+      expect(document.body.textContent).not.toContain(
+        m.session_input_outline_loading(),
+      );
+
+      reread.resolve({ items: makeItems(2), count: 2 });
+      await flush();
+      expect(document.body.textContent).toContain("prompt 1");
+    });
+
+    it("waits for the message list to land its rows before reading", async () => {
+      messages.loadedRevision = null;
+      messages.loading = true;
+      mocks.fetchSessionInputOutline.mockResolvedValue({
+        items: makeItems(1),
+        count: 1,
+      });
+      mountOutline();
+      await flush();
+
+      expect(mocks.fetchSessionInputOutline).not.toHaveBeenCalled();
+      expect(document.body.textContent).toContain(
+        m.session_input_outline_loading(),
+      );
+
+      messages.loadedRevision = "1";
+      messages.loading = false;
+      await flush();
+
+      expect(mocks.fetchSessionInputOutline).toHaveBeenCalledTimes(1);
+      expect(document.body.textContent).toContain("prompt 0");
+    });
+
+    it("does not read again when another session's transcript moves", async () => {
+      messages.sessionId = "other";
+      mocks.fetchSessionInputOutline.mockResolvedValue({
+        items: makeItems(1),
+        count: 1,
+      });
+      mountOutline();
+      await flush();
+
+      messages.loadedRevision = "2";
+      await flush();
+
+      expect(mocks.fetchSessionInputOutline).toHaveBeenCalledTimes(1);
+    });
+
+    it("keeps the inputs on screen when a re-read fails", async () => {
+      mocks.fetchSessionInputOutline.mockResolvedValueOnce({
+        items: makeItems(1),
+        count: 1,
+      });
+      mountOutline();
+      await flush();
+
+      mocks.fetchSessionInputOutline.mockRejectedValueOnce(new Error("boom"));
+      messages.loadedRevision = "2";
+      await flush();
+
+      expect(mocks.fetchSessionInputOutline).toHaveBeenCalledTimes(2);
+      expect(document.body.textContent).toContain("prompt 0");
+      expect(document.body.textContent).not.toContain(
+        m.session_input_outline_error(),
+      );
+    });
   });
 
   describe("height", () => {
@@ -349,6 +457,27 @@ describe("SessionInputOutline", () => {
       await flush();
 
       expect(getList().scrollTop).toBe(135);
+    });
+
+    it("leaves the list where the reader scrolled it when a re-read adds inputs", async () => {
+      messages.sessionId = "sess-1";
+      messages.loadedRevision = "1";
+      ui.selectedOrdinal = 18;
+      await mountOutline();
+      const list = getList();
+      expect(list.scrollTop).toBe(225);
+      list.scrollTop = 0;
+
+      mocks.fetchSessionInputOutline.mockResolvedValue({
+        items: makeItems(13),
+        count: 13,
+      });
+      messages.loadedRevision = "2";
+      await flush();
+      await tick();
+
+      expect(document.body.textContent).toContain("prompt 12");
+      expect(list.scrollTop).toBe(0);
     });
 
     it("leaves the list in place when the selected input is visible", async () => {

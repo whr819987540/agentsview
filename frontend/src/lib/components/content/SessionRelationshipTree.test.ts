@@ -30,6 +30,7 @@ vi.mock("../../api/inputTree.js", () => ({
 
 import { m } from "../../i18n/index.js";
 import { router } from "../../stores/router.svelte.js";
+import { messages } from "../../stores/messages.svelte.js";
 import { ui } from "../../stores/ui.svelte.js";
 // @ts-ignore
 import SessionRelationshipTree from "./SessionRelationshipTree.svelte";
@@ -232,6 +233,7 @@ describe("SessionRelationshipTree", () => {
     }
     ui.setSessionTreeHeight(280);
     ui.setSessionTreeView("sessions");
+    messages.clear();
     ui.activeModal = null;
     ui.clearScrollState();
     vi.restoreAllMocks();
@@ -344,6 +346,30 @@ describe("SessionRelationshipTree", () => {
       await flush();
       await flush();
     }
+
+    it("shows the inputs a sync adds when the transcript moves to a new revision", async () => {
+      messages.sessionId = "child";
+      messages.loadedRevision = "1";
+      await mountWithInputs();
+      expect(inputRow("fork input")).toBeDefined();
+      expect(inputRow("fork follow-up")).toBeUndefined();
+
+      const withFollowUp = makeInputTree([
+        ...makeInputTree().nodes,
+        inputNode(2, "child", 2, "fork follow-up", {
+          on_active_path: true,
+          active_ordinal: 2,
+          end_session_ids: ["child"],
+        }),
+      ]);
+      mocks.fetchSessionInputTree.mockResolvedValue(withFollowUp);
+      messages.loadedRevision = "2";
+      await flush();
+      await flush();
+
+      expect(mocks.fetchSessionInputTree).toHaveBeenCalledTimes(2);
+      expect(inputRow("fork follow-up")).toBeDefined();
+    });
 
     it("is offered only when the active session belongs to a fork family", async () => {
       const tree = makeTree();

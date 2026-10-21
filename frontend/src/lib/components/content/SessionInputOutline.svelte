@@ -9,6 +9,7 @@
   import { m } from "../../i18n/index.js";
   import { MessageSquareTextIcon, SquareTerminalIcon } from "../../icons.js";
   import { ui } from "../../stores/ui.svelte.js";
+  import { TranscriptRead } from "./transcript-read.svelte.js";
   import {
     SESSION_INPUT_OUTLINE_HEIGHT_MIN,
     SESSION_INPUT_OUTLINE_HEIGHT_STORAGE_MAX,
@@ -21,33 +22,13 @@
 
   let { sessionId }: Props = $props();
 
-  let items = $state<InputOutlineItem[]>([]);
-  let loading = $state(false);
-  let error = $state<string | null>(null);
-
-  $effect(() => {
-    const controller = new AbortController();
-    loading = true;
-    error = null;
-    items = [];
-
-    fetchSessionInputOutline(sessionId, {
-      includeForkContext: true,
-      signal: controller.signal,
-    })
-      .then((outline) => {
-        items = outline.items ?? [];
-      })
-      .catch((err: unknown) => {
-        if (controller.signal.aborted) return;
-        error = err instanceof Error ? err.message : String(err);
-      })
-      .finally(() => {
-        if (!controller.signal.aborted) loading = false;
-      });
-
-    return () => controller.abort();
-  });
+  const outline = new TranscriptRead(
+    () => sessionId,
+    (id, signal) =>
+      fetchSessionInputOutline(id, { includeForkContext: true, signal }),
+  );
+  const items = $derived<InputOutlineItem[]>(outline.data?.items ?? []);
+  const hasItems = $derived(items.length > 0);
 
   // Sizes below are CSS pixels (clientHeight/offsetHeight), not
   // getBoundingClientRect, which includes interface zoom.
@@ -92,18 +73,18 @@
   });
 
   // Keep the selected input visible when it changes or the outline loads,
-  // since the list may be scrolled away from it.
+  // since the list may be scrolled away from it. A re-read after new inputs
+  // arrive leaves the scroll position alone.
   $effect(() => {
     const list = listElement;
     const selected = ui.selectedOrdinal;
-    const loaded = items;
-    if (!list || selected === null || loaded.length === 0) return;
+    if (!list || selected === null || !hasItems) return;
     // Let the height limit settle against the measured panel first.
     void tick().then(() => {
       if (
         listElement === list &&
         ui.selectedOrdinal === selected &&
-        items === loaded
+        hasItems
       ) {
         scrollActiveItemIntoView(list);
       }
@@ -163,9 +144,9 @@
     {/if}
   </header>
 
-  {#if loading}
+  {#if outline.loading}
     <div class="outline-state">{m.session_input_outline_loading()}</div>
-  {:else if error}
+  {:else if outline.failed}
     <div class="outline-state error">{m.session_input_outline_error()}</div>
   {:else if items.length === 0}
     <div class="outline-state">{m.session_input_outline_empty()}</div>
