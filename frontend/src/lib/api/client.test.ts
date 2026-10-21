@@ -631,22 +631,25 @@ describe("watchSession", () => {
     expect(es.closed).toBe(false);
   });
 
-  it("refreshes once when the stream reconnects after dropping", () => {
+  it("refreshes once each time the stream connects", () => {
+    // The server reports only changes after it subscribes, so one that synced
+    // before the first connection, or while the stream was down, never arrives.
     const seen: string[] = [];
     watchSession("abc", () => seen.push("update"));
     const es = FakeEventSource.instances[0]!;
-
-    es.fireOpen();
     expect(seen).toEqual([]);
 
-    es.fireError();
-    es.fireError();
-    expect(seen).toEqual([]);
     es.fireOpen();
     expect(seen).toEqual(["update"]);
 
-    es.fireUpdate();
+    es.fireError();
+    es.fireError();
+    expect(seen).toEqual(["update"]);
+    es.fireOpen();
     expect(seen).toEqual(["update", "update"]);
+
+    es.fireUpdate();
+    expect(seen).toEqual(["update", "update", "update"]);
   });
 
   it("encodes the session ID as one URL path segment", () => {

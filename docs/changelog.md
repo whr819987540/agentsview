@@ -253,6 +253,11 @@ The latest published release is
 
 **Bug fixes**
 
+- An open session shows messages that synced while it was opening, such as the
+  final reply of an agent that had just finished. Before, they stayed hidden
+  until the session changed again. The live-update connection now refreshes
+  the session once when it first connects, as it already did after
+  reconnecting, and skips reading the messages again when nothing changed.
 - In newest-first order, new messages no longer push down the text you are
   reading. Before, each message that arrived while you were reading further
   down moved the transcript by that message's height. At the top of the list

@@ -191,11 +191,10 @@ test.describe("live updates", () => {
   });
 
   test("shows a message that synced before the watch connected", async ({ page }) => {
-    // The server's watch reports changes after the moment it subscribes, and
-    // the first connection does not refresh the transcript, so a sync that
-    // lands between the transcript read and the subscription never shows.
-    // A reconnect does refresh, which is why the stream here stays open.
-    test.fail();
+    // The server's watch reports changes after the moment it subscribes, so
+    // a sync that lands between the transcript read and the subscription
+    // shows only because the first connection refreshes the transcript. A
+    // reconnect refreshes too, which is why the stream here stays open.
     const fake = FakeTranscript.withRows(LIVE_SESSION, 80);
     await fake.install(page);
     const watches: Route[] = [];

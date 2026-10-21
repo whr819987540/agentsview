@@ -74,6 +74,8 @@ export class MessagesStore {
   private reloadPromise: Promise<void> | null = null;
   private reloadSessionId: string | null = null;
   private pendingReload: boolean = false;
+  // Settles when the session's first load lands or fails; a reload asked for before then waits for it.
+  private sessionLoad: Promise<void> | null = null;
   // Passes a moving transcript refused since the last outside reload request; bounded so a busy session can't reload forever.
   private revisionConflicts: number = 0;
   // Each window load takes a ticket when it starts; a replacement lands only if no later-started load already replaced the window.
@@ -126,6 +128,9 @@ export class MessagesStore {
     this.cancelledSessionId = null;
     this.loading = true;
     const owner = ++this.loadingOwner;
+    let settle!: () => void;
+    const sessionLoad = new Promise<void>((resolve) => (settle = resolve));
+    this.sessionLoad = sessionLoad;
 
     const generation = ++this.loadGeneration;
     const ac = new AbortController();
@@ -178,6 +183,8 @@ export class MessagesStore {
         this.loading = false;
         this.updateStableMainModelInfo();
       }
+      if (this.sessionLoad === sessionLoad) this.sessionLoad = null;
+      settle();
     }
   }
 
@@ -193,7 +200,8 @@ export class MessagesStore {
     if (!this.sessionId) return Promise.resolve();
 
     if (this.reloadPromise && this.reloadSessionId === this.sessionId) {
-      this.pendingReload = true;
+      // A reload still waiting for the first load has read nothing yet, so it covers this request too.
+      if (!this.sessionLoad) this.pendingReload = true;
       return this.reloadPromise;
     }
 
@@ -201,7 +209,17 @@ export class MessagesStore {
     this.reloadSessionId = id;
     this.reloading = true;
 
-    const promise = this.reloadNow(id).finally(async () => {
+    const firstLoad = this.sessionLoad;
+    const reloadWhenLoaded = async () => {
+      if (firstLoad) {
+        // A second load racing the first would read the transcript twice; reload once it lands instead.
+        await firstLoad;
+        // A session switch or a cancelled read dropped this reload while it waited.
+        if (this.reloadPromise !== promise) return;
+      }
+      await this.reloadNow(id);
+    };
+    const promise: Promise<void> = reloadWhenLoaded().finally(async () => {
       if (this.reloadPromise === promise) {
         this.reloadPromise = null;
         this.reloadSessionId = null;
@@ -264,6 +282,7 @@ export class MessagesStore {
     this.reloadPromise = null;
     this.reloadSessionId = null;
     this.pendingReload = false;
+    this.sessionLoad = null;
     this.loadOlderPromise = null;
   }
 
@@ -794,7 +813,10 @@ export class MessagesStore {
       const newCount = sess.message_count ?? 0;
       const oldCount = this.messageCount;
       let landed = true;
-      if (this.includeForkContext) {
+      if (sess.transcript_revision && sess.transcript_revision === this.loadedRevision) {
+        // The session still names the revision on screen, so its rows have not changed since
+        // they were read and need no second read. Read progress below still settles for them.
+      } else if (this.includeForkContext) {
         // Inherited context rows have negative ordinals, which the
         // ordinal-addressed window refresh cannot request.
         landed = await this.fullReload(id, signal);

@@ -1062,28 +1062,31 @@ describe("MessagesStore", () => {
       ]);
     });
 
-    it("ignores a continuation page that a reload overtook", async () => {
+    it("reloads after a first load whose continuation page was in flight", async () => {
       vi.mocked(api.getSession).mockResolvedValue(makeSession("s1", 1500));
       const second = createDeferred<MessagesResponse>();
       vi.mocked(api.getMessages)
         .mockResolvedValueOnce(page(range(0, 1000), "r1", "old"))
-        .mockReturnValueOnce(second.promise as ReturnType<typeof api.getMessages>);
+        .mockReturnValueOnce(second.promise as ReturnType<typeof api.getMessages>)
+        .mockResolvedValueOnce(page(range(0, 1000), "r2", "new"))
+        .mockResolvedValueOnce(page(range(1000, 1500), "r2", "new"));
       const load = messages.loadSession("s1");
       await vi.waitFor(() => expect(messages.messages).toHaveLength(1000));
 
-      vi.mocked(api.getMessages)
-        .mockResolvedValueOnce(page(range(0, 1000), "r2", "new"))
-        .mockResolvedValueOnce(page(range(1000, 1500), "r2", "new"));
-      await messages.reload();
-      expect(messages.loadedRevision).toBe("r2");
-
+      // The reload waits for the first load instead of reading alongside it.
+      const reload = messages.reload();
       second.resolve(page(range(1000, 1500), "r1", "old"));
       await load;
+      expect(messages.loadedRevision).toBe("r1");
+      expect(messages.messages).toHaveLength(1500);
+
+      await reload;
       expect(messages.loadedRevision).toBe("r2");
+      expect(messages.messages).toHaveLength(1500);
       expect(messages.messages.every((message) => message.content.startsWith("new"))).toBe(true);
     });
 
-    it("lets a reload outrank an initial load whose metadata read is still in flight", async () => {
+    it("reloads after a first load whose metadata read was in flight", async () => {
       const metadata = createDeferred<Session>();
       vi.mocked(api.getSession).mockReturnValueOnce(metadata.promise);
       const load = messages.loadSession("s1");
@@ -1092,17 +1095,20 @@ describe("MessagesStore", () => {
         ...makeSession("s1", 3),
         transcript_revision: "r2",
       });
-      vi.mocked(api.getMessages).mockResolvedValueOnce(page([0, 1, 2], "r2", "new"));
-      await messages.reload();
-      expect(messages.loadedRevision).toBe("r2");
-
-      // The stale metadata says the session is large, which would load only the newest page.
-      vi.mocked(api.getMessages).mockResolvedValueOnce(page([2, 1, 0], "r1", "old"));
+      // The stale metadata says the session is large, so the first load reads only the newest page.
+      vi.mocked(api.getMessages)
+        .mockResolvedValueOnce(page([2, 1, 0], "r1", "old"))
+        .mockResolvedValueOnce(page([0, 1, 2], "r2", "new"));
+      const reload = messages.reload();
       metadata.resolve({ ...makeSession("s1", 5_000), transcript_revision: "r1" });
       await load;
+      expect(messages.loadedRevision).toBe("r1");
+
+      await reload;
       expect(messages.loadedRevision).toBe("r2");
       expect(messages.activeSessionToken).toBe("r2");
       expect(messages.messages.every((message) => message.content.startsWith("new"))).toBe(true);
+      expect(vi.mocked(api.getMessages)).toHaveBeenCalledTimes(2);
     });
 
     it("serializes overlapping jumps into older history without duplicating rows", async () => {
@@ -1125,30 +1131,28 @@ describe("MessagesStore", () => {
       expect(ordinals[0]).toBeLessThanOrEqual(1500);
     });
 
-    it("ignores a delayed first page that a reload overtook", async () => {
+    it("reloads after a first load whose first page was in flight", async () => {
       vi.mocked(api.getSession)
         .mockResolvedValueOnce({ ...makeSession("s1", 3), transcript_revision: "r1" })
         .mockResolvedValue({ ...makeSession("s1", 3), transcript_revision: "r2" });
       const first = createDeferred<MessagesResponse>();
-      vi.mocked(api.getMessages).mockReturnValueOnce(
-        first.promise as ReturnType<typeof api.getMessages>,
-      );
+      vi.mocked(api.getMessages)
+        .mockReturnValueOnce(first.promise as ReturnType<typeof api.getMessages>)
+        .mockResolvedValueOnce(page([0, 1, 2], "r2", "new"));
       const load = messages.loadSession("s1");
       await vi.waitFor(() => expect(api.getMessages).toHaveBeenCalledTimes(1));
 
-      // A sync-triggered reload lands the newer transcript before the initial page returns.
-      vi.mocked(api.getMessages).mockResolvedValueOnce(page([0, 1, 2], "r2", "new"));
-      await messages.reload();
-      expect(messages.loadedRevision).toBe("r2");
-      const tokenAfterReload = messages.activeSessionToken;
-      expect(tokenAfterReload).toBe("r2");
-
+      // A sync-triggered reload waits for the initial page instead of reading alongside it.
+      const reload = messages.reload();
       first.resolve(page([0, 1, 2], "r1", "old"));
       await load;
+      expect(messages.loadedRevision).toBe("r1");
+      expect(messages.activeSessionToken).toBe("r1");
+
+      await reload;
       expect(messages.loadedRevision).toBe("r2");
       expect(messages.messages.every((message) => message.content.startsWith("new"))).toBe(true);
-      // The overtaken load keeps its stale read-progress token to itself.
-      expect(messages.activeSessionToken).toBe(tokenAfterReload);
+      expect(messages.activeSessionToken).toBe("r2");
     });
 
     it("replaces the window rather than merging rows from a new revision", async () => {

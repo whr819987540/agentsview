@@ -39,6 +39,7 @@ interface PageParams {
 
 /** What the list showed when the store made a request. */
 interface Shown {
+  request: "session" | "page";
   rows: number;
   first: number | undefined;
   last: number | undefined;
@@ -75,47 +76,83 @@ function ordinals(from: number, to: number): number[] {
  * read bound to an older revision is refused with 409. Every request also
  * records what the store's list shows at that moment, so a test can check
  * the list between the steps of a reload whichever requests the store makes.
+ * With `revisions: false` it answers like a backend that reports none.
  */
 function serve(
   store: MessagesStore,
   rows: Message[],
   meta: { message_count: number; relationship_type?: string },
+  { revisions = true } = {},
 ) {
   const state = { rows, revision: 1, meta };
   const shown: Shown[] = [];
   const servedOrdinals: number[] = [];
-  const record = () =>
+  const pageReads = { inFlight: 0, mostAtOnce: 0 };
+  let hold: {
+    matches: (params: PageParams) => boolean;
+    arrived: () => void;
+    gate: Promise<void>;
+  } | null = null;
+  const revision = () => (revisions ? String(state.revision) : "");
+  const record = (request: Shown["request"]) =>
     shown.push({
+      request,
       rows: store.messages.length,
       first: store.messages[0]?.ordinal,
       last: store.messages.at(-1)?.ordinal,
     });
   api.getSession.mockImplementation(async (id: string) => {
-    record();
-    return { id, ...state.meta, transcript_revision: String(state.revision) };
+    record("session");
+    return { id, ...state.meta, transcript_revision: revision() };
   });
   api.getMessages.mockImplementation(async (_id: string, params: PageParams = {}) => {
-    record();
-    if (params.expected_revision && params.expected_revision !== String(state.revision)) {
-      throw new ApiError(409, "transcript revision does not match");
+    record("page");
+    pageReads.mostAtOnce = Math.max(pageReads.mostAtOnce, ++pageReads.inFlight);
+    try {
+      if (hold?.matches(params)) {
+        const current = hold;
+        hold = null;
+        current.arrived();
+        await current.gate;
+      }
+      if (params.expected_revision && params.expected_revision !== revision()) {
+        throw new ApiError(409, "transcript revision does not match");
+      }
+      const limit = params.limit ?? 1000;
+      const page = state.rows
+        .filter((message) => params.from === undefined || message.ordinal >= params.from)
+        .slice(0, limit);
+      servedOrdinals.push(...page.map((message) => message.ordinal));
+      return { messages: page, count: page.length, transcript_revision: revision() };
+    } finally {
+      pageReads.inFlight--;
     }
-    const limit = params.limit ?? 1000;
-    const page = state.rows
-      .filter((message) => params.from === undefined || message.ordinal >= params.from)
-      .slice(0, limit);
-    servedOrdinals.push(...page.map((message) => message.ordinal));
-    return { messages: page, count: page.length, transcript_revision: String(state.revision) };
   });
   return {
     state,
     shown,
     servedOrdinals,
+    pageReads,
     /** Forget what earlier requests recorded. */
     reset() {
       shown.length = 0;
       servedOrdinals.length = 0;
     },
+    /** Hold the next page request that matches until release is called. */
+    holdNext(matches: (params: PageParams) => boolean) {
+      let arrived!: () => void;
+      const arrival = new Promise<void>((resolve) => (arrived = resolve));
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => (release = resolve));
+      hold = { matches, arrived, gate };
+      return { arrived: arrival, release };
+    },
   };
+}
+
+/** Let every request the store has queued reach the fake backend. */
+function settle() {
+  return new Promise<void>((resolve) => setTimeout(resolve, 0));
 }
 
 const stores: MessagesStore[] = [];
@@ -218,5 +255,80 @@ describe("a reload of a transcript already on screen", () => {
     expect(backend.servedOrdinals.length, "rows the reload read").toBe(
       new Set(backend.servedOrdinals).size,
     );
+  });
+});
+
+describe("a reload asked for while the session first loads", () => {
+  // The session watch asks for a reload as soon as it connects, which is
+  // usually while the transcript is still loading.
+  it("waits for the first load to land, then reloads once", async () => {
+    const store = newStore();
+    const backend = serve(
+      store,
+      ordinals(0, 1499).map((ordinal) => row("live", ordinal)),
+      { message_count: 1500 },
+    );
+    const secondPage = backend.holdNext((params) => params.from === 1000);
+    const load = store.loadSession("live");
+    await secondPage.arrived;
+    backend.reset();
+
+    const reloads = [store.reload(), store.reload()];
+    await settle();
+    expect(backend.pageReads.mostAtOnce, "page reads in flight at once").toBe(1);
+
+    secondPage.release();
+    await Promise.all([load, ...reloads]);
+    expect(backend.pageReads.mostAtOnce, "page reads in flight at once").toBe(1);
+    // One session read for both requests, made once the first load's rows were all on screen.
+    expect(backend.shown.filter((s) => s.request === "session")).toEqual([
+      { request: "session", rows: 1500, first: 0, last: 1499 },
+    ]);
+    expect(store.messages.map((message) => message.ordinal)).toEqual(ordinals(0, 1499));
+    expect(store.loading).toBe(false);
+  });
+});
+
+describe("a reload when the transcript has not changed", () => {
+  it("does not read rows again while the session names the revision on screen", async () => {
+    const store = newStore();
+    const backend = serve(
+      store,
+      ordinals(0, 2).map((ordinal) => row("live", ordinal)),
+      { message_count: 3 },
+    );
+    await store.loadSession("live");
+    const shownBefore = store.messages;
+    backend.reset();
+
+    await store.reload();
+
+    expect(backend.shown.map((s) => s.request)).toEqual(["session"]);
+    expect(store.messages).toBe(shownBefore);
+  });
+
+  it("reads the rows again when the backend reports no revision", async () => {
+    const store = newStore();
+    const backend = serve(
+      store,
+      ordinals(0, 2).map((ordinal) => row("live", ordinal)),
+      { message_count: 3 },
+      { revisions: false },
+    );
+    await store.loadSession("live");
+    backend.state.rows = [
+      { ...row("live", 0), content: "rewritten" },
+      ...backend.state.rows.slice(1),
+    ];
+    backend.reset();
+
+    await store.reload();
+
+    expect(backend.shown.map((s) => s.request)).toContain("page");
+    expect(store.messages.map((message) => message.content)).toEqual([
+      "rewritten",
+      "row 1",
+      "row 2",
+    ]);
   });
 });

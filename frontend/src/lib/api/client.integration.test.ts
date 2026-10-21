@@ -24,7 +24,8 @@ describe("generated session watch", () => {
     const onUpdate = vi.fn();
     const source = watchSession("session/one", onUpdate);
     try {
-      await vi.waitFor(() => expect(onUpdate).toHaveBeenCalledOnce());
+      // Once when the stream connects, and once for the delivered update.
+      await vi.waitFor(() => expect(onUpdate).toHaveBeenCalledTimes(2));
       expect(fetchMock).toHaveBeenCalledWith(
         "/api/v1/sessions/session%2Fone/watch",
         expect.objectContaining({ method: "GET" }),
