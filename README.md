@@ -61,9 +61,11 @@ Every build stays available as a `build-YYYYMMDD-<commit>` entry on the
 and download everything from that entry, so a push in the middle of an install
 cannot mix two builds.
 
-Pushes to other branches build the same kind of entry, but only `main` updates
-the rolling release, so installs and updates never pick up a branch build. To
-try one, download its binary under another name, for example:
+Other branches are built only on request. A maintainer builds the tip of a
+branch with `gh workflow run rolling-release.yml --ref <branch>`, which makes
+the same kind of entry. Only `main` updates the rolling release, so installs
+and updates never pick up a branch build. To try one, download its binary under
+another name, for example:
 
 ```bash
 curl -fL -o agentsview-test \
@@ -72,9 +74,7 @@ chmod +x agentsview-test
 ```
 
 Run it with a copy of your data directory, set through `AGENTSVIEW_DATA_DIR`,
-and another `--port`, so it leaves your installed daemon and archive alone. If
-a push does not start a build, a maintainer can build the tip of a branch with
-`gh workflow run rolling-release.yml --ref <branch>`.
+and another `--port`, so it leaves your installed daemon and archive alone.
 
 **Upstream stable release (macOS, Linux, Windows):**
 

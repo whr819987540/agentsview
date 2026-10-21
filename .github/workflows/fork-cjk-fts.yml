@@ -1,0 +1,55 @@
+name: Fork CJK FTS
+
+# The upstream CJK FTS workflow runs on a Namespace runner profile that exists
+# only in the upstream repository, so this fork skips its job. This workflow
+# runs the same check on a GitHub-hosted runner, for pull requests that change
+# the paths upstream filters on. Its steps mirror cjk-fts.yml; keep them and
+# the path list in sync when upstream changes how the check runs. It never
+# runs upstream.
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/cjk-fts.yml"
+      - ".github/workflows/fork-cjk-fts.yml"
+      - "Makefile"
+      - "internal/db/**"
+      - "internal/service/**"
+      - "internal/mcp/**"
+      - "scripts/build-simple-fts.sh"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  cjk-fts:
+    name: Go Test (CJK FTS sidecar)
+    if: github.repository != 'kenn-io/agentsview'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Restore pricing snapshot
+        run: go run ./internal/pricing/cmd/litellm-snapshot -restore
+
+      - name: Build pinned simple and cppjieba sidecar
+        run: bash scripts/build-simple-fts.sh dist/agentsview-simple
+
+      - name: Run database, service, and MCP tests with CJK FTS enabled
+        env:
+          AGENTSVIEW_SIMPLE_DIR: ${{ github.workspace }}/dist/agentsview-simple
+          CGO_ENABLED: "1"
+        run: go test -tags "fts5" ./internal/db ./internal/service ./internal/mcp -count=1 -timeout=20m

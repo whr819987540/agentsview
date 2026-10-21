@@ -22,8 +22,12 @@ on:
         required: false
         default: "10m"
 
+# This fork skips the weekly fuzzing. Every target is an upstream parser
+# that upstream already fuzzes on the same schedule. See
+# docs/fork/upstream-merge.md before removing the guard.
 jobs:
   fuzz:
+    if: github.repository == 'kenn-io/agentsview'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false

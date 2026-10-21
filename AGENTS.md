@@ -49,8 +49,9 @@ Before reviewing CI runner security, read the
 1. Watch GitHub Actions runs without being asked. Start right after every
    push, and again as soon as a pull request is opened, whether you or the
    user opened it. Watch every run for the head commit: the runs its push
-   started, such as the rolling release build, and the pull request's checks,
-   such as CI and fork checks. Local commits start no runs. Find the runs with
+   started, such as the rolling release build of `main`, and the pull
+   request's checks, such as CI and fork checks. Local commits start no runs.
+   Find the runs with
    `gh run list --branch <branch> --commit "$(git rev-parse HEAD)"`; the
    filter needs the full SHA, and new runs can take a few seconds to appear.
    Wait on each with `gh run watch <run-id> --exit-status` in the background

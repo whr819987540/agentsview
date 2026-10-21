@@ -22,9 +22,12 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# This fork does not publish macOS builds, so it skips the macOS-only
+# FSEvents tests. See docs/fork/upstream-merge.md before removing the guard.
 jobs:
   test-macos-fsevents:
     name: Go Test (macOS FSEvents)
+    if: github.repository == 'kenn-io/agentsview'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1

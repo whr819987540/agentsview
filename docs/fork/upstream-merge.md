@@ -11,10 +11,12 @@ Claude 活分支选择、Codex rollback、会话关系树、input outline、roll
 - 每次合并只产生一个合并提交。它的 message 集中记录 fork 的每个功能是保留、重做
   还是丢弃，以及原因。
 - 先在单独的合并分支上完成合并和验证，再把 `main` fast-forward 到合并分支并推送。
-  推送 `main` 会立即发布 rolling release。推送合并分支只构建一个 `build-*` 快照，
-  不更新 `latest`，可以先下载它的二进制测试；fast-forward 后，`main` 的构建会复用
-  这个快照。fork 的 lint 和测试（`fork-checks.yml`）只在 PR 上运行；想在发布前让
-  CI 跑一遍，可以先推送合并分支并开 PR，CI 通过后再 fast-forward。
+  推送 `main` 会立即发布 rolling release。推送合并分支不会自动构建；想先测试
+  二进制，就运行 `gh workflow run rolling-release.yml --ref <合并分支>`。它只
+  生成一个 `build-*` 快照，不更新 `latest`；fast-forward 后，`main` 的构建会复用
+  这个快照。fork 的 lint 和测试（`fork-checks.yml` 和 `fork-cjk-fts.yml`）只在
+  PR 上运行；想在发布前让 CI 跑一遍，可以先推送合并分支并开 PR，CI 通过后再
+  fast-forward。
 
 ## 步骤
 
@@ -115,8 +117,8 @@ Namespace runner 只有 upstream 有，fork 里用它的 job 会一直排队，�
 
 - `ci.yml` 和 `cjk-fts.yml` 的每个 job 加了
   `if: github.repository == 'kenn-io/agentsview'`，在 fork 里跳过。
-  `fork-checks.yml` 在 GitHub 托管 runner 上跑其中的 lint、Go、脚本、前端和 CJK
-  FTS 检查。
+  `fork-checks.yml` 在 GitHub 托管 runner 上跑其中的 lint、Go、脚本和前端检查，
+  `fork-cjk-fts.yml` 跑 CJK FTS 检查，并沿用 `cjk-fts.yml` 的路径过滤。
 - 桌面安装包（`desktop-artifacts.yml`、`desktop-artifacts-pr.yml` 和
   `.github/actions/build-desktop-artifact`）、`ci-macos-main.yml`、`fuzz.yml` 和
   `msys2-update-check.yml` 已经改用 GitHub 托管 runner。`msys2-update-check.yml`
@@ -132,6 +134,17 @@ PR 上的桌面构建通过 `desktop-artifacts-pr.yml` 调用 `desktop-artifacts
 一并跳过。这个跳过和 Namespace 无关；需要桌面安装包时，去掉这两处 `if` 即可，它们
 已经使用托管 runner。
 
+`ci-macos-main.yml`、`fuzz.yml` 和 `msys2-update-check.yml` 的 job 也加了同样的
+`if` 条件，在 fork 里跳过。这同样和 Namespace 无关，原因如下：
+
+- `ci-macos-main.yml`：fork 不发布 macOS 构建。
+- `fuzz.yml`：fuzz 的目标都是 upstream 的解析器，upstream 每周已经在跑同样的
+  fuzz。
+- `msys2-update-check.yml`：它提示 upstream 何时更新 `ci.yml` 里的 MSYS2 固定
+  版本。fork 不跑 `ci.yml`，合并 upstream 时会带上这些更新。
+
+需要其中某个检查时，去掉对应的 `if` 即可。
+
 upstream 从 #2236（`65006001`）起把所有 job 改到了 GitHub 托管 runner。合并到包含
 #2236 的 upstream 时：
 
@@ -139,8 +152,13 @@ upstream 从 #2236（`65006001`）起把所有 job 改到了 GitHub 托管 runne
    不再保留 `if` 条件；`.github/actionlint.yaml` 随 upstream 删除。
 1. 只要 fork 仍不需要桌面安装包，就在 upstream 版本的 `desktop-artifacts.yml` 和
    `desktop-macos-main.yml` 上重新加回 `build` job 的 `if` 条件。
-1. 删掉 `fork-checks.yml` 里和 upstream CI 重复的 job。整个 workflow 都重复时，
-   删掉这个文件，并更新上文"基本做法"里提到它的那句话。
+   `ci-macos-main.yml`、`fuzz.yml` 和 `msys2-update-check.yml` 也重新加回，除非
+   决定在 fork 里恢复这些检查。
+1. 删掉 `fork-checks.yml` 和 `fork-cjk-fts.yml` 里和 upstream CI 重复的 job。
+   整个 workflow 都重复时，删掉这个文件，并更新上文"基本做法"里提到它的那句话。
+   `fork-checks.yml` 前端 job 里的生产构建（`npm run build`）是 fork 加的；
+   upstream CI 没有这一步时，要把它保留下来，因为 Rolling Release 只构建
+   `main`。
 
 ### 多语言文件
 

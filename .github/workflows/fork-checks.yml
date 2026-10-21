@@ -1,11 +1,17 @@
 name: Fork Checks
 
-# The upstream CI and CJK FTS workflows run on Namespace runner profiles that
-# exist only in the upstream repository, so this fork skips their jobs. This
-# workflow runs the lint, Go, script, frontend, and CJK FTS checks on
-# GitHub-hosted runners instead. Its steps mirror ci.yml and cjk-fts.yml; keep
-# them in sync when upstream changes how those checks run. It never runs
-# upstream.
+# The upstream CI workflow runs on Namespace runner profiles that exist only
+# in the upstream repository, so this fork skips its jobs. This workflow runs
+# the lint, Go, script, and frontend checks on GitHub-hosted runners instead.
+# Its steps mirror ci.yml; keep them in sync when upstream changes how those
+# checks run. It never runs upstream.
+#
+# One step goes beyond ci.yml: the frontend job also runs the production
+# build. The rolling release builds only main, so without it a build that
+# type-checks but does not bundle would first fail after the merge. Like
+# ci.yml, it runs go vet only through make lint-ci, whose golangci-lint config
+# enables govet with the same fts5 tag. The CJK FTS check is in
+# fork-cjk-fts.yml, which keeps upstream's path filter.
 
 on:
   pull_request:
@@ -87,11 +93,6 @@ jobs:
 
       - name: Restore pricing snapshot
         run: go run ./internal/pricing/cmd/litellm-snapshot -restore
-
-      - name: Run go vet
-        run: go vet -tags "fts5" ./...
-        env:
-          CGO_ENABLED: "1"
 
       - name: Run Go tests
         run: go test -tags "fts5" ./... -count=1 -timeout=30m
@@ -207,29 +208,6 @@ jobs:
         run: npm test
         working-directory: frontend
 
-  cjk-fts:
-    name: Go Test (CJK FTS sidecar)
-    if: github.repository != 'kenn-io/agentsview'
-    runs-on: ubuntu-latest
-    timeout-minutes: 25
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
-        with:
-          go-version-file: go.mod
-
-      - name: Restore pricing snapshot
-        run: go run ./internal/pricing/cmd/litellm-snapshot -restore
-
-      - name: Build pinned simple and cppjieba sidecar
-        run: bash scripts/build-simple-fts.sh dist/agentsview-simple
-
-      - name: Run database, service, and MCP tests with CJK FTS enabled
-        env:
-          AGENTSVIEW_SIMPLE_DIR: ${{ github.workspace }}/dist/agentsview-simple
-          CGO_ENABLED: "1"
-        run: go test -tags "fts5" ./internal/db ./internal/service ./internal/mcp -count=1 -timeout=20m
+      - name: Production build
+        run: npm run build
+        working-directory: frontend
