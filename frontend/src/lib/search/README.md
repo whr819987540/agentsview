@@ -23,6 +23,14 @@ is pinned before older history arrives, so loading earlier pages does not change
 the selected occurrence. Explicit next/previous commands wrap at the ends of the
 results.
 
+The transcript scrolls to the current occurrence when the reader navigates: a
+new query, next/previous, a result row, or a filter or sort change. Afterwards,
+only rows inserted above the occurrence, such as older history, bring it back
+into view. Rows appended below it, such as a running session's new messages in
+oldest-first order, never scroll the transcript. Once the reader scrolls or
+turns on follow latest, moving rows do not scroll back to the occurrence until
+the next navigation.
+
 Enter, Shift+Enter, F3, Shift+F3, and the platform find-next shortcuts operate
 on the current input. A navigation request commits pending debounce text before
 choosing its target. Result rows from the previous query cannot navigate while a
@@ -82,6 +90,8 @@ and named groups. `matcher-equivalence.test.ts` and
 `session-index-cache.test.ts` cover Unicode offsets and prepared-text
 invalidation. Store recovery coverage is in `messages-history.test.ts` and
 `inSessionSearch-history.test.ts`. `ToolCallGroup-thinking.test.ts` covers
-grouped thinking and display ordering. Application browser cases are in
-`frontend/e2e/session-find.spec.ts` and
-`frontend/e2e/session-find-regressions.spec.ts`.
+grouped thinking and display ordering. `reveal.test.ts` covers bounded reveal
+settling, including remounting a row the virtualizer scrolled away. Application
+browser cases are in `frontend/e2e/session-find.spec.ts`,
+`frontend/e2e/session-find-regressions.spec.ts`, and
+`frontend/e2e/session-find-live-updates.spec.ts`.

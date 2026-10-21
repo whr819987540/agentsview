@@ -424,6 +424,7 @@
 
   function handleManualScrollIntent() {
     lastScrollRequest++;
+    searchRevealDetached = true;
     cancelRestoreWork();
     if (ui.followLatest) {
       cancelFollowLatestWork();
@@ -807,6 +808,23 @@
     return match ? `${match.ordinal}:${match.blockKey}:${match.occurrence}` : "";
   });
 
+  // Display row of the current match. Rows inserted above it, such as older
+  // history, move it; rows appended below it, such as live updates in
+  // oldest-first order, do not.
+  let searchMatchRow = $derived.by(() => {
+    const match = inSessionSearch.resolvedCurrent;
+    if (!match) return -1;
+    const ascIndex = displayItemsAsc.findIndex((item) => item.ordinals.includes(match.ordinal));
+    if (ascIndex < 0) return -1;
+    return ui.sortNewestFirst ? displayItemsAsc.length - 1 - ascIndex : ascIndex;
+  });
+
+  // The navigation the last reveal served, and the transcript it scrolled.
+  let lastSearchReveal: { target: string; root: HTMLElement } | null = null;
+  // Set once the reader scrolls after a reveal, so later row movement
+  // cannot pull the transcript back to the match.
+  let searchRevealDetached = false;
+
   async function revealSearchMatch(match: Match, sessionId: string, reqId: number): Promise<boolean> {
     return revealMatch({
       ordinal: match.ordinal,
@@ -834,21 +852,31 @@
     const request = inSessionSearch.navigationRevision;
     const key = searchRevealKey;
     const sessionId = messages.sessionId;
-    const count = displayItemsAsc.length;
+    const row = searchMatchRow;
     const newestFirst = ui.sortNewestFirst;
-    if (!inSessionSearch.isActive || !sessionId || !containerRef) return;
+    const root = containerRef;
+    if (!inSessionSearch.isActive || !sessionId || !root) return;
     if (!key) {
       // Active query without a renderable occurrence: drop any pending reveal
       // so a filtered-out block cannot be mounted or scrolled into view.
       lastScrollRequest++;
       return;
     }
-    void request;
-    void count;
-    void newestFirst;
+    void row;
     return untrack(() => {
       const match = inSessionSearch.resolvedCurrent;
       if (!match) return;
+      const target = `${sessionId}|${request}|${key}|${newestFirst}`;
+      const navigated =
+        lastSearchReveal?.target !== target || lastSearchReveal.root !== root;
+      lastSearchReveal = { target, root };
+      if (navigated) {
+        searchRevealDetached = false;
+      } else if (searchRevealDetached || ui.followLatest) {
+        // Only the match's row moved. A reader who scrolled away or now
+        // follows the latest message keeps their place.
+        return;
+      }
       const reqId = ++lastScrollRequest;
       activeFollowScrollRequest = null;
       ui.selectOrdinal(match.ordinal);

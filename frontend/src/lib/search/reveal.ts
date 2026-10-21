@@ -77,12 +77,25 @@ export async function revealMatch(options: RevealOptions): Promise<boolean> {
     revealInContainer(root!, () => targetRect(target), true, false, options.scrollToOffset);
   };
 
+  // Rows measured for the first time around a jump make the virtualizer shift
+  // the offset, which can carry the just-mounted row out of the overscan.
+  // Mount it again rather than abandoning the reveal off screen.
+  const locate = async (): Promise<HTMLElement | undefined> => {
+    const mounted = findSearchBlock(root!, options.blockKey);
+    if (mounted) return mounted;
+    if (!(await options.mountMessage()) || !options.isCurrent()) return undefined;
+    await options.afterUpdate();
+    await options.nextFrame();
+    if (!options.isCurrent() || options.getContainer() !== root) return undefined;
+    return findSearchBlock(root!, options.blockKey);
+  };
+
   settle(block);
 
   // One recheck covers virtual-row height changes after expanding a block.
   await options.nextFrame();
   if (!options.isCurrent() || options.getContainer() !== root) return false;
-  block = findSearchBlock(root, options.blockKey);
+  block = await locate();
   if (!block) return false;
   settle(block);
 
@@ -95,7 +108,7 @@ export async function revealMatch(options: RevealOptions): Promise<boolean> {
     await options.nextFrame();
     await options.nextFrame();
     if (!options.isCurrent() || options.getContainer() !== root) return false;
-    block = findSearchBlock(root, options.blockKey);
+    block = await locate();
     if (!block) return false;
     if (isRectVisibleIn(root, targetRect(block))) {
       visible = true;
