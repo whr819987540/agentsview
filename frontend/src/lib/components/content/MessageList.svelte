@@ -581,8 +581,7 @@
         resolveIndex: () => anchorDisplayIndex(anchor.ordinal),
         offsetPx: holdsAnchor() ? anchor.offsetPx : 0,
         getVirtualizer: () => virtualizer.instance,
-        getScrollTop: () =>
-          containerRef?.scrollTop ?? virtualizer.instance?.scrollOffset ?? 0,
+        getScrollTop: currentScrollTop,
         isCurrent: () => !destroyed && reqId === lastScrollRequest,
         nextFrame: raf,
       });
@@ -628,6 +627,10 @@
 
   function raf(): Promise<void> {
     return new Promise((r) => requestAnimationFrame(() => r()));
+  }
+
+  function currentScrollTop() {
+    return containerRef?.scrollTop ?? virtualizer.instance?.scrollOffset ?? 0;
   }
 
   /** Display index of the row holding `ordinal`, or -1 when no row holds it. */
@@ -678,7 +681,23 @@
 
       const idx = displayIndexOf(ordinal);
       if (idx < 0) return;
-      await scrollToDisplayIndex(idx, 0, 0, reqId, "start", targetHolds);
+      const landed = await scrollToDisplayIndex(idx, 0, 0, reqId, "start", targetHolds);
+      if (reqId !== lastScrollRequest) return;
+      if (!targetHolds()) return abandon();
+      if (!landed) return;
+      // The rows around the target are measured once it is on screen, and
+      // TanStack compensates them against estimated starts, which can carry
+      // the view rows away from it. Hold the target at the top until the
+      // layout holds still, as a session restore does.
+      await settleScrollAnchor({
+        resolveIndex: () => displayIndexOf(ordinal),
+        offsetPx: 0,
+        getVirtualizer: () => virtualizer.instance,
+        getScrollTop: currentScrollTop,
+        isCurrent: () =>
+          !destroyed && reqId === lastScrollRequest && targetHolds(),
+        nextFrame: raf,
+      });
       if (reqId === lastScrollRequest && !targetHolds()) abandon();
     } finally {
       if (activeScrollWork === reqId) activeScrollWork = null;
@@ -1069,8 +1088,7 @@
       resolveIndex: () => anchorDisplayIndex(held.ordinal),
       offsetPx: holdsRow ? held.offsetPx : 0,
       getVirtualizer: () => virtualizer.instance,
-      getScrollTop: () =>
-        containerRef?.scrollTop ?? virtualizer.instance?.scrollOffset ?? 0,
+      getScrollTop: currentScrollTop,
       isCurrent: () => !destroyed && reqId === lastScrollRequest,
       nextFrame: raf,
     });

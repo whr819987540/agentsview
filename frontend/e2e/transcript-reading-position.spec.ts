@@ -121,23 +121,16 @@ async function expectLinkLandsAtTop(page: Page, sessionId: string, ordinal: numb
 
 test.describe("jumps to a message", () => {
   test("puts a linked message at the top of a fully loaded transcript", async ({ page }) => {
-    // The jump scrolls to the target's offset once. The rows around it are
-    // then measured for the first time, and TanStack compensates each one
-    // against stale estimated starts, which leaves the view several rows off
-    // the target, often with the target off screen. Session restore holds
-    // its anchor through those measurements; jumps do not.
-    test.fail();
     const fake = FakeTranscript.withRows(OTHER_SESSION, 100);
     await fake.install(page);
-    // Whether a jump lands depends on the row heights around its target:
-    // row 60 lands today and row 30 does not. Both must.
+    // Whether a jump drifts depends on the row heights around its target, so
+    // check two targets.
     for (const ordinal of [60, 30]) await expectLinkLandsAtTop(page, OTHER_SESSION, ordinal);
   });
 
   test("puts a linked message near the top of the newest page at the top", async ({ page }) => {
-    // Lands near the top of the loaded rows, so the older page loads above
-    // it and carries the view away (see "older history" above).
-    test.fail();
+    // The jump lands near the top of the loaded rows, so older history loads
+    // above it while the target must stay put.
     const fake = FakeTranscript.withRows(PROGRESSIVE_SESSION, 5500);
     await fake.install(page);
     await expectLinkLandsAtTop(page, PROGRESSIVE_SESSION, 4510);

@@ -253,6 +253,11 @@ The latest published release is
 
 **Bug fixes**
 
+- Jumping to a message puts it at the top of the transcript, whether you open
+  a link to it, a search result, or a pin, use a list in the session analysis
+  panel, or step through prompts with the keyboard. Before, the view could stop
+  several messages away once the messages around it loaded, often with the
+  message you asked for off screen.
 - Scrolling up through a long session keeps you on the message you were
   reading while older messages load above it. Before, in a session with more
   than 3,000 messages, reaching the top of the loaded messages moved the view
