@@ -67,6 +67,14 @@ function message(id: string, content: string) {
 }
 
 test.describe("go to session", () => {
+  // The sidebar route below proxies every sidebar index request to the
+  // server, and each session navigation reloads the index. The last one can
+  // still be in flight when the test ends; let it finish before the page
+  // closes under it.
+  test.afterEach(async ({ page }) => {
+    await page.unrouteAll({ behavior: "wait" });
+  });
+
   test("opens by shortcut, resolves an off-list UUID, and preserves session state", async ({
     page,
   }, testInfo) => {
@@ -225,7 +233,9 @@ test.describe("go to session", () => {
     expect(await page.evaluate(() => window.history.length)).toBe(beforeTarget + 1);
     expect(await page.evaluate(() => window.location.search)).toBe("?desktop=1");
     expect(await page.evaluate(() => window.location.pathname)).toBe(TARGET_PATH);
-    expect(listResponses.length).toBeGreaterThan(0);
+    // The target's own data is mocked and can render before the sidebar
+    // index, which comes from the server, reaches the route handler.
+    await expect.poll(() => listResponses.length).toBeGreaterThan(0);
     expect(listResponses.every(({ ids }) => ids.every((id) => !id.includes(TARGET_UUID)))).toBe(true);
 
     await page.keyboard.press(`${modifier}+f`);

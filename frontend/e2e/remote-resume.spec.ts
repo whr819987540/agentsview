@@ -7,12 +7,15 @@ test.skip(
 );
 
 for (const width of [1280, 768, 400]) {
-  test(`remote copy menu and clipboard at ${width}`, async ({ page }, testInfo) => {
+  test(`remote copy menu and clipboard at ${width}`, async ({ page, baseURL }, testInfo) => {
     await page.setViewportSize({ width, height: 900 });
-    await page.context().grantPermissions(
-      ["clipboard-read", "clipboard-write"],
-      { origin: "http://127.0.0.1:8090" },
-    );
+    // The server listens on AGENTSVIEW_E2E_PORT, so take the origin from
+    // the configured base URL.
+    await page
+      .context()
+      .grantPermissions(["clipboard-read", "clipboard-write"], {
+        origin: new URL(baseURL!).origin,
+      });
     const session = {
       ...createMockSessions(1, "remote", () => "project")[0]!,
       id: "devbox1~claude:abc-123",
@@ -42,7 +45,7 @@ for (const width of [1280, 768, 400]) {
     });
     await page.route("**/api/v1/sessions/*/messages*", (route) => route.fulfill({ json: { messages: [], total: 0 } }));
     await page.route("**/api/v1/sessions/*/directory", (route) => route.fulfill({ json: { path: "" } }));
-    await page.goto(`http://127.0.0.1:8090/sessions/${encodeURIComponent(session.id)}`);
+    await page.goto(`/sessions/${encodeURIComponent(session.id)}`);
     await page.locator(".resume-btn").click();
     const menu = page.locator(".open-menu");
     await expect(menu).toBeVisible();

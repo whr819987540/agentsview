@@ -2623,9 +2623,7 @@ describe("SessionBreadcrumb", () => {
     await tick();
 
     document
-      .querySelector<HTMLButtonElement>(
-        'button[aria-label="Collapse visible blocks"]',
-      )!
+      .querySelector<HTMLButtonElement>('button[aria-label="Collapse visible blocks"]')!
       .click();
     await tick();
 
@@ -2637,9 +2635,7 @@ describe("SessionBreadcrumb", () => {
 
     ui.visibleBlocks = new Set<BlockType>(["assistant"]);
     document
-      .querySelector<HTMLButtonElement>(
-        'button[aria-label="Expand visible blocks"]',
-      )!
+      .querySelector<HTMLButtonElement>('button[aria-label="Expand visible blocks"]')!
       .click();
     await tick();
 
@@ -2652,4 +2648,45 @@ describe("SessionBreadcrumb", () => {
     unmount(component);
   });
 
+  it("issues bulk collapse and expand commands from the session actions menu", async () => {
+    // Narrow headers hide the bulk block buttons and show these menu items.
+    ui.visibleBlocks = new Set<BlockType>(["user", "tool"]);
+    const component = mount(SessionBreadcrumb, {
+      target: document.body,
+      props: {
+        session: makeSession("claude"),
+        onBack: () => {},
+      },
+    });
+    await tick();
+
+    async function chooseMenuItem(label: string) {
+      document.querySelector<HTMLButtonElement>(".actions-btn")!.click();
+      await tick();
+      const item = [...document.querySelectorAll<HTMLButtonElement>(".actions-menu-item")].find(
+        (button) => button.textContent?.trim() === label,
+      );
+      expect(item).toBeDefined();
+      item!.click();
+      await tick();
+    }
+
+    await chooseMenuItem("Collapse visible blocks");
+    expect(ui.bulkCollapseCommand).toMatchObject({
+      target: "collapsed",
+      visibleBlocks: ["user", "tool"],
+    });
+    expect(document.querySelector(".actions-menu")).toBeNull();
+    const collapseId = ui.bulkCollapseCommand!.id;
+
+    await chooseMenuItem("Expand visible blocks");
+    expect(ui.bulkCollapseCommand).toEqual({
+      id: collapseId + 1,
+      target: "expanded",
+      visibleBlocks: ["user", "tool"],
+    });
+    expect(document.querySelector(".actions-menu")).toBeNull();
+
+    await unmount(component);
+  });
 });

@@ -149,9 +149,13 @@ test.describe("Session Vital Signs", () => {
     await expect
       .poll(() => scroller.evaluate((element) => element.scrollTop), { timeout: 15_000 })
       .toBeGreaterThan(0);
+    // The User inputs outline in the analysis panel lists the same prompt,
+    // so look for it in the transcript. At the top of the transcript the
+    // prompt is cut off by the scroller's bottom edge; the jump shows it
+    // whole.
     await expect(
-      page.getByText("Confirm the slow path with the auth tests.", { exact: true }),
-    ).toBeInViewport();
+      scroller.getByText("Confirm the slow path with the auth tests.", { exact: true }),
+    ).toBeInViewport({ ratio: 1 });
     await page.screenshot({ path: testInfo.outputPath("turn-activity.png"), fullPage: true });
   });
 
