@@ -56,34 +56,16 @@ func NormalizeSessionFolderName(name string) (string, error) {
 // ordered by project and name.
 func (db *DB) ListSessionFolders(ctx context.Context) ([]SessionFolder, error) {
 	r := db.getReader()
-	rows, err := r.QueryContext(ctx, `
-		SELECT id, project, name, created_at, updated_at
-		FROM session_folders
-		ORDER BY project, name, id`)
+	folders, err := listSessionFolderRows(ctx, r)
 	if err != nil {
-		return nil, fmt.Errorf("listing session folders: %w", err)
+		return nil, err
 	}
-	var folders []SessionFolder
-	byID := map[int64]int{}
-	for rows.Next() {
-		var f SessionFolder
-		if err := rows.Scan(
-			&f.ID, &f.Project, &f.Name, &f.CreatedAt, &f.UpdatedAt,
-		); err != nil {
-			rows.Close()
-			return nil, fmt.Errorf("scanning session folder: %w", err)
-		}
-		f.SessionIDs = []string{}
-		byID[f.ID] = len(folders)
-		folders = append(folders, f)
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return nil, fmt.Errorf("listing session folders: %w", err)
-	}
-	rows.Close()
 	if len(folders) == 0 {
 		return []SessionFolder{}, nil
+	}
+	byID := make(map[int64]int, len(folders))
+	for i, f := range folders {
+		byID[f.ID] = i
 	}
 
 	members, err := r.QueryContext(ctx, `
@@ -106,6 +88,33 @@ func (db *DB) ListSessionFolders(ctx context.Context) ([]SessionFolder, error) {
 	}
 	if err := members.Err(); err != nil {
 		return nil, fmt.Errorf("listing session folder members: %w", err)
+	}
+	return folders, nil
+}
+
+func listSessionFolderRows(
+	ctx context.Context, r *readerHandle,
+) ([]SessionFolder, error) {
+	rows, err := r.QueryContext(ctx, `
+		SELECT id, project, name, created_at, updated_at
+		FROM session_folders
+		ORDER BY project, name, id`)
+	if err != nil {
+		return nil, fmt.Errorf("listing session folders: %w", err)
+	}
+	defer rows.Close()
+	var folders []SessionFolder
+	for rows.Next() {
+		f := SessionFolder{SessionIDs: []string{}}
+		if err := rows.Scan(
+			&f.ID, &f.Project, &f.Name, &f.CreatedAt, &f.UpdatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("scanning session folder: %w", err)
+		}
+		folders = append(folders, f)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("listing session folders: %w", err)
 	}
 	return folders, nil
 }
