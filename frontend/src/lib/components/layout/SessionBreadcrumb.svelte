@@ -1233,6 +1233,25 @@
         </button>
         {#if menuOpen}
           <div class="actions-menu" bind:this={menuEl}>
+            <!-- Narrow headers have no room for the bulk block buttons. -->
+            <button
+              class="actions-menu-item actions-menu-item--narrow"
+              onclick={() => {
+                ui.collapseVisibleBlocks();
+                closeMenu();
+              }}
+            >
+              {m.message_list_collapse_visible_blocks()}
+            </button>
+            <button
+              class="actions-menu-item actions-menu-item--narrow"
+              onclick={() => {
+                ui.expandVisibleBlocks();
+                closeMenu();
+              }}
+            >
+              {m.message_list_expand_visible_blocks()}
+            </button>
             <button
               class="actions-menu-item"
               onclick={startRename}
@@ -1852,6 +1871,10 @@
     background: var(--bg-surface-hover);
   }
 
+  .actions-menu-item--narrow {
+    display: none;
+  }
+
   .actions-menu-item.danger {
     color: var(--accent-red, #e55);
   }
@@ -1912,6 +1935,16 @@
 
     .usage-breakdown {
       display: none;
+    }
+
+    /* The badges and actions overflow the header here, so the bulk block
+       buttons move into the session actions menu. */
+    .bulk-block-btn {
+      display: none;
+    }
+
+    .actions-menu-item--narrow {
+      display: block;
     }
   }
 

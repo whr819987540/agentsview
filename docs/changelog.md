@@ -439,6 +439,12 @@ The latest published release is
   jump into a fork or subagent hidden inside a collapsed group, or step past a
   child row you had expanded. Sessions inside a collapsed group, section, or
   folder are skipped until you expand it.
+- The buttons at the right end of the session header stay inside the window on
+  narrow screens. Before, at widths such as 768 px or a 400 px phone, with
+  reasoning effort shown beside the model, the last buttons ran past the
+  window's edge and the session actions menu button was cut off. At 900 px wide
+  and below, **Collapse visible blocks** and **Expand visible blocks** now sit
+  in the session actions menu instead of the header.
 
 ## 0.44.0
 
