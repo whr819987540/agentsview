@@ -28,6 +28,8 @@ export { default as FileIcon } from "@lucide/svelte/icons/file";
 export { default as FileTextIcon } from "@lucide/svelte/icons/file-text";
 export { default as FileXIcon } from "@lucide/svelte/icons/file-x";
 export { default as FolderIcon } from "@lucide/svelte/icons/folder";
+export { default as FolderOpenIcon } from "@lucide/svelte/icons/folder-open";
+export { default as FolderPlusIcon } from "@lucide/svelte/icons/folder-plus";
 export { default as FunnelIcon } from "@lucide/svelte/icons/funnel";
 export { default as GlobeIcon } from "@lucide/svelte/icons/globe";
 export { default as Grid2x2Icon } from "@lucide/svelte/icons/grid-2x2";

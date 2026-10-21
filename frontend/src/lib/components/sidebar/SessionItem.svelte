@@ -10,6 +10,7 @@
     readProgress,
   } from "../../stores/read-progress.svelte.js";
   import { starred } from "../../stores/starred.svelte.js";
+  import { sessionFolders } from "../../stores/sessionFolders.svelte.js";
   import { formatRelativeTime, truncate } from "../../utils/format.js";
   import { agentColor as getAgentColor, agentLabel, entrypointBadge } from "../../utils/agents.js";
   import {
@@ -29,6 +30,8 @@
   import { router } from "../../stores/router.svelte.js";
   import { sync } from "../../stores/sync.svelte.js";
   import ProjectTypeahead from "../layout/ProjectTypeahead.svelte";
+  import SessionFolderPicker from "./SessionFolderPicker.svelte";
+  import { endSessionDrag, startSessionDrag } from "./session-drag.js";
 
   interface Props {
     session: SessionGroupInput;
@@ -66,6 +69,11 @@
     selectMode?: boolean;
     /** Whether this item is currently selected in multi-select mode. */
     selected?: boolean;
+    /** Sessions this row files into a folder, primary first. Set on
+     * root rows; enables dragging and "Move to folder". */
+    folderSessionIds?: string[];
+    /** Extra indent levels, 1 inside a folder. */
+    inset?: number;
   }
 
   let {
@@ -85,7 +93,11 @@
     hasTeammates = false,
     selectMode = false,
     selected = false,
+    folderSessionIds,
+    inset = 0,
   }: Props = $props();
+
+  let canFile = $derived(!!folderSessionIds && sessionFolders.editable);
 
   let sessionStatus = $derived(
     getSessionStatus(statusSession ?? session, groupSessions),
@@ -198,6 +210,7 @@
 
   // Context menu state
   let contextMenu: { x: number; y: number } | null = $state(null);
+  let folderPicker: { x: number; y: number } | null = $state(null);
   let projectEditor: { x: number; y: number } | null = $state(null);
   let targetProject = $state("");
   let projectSaving = $state(false);
@@ -273,6 +286,22 @@
     } finally {
       projectSaving = false;
     }
+  }
+
+  function openFolderPicker(e: MouseEvent) {
+    e.stopPropagation();
+    const origin = contextMenu;
+    if (!origin) return;
+    folderPicker = { x: origin.x, y: origin.y };
+    closeContextMenu();
+  }
+
+  function handleDragStart(e: DragEvent) {
+    if (!canFile || !folderSessionIds) return;
+    startSessionDrag(e, {
+      project: session.project,
+      sessionIds: folderSessionIds,
+    });
   }
 
   function startRename() {
@@ -403,7 +432,10 @@
   role="button"
   aria-current={isActive ? "page" : undefined}
   tabindex="0"
-  style:padding-left="{8 + depth * 16}px"
+  style:padding-left="{8 + depth * 16 + inset * 14}px"
+  draggable={canFile && !renaming ? "true" : undefined}
+  ondragstart={handleDragStart}
+  ondragend={endSessionDrag}
   onclick={handleRowClick}
   onkeydown={(e) => {
     if (e.target !== e.currentTarget) {
@@ -488,6 +520,7 @@
       <a
         class="session-info-link"
         href={sessionHref}
+        draggable={canFile ? "false" : undefined}
         onclick={handleSessionClick}
       >
         <div
@@ -583,6 +616,11 @@
         {m.sidebar_row_change_project()}
       </button>
     {/if}
+    {#if canFile}
+      <button class="context-menu-item" onclick={openFolderPicker}>
+        {m.sidebar_row_move_to_folder()}
+      </button>
+    {/if}
     <button
       class="context-menu-item"
       onclick={() => {
@@ -596,6 +634,16 @@
       {m.sidebar_row_delete()}
     </button>
   </div>
+{/if}
+
+{#if folderPicker && folderSessionIds}
+  <SessionFolderPicker
+    x={folderPicker.x}
+    y={folderPicker.y}
+    project={session.project}
+    sessionIds={folderSessionIds}
+    onclose={() => (folderPicker = null)}
+  />
 {/if}
 
 {#if projectEditor}

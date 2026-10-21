@@ -1833,6 +1833,8 @@ var readOnlyRequiredTables = []string{
 	"insights",
 	"pinned_messages",
 	"starred_sessions",
+	"session_folders",
+	"session_folder_members",
 	"excluded_sessions",
 	"worktree_project_mappings",
 	"session_project_assignments",

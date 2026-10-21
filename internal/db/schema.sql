@@ -732,6 +732,29 @@ CREATE TABLE IF NOT EXISTS starred_sessions (
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
+-- Session folders: user-made folders that group one project's sessions in
+-- the sidebar. They change how the sidebar lists sessions, not the sessions.
+CREATE TABLE IF NOT EXISTS session_folders (
+    id         INTEGER PRIMARY KEY,
+    project    TEXT NOT NULL,
+    name       TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    UNIQUE(project, name)
+);
+
+-- A session sits in at most one folder. Deleting the session or the folder
+-- removes its row, which returns the session to the project's top level.
+CREATE TABLE IF NOT EXISTS session_folder_members (
+    session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+    folder_id  INTEGER NOT NULL REFERENCES session_folders(id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
+-- Backs the ON DELETE CASCADE from session_folders(id).
+CREATE INDEX IF NOT EXISTS idx_session_folder_members_folder
+    ON session_folder_members(folder_id);
+
 -- Excluded sessions: tracks session IDs that were permanently
 -- deleted by the user so the sync engine does not re-import them.
 CREATE TABLE IF NOT EXISTS excluded_sessions (

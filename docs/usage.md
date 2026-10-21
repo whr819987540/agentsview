@@ -418,6 +418,37 @@ collapsible sections by agent type. Each agent group shows a color-coded dot,
 agent name, and session count. Click an agent header to expand or collapse its
 section. Groups start collapsed when first enabled.
 
+### Session Folders
+
+Sort a project's sessions into folders in the sidebar. Folders change only how
+the sidebar lists sessions: a session keeps its project and its data, and
+deleting a folder never deletes a session. Session folders are unreleased.
+
+Folders appear when the sidebar shows sessions by project: filter the list to
+one project, or turn on **Group by project**. Each project lists its folders
+first, then the sessions that are in no folder. Folders start collapsed; click a
+folder to open it. The sidebar remembers the folders you opened in this
+browser.
+
+1. Create a folder with the **New folder** button in the sidebar header while
+   the list is filtered to a project. When grouping by project, right-click the
+   project's header instead. Type a name and press Enter.
+1. Move a session by dragging its row onto a folder, or right-click the session
+   and choose **Move to folder…**. The picker can also create a folder, and
+   **No folder** takes the session out of its folder. Dropping a session on a
+   row outside any folder also takes it out. A session's continuations and
+   subagents move with it.
+1. Rename a folder by double-clicking it or from its right-click menu. Folder
+   names are unique within a project.
+1. Delete a folder from its right-click menu. Its sessions return to the
+   project's list.
+
+A session sits in at most one folder, and only in a folder of its own project.
+If you change a session's project, it no longer shows in its old project's
+folder. Folders are saved in the SQLite archive, so they survive restarts and
+full resyncs. PostgreSQL, ClickHouse, and DuckDB replicas do not carry folders:
+a sidebar served from a replica shows no folders and cannot create them.
+
 ### Sub-Agent Tree
 
 When a session spawns sub-agents or teams, the sidebar organizes them in a

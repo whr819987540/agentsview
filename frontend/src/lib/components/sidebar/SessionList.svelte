@@ -1,16 +1,20 @@
 <script lang="ts">
-  import { onDestroy, onMount } from "svelte";
+  import { onDestroy, onMount, tick } from "svelte";
+  import { showFlash } from "@kenn-io/kit-ui";
   import { m } from "../../i18n/index.js";
-  import { sessions } from "../../stores/sessions.svelte.js";
+  import { sessions, type SessionGroup } from "../../stores/sessions.svelte.js";
   import { ui } from "../../stores/ui.svelte.js";
   import { starred } from "../../stores/starred.svelte.js";
+  import { sessionFolders } from "../../stores/sessionFolders.svelte.js";
   import SessionItem from "./SessionItem.svelte";
+  import SessionFolderRow from "./SessionFolderRow.svelte";
   import SessionFilterControl from "../filters/SessionFilterControl.svelte";
   import SidebarToggleButton from "../layout/SidebarToggleButton.svelte";
   import {
     ChevronDownIcon,
     ChevronRightIcon,
     FolderIcon,
+    FolderPlusIcon,
     UserRoundIcon,
     UsersRoundIcon,
   } from "../../icons.js";
@@ -20,12 +24,14 @@
   import { registerSessionList } from "../../utils/arrow-target.js";
   import {
     type DisplayItem,
+    type FolderView,
     type GroupMode,
     ITEM_HEIGHT,
     OVERSCAN,
     STORAGE_KEY_GROUP,
     getInitialGroupMode,
     adjacentVisibleSessionId,
+    assignGroupFolders,
     buildGroupSections,
     buildDisplayItems,
     computeTotalSize,
@@ -34,6 +40,22 @@
     selectLiveId,
     selectPrimaryId,
   } from "./session-list-utils.js";
+  import { endSessionDrag, sessionDragFor } from "./session-drag.js";
+
+  const EXPANDED_FOLDERS_KEY = "agentsview-sidebar-expanded-folders";
+
+  function readExpandedFolders(): Set<number> {
+    try {
+      const raw = localStorage?.getItem(EXPANDED_FOLDERS_KEY);
+      const ids = raw ? JSON.parse(raw) : [];
+      if (Array.isArray(ids)) {
+        return new Set(ids.filter((id): id is number => Number.isInteger(id)));
+      }
+    } catch {
+      // Corrupt or unavailable storage: start with folders collapsed.
+    }
+    return new Set();
+  }
 
   let containerRef: HTMLDivElement | undefined = $state(undefined);
   let scrollTop = $state(0);
@@ -50,6 +72,12 @@
   let collapseAll = $state(getInitialGroupMode() !== "none");
   // Track which continuation chains are expanded.
   let expandedGroups: Set<string> = $state(new Set());
+  // Folders start collapsed; the expanded ones are remembered per browser.
+  let expandedFolders: Set<number> = $state(readExpandedFolders());
+  let renamingFolderId: number | null = $state(null);
+  // Folder a dragged session would land in; null is the project top level.
+  let dropTarget: number | null | undefined = $state(undefined);
+  let projectMenu: { x: number; y: number; project: string } | null = $state(null);
   let detachSidebar: (() => void) | null = null;
 
   function navigateVisibleSession(delta: number) {
@@ -62,6 +90,7 @@
   }
 
   onMount(() => {
+    void sessionFolders.load();
     detachSidebar = sessions.attachSidebar();
     const element = containerRef;
     if (!element) return;
@@ -126,9 +155,38 @@
     return all;
   });
 
+  // Folders show in project sections, or when the list is filtered to
+  // one project.
+  let folderProject = $derived(
+    groupMode === "none" ? sessions.filters.project || null : null,
+  );
+  let folderView: FolderView | undefined = $derived.by(() => {
+    if (groupMode !== "project" && folderProject === null) return undefined;
+    const folderProjects = new Map(
+      sessionFolders.folders.map((f) => [f.id, f.project]),
+    );
+    return {
+      project: folderProject,
+      foldersByProject: sessionFolders.foldersByProject,
+      groupFolder: assignGroupFolders(
+        groups,
+        sessionFolders.folderIdBySession,
+        folderProjects,
+      ),
+      expanded: expandedFolders,
+    };
+  });
+
   // Build flat display items for virtual scrolling.
   let displayItems = $derived.by(() =>
-    buildDisplayItems(groups, groupSections, groupMode, collapsed, expandedGroups),
+    buildDisplayItems(
+      groups,
+      groupSections,
+      groupMode,
+      collapsed,
+      expandedGroups,
+      folderView,
+    ),
   );
 
   // When include_children is enabled the API total includes
@@ -191,6 +249,122 @@
       }
       manualExpanded = next;
     }
+  }
+
+  function setFolderExpanded(folderId: number, expanded: boolean) {
+    if (expandedFolders.has(folderId) === expanded) return;
+    const next = new Set(expandedFolders);
+    if (expanded) next.add(folderId);
+    else next.delete(folderId);
+    expandedFolders = next;
+    try {
+      localStorage?.setItem(EXPANDED_FOLDERS_KEY, JSON.stringify([...next]));
+    } catch {
+      // Storage full or unavailable: the state lasts for this page only.
+    }
+  }
+
+  /** The sessions a root row files into a folder, primary first. */
+  function folderSessionIds(group: SessionGroup): string[] {
+    const members = group.allSessions ?? group.sessions;
+    return [
+      group.primarySessionId,
+      ...members.map((s) => s.id).filter((id) => id !== group.primarySessionId),
+    ];
+  }
+
+  async function createFolder(project: string) {
+    projectMenu = null;
+    try {
+      const folder = await sessionFolders.create(
+        project,
+        sessionFolders.availableName(project, m.sidebar_folder_default_name()),
+      );
+      if (groupMode !== "none" && collapsed.has(project)) toggleGroup(project);
+      renamingFolderId = folder.id;
+      await tick();
+      const row = renderDisplayItems.find((it) => it.id === `folder:${folder.id}`);
+      if (row && containerRef) {
+        const viewTop = containerRef.scrollTop;
+        const viewBottom = viewTop + containerRef.clientHeight;
+        if (row.top < viewTop || row.top + row.height > viewBottom) {
+          containerRef.scrollTop = Math.max(0, row.top - ITEM_HEIGHT);
+        }
+      }
+    } catch {
+      showFlash(m.sidebar_folder_save_failed(), { tone: "danger" });
+    }
+  }
+
+  function acceptedDrag(e: DragEvent, item: DisplayItem) {
+    if (item.dropFolderId === undefined || !sessionFolders.editable) return null;
+    const drag = sessionDragFor(e);
+    if (!drag || drag.project !== item.dropProject) return null;
+    return drag;
+  }
+
+  function handleDragOver(e: DragEvent, item: DisplayItem) {
+    if (!acceptedDrag(e, item)) return;
+    e.preventDefault();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
+    dropTarget = item.dropFolderId;
+  }
+
+  function handleDragLeave(e: DragEvent, item: DisplayItem) {
+    const into = e.relatedTarget;
+    if (into instanceof Node && (e.currentTarget as Node).contains(into)) return;
+    if (dropTarget === item.dropFolderId) dropTarget = undefined;
+  }
+
+  async function handleDrop(e: DragEvent, item: DisplayItem) {
+    const drag = acceptedDrag(e, item);
+    dropTarget = undefined;
+    endSessionDrag();
+    if (!drag || item.dropFolderId === undefined) return;
+    e.preventDefault();
+    const target = item.dropFolderId;
+    if (target === sessionFolders.folderIdForSessions(drag.project, drag.sessionIds)) {
+      return;
+    }
+    try {
+      if (target === null) {
+        await sessionFolders.removeSessions(drag.sessionIds);
+      } else {
+        await sessionFolders.moveSessions(target, drag.sessionIds);
+      }
+    } catch {
+      showFlash(m.sidebar_folder_move_failed(), { tone: "danger" });
+    }
+  }
+
+  $effect(() => {
+    if (!projectMenu) return;
+    function close() {
+      projectMenu = null;
+    }
+    function onKeyDown(e: KeyboardEvent) {
+      if (e.key === "Escape") close();
+    }
+    const id = setTimeout(() => {
+      document.addEventListener("click", close, { once: true });
+      document.addEventListener("contextmenu", close, { once: true });
+    }, 0);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      clearTimeout(id);
+      document.removeEventListener("click", close);
+      document.removeEventListener("contextmenu", close);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  });
+
+  function mountOverlay(node: HTMLElement) {
+    document.body.appendChild(node);
+    return {
+      destroy() {
+        node.remove();
+      },
+    };
   }
 
   function toggleChainExpand(groupKey: string) {
@@ -457,6 +631,17 @@
           }
         }
       }
+      // Session may be filed in a collapsed folder.
+      if (folderView) {
+        const owner = groups.find((g) =>
+          g.sessions.some((s) => s.id === activeId),
+        );
+        const folderId = owner && folderView.groupFolder.get(owner.key);
+        if (folderId !== undefined && !expandedFolders.has(folderId)) {
+          setFolderExpanded(folderId, true);
+          return;
+        }
+      }
       // Session may be inside a collapsed continuation chain.
       // Auto-expand the parent group and relevant sub-groups.
       for (const g of groups) {
@@ -526,6 +711,16 @@
     >
       <CheckIcon size="12" strokeWidth="2" aria-hidden="true" />
     </button>
+    {#if folderProject && sessionFolders.editable}
+      <button
+        class="select-toggle-btn"
+        onclick={() => void createFolder(folderProject!)}
+        title={m.sidebar_folder_create()}
+        aria-label={m.sidebar_folder_create()}
+      >
+        <FolderPlusIcon size="12" strokeWidth="2" aria-hidden="true" />
+      </button>
+    {/if}
     <SessionFilterControl
       {groupMode}
       onToggleGroupByAgent={toggleGroupByAgent}
@@ -605,22 +800,48 @@
   </div>
 {/if}
 
+<!-- svelte-ignore a11y_no_static_element_interactions -->
 <div
   class="session-list-scroll"
   bind:this={containerRef}
   onscroll={handleScroll}
+  ondragend={() => (dropTarget = undefined)}
 >
   <div
     style="height: {renderTotalSize}px; width: 100%; position: relative;"
   >
     {#each visibleItems as item (item.id)}
+      <!-- svelte-ignore a11y_no_static_element_interactions -->
       <div
         style="position: absolute; top: 0; left: 0; width: 100%; height: {item.height}px; transform: translateY({item.top}px);"
+        ondragover={(e) => handleDragOver(e, item)}
+        ondragleave={(e) => handleDragLeave(e, item)}
+        ondrop={(e) => void handleDrop(e, item)}
       >
-        {#if item.type === "header"}
+        {#if item.type === "folder" && item.folder}
+          {@const folderId = item.folder.id}
+          <SessionFolderRow
+            folder={item.folder}
+            count={item.count}
+            expanded={expandedFolders.has(folderId)}
+            editable={sessionFolders.editable}
+            renaming={renamingFolderId === folderId}
+            dropActive={dropTarget === folderId}
+            onToggle={() => setFolderExpanded(folderId, !expandedFolders.has(folderId))}
+            onRenameStart={() => (renamingFolderId = folderId)}
+            onRenameEnd={() => {
+              if (renamingFolderId === folderId) renamingFolderId = null;
+            }}
+          />
+        {:else if item.type === "header"}
           <button
             class="group-header"
             onclick={() => toggleGroup(item.label)}
+            oncontextmenu={(e) => {
+              if (groupMode !== "project" || !sessionFolders.editable) return;
+              e.preventDefault();
+              projectMenu = { x: e.clientX, y: e.clientY, project: item.label };
+            }}
             title={groupToggleLabel(!collapsed.has(item.label), item.label)}
             aria-label={groupToggleLabel(!collapsed.has(item.label), item.label)}
           >
@@ -645,7 +866,7 @@
           {@const subExpanded = expandedGroups.has(subKey)}
           <button
             class="sub-group-header"
-            style:padding-left="{8 + (item.depth ?? 1) * 16}px"
+            style:padding-left="{8 + (item.depth ?? 1) * 16 + (item.inset ?? 0) * 14}px"
             onclick={() => toggleChainExpand(subKey)}
             title={groupToggleLabel(subExpanded, m.sidebar_subagents())}
             aria-label={groupToggleLabel(subExpanded, m.sidebar_subagents())}
@@ -664,7 +885,7 @@
           {@const teamExpanded = expandedGroups.has(teamKey)}
           <button
             class="sub-group-header"
-            style:padding-left="{8 + (item.depth ?? 1) * 16}px"
+            style:padding-left="{8 + (item.depth ?? 1) * 16 + (item.inset ?? 0) * 14}px"
             onclick={() => toggleChainExpand(teamKey)}
             title={groupToggleLabel(teamExpanded, m.sidebar_team())}
             aria-label={groupToggleLabel(teamExpanded, m.sidebar_team())}
@@ -686,6 +907,7 @@
             hideProject={groupMode === "project"}
             compact
             depth={item.depth ?? 1}
+            inset={item.inset ?? 0}
             isLastChild={item.isLastChild ?? false}
             selectMode={sessions.selectMode}
             selected={sessions.selectedIds.has(item.session.id)}
@@ -718,6 +940,8 @@
                 ? () => toggleChainExpand(item.group!.key)
                 : undefined}
               depth={0}
+              inset={item.inset ?? 0}
+              folderSessionIds={folderSessionIds(item.group)}
               hasSubagents={groupHasSubagents}
               hasTeammates={groupHasTeammates}
               selectMode={sessions.selectMode}
@@ -729,6 +953,21 @@
     {/each}
   </div>
 </div>
+
+{#if projectMenu}
+  <div
+    class="context-menu"
+    use:mountOverlay
+    style="left: {projectMenu.x}px; top: {projectMenu.y}px;"
+  >
+    <button
+      class="context-menu-item"
+      onclick={() => void createFolder(projectMenu!.project)}
+    >
+      {m.sidebar_folder_create()}
+    </button>
+  </div>
+{/if}
 
 <style>
   .session-list-header {
