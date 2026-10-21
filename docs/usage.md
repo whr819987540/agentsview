@@ -620,8 +620,10 @@ Available URL filters:
 
 ### Navigation
 
-Use `]` and `[` to move between sessions in the list. The selected session is
-highlighted with a left border accent.
+Use `]` and `[` to move to the next and previous session row in the sidebar.
+Sessions inside a collapsed group, section, or folder are skipped; expand it to
+step through them. The selected session is highlighted with a left border
+accent.
 
 ______________________________________________________________________
 

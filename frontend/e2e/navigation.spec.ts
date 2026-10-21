@@ -25,6 +25,38 @@ test.describe("Navigation", () => {
     await expect(sp.sessionItems.first()).toHaveClass(/active/);
   });
 
+  test("keyboard ] follows the sidebar rows around a nested fork", async ({ page }) => {
+    // The fork ran after its root, so the store's recency order puts it
+    // right before the root. The sidebar nests it under the root's row.
+    const rootId = "test-session-medium-8";
+    const root = page.locator(`.session-item[data-session-id="${rootId}"]`);
+    const fork = page.locator('.session-item[data-session-id="test-session-fork-1"]');
+    const rowAfterRoot = async () => {
+      const ids = await sp.sessionItems.evaluateAll((rows) =>
+        rows.map((row) => row.getAttribute("data-session-id")),
+      );
+      return ids[ids.indexOf(rootId) + 1];
+    };
+
+    await root.click();
+    await expect(root).toHaveClass(/active/);
+    await expect(fork).toHaveCount(0);
+    const belowRoot = await rowAfterRoot();
+    expect(belowRoot).toMatch(/^test-session-/);
+
+    await sp.pressNextSessionShortcut();
+    await expect(page).toHaveURL(new RegExp(`/sessions/${belowRoot}$`));
+    await expect(fork).toHaveCount(0);
+
+    await root.getByRole("button", { name: "Expand", exact: true }).click();
+    await expect.poll(rowAfterRoot).toBe("test-session-fork-1");
+    await root.click();
+    await sp.pressNextSessionShortcut();
+    await expect(fork).toHaveClass(/active/);
+    await sp.pressNextSessionShortcut();
+    await expect(page).toHaveURL(new RegExp(`/sessions/${belowRoot}$`));
+  });
+
   test("analytics page shows when no session selected", async () => {
     await expect(sp.analyticsPage).toBeVisible();
     await expect(sp.analyticsToolbar).toBeVisible();

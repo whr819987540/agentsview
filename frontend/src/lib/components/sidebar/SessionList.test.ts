@@ -12,6 +12,7 @@ import { starred } from "../../stores/starred.svelte.js";
 import { ui } from "../../stores/ui.svelte.js";
 import { m, setLocale } from "../../i18n/index.js";
 import { ITEM_HEIGHT, OVERSCAN, STORAGE_KEY_GROUP } from "./session-list-utils.js";
+import { registerShortcuts } from "../../utils/keyboard.js";
 
 vi.mock("../../api/client.js", () => ({
   listSessions: vi.fn().mockResolvedValue({
@@ -823,6 +824,109 @@ describe("SessionList visible hydration", () => {
 
     expect(document.body.textContent).toContain("Main continuation");
     expect(document.body.textContent).not.toContain("Branch continuation");
+  });
+
+  describe("[ and ] shortcuts", () => {
+    let unregisterShortcuts: (() => void) | undefined;
+
+    afterEach(() => {
+      unregisterShortcuts?.();
+      unregisterShortcuts = undefined;
+    });
+
+    function press(key: "[" | "]") {
+      document.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true }));
+    }
+
+    async function mountRecencyOrderedList() {
+      // The sidebar index lists sessions newest first, so a fork that ran
+      // after its root sits between the newer row and the root. The sidebar
+      // nests the fork under the root's collapsed row instead.
+      sessions.sessions = [
+        makeSession({
+          id: "newer",
+          first_message: "newer transcript",
+          started_at: "2024-01-01T08:00:00Z",
+          ended_at: "2024-01-01T09:00:00Z",
+        }),
+        makeSession({
+          id: "fork",
+          parent_session_id: "root",
+          relationship_type: "fork",
+          first_message: "fork transcript",
+          started_at: "2024-01-01T05:00:00Z",
+          ended_at: "2024-01-01T06:00:00Z",
+        }),
+        makeSession({
+          id: "root",
+          first_message: "root transcript",
+          started_at: "2024-01-01T01:00:00Z",
+          ended_at: "2024-01-01T02:00:00Z",
+        }),
+        makeSession({
+          id: "older",
+          first_message: "older transcript",
+          started_at: "2024-01-01T00:00:00Z",
+          ended_at: "2024-01-01T00:30:00Z",
+        }),
+      ];
+      vi.spyOn(sessions, "hydrateVisibleSessions").mockResolvedValue(undefined);
+      component = mount(SessionList, { target: document.body });
+      unregisterShortcuts = registerShortcuts({
+        navigateMessage: vi.fn(),
+        navigateUserPrompt: vi.fn(),
+      });
+      await tick();
+    }
+
+    function rowIds(): (string | null)[] {
+      return [...document.querySelectorAll(".session-item")].map((row) =>
+        row.getAttribute("data-session-id"),
+      );
+    }
+
+    it("steps over a fork nested in a collapsed group", async () => {
+      await mountRecencyOrderedList();
+      expect(rowIds()).toEqual(["newer", "root", "older"]);
+      sessions.activeSessionId = "newer";
+
+      press("]");
+      expect(sessions.activeSessionId).toBe("root");
+      press("]");
+      expect(sessions.activeSessionId).toBe("older");
+      press("[");
+      press("[");
+      expect(sessions.activeSessionId).toBe("newer");
+    });
+
+    it("visits a fork once its group is expanded", async () => {
+      await mountRecencyOrderedList();
+      sessions.activeSessionId = "root";
+      await tick();
+      document
+        .querySelector<HTMLButtonElement>(
+          `[data-session-id="root"] button[aria-label="${m.sidebar_row_expand()}"]`,
+        )!
+        .click();
+      await tick();
+      expect(rowIds()).toEqual(["newer", "root", "fork", "older"]);
+
+      press("]");
+      expect(sessions.activeSessionId).toBe("fork");
+      press("]");
+      expect(sessions.activeSessionId).toBe("older");
+      press("[");
+      expect(sessions.activeSessionId).toBe("fork");
+    });
+
+    it("keeps the sidebar's order while the sidebar is hidden", async () => {
+      await mountRecencyOrderedList();
+      sessions.activeSessionId = "newer";
+      document.querySelector<HTMLElement>(".session-list-scroll")!.style.display = "none";
+
+      press("]");
+      expect(sessions.activeSessionId).toBe("root");
+    });
   });
 
   it("heads a continuation chain with its root and shows the newest continuation's state", async () => {

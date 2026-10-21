@@ -42,6 +42,17 @@ export function navigateRegisteredSessionList(delta: number): boolean {
   return true;
 }
 
+/**
+ * Moves through the registered list's rows even while the sidebar is hidden,
+ * so `[` and `]` keep the order the reader sees when it is open. Returns
+ * false when no list is mounted.
+ */
+export function navigateSessionListRows(delta: number): boolean {
+  if (!sessionListElement?.isConnected || !sessionListNavigate) return false;
+  sessionListNavigate(delta);
+  return true;
+}
+
 export function resolveArrowTarget(
   activeElement: Element | null = typeof document === "undefined" ? null : document.activeElement,
   sessionList: HTMLElement | null = sessionListElement,

@@ -15,12 +15,21 @@ import { toggleSidebarWithFocus } from "./sidebar-toggle.js";
 import {
   getSessionListElement,
   navigateRegisteredSessionList,
+  navigateSessionListRows,
   resolveArrowTarget,
   type ArrowInteractionTarget,
 } from "./arrow-target.js";
 
 function starredSessionFilter(): ((s: { id: string }) => boolean) | undefined {
   return starred.filterOnly ? (s: { id: string }) => starred.isStarred(s.id) : undefined;
+}
+
+// The store's flat list also holds the forks, continuations and subagents
+// that the sidebar nests under their root, so walking it can land on a row
+// the sidebar hides. Follow the sidebar's rows whenever it is mounted.
+function navigateSessions(delta: number): void {
+  if (navigateSessionListRows(delta)) return;
+  sessions.navigateSession(delta, starredSessionFilter());
 }
 
 function isInputFocused(): boolean {
@@ -211,12 +220,8 @@ export function registerShortcuts(opts: ShortcutOptions): () => void {
           opts.navigateMessage(-1);
         }
       },
-      "]": () => {
-        sessions.navigateSession(1, starredSessionFilter());
-      },
-      "[": () => {
-        sessions.navigateSession(-1, starredSessionFilter());
-      },
+      "]": () => navigateSessions(1),
+      "[": () => navigateSessions(-1),
       o: () => ui.toggleSort(),
       l: () => ui.cycleLayout(),
       r: () => sync.triggerSync(),
