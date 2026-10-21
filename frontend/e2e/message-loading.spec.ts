@@ -1,6 +1,7 @@
 import { test, expect } from "@playwright/test";
 import { SessionsPage } from "./pages/sessions-page";
 import { waitForStableValue, waitForRowCountStable } from "./helpers/virtual-list-helpers";
+import { frames } from "./helpers/transcript-fixture";
 
 test.describe("Message loading", () => {
   test("clicking session shows messages", async ({ page }) => {
@@ -175,11 +176,12 @@ test.describe("Message loading", () => {
     await page.keyboard.press("ArrowUp");
 
     await expect(follow).toHaveAttribute("aria-pressed", "false");
-    await expect
-      .poll(() => sp.scroller.evaluate((el) => el.scrollTop), {
-        timeout: 2_000,
-      })
-      .toBeLessThan(1_000);
+    // The first loaded message is selected and shown, and it stays shown
+    // when older history loads above it.
+    const selected = sp.scroller.locator(".virtual-row.selected");
+    await expect(selected).toBeInViewport();
+    await frames(page, 20);
+    await expect(selected).toBeInViewport();
   });
 
   test("follow latest settles after a tall final message is measured", async ({ page }) => {
@@ -423,10 +425,12 @@ test.describe("Message loading", () => {
       ).__followRaf.restore();
     });
 
-    await expect
-      .poll(() => sp.scroller.evaluate((el) => el.scrollTop), {
-        timeout: 2_000,
-      })
-      .toBeLessThanOrEqual(8);
+    // Scrolling to the top loads older history above the first row, and the
+    // reader stays on that row, so the list has moved, but not to the newest
+    // message. Give a leaked follow scroll a few frames to land.
+    await frames(page, 10);
+    expect(
+      await sp.scroller.evaluate((el) => el.scrollHeight - el.clientHeight - el.scrollTop),
+    ).toBeGreaterThan(8);
   });
 });

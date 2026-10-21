@@ -259,6 +259,38 @@ The latest published release is
 
 **Bug fixes**
 
+- Hiding a block type, switching between Normal and Focused, or flipping the
+  sort order keeps the message you were reading in view. Before, the transcript
+  kept its scroll position while its rows changed, so you landed far from that
+  message, and flipping the order twice did not bring you back. If the message
+  you were reading is hidden, the next visible one takes its place. At the very
+  start of the list, flipping the order still shows the other end.
+- An open session shows messages that synced while it was opening, such as the
+  final reply of an agent that had just finished. Before, they stayed hidden
+  until the session changed again. The live-update connection now refreshes
+  the session once when it first connects, as it already did after
+  reconnecting, and skips reading the messages again when nothing changed.
+- In newest-first order, new messages no longer push down the text you are
+  reading. Before, each message that arrived while you were reading further
+  down moved the transcript by that message's height. At the top of the list
+  you still see new messages arrive; turn on **Follow latest messages** to keep
+  the newest one in view from anywhere.
+- Reading far down a forked session no longer throws you back when a new
+  message arrives. Before, each update briefly cut the transcript to its first
+  1,000 messages, so a reader below them landed near the 1,000th one instead.
+  The same could happen in a busy session when two syncs landed close together.
+  The transcript now keeps what you see until the updated copy has arrived in
+  full.
+- Jumping to a message puts it at the top of the transcript, whether you open
+  a link to it, a search result, or a pin, use a list in the session analysis
+  panel, or step through prompts with the keyboard. Before, the view could stop
+  several messages away once the messages around it loaded, often with the
+  message you asked for off screen.
+- Scrolling up through a long session keeps you on the message you were
+  reading while older messages load above it. Before, in a session with more
+  than 3,000 messages, reaching the top of the loaded messages moved the view
+  about a thousand messages back, and loading continued until the view reached
+  the start of the session.
 - Find in a session no longer pulls the transcript back to the current match
   when new messages arrive. Before, while find was open on a running session,
   each live update could scroll you back to the match, even after you had

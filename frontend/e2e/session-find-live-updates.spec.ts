@@ -94,6 +94,21 @@ async function scrollTop(page: Page) {
   return page.locator(".message-list-scroll").evaluate((el) => Math.round(el.scrollTop));
 }
 
+/** The row at the top of the transcript and how far the viewport top sits
+ *  below it. Rows added above the reader change scrollTop but not this. */
+async function readingPosition(page: Page) {
+  return page.locator(".message-list-scroll").evaluate((el) => {
+    const top = el.getBoundingClientRect().top;
+    const first = [...el.querySelectorAll<HTMLElement>(".virtual-row")]
+      .map((row) => ({ row, rect: row.getBoundingClientRect() }))
+      .filter(({ rect }) => rect.bottom > top + 0.5)
+      .sort((a, b) => a.rect.top - b.rect.top)[0];
+    return first
+      ? { ordinal: first.row.dataset.ordinal, offset: Math.round(top - first.rect.top) }
+      : null;
+  });
+}
+
 test.describe("session find during live updates", () => {
   for (const newestFirst of [false, true]) {
     test(`keeps the reader's place with newestFirst=${newestFirst}`, async ({ page }) => {
@@ -121,12 +136,12 @@ test.describe("session find during live updates", () => {
           return (await scrollTop(page)) === before;
         })
         .toBe(true);
-      const readerTop = await scrollTop(page);
+      const readerAt = await readingPosition(page);
 
       await appendLiveMatch();
       await expect(page.locator(".search-announcement")).toHaveText(/ of 3$/);
       await frames(page, 20);
-      expect(await scrollTop(page)).toBe(readerTop);
+      expect(await readingPosition(page)).toEqual(readerAt);
       await expect(current).not.toBeInViewport();
     });
   }

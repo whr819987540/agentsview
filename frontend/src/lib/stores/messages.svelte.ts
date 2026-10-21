@@ -74,6 +74,8 @@ export class MessagesStore {
   private reloadPromise: Promise<void> | null = null;
   private reloadSessionId: string | null = null;
   private pendingReload: boolean = false;
+  // Settles when the session's first load lands or fails; a reload asked for before then waits for it.
+  private sessionLoad: Promise<void> | null = null;
   // Passes a moving transcript refused since the last outside reload request; bounded so a busy session can't reload forever.
   private revisionConflicts: number = 0;
   // Each window load takes a ticket when it starts; a replacement lands only if no later-started load already replaced the window.
@@ -126,6 +128,9 @@ export class MessagesStore {
     this.cancelledSessionId = null;
     this.loading = true;
     const owner = ++this.loadingOwner;
+    let settle!: () => void;
+    const sessionLoad = new Promise<void>((resolve) => (settle = resolve));
+    this.sessionLoad = sessionLoad;
 
     const generation = ++this.loadGeneration;
     const ac = new AbortController();
@@ -178,6 +183,8 @@ export class MessagesStore {
         this.loading = false;
         this.updateStableMainModelInfo();
       }
+      if (this.sessionLoad === sessionLoad) this.sessionLoad = null;
+      settle();
     }
   }
 
@@ -193,7 +200,8 @@ export class MessagesStore {
     if (!this.sessionId) return Promise.resolve();
 
     if (this.reloadPromise && this.reloadSessionId === this.sessionId) {
-      this.pendingReload = true;
+      // A reload still waiting for the first load has read nothing yet, so it covers this request too.
+      if (!this.sessionLoad) this.pendingReload = true;
       return this.reloadPromise;
     }
 
@@ -201,7 +209,17 @@ export class MessagesStore {
     this.reloadSessionId = id;
     this.reloading = true;
 
-    const promise = this.reloadNow(id).finally(async () => {
+    const firstLoad = this.sessionLoad;
+    const reloadWhenLoaded = async () => {
+      if (firstLoad) {
+        // A second load racing the first would read the transcript twice; reload once it lands instead.
+        await firstLoad;
+        // A session switch or a cancelled read dropped this reload while it waited.
+        if (this.reloadPromise !== promise) return;
+      }
+      await this.reloadNow(id);
+    };
+    const promise: Promise<void> = reloadWhenLoaded().finally(async () => {
       if (this.reloadPromise === promise) {
         this.reloadPromise = null;
         this.reloadSessionId = null;
@@ -264,6 +282,7 @@ export class MessagesStore {
     this.reloadPromise = null;
     this.reloadSessionId = null;
     this.pendingReload = false;
+    this.sessionLoad = null;
     this.loadOlderPromise = null;
   }
 
@@ -383,6 +402,10 @@ export class MessagesStore {
     ticket: number,
     messageCountHint?: number,
   ): Promise<boolean> {
+    // An empty list shows each page as it lands. Rows already on screen stay
+    // until the whole replacement has arrived, so a reader below the first
+    // page keeps their place.
+    const showEachPage = this.messages.length === 0;
     let from: number | undefined = this.includeForkContext ? undefined : 0;
     let loaded: Message[] = [];
     let complete = false;
@@ -397,54 +420,50 @@ export class MessagesStore {
         revision,
       );
       if (this.sessionId !== id) return false;
+      // A load that started later already replaced the window, possibly while this page was in flight.
+      if (ticket < this.windowTicket) return false;
       revision ??= res.revision;
-      if (loaded.length === 0) {
-        // A load that started later already replaced the window.
-        if (ticket < this.windowTicket) return false;
-        this.windowTicket = ticket;
-        this.historyComplete = false;
-        // Rows already parsed may come back rewritten under the same IDs and lengths.
-        clearContentCaches();
-      } else if (this.windowTicket !== ticket) {
-        // A newer revision replaced the window while this page was in flight.
-        return false;
-      }
-      if (res.messages.length === 0) {
-        if (loaded.length === 0) {
-          // The session has no rows now, so nothing from an earlier revision may stay on screen.
-          this.messages = [];
-          this.loadedRevision = revision;
-        }
-        complete = true;
-        break;
-      }
-
+      const firstPage = loaded.length === 0;
       loaded = [...loaded, ...res.messages];
-      // Every row on screen now comes from this one revision, so it can be published page by page.
-      this.messages = loaded;
-      this.loadedRevision = revision;
-
-      const newest = loaded[loaded.length - 1];
-      this.messageCount = messageCountHint ?? (newest ? newest.ordinal + 1 : loaded.length);
-      this.hasOlder = false;
+      if (showEachPage && (firstPage || res.messages.length > 0)) {
+        if (firstPage) this.takeWindow(ticket);
+        // Every row on screen now comes from this one revision, so it can be published page by page.
+        this.showFromFirstRow(loaded, revision, messageCountHint);
+      }
 
       if (res.messages.length < MESSAGE_PAGE_SIZE) {
         complete = true;
         break;
       }
-      const last = res.messages[res.messages.length - 1];
-      if (!last) break;
-      const nextFrom = last.ordinal + 1;
+      const nextFrom = res.messages.at(-1)!.ordinal + 1;
       if (currentFrom !== undefined && nextFrom <= currentFrom) break;
       from = nextFrom;
     }
 
-    const newest = this.messages[this.messages.length - 1];
-    if (this.sessionId !== id) return false;
-    this.messageCount = messageCountHint ?? (newest ? newest.ordinal + 1 : this.messages.length);
-    this.hasOlder = false;
+    if (!showEachPage) {
+      // Swap the whole transcript in at once; an empty one leaves nothing from an earlier revision on screen.
+      this.takeWindow(ticket);
+      this.showFromFirstRow(loaded, revision, messageCountHint);
+    }
     this.historyComplete = complete;
     return true;
+  }
+
+  /** Make the load holding `ticket` the owner of the window it is about to replace. */
+  private takeWindow(ticket: number) {
+    this.windowTicket = ticket;
+    this.historyComplete = false;
+    // Rows already parsed may come back rewritten under the same IDs and lengths.
+    clearContentCaches();
+  }
+
+  /** Show rows read from the transcript's first row as the whole window. */
+  private showFromFirstRow(rows: Message[], revision: string | null, messageCountHint?: number) {
+    this.messages = rows;
+    this.loadedRevision = revision;
+    const newest = rows.at(-1);
+    this.messageCount = messageCountHint ?? (newest ? newest.ordinal + 1 : 0);
+    this.hasOlder = false;
   }
 
   /** Load the newest page; false when the session changed or a later load overtook this one. */
@@ -794,7 +813,10 @@ export class MessagesStore {
       const newCount = sess.message_count ?? 0;
       const oldCount = this.messageCount;
       let landed = true;
-      if (this.includeForkContext) {
+      if (sess.transcript_revision && sess.transcript_revision === this.loadedRevision) {
+        // The session still names the revision on screen, so its rows have not changed since
+        // they were read and need no second read. Read progress below still settles for them.
+      } else if (this.includeForkContext) {
         // Inherited context rows have negative ordinals, which the
         // ordinal-addressed window refresh cannot request.
         landed = await this.fullReload(id, signal);
@@ -822,12 +844,14 @@ export class MessagesStore {
         const newest = this.messages[this.messages.length - 1];
         if (refreshed === "superseded") {
           landed = false;
-        } else if (refreshed === "empty" || !newest || newest.ordinal !== newCount - 1) {
-          // An empty refresh means the transcript shrank underneath the window.
+        } else if (refreshed === "empty" || !newest || newest.ordinal < newCount - 1) {
+          // An empty refresh, or one that stops short of the count, means the transcript shrank underneath the window.
           landed = await this.fullReload(id, signal, newCount);
         } else {
-          this.messageCount = newCount;
-          this.historyComplete = this.messages[0]?.ordinal === 0 && newest.ordinal === newCount - 1;
+          // The refresh read to the transcript's end. Another sync can land between the metadata
+          // and row reads, so the rows may run past the count the metadata reported.
+          this.messageCount = Math.max(newCount, newest.ordinal + 1);
+          this.historyComplete = this.messages[0]?.ordinal === 0;
         }
       } else {
         landed = await this.fullReload(id, signal, newCount);

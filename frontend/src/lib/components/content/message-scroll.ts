@@ -17,9 +17,14 @@ export function getLatestDisplayIndex(displayCount: number, newestFirst: boolean
   return newestFirst ? 0 : displayCount - 1;
 }
 
+/** Whether the list is scrolled to its first row. */
+export function isAtListStart(metrics: Pick<ScrollMetrics, "scrollTop">): boolean {
+  return metrics.scrollTop <= LATEST_EDGE_TOLERANCE_PX;
+}
+
 export function isAtLatestEdge(metrics: ScrollMetrics, newestFirst: boolean): boolean {
   if (newestFirst) {
-    return metrics.scrollTop <= LATEST_EDGE_TOLERANCE_PX;
+    return isAtListStart(metrics);
   }
 
   return (
