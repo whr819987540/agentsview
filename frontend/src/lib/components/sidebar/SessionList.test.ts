@@ -981,7 +981,9 @@ describe("SessionList visible hydration", () => {
     component = mount(SessionList, { target: document.body });
     await tick();
 
-    const selectModeButton = document.querySelector<HTMLButtonElement>(".select-toggle-btn");
+    const selectModeButton = document.querySelector<HTMLButtonElement>(
+      `[aria-label="${m.sidebar_multi_select()}"]`,
+    );
     expect(selectModeButton).not.toBeNull();
     selectModeButton!.click();
     await tick();
@@ -1193,7 +1195,9 @@ describe("SessionList visible hydration", () => {
     expect(document.querySelector<HTMLElement>('[data-session-id="parent"]')).not.toBeNull();
     expect(document.querySelector<HTMLElement>('[data-session-id="child"]')).toBeNull();
 
-    const selectModeButton = document.querySelector<HTMLButtonElement>(".select-toggle-btn");
+    const selectModeButton = document.querySelector<HTMLButtonElement>(
+      `[aria-label="${m.sidebar_multi_select()}"]`,
+    );
     expect(selectModeButton).not.toBeNull();
     selectModeButton!.click();
     await tick();
@@ -1225,7 +1229,9 @@ describe("SessionList visible hydration", () => {
     component = mount(SessionList, { target: document.body });
     await tick();
 
-    const selectModeButton = document.querySelector<HTMLButtonElement>(".select-toggle-btn");
+    const selectModeButton = document.querySelector<HTMLButtonElement>(
+      `[aria-label="${m.sidebar_multi_select()}"]`,
+    );
     expect(selectModeButton).not.toBeNull();
     selectModeButton!.click();
     await tick();

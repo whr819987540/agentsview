@@ -449,6 +449,22 @@ folder. Folders are saved in the SQLite archive, so they survive restarts and
 full resyncs. PostgreSQL, ClickHouse, and DuckDB replicas do not carry folders:
 a sidebar served from a replica shows no folders and cannot create them.
 
+### Expand and Collapse All
+
+The first button in the sidebar header opens or closes the whole list. It reads
+**Collapse all** while any section, folder, or session in the list is open, and
+**Expand all** when everything is closed. It is hidden when nothing in the list
+can open.
+
+- **Expand all** opens every agent or project section, the folders of the
+  projects in the list, and each session's continuations, forks, and team.
+  Sections that load later open too.
+- **Collapse all** closes all of them. Folders of projects outside the list
+  keep their state.
+- Neither action changes subagents. A session whose only children are
+  subagents stays closed, and each **Subagents** list keeps its open or closed
+  state for the next time its session opens.
+
 ### Sub-Agent Tree
 
 When a session spawns sub-agents or teams, the sidebar organizes them in a

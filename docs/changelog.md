@@ -11,6 +11,12 @@ The latest published release is
 
 **New features**
 
+- Open or close the whole sidebar list in one click. The **Expand all** /
+  **Collapse all** button in the sidebar header opens or closes every agent or
+  project section, every folder, and every session that has continuations,
+  forks, or a team. Subagents are left alone: a session whose only children are
+  subagents stays closed, and a **Subagents** list you opened is open again
+  when its session reopens.
 - Sort a project's sessions into folders in the sidebar. Filter the sidebar to a
   project or group it by project, create a folder with the **New folder**
   button or a project header's right-click menu, then drag sessions onto it or

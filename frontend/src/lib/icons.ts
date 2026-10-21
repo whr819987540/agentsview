@@ -11,6 +11,8 @@ export { default as ChevronDownIcon } from "@lucide/svelte/icons/chevron-down";
 export { default as ChevronLeftIcon } from "@lucide/svelte/icons/chevron-left";
 export { default as ChevronRightIcon } from "@lucide/svelte/icons/chevron-right";
 export { default as ChevronUpIcon } from "@lucide/svelte/icons/chevron-up";
+export { default as ChevronsDownUpIcon } from "@lucide/svelte/icons/chevrons-down-up";
+export { default as ChevronsUpDownIcon } from "@lucide/svelte/icons/chevrons-up-down";
 export { default as CirclePlayIcon } from "@lucide/svelte/icons/circle-play";
 export { default as CircleQuestionMarkIcon } from "@lucide/svelte/icons/circle-question-mark";
 export { default as ClockIcon } from "@lucide/svelte/icons/clock";

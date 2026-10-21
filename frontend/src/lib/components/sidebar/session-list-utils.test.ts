@@ -9,6 +9,7 @@ import {
   assignGroupFolders,
   buildGroupSections,
   buildDisplayItems,
+  bulkExpandKeys,
   computeTotalSize,
   findStart,
   isSubagentDescendant,
@@ -890,6 +891,42 @@ describe("child classification precedence", () => {
       parent_session_id: "sub",
     });
     expect(isSubagentDescendant(child, [subagent, child])).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// bulkExpandKeys
+// ---------------------------------------------------------------------------
+
+describe("bulkExpandKeys", () => {
+  const root = () => makeSession({ id: "root" });
+  const continuation = () =>
+    makeSession({ id: "cont", parent_session_id: "root", relationship_type: "continuation" });
+  const fork = () =>
+    makeSession({ id: "fork", parent_session_id: "root", relationship_type: "fork" });
+  const subagent = () =>
+    makeSession({ id: "sub", parent_session_id: "root", relationship_type: "subagent" });
+  const subagentContinuation = () =>
+    makeSession({ id: "sub-cont", parent_session_id: "sub", relationship_type: "continuation" });
+  const teammate = () =>
+    makeSession({
+      id: "tm",
+      parent_session_id: "root",
+      first_message: "<teammate-message>hi</teammate-message>",
+    });
+
+  it.each([
+    ["a single session", [root()], []],
+    ["a continuation", [root(), continuation()], ["root"]],
+    ["a fork", [root(), fork()], ["root"]],
+    ["only subagents", [root(), subagent()], []],
+    ["a subagent and its continuation", [root(), subagent(), subagentContinuation()], []],
+    ["a teammate", [root(), teammate()], ["root", "team:root"]],
+    ["a continuation and a subagent", [root(), continuation(), subagent()], ["root"]],
+  ])("opens a group with %s", (_name, members, want) => {
+    const groups = buildSessionGroups(members);
+    expect(groups).toHaveLength(1);
+    expect(bulkExpandKeys(groups[0]!)).toEqual(want);
   });
 });
 

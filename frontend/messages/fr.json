@@ -514,6 +514,8 @@
   "sidebar_unclean_title": "Terminée en plein appel d'outil (inactive depuis plus d'une heure)",
   "sidebar_expand_group": "Déplier le groupe {name}",
   "sidebar_collapse_group": "Replier le groupe {name}",
+  "sidebar_expand_all": "Tout déplier",
+  "sidebar_collapse_all": "Tout replier",
   "sidebar_expand_folder": "Déplier le dossier {name}",
   "sidebar_collapse_folder": "Replier le dossier {name}",
   "sidebar_folder_create": "Nouveau dossier",

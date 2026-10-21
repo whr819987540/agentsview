@@ -514,6 +514,8 @@
   "sidebar_unclean_title": "ツールコールの途中で終了しました（アイドル状態が 1 時間以上）",
   "sidebar_expand_group": "{name} グループを展開します",
   "sidebar_collapse_group": "{name} グループを折りたたむ",
+  "sidebar_expand_all": "すべて展開する",
+  "sidebar_collapse_all": "すべて折りたたむ",
   "sidebar_expand_folder": "{name} フォルダーを展開",
   "sidebar_collapse_folder": "{name} フォルダーを折りたたむ",
   "sidebar_folder_create": "新しいフォルダー",

@@ -432,6 +432,8 @@
   "sidebar_unclean_title": "Terminated mid tool call (over 1 hour idle)",
   "sidebar_expand_group": "Expand {name} group",
   "sidebar_collapse_group": "Collapse {name} group",
+  "sidebar_expand_all": "Expand all",
+  "sidebar_collapse_all": "Collapse all",
   "sidebar_expand_folder": "Expand {name} folder",
   "sidebar_collapse_folder": "Collapse {name} folder",
   "sidebar_folder_create": "New folder",

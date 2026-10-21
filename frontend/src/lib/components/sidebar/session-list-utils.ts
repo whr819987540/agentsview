@@ -183,6 +183,46 @@ export function isSubagentDescendant(
   return sessionAncestryMatches(s, groupSessions, isSubagent);
 }
 
+interface GroupChildren {
+  subagents: SessionGroupInput[];
+  teammates: SessionGroupInput[];
+  continuations: SessionGroupInput[];
+}
+
+/**
+ * Separate a group's children into subagents, teammates, and
+ * continuations. Use allSessions (unfiltered) for ancestry
+ * classification so that filtered-out ancestors don't break the
+ * parent-chain walk.
+ */
+function classifyChildren(g: SessionGroup): GroupChildren {
+  const ancestryPool = g.allSessions ?? g.sessions;
+  const out: GroupChildren = { subagents: [], teammates: [], continuations: [] };
+  for (const s of g.sessions) {
+    if (s.id === g.primarySessionId) continue;
+    if (isSubagentDescendant(s, ancestryPool)) {
+      out.subagents.push(s);
+    } else if (isTeammate(s, ancestryPool)) {
+      out.teammates.push(s);
+    } else {
+      out.continuations.push(s);
+    }
+  }
+  return out;
+}
+
+/**
+ * The expandedGroups keys that "Expand all" adds for a group: the
+ * group itself and its Team sub-group. Subagents are left out, so a
+ * group whose only children are subagents stays closed and the
+ * Subagents sub-group keeps its state.
+ */
+export function bulkExpandKeys(g: SessionGroup): string[] {
+  const { teammates, continuations } = classifyChildren(g);
+  if (teammates.length > 0) return [g.key, `team:${g.key}`];
+  return continuations.length > 0 ? [g.key] : [];
+}
+
 /**
  * Emit display items for a single SessionGroup, expanding
  * child sessions when the group key is in expandedGroups.
@@ -219,23 +259,7 @@ function emitGroupItems(
 
   if (!isExpanded) return;
 
-  // Separate children into subagents, teammates, and continuations.
-  // Use allSessions (unfiltered) for ancestry classification so that
-  // filtered-out ancestors don't break the parent-chain walk.
-  const children = g.sessions.filter((s) => s.id !== g.primarySessionId);
-  const ancestryPool = g.allSessions ?? g.sessions;
-  const subagents: SessionGroupInput[] = [];
-  const teammates: SessionGroupInput[] = [];
-  const continuations: SessionGroupInput[] = [];
-  for (const s of children) {
-    if (isSubagentDescendant(s, ancestryPool)) {
-      subagents.push(s);
-    } else if (isTeammate(s, ancestryPool)) {
-      teammates.push(s);
-    } else {
-      continuations.push(s);
-    }
-  }
+  const { subagents, teammates, continuations } = classifyChildren(g);
 
   // Sort each child group most-recent-first so the sidebar
   // matches the main session list ordering convention.

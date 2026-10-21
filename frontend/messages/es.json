@@ -514,6 +514,8 @@
   "sidebar_unclean_title": "Terminada en mitad de una llamada a herramienta (más de 1 hora inactiva)",
   "sidebar_expand_group": "Expandir el grupo {name}",
   "sidebar_collapse_group": "Contraer el grupo {name}",
+  "sidebar_expand_all": "Expandir todo",
+  "sidebar_collapse_all": "Contraer todo",
   "sidebar_expand_folder": "Expandir la carpeta {name}",
   "sidebar_collapse_folder": "Contraer la carpeta {name}",
   "sidebar_folder_create": "Nueva carpeta",
