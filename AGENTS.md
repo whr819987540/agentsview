@@ -41,6 +41,15 @@ Before reviewing CI runner security, read the
 1. Check the branch state before editing. Do not create or switch branches
    without the user's permission. A Codex-managed detached worktree may
    receive commits; leave branch creation to the user or app.
+1. Make every change that needs a new branch in its own git worktree under
+   `.worktrees/`, which `.gitignore` excludes. Never create or switch branches
+   in the main checkout, because another session may be working there. Create
+   the worktree from the latest `origin/main`, for example
+   `git worktree add .worktrees/<topic> -b <branch> origin/main`, and edit,
+   build, test, and commit inside it. Each worktree needs its own `npm ci` and
+   frontend build. Give its dev servers and e2e runs their own ports and
+   scratch data directories. After the pull request merges, remove the
+   worktree with `git worktree remove` and delete its local branch.
 1. Commit every turn that changes tracked files. Do not make empty commits. If a
    turn is read-only or changes only ignored files, say that no commit was
    made.
