@@ -159,9 +159,6 @@ test.describe("live updates", () => {
   test("newest first keeps a reader in the middle in place when messages arrive", async ({
     page,
   }) => {
-    // New rows enter above the reader at estimated heights and nothing
-    // compensates, so the text being read moves down by their height.
-    test.fail();
     const fake = FakeTranscript.withRows(LIVE_SESSION, 80);
     await fake.install(page);
     const watch = await routeSessionWatch(page, LIVE_SESSION);
@@ -177,6 +174,20 @@ test.describe("live updates", () => {
     await expect.poll(() => laidOutHeight(scroller)).toBeGreaterThan(heightBefore + 100);
     await frames(page, 10);
     await expectSamePosition(scroller, before);
+  });
+
+  test("newest first shows new messages to a reader at the top", async ({ page }) => {
+    const fake = FakeTranscript.withRows(LIVE_SESSION, 80);
+    await fake.install(page);
+    const watch = await routeSessionWatch(page, LIVE_SESSION);
+    const scroller = await openTranscript(page, `/sessions/${LIVE_SESSION}`);
+    await setNewestFirst(page, scroller);
+    await expect.poll(() => scroller.evaluate((el) => el.scrollTop)).toBe(0);
+    expect((await visibleOrdinals(scroller))[0]).toBe(79);
+
+    fake.append(2);
+    await watch.notifyUpdated();
+    await expect.poll(async () => (await visibleOrdinals(scroller))[0]).toBe(81);
   });
 
   test("shows a message that synced before the watch connected", async ({ page }) => {

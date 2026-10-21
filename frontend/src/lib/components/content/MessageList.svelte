@@ -27,6 +27,7 @@
   import SessionFindView from "./SessionFindView.svelte";
   import {
     getLatestDisplayIndex,
+    isAtLatestEdge,
     type ScrollAlign,
   } from "./message-scroll.js";
   import { m } from "../../i18n/index.js";
@@ -1016,17 +1017,16 @@
     });
   });
 
-  // The list keeps its scroll offset when rows are laid out above the
-  // reader, such as older history loading, so the reader would land among
-  // the new rows. Read the row at the top before the change lands and put
-  // it back where it was once the list has laid the new rows out.
+  // The list keeps its scroll offset when rows change above the reader,
+  // such as older history loading or, newest first, new messages arriving,
+  // so the reader would land among the new rows. Read the row at the top
+  // before the change lands and put it back where it was once the list has
+  // laid the new rows out.
   let heldPosition:
     | { sessionId: string; ordinal: number; offsetPx: number }
     | null = null;
-  let laidOutOldest: {
-    sessionId: string | null;
-    ordinal: number | undefined;
-  } = { sessionId: null, ordinal: undefined };
+  // The session whose rows the list last laid out.
+  let laidOutSessionId: string | null = null;
 
   /** Whether a jump, a search reveal, a position restore, or follow latest
    *  owns the viewport, so a change must not hold the reader's place. */
@@ -1097,15 +1097,21 @@
   // Runs before the rows render, while the screen still shows the old ones.
   $effect.pre(() => {
     const sessionId = messages.sessionId;
-    const oldest = messages.messages[0]?.ordinal;
+    // Older history, live updates, and reloads all change the loaded rows.
+    void messages.messages;
+    void messages.messages.length;
+    void messages.loadedRevision;
     untrack(() => {
-      const previous = laidOutOldest;
-      laidOutOldest = { sessionId, ordinal: oldest };
-      if (sessionId === null || previous.sessionId !== sessionId) return;
+      const sameSession =
+        sessionId !== null && sessionId === laidOutSessionId;
+      laidOutSessionId = sessionId;
+      if (!sameSession) return;
+      // A reader at the top of a newest-first list is watching the newest
+      // messages, so new ones keep arriving into view there.
       if (
-        oldest === undefined ||
-        previous.ordinal === undefined ||
-        oldest >= previous.ordinal
+        ui.sortNewestFirst &&
+        containerRef &&
+        isAtLatestEdge(containerRef, true)
       ) {
         return;
       }

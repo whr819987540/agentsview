@@ -253,6 +253,11 @@ The latest published release is
 
 **Bug fixes**
 
+- In newest-first order, new messages no longer push down the text you are
+  reading. Before, each message that arrived while you were reading further
+  down moved the transcript by that message's height. At the top of the list
+  you still see new messages arrive; turn on **Follow latest messages** to keep
+  the newest one in view from anywhere.
 - Reading far down a forked session no longer throws you back when a new
   message arrives. Before, each update briefly cut the transcript to its first
   1,000 messages, so a reader below them landed near the 1,000th one instead.
