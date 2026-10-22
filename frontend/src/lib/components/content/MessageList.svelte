@@ -35,6 +35,7 @@
   import {
     anchorScrollOffset,
     settleScrollAnchor,
+    settleScrollEnd,
     settleVirtualScroll,
   } from "./staged-scroll.js";
   import { revealMatch } from "../../search/reveal.js";
@@ -818,6 +819,47 @@
   export function scrollToLatest() {
     scrollToLatestInternal();
   }
+
+  async function scrollToBottomInternal() {
+    const reqId = ++lastScrollRequest;
+    activeFollowScrollRequest = null;
+    activeScrollWork = reqId;
+    restoreTarget = null;
+    activeRestoreRequest = null;
+    // The reader chose to leave the current find match.
+    searchRevealDetached = true;
+    try {
+      // Newest first, the bottom row is the oldest message, which a long
+      // session may not have loaded yet.
+      if (ui.sortNewestFirst && messages.hasOlder) {
+        await messages.ensureOrdinalLoaded(0);
+        if (reqId !== lastScrollRequest) return;
+        await raf();
+        await raf();
+        if (reqId !== lastScrollRequest) return;
+      }
+      const last = displayItemsAsc.length - 1;
+      if (last < 0) return;
+      const landed = await scrollToDisplayIndex(last, 0, 0, reqId, "end");
+      if (!landed || reqId !== lastScrollRequest) return;
+      await settleScrollEnd({
+        getScrollElement: () => containerRef,
+        isCurrent: () => !destroyed && reqId === lastScrollRequest,
+        nextFrame: raf,
+      });
+    } finally {
+      if (activeScrollWork === reqId) activeScrollWork = null;
+    }
+  }
+
+  // Requests made before this list mounted belong to a list that is gone.
+  let handledBottomRequest = ui.scrollToBottomRequest;
+  $effect(() => {
+    const request = ui.scrollToBottomRequest;
+    if (request === handledBottomRequest) return;
+    handledBottomRequest = request;
+    untrack(() => void scrollToBottomInternal());
+  });
 
   export function getDisplayItems(): DisplayItem[] {
     return displayItemsAsc;

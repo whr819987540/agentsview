@@ -313,6 +313,7 @@
   "message_list_empty": "Selecciona una sesión para ver los mensajes",
   "message_list_loading": "Cargando mensajes...",
   "message_list_block_controls": "Message block controls",
+  "message_list_scroll_to_bottom": "Desplazarse hasta el final",
   "message_list_collapse_visible_blocks": "Collapse visible blocks",
   "message_list_expand_visible_blocks": "Expand visible blocks",
   "code_block_label": "Code",

@@ -1,5 +1,6 @@
 <script lang="ts">
   import {
+    ArrowDownToLineIcon,
     ChartColumnIcon,
     CheckIcon,
     ChevronDownIcon,
@@ -1166,6 +1167,14 @@
       {/if}
       <div class="actions-wrapper" bind:this={actionsEl}>
         <button
+          class="scroll-bottom-btn"
+          title={m.message_list_scroll_to_bottom()}
+          onclick={() => ui.scrollToBottom()}
+          aria-label={m.message_list_scroll_to_bottom()}
+        >
+          <ArrowDownToLineIcon size="13" strokeWidth="2" aria-hidden="true" />
+        </button>
+        <button
           class="bulk-block-btn"
           title={m.message_list_collapse_visible_blocks()}
           onclick={() => ui.collapseVisibleBlocks()}
@@ -1235,7 +1244,17 @@
         </button>
         {#if menuOpen}
           <div class="actions-menu" bind:this={menuEl}>
-            <!-- Narrow headers have no room for the bulk block buttons. -->
+            <!-- Narrow headers have no room for the scroll and bulk block
+                 buttons. -->
+            <button
+              class="actions-menu-item actions-menu-item--narrow"
+              onclick={() => {
+                ui.scrollToBottom();
+                closeMenu();
+              }}
+            >
+              {m.message_list_scroll_to_bottom()}
+            </button>
             <button
               class="actions-menu-item actions-menu-item--narrow"
               onclick={() => {
@@ -1718,6 +1737,7 @@
     gap: 2px;
   }
 
+  .scroll-bottom-btn,
   .bulk-block-btn,
   .link-btn {
     display: flex;
@@ -1734,6 +1754,7 @@
     flex-shrink: 0;
   }
 
+  .scroll-bottom-btn:hover,
   .bulk-block-btn:hover {
     background: var(--bg-surface-hover);
     color: var(--text-secondary);
@@ -1900,6 +1921,7 @@
   .session-breadcrumb:global([data-density~="compact"]) .token-badge--desktop,
   .session-breadcrumb:global([data-density~="compact"]) .session-id,
   .session-breadcrumb:global([data-density~="compact"]) .usage-breakdown,
+  .session-breadcrumb:global([data-density~="compact"]) .scroll-bottom-btn,
   .session-breadcrumb:global([data-density~="compact"]) .bulk-block-btn {
     display: none;
   }
@@ -1913,7 +1935,8 @@
     text-overflow: ellipsis;
   }
 
-  /* The session actions menu offers the bulk block commands instead. */
+  /* The session actions menu offers the scroll and bulk block commands
+     instead. */
   .session-breadcrumb:global([data-density~="compact"]) .actions-menu-item--narrow {
     display: block;
   }

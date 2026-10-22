@@ -263,6 +263,7 @@
   "message_list_empty": "選擇一個會話查看消息",
   "message_list_loading": "正在加載消息...",
   "message_list_block_controls": "消息塊控件",
+  "message_list_scroll_to_bottom": "捲動到底部",
   "message_list_collapse_visible_blocks": "摺疊可見塊",
   "message_list_expand_visible_blocks": "展開可見塊",
   "code_block_label": "代碼",

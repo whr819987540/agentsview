@@ -25,6 +25,7 @@ describe("UIStore", () => {
     ui.pendingScrollOrdinal = null;
     ui.followLatest = false;
     ui.followLatestRequest = 0;
+    ui.scrollToBottomRequest = 0;
   });
 
   describe("activeModal", () => {
@@ -225,6 +226,33 @@ describe("UIStore", () => {
 
       expect(ui.followLatest).toBe(false);
       expect(ui.pendingScrollOrdinal).toBe(10);
+    });
+  });
+
+  describe("scrollToBottom", () => {
+    it("records a new request each time, even when one is pending", () => {
+      ui.scrollToBottom();
+      ui.scrollToBottom();
+
+      expect(ui.scrollToBottomRequest).toBe(2);
+    });
+
+    it("stops follow latest, which would pull a newest-first list back up", () => {
+      ui.setFollowLatest(true);
+      ui.scrollToBottom();
+
+      expect(ui.followLatest).toBe(false);
+      expect(ui.followLatestRequest).toBe(1);
+    });
+
+    it("drops a pending jump to a message", () => {
+      ui.scrollToOrdinal(10, "sess-123", { index: 1, toolUseId: "toolu_1" });
+      ui.scrollToBottom();
+
+      expect(ui.selectedOrdinal).toBeNull();
+      expect(ui.pendingScrollOrdinal).toBeNull();
+      expect(ui.pendingScrollSession).toBeNull();
+      expect(ui.pendingScrollCall).toBeNull();
     });
   });
 

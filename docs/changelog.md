@@ -11,6 +11,13 @@ The latest published release is
 
 **New features**
 
+- Jump to the end of a session's messages in one click. The **Scroll to
+  bottom** button, a down arrow to the left of **Collapse visible blocks** in
+  the session header, shows the newest message in oldest-first order and the
+  first message in newest-first order, loading older history first when it is
+  needed. It scrolls once and does not follow new messages; use **Follow latest
+  messages** for that. When the header is short of room, it is in the session
+  actions menu.
 - Open or close the whole sidebar list in one click. The **Expand all** /
   **Collapse all** button in the sidebar header opens or closes every agent or
   project section, every folder, and every session that has continuations,
@@ -475,13 +482,13 @@ The latest published release is
   Before, the session actions menu button was cut off whenever the badges and
   buttons needed more room than the header had, for example on a 400 px phone,
   in a 1,000 px window with a wide sidebar, or in a 1,280 px window with the
-  analysis panel open. The header now measures its own room instead of going
-  by the window width, so the sidebar and panels count too. When everything
-  does not fit, it first hides the start time, session ID, and usage breakdown
-  and moves **Collapse visible blocks** and **Expand visible blocks** into the
-  session actions menu. If that is not enough, it hides the agent badge, then
-  the token and cost badges, and last the remaining badges, keeping the
-  buttons.
+  analysis panel open. The header now measures its own room instead of going by
+  the window width, so the sidebar and panels count too. When everything does
+  not fit, it first hides the start time, session ID, and usage breakdown and
+  moves **Scroll to bottom**, **Collapse visible blocks**, and **Expand visible
+  blocks** into the session actions menu. If that is not enough, it hides the
+  agent badge, then the token and cost badges, and last the remaining badges,
+  keeping the buttons.
 
 ## 0.44.0
 

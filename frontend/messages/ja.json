@@ -313,6 +313,7 @@
   "message_list_empty": "メッセージを表示するセッションを選択してください",
   "message_list_loading": "メッセージを読み込んでいます...",
   "message_list_block_controls": "Message block controls",
+  "message_list_scroll_to_bottom": "一番下までスクロール",
   "message_list_collapse_visible_blocks": "Collapse visible blocks",
   "message_list_expand_visible_blocks": "Expand visible blocks",
   "code_block_label": "Code",

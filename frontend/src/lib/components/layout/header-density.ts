@@ -5,8 +5,8 @@
  * hid.
  *
  * - `compact`: hides the start time, session ID, and usage breakdown, shortens
- *   the token badge, and moves the bulk block buttons into the session actions
- *   menu.
+ *   the token badge, and moves the scroll and bulk block buttons into the
+ *   session actions menu.
  * - `tight`: hides the agent badges and narrows the gaps.
  * - `no-usage`: hides the token and cost badges.
  * - `actions-only`: hides every badge, leaving the action buttons.
