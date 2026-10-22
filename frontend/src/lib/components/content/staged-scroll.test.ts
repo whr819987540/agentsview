@@ -1,8 +1,10 @@
 import { describe, expect, it, vi } from "vite-plus/test";
 import {
   settleScrollAnchor,
+  settleScrollEnd,
   settleVirtualScroll,
   type AnchorSettleOptions,
+  type EndSettleOptions,
   type StagedScrollOptions,
 } from "./staged-scroll.js";
 
@@ -189,5 +191,80 @@ describe("settleScrollAnchor", () => {
 
     expect(await settleScrollAnchor(options)).toBe(false);
     expect(virtualizer.scrollToOffset).toHaveBeenCalledTimes(6);
+  });
+});
+
+/** A scroll container that clamps scrollTop to its scrollable range, as a
+ *  browser does. */
+function endSetup(scrollHeight: number, scrollTop: number) {
+  const list = {
+    scrollHeight,
+    clientHeight: 600,
+    top: scrollTop,
+    writes: [] as number[],
+    get scrollTop() {
+      return this.top;
+    },
+    set scrollTop(value: number) {
+      this.writes.push(value);
+      this.top = Math.min(Math.max(0, value), this.scrollHeight - this.clientHeight);
+    },
+  };
+  const options: EndSettleOptions = {
+    getScrollElement: () => list,
+    isCurrent: () => true,
+    nextFrame: vi.fn().mockResolvedValue(undefined),
+  };
+  return { list, options };
+}
+
+describe("settleScrollEnd", () => {
+  it("follows the end down while the last rows measure taller than estimated", async () => {
+    const { list, options } = endSetup(9600, 9000);
+    let frame = 0;
+    options.nextFrame = vi.fn(async () => {
+      frame++;
+      if (frame === 1) list.scrollHeight = 10_400;
+      if (frame === 3) list.scrollHeight = 10_750;
+    });
+
+    expect(await settleScrollEnd(options)).toBe(true);
+    expect(list.writes).toEqual([9800, 10_150]);
+    expect(list.scrollTop).toBe(10_150);
+  });
+
+  it("stops once a newer scroll replaces it", async () => {
+    const { list, options } = endSetup(9600, 0);
+    let current = true;
+    options.isCurrent = () => current;
+    options.nextFrame = vi.fn(async () => {
+      // The reader scrolls back up and the list grows below them.
+      list.top = 4000;
+      list.scrollHeight = 10_400;
+      current = false;
+    });
+
+    expect(await settleScrollEnd(options)).toBe(false);
+    expect(list.writes).toEqual([9000]);
+    expect(list.scrollTop).toBe(4000);
+  });
+
+  it("does nothing without a scroll container", async () => {
+    const { options } = endSetup(9600, 0);
+    options.getScrollElement = () => undefined;
+
+    expect(await settleScrollEnd(options)).toBe(false);
+    expect(options.nextFrame).not.toHaveBeenCalled();
+  });
+
+  it("gives up when the list keeps growing", async () => {
+    const { list, options } = endSetup(9600, 0);
+    options.maxFrames = 6;
+    options.nextFrame = vi.fn(async () => {
+      list.scrollHeight += 100;
+    });
+
+    expect(await settleScrollEnd(options)).toBe(false);
+    expect(list.writes).toHaveLength(6);
   });
 });

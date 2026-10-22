@@ -229,6 +229,22 @@ export function visibleOrdinals(scroller: Locator): Promise<number[]> {
   });
 }
 
+/** Pixels of transcript left below the viewport. */
+export function distanceFromEnd(scroller: Locator): Promise<number> {
+  return scroller.evaluate((el) => Math.round(el.scrollHeight - el.clientHeight - el.scrollTop));
+}
+
+/** Switch the transcript to newest first and wait until it shows that order. */
+export async function setNewestFirst(page: Page, scroller: Locator) {
+  await page.getByLabel("Toggle sort order").click();
+  await expect
+    .poll(async () => {
+      const shown = await visibleOrdinals(scroller);
+      return shown.length > 1 && shown[0]! > shown[1]!;
+    })
+    .toBe(true);
+}
+
 /** Height of every row the list has laid out, measured or estimated. */
 export function laidOutHeight(scroller: Locator): Promise<number> {
   return scroller.evaluate((el) => el.scrollHeight);

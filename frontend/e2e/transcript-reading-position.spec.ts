@@ -1,5 +1,6 @@
 import { expect, test, type Locator, type Page, type Route } from "@playwright/test";
 import {
+  distanceFromEnd,
   FakeTranscript,
   frames,
   holdAnimationFrames,
@@ -8,6 +9,7 @@ import {
   readingPosition,
   releaseAnimationFrames,
   routeSessionWatch,
+  setNewestFirst,
   settledReadingPosition,
   transcriptRow,
   visibleOrdinals,
@@ -40,20 +42,6 @@ function rowTop(scroller: Locator, ordinal: number): Promise<number | null> {
     if (!row) return null;
     return Math.round(row.getBoundingClientRect().top - el.getBoundingClientRect().top);
   }, ordinal);
-}
-
-function distanceFromEnd(scroller: Locator): Promise<number> {
-  return scroller.evaluate((el) => Math.round(el.scrollHeight - el.clientHeight - el.scrollTop));
-}
-
-async function setNewestFirst(page: Page, scroller: Locator) {
-  await page.getByLabel("Toggle sort order").click();
-  await expect
-    .poll(async () => {
-      const shown = await visibleOrdinals(scroller);
-      return shown.length > 1 && shown[0]! > shown[1]!;
-    })
-    .toBe(true);
 }
 
 async function expectSamePosition(scroller: Locator, before: ReadingPosition) {

@@ -2610,6 +2610,36 @@ describe("SessionBreadcrumb", () => {
     });
   });
 
+  it("asks the transcript to scroll to the bottom from the button and the narrow menu", async () => {
+    const component = mount(SessionBreadcrumb, {
+      target: document.body,
+      props: {
+        session: makeSession("claude"),
+        onBack: () => {},
+      },
+    });
+    await tick();
+    const before = ui.scrollToBottomRequest;
+
+    document.querySelector<HTMLButtonElement>('button[aria-label="Scroll to bottom"]')!.click();
+    await tick();
+    expect(ui.scrollToBottomRequest).toBe(before + 1);
+
+    // Narrow headers hide the button and show this menu item.
+    document.querySelector<HTMLButtonElement>(".actions-btn")!.click();
+    await tick();
+    const item = [...document.querySelectorAll<HTMLButtonElement>(".actions-menu-item")].find(
+      (button) => button.textContent?.trim() === "Scroll to bottom",
+    );
+    expect(item).toBeDefined();
+    item!.click();
+    await tick();
+    expect(ui.scrollToBottomRequest).toBe(before + 2);
+    expect(document.querySelector(".actions-menu")).toBeNull();
+
+    await unmount(component);
+  });
+
   it("issues bulk collapse and expand commands from breadcrumb controls", async () => {
     ui.visibleBlocks = new Set<BlockType>(["user", "tool"]);
     const component = mount(SessionBreadcrumb, {

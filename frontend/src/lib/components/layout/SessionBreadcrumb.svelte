@@ -1,5 +1,6 @@
 <script lang="ts">
   import {
+    ArrowDownToLineIcon,
     ChartColumnIcon,
     CheckIcon,
     ChevronDownIcon,
@@ -1164,6 +1165,14 @@
       {/if}
       <div class="actions-wrapper">
         <button
+          class="scroll-bottom-btn"
+          title={m.message_list_scroll_to_bottom()}
+          onclick={() => ui.scrollToBottom()}
+          aria-label={m.message_list_scroll_to_bottom()}
+        >
+          <ArrowDownToLineIcon size="13" strokeWidth="2" aria-hidden="true" />
+        </button>
+        <button
           class="bulk-block-btn"
           title={m.message_list_collapse_visible_blocks()}
           onclick={() => ui.collapseVisibleBlocks()}
@@ -1233,7 +1242,17 @@
         </button>
         {#if menuOpen}
           <div class="actions-menu" bind:this={menuEl}>
-            <!-- Narrow headers have no room for the bulk block buttons. -->
+            <!-- Narrow headers have no room for the scroll and bulk block
+                 buttons. -->
+            <button
+              class="actions-menu-item actions-menu-item--narrow"
+              onclick={() => {
+                ui.scrollToBottom();
+                closeMenu();
+              }}
+            >
+              {m.message_list_scroll_to_bottom()}
+            </button>
             <button
               class="actions-menu-item actions-menu-item--narrow"
               onclick={() => {
@@ -1716,6 +1735,7 @@
     gap: 2px;
   }
 
+  .scroll-bottom-btn,
   .bulk-block-btn,
   .link-btn {
     display: flex;
@@ -1732,6 +1752,7 @@
     flex-shrink: 0;
   }
 
+  .scroll-bottom-btn:hover,
   .bulk-block-btn:hover {
     background: var(--bg-surface-hover);
     color: var(--text-secondary);
@@ -1937,8 +1958,9 @@
       display: none;
     }
 
-    /* The badges and actions overflow the header here, so the bulk block
-       buttons move into the session actions menu. */
+    /* The badges and actions overflow the header here, so the scroll and
+       bulk block buttons move into the session actions menu. */
+    .scroll-bottom-btn,
     .bulk-block-btn {
       display: none;
     }
