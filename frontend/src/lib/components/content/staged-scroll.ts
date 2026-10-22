@@ -128,9 +128,10 @@ export interface EndSettleOptions {
 
 /** Hold the viewport at the bottom of the list while row measurements land.
  *  Rows measured for the first time change the list's height, so a single
- *  scroll to the last row can stop short of the end. A true result means the viewport stayed at the bottom for `stableFrames`
- *  frames in a row; false means cancellation, a missing list, or no settled
- *  position within `maxFrames`. */
+ *  scroll to the last row can stop short of the end. A true result means the
+ *  viewport stayed at the bottom for `stableFrames` frames in a row; false
+ *  means cancellation, a missing list, or no settled position within
+ *  `maxFrames`. */
 export async function settleScrollEnd(options: EndSettleOptions): Promise<boolean> {
   const stableFrames = options.stableFrames ?? 5;
   const maxFrames = options.maxFrames ?? 90;
