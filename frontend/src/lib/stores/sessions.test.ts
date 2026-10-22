@@ -3024,6 +3024,26 @@ describe("buildSessionGroups", () => {
     ]);
   });
 
+  it("keeps working sessions in place whichever one wrote last", () => {
+    const isoAgo = (ms: number) => new Date(Date.now() - ms).toISOString();
+    const rows = (lastWriter: string) =>
+      ["started-earlier", "started-later"].map((id) =>
+        makeSkinnyRow({
+          id,
+          started_at: isoAgo(id === "started-earlier" ? 2 * 60 * 60 * 1000 : 60 * 60 * 1000),
+          ended_at: isoAgo(id === lastWriter ? 5 * 1000 : 20 * 1000),
+        }),
+      );
+
+    for (const lastWriter of ["started-later", "started-earlier"]) {
+      const groups = buildSessionGroups(rows(lastWriter) as any);
+      expect(
+        groups.map((g) => g.key),
+        `last writer ${lastWriter}`,
+      ).toEqual(["started-later", "started-earlier"]);
+    }
+  });
+
   it("sidebar index freshness rollup uses every skinny group member", () => {
     const rows = [
       makeSkinnyRow({

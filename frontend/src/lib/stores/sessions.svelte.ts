@@ -1987,11 +1987,21 @@ export function buildSessionGroups(sessions: SessionGroupInput[]): SessionGroup[
   //   2. group freshness — within a tier, the group whose
   //      newest member was written most recently wins. Mirrors
   //      the time-since-last-update order the sidebar had before
-  //      the status sort was added.
+  //      the status sort was added. Working groups are the
+  //      exception: they all wrote within the last minute, and
+  //      ordering them by the last write would swap two running
+  //      agents on every message. The group that started last
+  //      leads instead, so a working group keeps its place.
   ordered.sort((a, b) => {
     const sa = statusSortKey(a);
     const sb = statusSortKey(b);
     if (sa !== sb) return sa - sb;
+    if (sa === WORKING_SORT_KEY) {
+      const startA = groupStart(a);
+      const startB = groupStart(b);
+      if (startA !== startB) return startA > startB ? -1 : 1;
+      return a.key < b.key ? -1 : a.key > b.key ? 1 : 0;
+    }
     const ra = groupFreshness(a);
     const rb = groupFreshness(b);
     if (ra > rb) return -1;
@@ -2001,12 +2011,14 @@ export function buildSessionGroups(sessions: SessionGroupInput[]): SessionGroup[
   return ordered;
 }
 
+const WORKING_SORT_KEY = 0;
+
 function statusSortKey(group: SessionGroup): number {
   const live = group.sessions.find((s) => s.id === group.liveSessionId) ?? group.sessions[0]!;
   const status = getSessionStatus(live, group.sessions);
   switch (status) {
     case "working":
-      return 0;
+      return WORKING_SORT_KEY;
     case "waiting":
       return 1;
     case "idle":
@@ -2019,6 +2031,11 @@ function statusSortKey(group: SessionGroup): number {
       return 5;
   }
   return 6;
+}
+
+/** When the group's first session started; later starts sort first. */
+function groupStart(group: SessionGroup): string {
+  return group.startedAt ?? group.sessions[0]?.created_at ?? "";
 }
 
 function groupFreshness(group: SessionGroup): string {

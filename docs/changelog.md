@@ -259,6 +259,11 @@ The latest published release is
 
 **Bug fixes**
 
+- Sessions with a working agent keep their places in the sidebar when new
+  messages arrive. Before, with two or more agents running, each message moved
+  the session that wrote it above the others, so the top of the list kept
+  swapping. Working sessions now stay in the order they started, newest first.
+  A session still moves up when its agent starts working again.
 - Hiding a block type, switching between Normal and Focused, or flipping the
   sort order keeps the message you were reading in view. Before, the transcript
   kept its scroll position while its rows changed, so you landed far from that
