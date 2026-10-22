@@ -11,6 +11,7 @@
   } from "../../stores/read-progress.svelte.js";
   import { starred } from "../../stores/starred.svelte.js";
   import { sessionFolders } from "../../stores/sessionFolders.svelte.js";
+  import { rowSessions, sessionEndMarks } from "../../stores/sessionEndMarks.svelte.js";
   import { formatRelativeTime, truncate } from "../../utils/format.js";
   import { agentColor as getAgentColor, agentLabel, entrypointBadge } from "../../utils/agents.js";
   import {
@@ -18,6 +19,7 @@
     previewMessage,
   } from "../../utils/messages.js";
   import {
+    CheckIcon,
     ChevronDownIcon,
     ChevronRightIcon,
     StarIcon,
@@ -102,6 +104,9 @@
   let sessionStatus = $derived(
     getSessionStatus(statusSession ?? session, groupSessions),
   );
+
+  let endMarkSessions = $derived(rowSessions(session, groupSessions));
+  let isEnded = $derived(sessionEndMarks.isEnded(endMarkSessions));
 
   let isActive = $derived.by(() => {
     const aid = sessions.activeSessionId;
@@ -285,6 +290,19 @@
         : m.data_session_assignment_clear_failed();
     } finally {
       projectSaving = false;
+    }
+  }
+
+  async function toggleEnded() {
+    closeContextMenu();
+    try {
+      if (isEnded) {
+        await sessionEndMarks.unmark(endMarkSessions);
+      } else {
+        await sessionEndMarks.mark(endMarkSessions);
+      }
+    } catch {
+      showFlash(m.session_end_mark_failed(), { tone: "danger" });
     }
   }
 
@@ -495,7 +513,13 @@
   {/if}
 
   <span class="status-slot">
-    <StatusDot status={sessionStatus} label={sessionStatusLabel(sessionStatus)} size={6} />
+    {#if isEnded}
+      <span class="ended-mark" role="img" title={m.session_end_mark_label()} aria-label={m.session_end_mark_label()}>
+        <CheckIcon size="10" strokeWidth="3" aria-hidden="true" />
+      </span>
+    {:else}
+      <StatusDot status={sessionStatus} label={sessionStatusLabel(sessionStatus)} size={6} />
+    {/if}
   </span>
 
 
@@ -623,6 +647,11 @@
     {#if canFile}
       <button class="context-menu-item" onclick={openFolderPicker}>
         {m.sidebar_row_move_to_folder()}
+      </button>
+    {/if}
+    {#if sessionEndMarks.editable}
+      <button class="context-menu-item" onclick={() => void toggleEnded()}>
+        {isEnded ? m.session_end_mark_unmark() : m.session_end_mark_mark()}
       </button>
     {/if}
     <button
@@ -859,6 +888,11 @@
     justify-content: center;
     width: 10px;
     flex-shrink: 0;
+  }
+
+  .ended-mark {
+    display: inline-flex;
+    color: var(--text-muted);
   }
 
   .session-info {

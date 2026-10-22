@@ -1835,6 +1835,7 @@ var readOnlyRequiredTables = []string{
 	"starred_sessions",
 	"session_folders",
 	"session_folder_members",
+	"session_end_marks",
 	"excluded_sessions",
 	"worktree_project_mappings",
 	"session_project_assignments",

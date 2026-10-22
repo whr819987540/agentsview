@@ -11,6 +11,13 @@ The latest published release is
 
 **New features**
 
+- Mark a session as ended when you are done with it. Right-click a session in
+  the sidebar, or open the session actions menu in the session header, and
+  choose **Mark as ended**. The row's status dot becomes a small gray check and
+  the row sorts with the quiet sessions. The mark clears itself when the
+  session has new activity, such as when you resume it. Marks are saved in the
+  local archive and are not shown when serving from a PostgreSQL, ClickHouse,
+  or DuckDB replica.
 - Jump to the end of a session's messages in one click. The **Scroll to
   bottom** button, a down arrow to the left of **Collapse visible blocks** in
   the session header, shows the newest message in oldest-first order and the

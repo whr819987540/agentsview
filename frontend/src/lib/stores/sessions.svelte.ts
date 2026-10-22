@@ -10,6 +10,7 @@ import type {
 import { sync } from "./sync.svelte.js";
 import { events } from "./events.svelte.js";
 import { starred } from "./starred.svelte.js";
+import { sessionEndMarks } from "./sessionEndMarks.svelte.js";
 import { yokedDates } from "./yokedDates.svelte.js";
 import { SESSION_ANALYTICS_WINDOW_PARAM, parseWindowDaysParam } from "./sessionRouteParams.js";
 import { rollingRange } from "../utils/dates.js";
@@ -1983,7 +1984,8 @@ export function buildSessionGroups(sessions: SessionGroupInput[]): SessionGroup[
   //      quiet → unclean. Awaiting-user rows sit above idle even
   //      when older, and unclean (terminated mid tool call) sinks
   //      to the very bottom so noise from old crashed sessions
-  //      doesn't push live work off-screen.
+  //      doesn't push live work off-screen. A group the user
+  //      marked ended sorts as quiet until it has new activity.
   //   2. group freshness — within a tier, the group whose
   //      newest member was written most recently wins. Mirrors
   //      the time-since-last-update order the sidebar had before
@@ -2013,7 +2015,10 @@ export function buildSessionGroups(sessions: SessionGroupInput[]): SessionGroup[
 
 const WORKING_SORT_KEY = 0;
 
+const QUIET_SORT_KEY = 4;
+
 function statusSortKey(group: SessionGroup): number {
+  if (sessionEndMarks.isEnded(group.sessions)) return QUIET_SORT_KEY;
   const live = group.sessions.find((s) => s.id === group.liveSessionId) ?? group.sessions[0]!;
   const status = getSessionStatus(live, group.sessions);
   switch (status) {
@@ -2026,7 +2031,7 @@ function statusSortKey(group: SessionGroup): number {
     case "stale":
       return 3;
     case "quiet":
-      return 4;
+      return QUIET_SORT_KEY;
     case "unclean":
       return 5;
   }

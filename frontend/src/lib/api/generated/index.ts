@@ -19,6 +19,7 @@ export * as RecentEditsService from "./recent-edits/recent-edits.ts";
 export * as RemoteSyncService from "./remote-sync/remote-sync.ts";
 export * as SearchService from "./search/search.ts";
 export * as SecretsService from "./secrets/secrets.ts";
+export * as SessionEndMarksService from "./session-end-marks/session-end-marks.ts";
 export * as SessionFoldersService from "./session-folders/session-folders.ts";
 export * as SessionsService from "./sessions/sessions.ts";
 export * as SettingsService from "./settings/settings.ts";
