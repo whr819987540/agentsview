@@ -11,6 +11,13 @@ The latest published release is
 
 **New features**
 
+- Jump to the end of a session's messages in one click. The **Scroll to
+  bottom** button, a down arrow to the left of **Collapse visible blocks** in
+  the session header, shows the newest message in oldest-first order and the
+  first message in newest-first order, loading older history first when it is
+  needed. It scrolls once and does not follow new messages; use **Follow latest
+  messages** for that. At 900 px wide and below, it is in the session actions
+  menu.
 - Open or close the whole sidebar list in one click. The **Expand all** /
   **Collapse all** button in the sidebar header opens or closes every agent or
   project section, every folder, and every session that has continuations,

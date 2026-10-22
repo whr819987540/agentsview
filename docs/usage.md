@@ -1030,6 +1030,20 @@ turns follow mode off. Clicking the toggle again re-engages it and jumps to the
 latest message. The preference is persisted in localStorage, so a session you
 opened in follow mode comes back in follow mode.
 
+### Scroll to Bottom
+
+The **Scroll to bottom** button in the session header, the down arrow to the
+left of **Collapse visible blocks**, moves the message list to its end once. In
+oldest-first order the end is the newest message. In newest-first order it is
+the first message, and the button loads any older history that has not loaded
+yet before it scrolls.
+
+Unlike [Follow Latest Message](#follow-latest-message), the list does not keep
+up with messages that arrive afterward. The button turns follow mode off, since
+in newest-first order follow mode would pull the list back to the top. At 900 px
+wide and below, the button sits in the session actions menu instead of the
+header.
+
 ______________________________________________________________________
 
 ## Command Palette

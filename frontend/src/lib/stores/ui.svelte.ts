@@ -370,6 +370,8 @@ class UIStore {
   signalPanelOpen: boolean = $state(readStoredBool(SIGNAL_PANEL_KEY, false));
   followLatest: boolean = $state(readStoredBool(FOLLOW_LATEST_KEY, false));
   followLatestRequest: number = $state(0);
+  /** Bumped by each request to jump once to the bottom of the transcript. */
+  scrollToBottomRequest: number = $state(0);
 
   /** Set of block types currently visible. */
   visibleBlocks: Set<BlockType> = $state(readBlockFilters());
@@ -709,6 +711,17 @@ class UIStore {
       this.pendingScrollSession = null;
       this.pendingScrollCall = null;
     }
+  }
+
+  /** Jump once to the bottom of the transcript. Unlike follow latest, the
+   *  list does not keep up with messages that arrive afterward. */
+  scrollToBottom() {
+    this.followLatest = false;
+    this.scrollToBottomRequest += 1;
+    this.selectedOrdinal = null;
+    this.pendingScrollOrdinal = null;
+    this.pendingScrollSession = null;
+    this.pendingScrollCall = null;
   }
 
   toggleFollowLatest() {

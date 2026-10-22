@@ -27,9 +27,9 @@ The transcript scrolls to the current occurrence when the reader navigates: a
 new query, next/previous, a result row, or a filter or sort change. Afterwards,
 only rows inserted above the occurrence, such as older history, bring it back
 into view. Rows appended below it, such as a running session's new messages in
-oldest-first order, never scroll the transcript. Once the reader scrolls or
-turns on follow latest, moving rows do not scroll back to the occurrence until
-the next navigation.
+oldest-first order, never scroll the transcript. Once the reader scrolls,
+turns on follow latest, or jumps to the bottom, moving rows do not scroll back
+to the occurrence until the next navigation.
 
 Enter, Shift+Enter, F3, Shift+F3, and the platform find-next shortcuts operate
 on the current input. A navigation request commits pending debounce text before

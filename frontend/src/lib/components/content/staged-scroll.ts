@@ -117,3 +117,36 @@ export async function settleScrollAnchor(options: AnchorSettleOptions): Promise<
   }
   return false;
 }
+
+export interface EndSettleOptions {
+  getScrollElement(): { scrollTop: number; scrollHeight: number; clientHeight: number } | undefined;
+  isCurrent(): boolean;
+  nextFrame(): Promise<void>;
+  stableFrames?: number;
+  maxFrames?: number;
+}
+
+/** Hold the viewport at the bottom of the list while row measurements land.
+ *  Rows measured for the first time change the list's height, so a single
+ *  scroll to the last row can stop short of the end. A true result means the viewport stayed at the bottom for `stableFrames`
+ *  frames in a row; false means cancellation, a missing list, or no settled
+ *  position within `maxFrames`. */
+export async function settleScrollEnd(options: EndSettleOptions): Promise<boolean> {
+  const stableFrames = options.stableFrames ?? 5;
+  const maxFrames = options.maxFrames ?? 90;
+  let stable = 0;
+  for (let frame = 0; frame < maxFrames; frame++) {
+    if (!options.isCurrent()) return false;
+    const el = options.getScrollElement();
+    if (!el) return false;
+    const bottom = Math.max(0, el.scrollHeight - el.clientHeight);
+    if (Math.abs(bottom - el.scrollTop) > 1) {
+      el.scrollTop = bottom;
+      stable = 0;
+    } else if (++stable >= stableFrames) {
+      return true;
+    }
+    await options.nextFrame();
+  }
+  return false;
+}
