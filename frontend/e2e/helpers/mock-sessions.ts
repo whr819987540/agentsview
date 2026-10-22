@@ -25,22 +25,29 @@ export function createMockSessions(
   prefix: string,
   projectFn: (index: number) => string,
 ): MockSession[] {
-  const now = new Date().toISOString();
-  return Array.from({ length: count }, (_, i) => ({
-    id: `${prefix}-${i}`,
-    project: projectFn(i),
-    machine: "test-machine",
-    agent: "test-agent",
-    first_message: `Hello from ${prefix} ${i}`,
-    started_at: now,
-    ended_at: now,
-    message_count: 10,
-    user_message_count: 5,
-    created_at: now,
-    file_path: `/tmp/${prefix}-${i}.json`,
-    is_automated: false,
-    is_teammate: false,
-  }));
+  // One millisecond apart, newest first, so the sidebar shows the sessions in
+  // index order whether it sorts by start or by last write. With one shared
+  // time the order falls to tie-breaks, such as comparing working sessions'
+  // IDs as strings, which puts "session-10" before "session-2".
+  const newest = Date.now();
+  return Array.from({ length: count }, (_, i) => {
+    const at = new Date(newest - i).toISOString();
+    return {
+      id: `${prefix}-${i}`,
+      project: projectFn(i),
+      machine: "test-machine",
+      agent: "test-agent",
+      first_message: `Hello from ${prefix} ${i}`,
+      started_at: at,
+      ended_at: at,
+      message_count: 10,
+      user_message_count: 5,
+      created_at: at,
+      file_path: `/tmp/${prefix}-${i}.json`,
+      is_automated: false,
+      is_teammate: false,
+    };
+  });
 }
 
 interface SessionDataSet {
