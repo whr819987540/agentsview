@@ -409,6 +409,8 @@
     if (!contextMenu && !projectEditor) return;
     function handler(e: KeyboardEvent) {
       if (e.key === "Escape") {
+        // Claim the key so the global Escape does not also leave the session.
+        e.preventDefault();
         contextMenu = null;
         projectEditor = null;
       }

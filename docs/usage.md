@@ -1340,7 +1340,7 @@ Press `?` to see all shortcuts in a modal overlay.
 | `Cmd+K`   | Open command palette              |
 | `Cmd+G`   | Open a session by ID or UUID       |
 | `Cmd+F`   | Search within current session     |
-| `Esc`     | Close modal / deselect session    |
+| `Esc`     | Close menu / deselect session     |
 | `j` / `↓` | Next message                      |
 | `k` / `↑` | Previous message                  |
 | `Shift+J` | Next user prompt                  |
@@ -1357,7 +1357,9 @@ Press `?` to see all shortcuts in a modal overlay.
 | `?`       | Show shortcuts                    |
 
 Use `Ctrl` in place of `Cmd` on Windows and Linux. Most shortcuts are disabled
-when typing in an input field. `Esc` always works.
+when typing in an input field. `Esc` always works. It closes the open menu,
+popover, or modal first, and deselects the session only when nothing else is
+open.
 
 ______________________________________________________________________
 

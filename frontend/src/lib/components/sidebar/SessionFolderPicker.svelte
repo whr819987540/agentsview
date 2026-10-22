@@ -46,7 +46,11 @@
       }
     }
     function onKeyDown(e: KeyboardEvent) {
-      if (e.key === "Escape") onclose();
+      if (e.key === "Escape") {
+        // Claim the key so the global Escape does not also leave the session.
+        e.preventDefault();
+        onclose();
+      }
     }
     document.addEventListener("pointerdown", onPointerDown, true);
     document.addEventListener("keydown", onKeyDown);

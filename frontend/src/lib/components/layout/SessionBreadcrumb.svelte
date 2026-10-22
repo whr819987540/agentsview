@@ -807,8 +807,13 @@
         closeMenu();
       } else if (showOpenMenu) {
         showOpenMenu = false;
-        e.preventDefault();
+      } else if (usageBreakdownOpen) {
+        usageBreakdownOpen = false;
+      } else {
+        return;
       }
+      // Claim the key so the global Escape does not also leave the session.
+      e.preventDefault();
       return;
     }
     if (showOpenMenu && isLocal) {
@@ -877,7 +882,10 @@
       bind:this={renameInput}
       onkeydown={(e) => {
         if (e.key === "Enter") submitRename();
-        if (e.key === "Escape") cancelRename();
+        if (e.key === "Escape") {
+          e.preventDefault();
+          cancelRename();
+        }
       }}
       onblur={submitRename}
     />
