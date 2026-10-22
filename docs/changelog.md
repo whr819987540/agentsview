@@ -16,8 +16,8 @@ The latest published release is
   the session header, shows the newest message in oldest-first order and the
   first message in newest-first order, loading older history first when it is
   needed. It scrolls once and does not follow new messages; use **Follow latest
-  messages** for that. At 900 px wide and below, it is in the session actions
-  menu.
+  messages** for that. When the header is short of room, it is in the session
+  actions menu.
 - Open or close the whole sidebar list in one click. The **Expand all** /
   **Collapse all** button in the sidebar header opens or closes every agent or
   project section, every folder, and every session that has continuations,
@@ -266,6 +266,15 @@ The latest published release is
 
 **Bug fixes**
 
+- Sessions with a working agent keep their places in the sidebar when new
+  messages arrive. Before, with two or more agents running, each message moved
+  the session that wrote it above the others, so the top of the list kept
+  swapping. Working sessions now stay in the order they started, newest first.
+  A session still moves up when its agent starts working again.
+- A session's title no longer shifts sideways in the sidebar when its status
+  changes. Before, the Waiting speech bubble was wider than the other status
+  dots, so the title jumped when a waiting session got a new message and
+  jumped back when the agent finished. All titles now line up.
 - Pressing Escape to close a menu no longer also closes the session. Before,
   closing the session actions menu, the Resume menu, or a session, folder, or
   project menu in the sidebar with Escape also took you back to the session
@@ -484,12 +493,17 @@ The latest published release is
   jump into a fork or subagent hidden inside a collapsed group, or step past a
   child row you had expanded. Sessions inside a collapsed group, section, or
   folder are skipped until you expand it.
-- The buttons at the right end of the session header stay inside the window on
-  narrow screens. Before, at widths such as 768 px or a 400 px phone, with
-  reasoning effort shown beside the model, the last buttons ran past the
-  window's edge and the session actions menu button was cut off. At 900 px wide
-  and below, **Collapse visible blocks** and **Expand visible blocks** now sit
-  in the session actions menu instead of the header.
+- The buttons at the right end of the session header stay inside the header.
+  Before, the session actions menu button was cut off whenever the badges and
+  buttons needed more room than the header had, for example on a 400 px phone,
+  in a 1,000 px window with a wide sidebar, or in a 1,280 px window with the
+  analysis panel open. The header now measures its own room instead of going by
+  the window width, so the sidebar and panels count too. When everything does
+  not fit, it first hides the start time, session ID, and usage breakdown and
+  moves **Scroll to bottom**, **Collapse visible blocks**, and **Expand visible
+  blocks** into the session actions menu. If that is not enough, it hides the
+  agent badge, then the token and cost badges, and last the remaining badges,
+  keeping the buttons.
 
 ## 0.44.0
 

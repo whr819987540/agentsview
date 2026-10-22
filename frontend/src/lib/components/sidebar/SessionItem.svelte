@@ -494,7 +494,9 @@
     </button>
   {/if}
 
-  <StatusDot status={sessionStatus} label={sessionStatusLabel(sessionStatus)} size={6} />
+  <span class="status-slot">
+    <StatusDot status={sessionStatus} label={sessionStatusLabel(sessionStatus)} size={6} />
+  </span>
 
 
   <div class="session-info">
@@ -847,6 +849,16 @@
     max-width: 74px;
     overflow: hidden;
     text-overflow: ellipsis;
+  }
+
+  /* The waiting bubble is 10px wide and the other status dots are 6px.
+     One slot for both keeps the title in place when the status changes. */
+  .status-slot {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 10px;
+    flex-shrink: 0;
   }
 
   .session-info {

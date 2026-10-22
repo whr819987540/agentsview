@@ -393,6 +393,12 @@ explaining the current state.
 | Unclean | Red               | Same flagged state as Stale, but idle for more than an hour                                                             |
 | Quiet   | Hidden            | Cleanly-ended sessions older than 10 minutes; no dot is rendered                                                        |
 
+The sidebar lists sessions by state: Working, Waiting, Idle, Stale, Quiet, then
+Unclean. Within a state, the session written to most recently comes first.
+Working sessions are the exception: they keep the order they started in,
+newest first, so new messages from running agents don't swap them. A session
+still moves up when its agent starts working again.
+
 The "flagged" tier (Stale and Unclean) is meant to surface sessions that look
 like an agent crashed mid tool call or had its session file truncated, so
 they're easy to pick out from sessions that simply haven't been touched in a
@@ -1040,9 +1046,9 @@ yet before it scrolls.
 
 Unlike [Follow Latest Message](#follow-latest-message), the list does not keep
 up with messages that arrive afterward. The button turns follow mode off, since
-in newest-first order follow mode would pull the list back to the top. At 900 px
-wide and below, the button sits in the session actions menu instead of the
-header.
+in newest-first order follow mode would pull the list back to the top. When the
+session header is short of room, the button sits in the session actions menu
+instead of the header.
 
 ______________________________________________________________________
 
