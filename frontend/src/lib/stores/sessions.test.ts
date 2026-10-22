@@ -9,6 +9,7 @@ import {
 } from "./sessions.svelte.js";
 import { SessionsService, type DbSession } from "../api/generated/index";
 import { starred } from "./starred.svelte.js";
+import { sessionEndMarks } from "./sessionEndMarks.svelte.js";
 import { yokedDates } from "./yokedDates.svelte.js";
 import type { Filters } from "./sessions.svelte.js";
 import type { Session } from "../api/types.js";
@@ -3022,6 +3023,39 @@ describe("buildSessionGroups", () => {
       "quiet",
       "unclean",
     ]);
+  });
+
+  it("sorts a row marked ended with the quiet rows until it has new activity", () => {
+    const isoAgo = (ms: number) => new Date(Date.now() - ms).toISOString();
+    const markedEnd = isoAgo(5 * 60 * 1000);
+    const rows = [
+      makeSkinnyRow({
+        id: "quiet",
+        ended_at: isoAgo(30 * 60 * 1000),
+        termination_status: "clean",
+      }),
+      makeSkinnyRow({
+        id: "marked",
+        ended_at: markedEnd,
+        termination_status: "awaiting_user",
+      }),
+      makeSkinnyRow({
+        id: "idle",
+        ended_at: isoAgo(6 * 60 * 1000),
+      }),
+    ];
+    const order = () => buildSessionGroups(rows as any).map((g) => g.primarySessionId);
+
+    try {
+      sessionEndMarks.marks = new Map([["marked", markedEnd]]);
+      expect(order()).toEqual(["idle", "marked", "quiet"]);
+
+      // The session wrote again after it was marked.
+      sessionEndMarks.marks = new Map([["marked", isoAgo(10 * 60 * 1000)]]);
+      expect(order()).toEqual(["marked", "idle", "quiet"]);
+    } finally {
+      sessionEndMarks.marks = new Map();
+    }
   });
 
   it("keeps working sessions in place whichever one wrote last", () => {

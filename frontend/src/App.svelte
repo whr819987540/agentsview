@@ -77,6 +77,7 @@
   import { parseScrollCall, ui, type ScrollCall } from "./lib/stores/ui.svelte.js";
   import { router } from "./lib/stores/router.svelte.js";
   import { starred } from "./lib/stores/starred.svelte.js";
+  import { sessionEndMarks } from "./lib/stores/sessionEndMarks.svelte.js";
   import { pins } from "./lib/stores/pins.svelte.js";
   import { settings } from "./lib/stores/settings.svelte.js";
   import { analyticsPageDates } from "./lib/stores/analyticsPageDates.js";
@@ -817,6 +818,7 @@
     globalAuthToken = getAuthToken();
     settings.load();
     starred.load();
+    void sessionEndMarks.load();
     sync.loadStatus();
     sync.loadStats();
     sync.loadVersion();

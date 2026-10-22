@@ -755,6 +755,15 @@ CREATE TABLE IF NOT EXISTS session_folder_members (
 CREATE INDEX IF NOT EXISTS idx_session_folder_members_folder
     ON session_folder_members(folder_id);
 
+-- Session end marks: the user marked a session as ended. activity_at is the
+-- session's last activity the user saw when marking; the sidebar treats the
+-- mark as cleared once the session has newer activity.
+CREATE TABLE IF NOT EXISTS session_end_marks (
+    session_id  TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+    activity_at TEXT NOT NULL,
+    created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
 -- Excluded sessions: tracks session IDs that were permanently
 -- deleted by the user so the sync engine does not re-import them.
 CREATE TABLE IF NOT EXISTS excluded_sessions (

@@ -49,6 +49,12 @@
   import SidebarToggleButton from "./SidebarToggleButton.svelte";
   import { fitHeaderDensity } from "./header-density.js";
   import { sessions } from "../../stores/sessions.svelte.js";
+  import {
+    rowSessions,
+    sessionEndMarks,
+    type EndMarkSession,
+  } from "../../stores/sessionEndMarks.svelte.js";
+  import { showFlash } from "@kenn-io/kit-ui";
   import { router } from "../../stores/router.svelte.js";
   import { insights } from "../../stores/insights.svelte.js";
   import {
@@ -573,6 +579,30 @@
 
   function cancelRename() {
     renaming = false;
+  }
+
+  /** The sessions of the sidebar row this session belongs to, the row's
+   *  shown session first, so the header marks the row the sidebar shows. */
+  function endMarkRow(current: Session): EndMarkSession[] {
+    const group = sessions.groupedSessions.find((g) =>
+      g.sessions.some((s) => s.id === current.id),
+    );
+    if (!group) return [current];
+    const shown = group.sessions.find((s) => s.id === group.primarySessionId) ?? current;
+    return rowSessions(shown, group.sessions);
+  }
+
+  async function toggleEnded(row: EndMarkSession[], ended: boolean) {
+    closeMenu();
+    try {
+      if (ended) {
+        await sessionEndMarks.unmark(row);
+      } else {
+        await sessionEndMarks.mark(row);
+      }
+    } catch {
+      showFlash(m.session_end_mark_failed(), { tone: "danger" });
+    }
   }
 
   async function handleDelete() {
@@ -1287,6 +1317,16 @@
             >
               {m.session_breadcrumb_rename()}
             </button>
+            {#if sessionEndMarks.editable}
+              {@const endRow = endMarkRow(session)}
+              {@const ended = sessionEndMarks.isEnded(endRow)}
+              <button
+                class="actions-menu-item"
+                onclick={() => void toggleEnded(endRow, ended)}
+              >
+                {ended ? m.session_end_mark_unmark() : m.session_end_mark_mark()}
+              </button>
+            {/if}
             <button
               class="actions-menu-item danger"
               onclick={handleDelete}

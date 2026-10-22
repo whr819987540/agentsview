@@ -64,8 +64,9 @@ type sessionFolderRemoveInput struct {
 	}
 }
 
-// sessionFolderDB returns the local archive for folder edits.
-func (s *Server) sessionFolderDB() (*db.DB, error) {
+// writableLocalDB returns the local archive for edits that only SQLite
+// stores, such as folders and session end marks.
+func (s *Server) writableLocalDB() (*db.DB, error) {
 	localDB, ok := s.db.(*db.DB)
 	if !ok || localDB == nil || localDB.ReadOnly() {
 		return nil, apiError(http.StatusNotImplemented, "not available in remote mode")
@@ -121,7 +122,7 @@ func (s *Server) humaCreateSessionFolder(
 	ctx context.Context,
 	in *sessionFolderCreateInput,
 ) (*createdOutput[db.SessionFolder], error) {
-	localDB, err := s.sessionFolderDB()
+	localDB, err := s.writableLocalDB()
 	if err != nil {
 		return nil, err
 	}
@@ -136,7 +137,7 @@ func (s *Server) humaRenameSessionFolder(
 	ctx context.Context,
 	in *sessionFolderRenameInput,
 ) (*jsonOutput[db.SessionFolder], error) {
-	localDB, err := s.sessionFolderDB()
+	localDB, err := s.writableLocalDB()
 	if err != nil {
 		return nil, err
 	}
@@ -151,7 +152,7 @@ func (s *Server) humaDeleteSessionFolder(
 	ctx context.Context,
 	in *sessionFolderPathInput,
 ) (*noContentOutput, error) {
-	localDB, err := s.sessionFolderDB()
+	localDB, err := s.writableLocalDB()
 	if err != nil {
 		return nil, err
 	}
@@ -165,7 +166,7 @@ func (s *Server) humaMoveSessionsToFolder(
 	ctx context.Context,
 	in *sessionFolderMoveInput,
 ) (*jsonOutput[sessionFoldersResponse], error) {
-	localDB, err := s.sessionFolderDB()
+	localDB, err := s.writableLocalDB()
 	if err != nil {
 		return nil, err
 	}
@@ -179,7 +180,7 @@ func (s *Server) humaRemoveSessionsFromFolders(
 	ctx context.Context,
 	in *sessionFolderRemoveInput,
 ) (*jsonOutput[sessionFoldersResponse], error) {
-	localDB, err := s.sessionFolderDB()
+	localDB, err := s.writableLocalDB()
 	if err != nil {
 		return nil, err
 	}

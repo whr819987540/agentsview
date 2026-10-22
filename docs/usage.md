@@ -392,12 +392,13 @@ explaining the current state.
 | Stale   | Amber             | 10–60 minutes idle and last assistant message has an unresolved tool call (or the session file was truncated mid-write) |
 | Unclean | Red               | Same flagged state as Stale, but idle for more than an hour                                                             |
 | Quiet   | Hidden            | Cleanly-ended sessions older than 10 minutes; no dot is rendered                                                        |
+| Ended   | Gray check        | You [marked the session as ended](#mark-a-session-as-ended) and it has had no activity since                            |
 
 The sidebar lists sessions by state: Working, Waiting, Idle, Stale, Quiet, then
-Unclean. Within a state, the session written to most recently comes first.
-Working sessions are the exception: they keep the order they started in,
-newest first, so new messages from running agents don't swap them. A session
-still moves up when its agent starts working again.
+Unclean. Ended sessions sort with Quiet. Within a state, the session written to
+most recently comes first. Working sessions are the exception: they keep the
+order they started in, newest first, so new messages from running agents don't
+swap them. A session still moves up when its agent starts working again.
 
 The "flagged" tier (Stale and Unclean) is meant to surface sessions that look
 like an agent crashed mid tool call or had its session file truncated, so
@@ -416,6 +417,24 @@ status still wins for the Waiting state — a fork running in parallel doesn't
 change that the parent has said *"your turn"*. A continuation chain's row shows
 the original session, but its Waiting state comes from the newest continuation,
 where the conversation is now.
+
+### Mark a Session as Ended
+
+Mark a session as ended when you are done with it, so the sidebar shows at a
+glance which sessions still need you. Right-click the session in the sidebar
+and choose **Mark as ended**, or choose it from the session actions menu in the
+session header. The row's status dot becomes a small gray check, and the row
+sorts with the Quiet sessions. Choose **Unmark as ended** to remove the mark.
+Session end marks are unreleased.
+
+The mark lasts until the session has new activity. When you resume the
+session, or one of its continuations or subagents writes again, the row shows
+its live status again; mark it again when you are done. A mark applies to the
+whole sidebar row, including the session's continuations and subagents.
+
+Marks are saved in the SQLite archive, so they survive restarts and full
+resyncs. PostgreSQL, ClickHouse, and DuckDB replicas do not carry marks: a
+sidebar served from a replica shows none and has no menu item to add them.
 
 ### Group by Agent
 
