@@ -108,6 +108,13 @@ function dragEvent(type: string): Event {
   return new Event(type, { bubbles: true, cancelable: true });
 }
 
+/** Press Escape the way a browser delivers it to the document. */
+function pressEscape(): KeyboardEvent {
+  const event = new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true });
+  document.dispatchEvent(event);
+  return event;
+}
+
 describe("SessionList folders", () => {
   let component: ReturnType<typeof mount> | undefined;
   let originalResizeObserver: typeof ResizeObserver | undefined;
@@ -292,6 +299,43 @@ describe("SessionList folders", () => {
     );
     expect(document.querySelector(".folder-picker")).toBeNull();
     expect(visibleSessionIds()).toEqual(["a1"]);
+  });
+
+  // A claimed Escape keeps the global shortcut from also leaving the session.
+  it("closes a folder's menu on Escape and claims the key", async () => {
+    component = mount(SessionList, { target: document.body });
+    await settle();
+
+    document
+      .querySelector<HTMLElement>(".folder-row")!
+      .dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, clientX: 12, clientY: 12 }));
+    await tick();
+    expect(document.querySelector(".context-menu")).not.toBeNull();
+
+    const escape = pressEscape();
+    await tick();
+
+    expect(document.querySelector(".context-menu")).toBeNull();
+    expect(escape.defaultPrevented).toBe(true);
+  });
+
+  it("closes a project's menu on Escape and claims the key", async () => {
+    localStorage.setItem(STORAGE_KEY_GROUP, "project");
+    sessions.filters = { ...sessions.filters, project: "" };
+    component = mount(SessionList, { target: document.body });
+    await settle();
+
+    document
+      .querySelector<HTMLElement>(".group-header")!
+      .dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, clientX: 12, clientY: 12 }));
+    await tick();
+    expect(document.querySelector(".context-menu")).not.toBeNull();
+
+    const escape = pressEscape();
+    await tick();
+
+    expect(document.querySelector(".context-menu")).toBeNull();
+    expect(escape.defaultPrevented).toBe(true);
   });
 
   it("creates a folder from the header and saves the name typed into it", async () => {

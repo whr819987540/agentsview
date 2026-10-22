@@ -175,6 +175,29 @@ describe("registerShortcuts", () => {
       expect(sessions.activeSessionId).toBeNull();
     });
 
+    it("leaves the session open when a menu opened later claims Escape", () => {
+      sessions.activeSessionId = "s1";
+      let menuOpen = true;
+      // Registered after the shortcuts, as a menu's listener is when it opens.
+      const closeMenu = (e: KeyboardEvent) => {
+        if (e.key !== "Escape" || !menuOpen) return;
+        e.preventDefault();
+        menuOpen = false;
+      };
+      document.addEventListener("keydown", closeMenu);
+      try {
+        fireCancelableKey("Escape");
+        expect(menuOpen).toBe(false);
+        expect(sessions.activeSessionId).toBe("s1");
+
+        // With the menu closed, the next Escape leaves the session.
+        fireCancelableKey("Escape");
+        expect(sessions.activeSessionId).toBeNull();
+      } finally {
+        document.removeEventListener("keydown", closeMenu);
+      }
+    });
+
     it("should prioritize closing modal over deselecting session", () => {
       ui.activeModal = "shortcuts";
       sessions.activeSessionId = "s1";

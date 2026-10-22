@@ -171,14 +171,8 @@ export function registerShortcuts(opts: ShortcutOptions): () => void {
       }
     }
 
-    // Esc — always works
-    if (e.key === "Escape") {
-      // The palette handles Escape after its nested popovers have had a
-      // chance to claim it at document level.
-      if (ui.activeModal === "commandPalette") return;
-      handleEscape();
-      return;
-    }
+    // Escape is handled by escapeHandler once the event reaches the window.
+    if (e.key === "Escape") return;
 
     // All remaining shortcuts are plain single-key — skip if any modifier is held.
     // (Shift is allowed because "?" requires Shift on most layouts.)
@@ -305,12 +299,26 @@ export function registerShortcuts(opts: ShortcutOptions): () => void {
     }
   }
 
+  // Escape always works, but only after every listener on the document has
+  // seen it, including the ones a menu adds when it opens later than these
+  // shortcuts. A menu or popover that closes on Escape claims the key with
+  // preventDefault, so one press closes only that layer and does not also
+  // leave the session.
+  function escapeHandler(e: KeyboardEvent) {
+    if (e.key !== "Escape" || ignoreShortcut(e)) return;
+    // The palette handles its own Escape at window level.
+    if (ui.activeModal === "commandPalette") return;
+    handleEscape();
+  }
+
   document.addEventListener("pointerdown", rememberArrowInteraction, true);
   document.addEventListener("focusin", rememberArrowInteraction, true);
   document.addEventListener("keydown", handler);
+  window.addEventListener("keydown", escapeHandler);
   return () => {
     document.removeEventListener("pointerdown", rememberArrowInteraction, true);
     document.removeEventListener("focusin", rememberArrowInteraction, true);
     document.removeEventListener("keydown", handler);
+    window.removeEventListener("keydown", escapeHandler);
   };
 }

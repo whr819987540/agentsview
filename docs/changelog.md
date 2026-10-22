@@ -266,6 +266,12 @@ The latest published release is
 
 **Bug fixes**
 
+- Pressing Escape to close a menu no longer also closes the session. Before,
+  closing the session actions menu, the Resume menu, or a session, folder, or
+  project menu in the sidebar with Escape also took you back to the session
+  list. Escape now closes only the menu on top, and a second press leaves the
+  session. The usage breakdown in the session header now closes with Escape
+  too.
 - Hiding a block type, switching between Normal and Focused, or flipping the
   sort order keeps the message you were reading in view. Before, the transcript
   kept its scroll position while its rows changed, so you landed far from that
