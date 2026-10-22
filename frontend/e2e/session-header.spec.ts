@@ -69,11 +69,9 @@ async function waitForAllBadges(page: Page) {
 async function expectActionsReachable(page: Page, label: string) {
   await waitForAllBadges(page);
   await expect.poll(() => actionsOverflow(page), label).toBeLessThanOrEqual(0);
-  const menuButton = page.locator(".session-breadcrumb .actions-btn");
-  await menuButton.click();
+  await page.locator(".session-breadcrumb .actions-btn").click();
   await expect(page.locator(".actions-menu"), label).toBeVisible();
-  // Escape would also leave the session, so close the menu with its button.
-  await menuButton.click();
+  await page.keyboard.press("Escape");
   await expect(page.locator(".actions-menu")).toHaveCount(0);
 }
 
