@@ -155,4 +155,23 @@ test.describe("sidebar live updates", () => {
 
     expect(await rowLayout(page)).toEqual(before);
   });
+
+  test("keeps the title in place when a waiting session starts working", async ({ page }) => {
+    const waiting = indexRow("waiting", 60 * MINUTE, 2 * MINUTE);
+    waiting.termination_status = "awaiting_user";
+    const { sendDataChanged } = await openSidebar(page, [waiting, ...quietRows(4)]);
+    const row = sessionRow(page, "waiting");
+    await expect(row.locator(".kit-status-bubble")).toBeVisible();
+    const before = await rowLayout(page);
+
+    addMessage(waiting);
+    await sendDataChanged();
+    await expect(row.locator(".kit-status-dot--working")).toBeVisible();
+    await frames(page, 5);
+
+    const after = await rowLayout(page);
+    expect(after).toEqual(before);
+    // Every status shares one slot, so titles line up across rows.
+    expect(new Set(after.map((entry) => entry.titleLeft)).size).toBe(1);
+  });
 });
