@@ -471,12 +471,17 @@ The latest published release is
   jump into a fork or subagent hidden inside a collapsed group, or step past a
   child row you had expanded. Sessions inside a collapsed group, section, or
   folder are skipped until you expand it.
-- The buttons at the right end of the session header stay inside the window on
-  narrow screens. Before, at widths such as 768 px or a 400 px phone, with
-  reasoning effort shown beside the model, the last buttons ran past the
-  window's edge and the session actions menu button was cut off. At 900 px wide
-  and below, **Collapse visible blocks** and **Expand visible blocks** now sit
-  in the session actions menu instead of the header.
+- The buttons at the right end of the session header stay inside the header.
+  Before, the session actions menu button was cut off whenever the badges and
+  buttons needed more room than the header had, for example on a 400 px phone,
+  in a 1,000 px window with a wide sidebar, or in a 1,280 px window with the
+  analysis panel open. The header now measures its own room instead of going
+  by the window width, so the sidebar and panels count too. When everything
+  does not fit, it first hides the start time, session ID, and usage breakdown
+  and moves **Collapse visible blocks** and **Expand visible blocks** into the
+  session actions menu. If that is not enough, it hides the agent badge, then
+  the token and cost badges, and last the remaining badges, keeping the
+  buttons.
 
 ## 0.44.0
 

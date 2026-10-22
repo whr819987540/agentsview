@@ -46,6 +46,7 @@
   import ToolSequencesPanel from "../content/ToolSequencesPanel.svelte";
   import SessionFilterControl from "../filters/SessionFilterControl.svelte";
   import SidebarToggleButton from "./SidebarToggleButton.svelte";
+  import { fitHeaderDensity } from "./header-density.js";
   import { sessions } from "../../stores/sessions.svelte.js";
   import { router } from "../../stores/router.svelte.js";
   import { insights } from "../../stores/insights.svelte.js";
@@ -77,6 +78,7 @@
   let renameValue = $state("");
   let renameInput = $state<HTMLInputElement | null>(null);
   let menuBtnEl = $state<HTMLButtonElement | null>(null);
+  let actionsEl = $state<HTMLDivElement | null>(null);
   let menuEl = $state<HTMLDivElement | null>(null);
   let showOpenMenu = $state(false);
   let openers: Opener[] = $state([]);
@@ -884,7 +886,7 @@
     </span>
   {/if}
   {#if session}
-    <span class="breadcrumb-meta">
+    <span class="breadcrumb-meta" {@attach fitHeaderDensity(() => actionsEl)}>
       <span
         class="agent-badge"
         style:background={agentColor(session.agent)}
@@ -1162,7 +1164,7 @@
           title={mainModel}
         ><span class="model-badge__model">{mainModelInfo.model}</span>{#if mainModelInfo.reasoningEffort}{" "}<span class="model-badge__effort">{mainModelInfo.reasoningEffort}</span>{/if}</span>
       {/if}
-      <div class="actions-wrapper">
+      <div class="actions-wrapper" bind:this={actionsEl}>
         <button
           class="bulk-block-btn"
           title={m.message_list_collapse_visible_blocks()}
@@ -1887,83 +1889,58 @@
     );
   }
 
-  @media (max-width: 900px) {
-    .breadcrumb-meta {
-      gap: 2px;
-    }
-
-    .session-time {
-      display: none;
-    }
-
-    .token-badge--desktop {
-      display: none;
-    }
-
-    .token-badge--mobile {
-      display: inline-flex;
-      font-size: 9px;
-      padding: 1px 4px;
-      max-width: 110px;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-
-    .usage-breakdown-trigger {
-      font-size: 9px;
-      padding: 1px 4px;
-    }
-
-    .usage-breakdown-menu {
-      right: -54px;
-      width: min(360px, calc(100vw - 16px));
-    }
-
-    .usage-breakdown-row {
-      grid-template-columns: minmax(56px, 0.8fr) minmax(68px, 1fr) max-content;
-      gap: 6px;
-      font-size: 10px;
-    }
-
-    .usage-breakdown-cost {
-      display: none;
-    }
-
-    .session-id {
-      display: none;
-    }
-
-    .usage-breakdown {
-      display: none;
-    }
-
-    /* The badges and actions overflow the header here, so the bulk block
-       buttons move into the session actions menu. */
-    .bulk-block-btn {
-      display: none;
-    }
-
-    .actions-menu-item--narrow {
-      display: block;
-    }
+  /* Tighter layouts for a header without room for everything, chosen by
+     measuring it (header-density.ts). The steps add up: a tight header is also
+     compact. */
+  .session-breadcrumb:global([data-density~="compact"]) .breadcrumb-meta {
+    gap: 2px;
   }
 
-  @media (max-width: 640px) {
-    .session-breadcrumb {
-      gap: 4px;
-      padding: 0 6px;
-    }
+  .session-breadcrumb:global([data-density~="compact"]) .session-time,
+  .session-breadcrumb:global([data-density~="compact"]) .token-badge--desktop,
+  .session-breadcrumb:global([data-density~="compact"]) .session-id,
+  .session-breadcrumb:global([data-density~="compact"]) .usage-breakdown,
+  .session-breadcrumb:global([data-density~="compact"]) .bulk-block-btn {
+    display: none;
+  }
 
-    .breadcrumb-meta {
-      gap: 1px;
-    }
+  .session-breadcrumb:global([data-density~="compact"]) .token-badge--mobile {
+    display: inline-flex;
+    font-size: 9px;
+    padding: 1px 4px;
+    max-width: 110px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
 
-    .breadcrumb-meta > .agent-badge {
-      display: none;
-    }
+  /* The session actions menu offers the bulk block commands instead. */
+  .session-breadcrumb:global([data-density~="compact"]) .actions-menu-item--narrow {
+    display: block;
+  }
 
-    .actions-wrapper {
-      gap: 0;
-    }
+  .session-breadcrumb:global([data-density~="tight"]) {
+    gap: 4px;
+    padding: 0 6px;
+  }
+
+  .session-breadcrumb:global([data-density~="tight"]) .breadcrumb-meta {
+    gap: 1px;
+  }
+
+  .session-breadcrumb:global([data-density~="tight"]) .breadcrumb-meta > .agent-badge {
+    display: none;
+  }
+
+  .session-breadcrumb:global([data-density~="tight"]) .actions-wrapper {
+    gap: 0;
+  }
+
+  .session-breadcrumb:global([data-density~="no-usage"]) .token-badge,
+  .session-breadcrumb:global([data-density~="no-usage"]) .cost-badge {
+    display: none;
+  }
+
+  .session-breadcrumb:global([data-density~="actions-only"]) .breadcrumb-meta > :not(.actions-wrapper) {
+    display: none;
   }
 </style>
