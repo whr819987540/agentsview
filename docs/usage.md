@@ -1040,9 +1040,9 @@ yet before it scrolls.
 
 Unlike [Follow Latest Message](#follow-latest-message), the list does not keep
 up with messages that arrive afterward. The button turns follow mode off, since
-in newest-first order follow mode would pull the list back to the top. At 900 px
-wide and below, the button sits in the session actions menu instead of the
-header.
+in newest-first order follow mode would pull the list back to the top. When the
+session header is short of room, the button sits in the session actions menu
+instead of the header.
 
 ______________________________________________________________________
 
