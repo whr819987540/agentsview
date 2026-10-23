@@ -364,6 +364,8 @@ Each session item shows:
   (including Codex session models).
 - **Star button** — click the star icon or press `s` to star a session. Starred
   sessions persist in the SQLite database so they survive server restarts.
+- **End mark button** — hover a session and click the circled check next to the
+  star to [mark it as ended](#mark-a-session-as-ended).
 - **Agent tag** — agent name on the right side, tinted with the agent's accent
   color.
 - **Machine label** — when using [PostgreSQL sync](/docs/pg-sync/), sessions
@@ -421,11 +423,12 @@ where the conversation is now.
 ### Mark a Session as Ended
 
 Mark a session as ended when you are done with it, so the sidebar shows at a
-glance which sessions still need you. Right-click the session in the sidebar
+glance which sessions still need you. Hover the session in the sidebar and
+click the circled check next to the star. You can also right-click the session
 and choose **Mark as ended**, or choose it from the session actions menu in the
 session header. The row's status dot becomes a small gray check, and the row
-sorts with the Quiet sessions. Choose **Unmark as ended** to remove the mark.
-Session end marks are unreleased.
+sorts with the Quiet sessions. To remove the mark, hover the row and click the
+filled check, or choose **Unmark as ended**. Session end marks are unreleased.
 
 The mark lasts until the session has new activity. When you resume the
 session, or one of its continuations or subagents writes again, the row shows
@@ -434,7 +437,8 @@ whole sidebar row, including the session's continuations and subagents.
 
 Marks are saved in the SQLite archive, so they survive restarts and full
 resyncs. PostgreSQL, ClickHouse, and DuckDB replicas do not carry marks: a
-sidebar served from a replica shows none and has no menu item to add them.
+sidebar served from a replica shows none and has no button or menu item to add
+them.
 
 ### Group by Agent
 

@@ -225,4 +225,38 @@ describe("SessionItem end mark", () => {
 
     expect(menuItem("Mark as ended")).toBeUndefined();
   });
+
+  function rowButton(label: string): HTMLButtonElement | null {
+    return document.querySelector<HTMLButtonElement>(`.session-item button[aria-label="${label}"]`);
+  }
+
+  it("marks and unmarks the row from its hover button without opening it", () => {
+    sessionEndMarks.editable = true;
+    const mark = vi.spyOn(sessionEndMarks, "mark").mockResolvedValue();
+    const unmark = vi.spyOn(sessionEndMarks, "unmark").mockResolvedValue();
+    const select = vi.spyOn(sessions, "selectSession").mockImplementation(() => {});
+    mountRow({ groupSessions: [continuation, root], statusSession: continuation });
+
+    expect(rowButton("Unmark as ended")).toBeNull();
+    rowButton("Mark as ended")!.click();
+    expect(mark).toHaveBeenCalledWith([root, continuation]);
+
+    sessionEndMarks.marks = new Map([["root", "2024-01-01T03:00:00Z"]]);
+    flushSync();
+    expect(rowButton("Mark as ended")).toBeNull();
+    rowButton("Unmark as ended")!.click();
+    expect(unmark).toHaveBeenCalledWith([root, continuation]);
+    expect(select).not.toHaveBeenCalled();
+  });
+
+  it("leaves out the hover button when marks cannot change and on child rows", () => {
+    mountRow();
+    expect(rowButton("Mark as ended")).toBeNull();
+
+    void unmount(component!);
+    component = undefined;
+    sessionEndMarks.editable = true;
+    mountRow({ compact: true, depth: 1 });
+    expect(rowButton("Mark as ended")).toBeNull();
+  });
 });
