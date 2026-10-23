@@ -423,12 +423,15 @@ where the conversation is now.
 ### Mark a Session as Ended
 
 Mark a session as ended when you are done with it, so the sidebar shows at a
-glance which sessions still need you. Hover the session in the sidebar and
-click the circled check next to the star. You can also right-click the session
-and choose **Mark as ended**, or choose it from the session actions menu in the
-session header. The row's status dot becomes a small green check, and the row
-sorts with the Quiet sessions. To remove the mark, hover the row and click the
-filled check, or choose **Unmark as ended**. Session end marks are unreleased.
+glance which sessions still need you. Hover the session in the sidebar, or tab
+to it, and click the circled check next to the star. You can also right-click
+the session and choose **Mark as ended**, or choose it from the session actions
+menu in the session header. The row's status dot becomes a small green check,
+and the row sorts with the Quiet sessions. When you use the check button, the
+row keeps its place until the pointer, or keyboard focus, leaves the sidebar
+list, so the next row does not slide under the pointer. To remove the mark,
+click the check button again, or choose **Unmark as ended**. Session end marks
+are unreleased.
 
 A mark applies to the whole sidebar row, including the session's continuations
 and subagents, even ones the sidebar has not loaded or a filter such as

@@ -299,6 +299,28 @@ describe("SessionEndMarksStore", () => {
   });
 });
 
+describe("SessionEndMarksStore sort holds", () => {
+  it("sorts a toggled row as it did before until the holds are released", async () => {
+    const store = createSessionEndMarksStore();
+    await store.load();
+    const row = [session("open", "2026-10-01T10:00:00Z")];
+
+    store.holdSortPlace(row);
+    await store.mark(row);
+    expect(store.isEnded(row)).toBe(true);
+    expect(store.sortsAsEnded(row)).toBe(false);
+
+    // Toggling again keeps the place the row had before the first toggle.
+    store.holdSortPlace(row);
+    await store.unmark(row);
+    await store.mark(row);
+    expect(store.sortsAsEnded(row)).toBe(false);
+
+    store.releaseSortHolds();
+    expect(store.sortsAsEnded(row)).toBe(true);
+  });
+});
+
 describe("SessionEndMarksStore loading", () => {
   it("retries a failed first read", async () => {
     vi.useFakeTimers();

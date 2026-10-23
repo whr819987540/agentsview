@@ -2021,7 +2021,7 @@ const WORKING_SORT_KEY = 0;
 const QUIET_SORT_KEY = 4;
 
 function statusSortKey(group: SessionGroup): number {
-  if (sessionEndMarks.isEnded(group.sessions)) return QUIET_SORT_KEY;
+  if (sessionEndMarks.sortsAsEnded(group.sessions)) return QUIET_SORT_KEY;
   const live = group.sessions.find((s) => s.id === group.liveSessionId) ?? group.sessions[0]!;
   const status = getSessionStatus(live, group.sessions);
   switch (status) {

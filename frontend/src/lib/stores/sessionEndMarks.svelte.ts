@@ -54,6 +54,11 @@ class SessionEndMarksStore {
   marks: Map<string, string> = $state(new Map());
   /** False on read-only servers: marks cannot change. */
   editable: boolean = $state(false);
+  /** Rows toggled from their sidebar button, by shown session, with
+   *  whether each sorted as ended before. The sidebar keeps their place
+   *  until the pointer and focus leave it, so another row's button does
+   *  not slide under the pointer. */
+  sortHolds: Map<string, boolean> = $state(new Map());
   /** The server's marks as last read or written. */
   private confirmed = new Map<string, string>();
   /** Each session's latest change whose request has not finished: the
@@ -139,6 +144,29 @@ class SessionEndMarksStore {
     if (markMs === null) return false;
     const latest = markMs;
     return sessions.every((s) => timeMs(activityAt(s)) <= latest);
+  }
+
+  /** Keep the row's place in the sidebar order until releaseSortHolds. */
+  holdSortPlace(sessions: EndMarkSession[]) {
+    const first = sessions[0];
+    if (!first || this.sortHolds.has(first.id)) return;
+    this.sortHolds = new Map(this.sortHolds).set(first.id, this.isEnded(sessions));
+  }
+
+  releaseSortHolds() {
+    if (this.sortHolds.size > 0) this.sortHolds = new Map();
+  }
+
+  /** Whether the sidebar sorts a row as ended. A held row sorts as it did
+   *  before the user toggled it. */
+  sortsAsEnded(sessions: EndMarkSession[]): boolean {
+    if (this.sortHolds.size > 0) {
+      for (const s of sessions) {
+        const held = this.sortHolds.get(s.id);
+        if (held !== undefined) return held;
+      }
+    }
+    return this.isEnded(sessions);
   }
 
   /** Mark the row if it is not ended, else remove its marks. */

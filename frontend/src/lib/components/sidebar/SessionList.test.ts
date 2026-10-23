@@ -9,7 +9,7 @@ import { readProgress } from "../../stores/read-progress.svelte.js";
 import { sessions } from "../../stores/sessions.svelte.js";
 import type { Session } from "../../api/types.js";
 import { starred } from "../../stores/starred.svelte.js";
-import { sessionEndMarks } from "../../stores/sessionEndMarks.svelte.js";
+import { lastActivity, sessionEndMarks } from "../../stores/sessionEndMarks.svelte.js";
 import { ui } from "../../stores/ui.svelte.js";
 import { m, setLocale } from "../../i18n/index.js";
 import { ITEM_HEIGHT, OVERSCAN, STORAGE_KEY_GROUP } from "./session-list-utils.js";
@@ -605,7 +605,7 @@ describe("SessionList visible hydration", () => {
 
     function endButton(id: string): HTMLButtonElement | null {
       return document.querySelector<HTMLButtonElement>(
-        `.session-item[data-session-id="${id}"] .end-btn`,
+        `.session-item[data-session-id="${id}"] .end-slot button`,
       );
     }
 
@@ -633,6 +633,64 @@ describe("SessionList visible hydration", () => {
       ).not.toBeNull();
       endButton("cont")!.click();
       expect(unmark.mock.calls[0]![0].map((s) => s.id).sort()).toEqual(["cont", "root"]);
+    });
+  });
+
+  describe("end button", () => {
+    const ago = (minutes: number) => new Date(Date.now() - minutes * 60_000).toISOString();
+
+    beforeEach(() => {
+      sessions.sessions = [
+        makeSession({ id: "idle", display_name: "Idle", ended_at: ago(3), is_index_only: true }),
+        makeSession({
+          id: "stale",
+          display_name: "Stale",
+          ended_at: ago(20),
+          termination_status: "tool_call_pending",
+          is_index_only: true,
+        }),
+      ];
+      sessionEndMarks.editable = true;
+      vi.spyOn(sessions, "hydrateVisibleSessions").mockResolvedValue(undefined);
+      vi.spyOn(sessionEndMarks, "mark").mockImplementation(async (row) => {
+        sessionEndMarks.marks = new Map([[row[0]!.id, lastActivity(row)]]);
+      });
+    });
+
+    afterEach(() => {
+      sessionEndMarks.releaseSortHolds();
+      sessionEndMarks.marks = new Map();
+      sessionEndMarks.editable = false;
+    });
+
+    function order(): string[] {
+      return [...document.querySelectorAll<HTMLElement>(".session-item")].map(
+        (el) => el.dataset.sessionId!,
+      );
+    }
+
+    it("keeps the row in place until the pointer leaves the list", async () => {
+      component = mount(SessionList, { target: document.body });
+      await tick();
+      expect(order()).toEqual(["idle", "stale"]);
+      const list = document.querySelector<HTMLElement>(".session-list-scroll")!;
+      list.dispatchEvent(new PointerEvent("pointerover", { bubbles: true }));
+      const button = document.querySelector<HTMLButtonElement>(
+        '.session-item[data-session-id="idle"] .end-slot button',
+      )!;
+
+      button.focus();
+      button.click();
+      await tick();
+
+      expect(document.querySelector('.session-item[data-session-id="idle"] .ended-mark')).not
+        .toBeNull();
+      expect(order()).toEqual(["idle", "stale"]);
+      expect(document.activeElement).toBe(button);
+
+      list.dispatchEvent(new PointerEvent("pointerleave"));
+      await tick();
+      expect(order()).toEqual(["stale", "idle"]);
     });
   });
 
