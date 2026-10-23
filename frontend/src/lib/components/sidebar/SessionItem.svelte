@@ -302,11 +302,7 @@
   async function toggleEnded() {
     closeContextMenu();
     try {
-      if (isEnded) {
-        await sessionEndMarks.unmark(endMarkSessions);
-      } else {
-        await sessionEndMarks.mark(endMarkSessions);
-      }
+      await sessionEndMarks.toggle(endMarkSessions);
     } catch {
       showFlash(m.session_end_mark_failed(), { tone: "danger" });
     }

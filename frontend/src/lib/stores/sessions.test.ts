@@ -7,7 +7,7 @@ import {
   filtersToParams,
   splitExcludeProjectParam,
 } from "./sessions.svelte.js";
-import { SessionsService, type DbSession } from "../api/generated/index";
+import { SessionEndMarksService, SessionsService, type DbSession } from "../api/generated/index";
 import { starred } from "./starred.svelte.js";
 import { sessionEndMarks } from "./sessionEndMarks.svelte.js";
 import { yokedDates } from "./yokedDates.svelte.js";
@@ -80,6 +80,9 @@ vi.mock("../api/generated/index", () => ({
     postApiV1SessionsByIdRestore: vi.fn(({ id }) => api.restoreSession(id)),
     patchApiV1SessionsByIdRename: vi.fn(({ id }, body) => api.renameSession(id, body.display_name)),
     getApiV1SessionsByIdChildren: vi.fn().mockResolvedValue([]),
+  },
+  SessionEndMarksService: {
+    getApiV1SessionEndMarks: vi.fn().mockResolvedValue({ marks: [], editable: false }),
   },
   MetadataService: {
     getApiV1Projects: vi.fn((params) => api.getProjects(params)),
@@ -585,6 +588,20 @@ describe("SessionsStore", () => {
       expect(sessions.sessions).toHaveLength(500);
       expect(sessions.total).toBe(86312);
       expect(sessions.nextCursor).toBe("next");
+    });
+
+    it("reads the end marks again after each sidebar load", async () => {
+      mockSidebarPage();
+      vi.mocked(SessionEndMarksService.getApiV1SessionEndMarks).mockClear();
+
+      const detach = sessions.attachSidebar();
+      await sessions.load();
+      await sessions.load({ force: true });
+      detach();
+
+      await vi.waitFor(() =>
+        expect(SessionEndMarksService.getApiV1SessionEndMarks).toHaveBeenCalledTimes(2),
+      );
     });
 
     it("keeps sidebar rows skinny and carries sidebar classifications", async () => {

@@ -592,14 +592,10 @@
     return rowSessions(shown, group.sessions);
   }
 
-  async function toggleEnded(row: EndMarkSession[], ended: boolean) {
+  async function toggleEnded(row: EndMarkSession[]) {
     closeMenu();
     try {
-      if (ended) {
-        await sessionEndMarks.unmark(row);
-      } else {
-        await sessionEndMarks.mark(row);
-      }
+      await sessionEndMarks.toggle(row);
     } catch {
       showFlash(m.session_end_mark_failed(), { tone: "danger" });
     }
@@ -1322,7 +1318,7 @@
               {@const ended = sessionEndMarks.isEnded(endRow)}
               <button
                 class="actions-menu-item"
-                onclick={() => void toggleEnded(endRow, ended)}
+                onclick={() => void toggleEnded(endRow)}
               >
                 {ended ? m.session_end_mark_unmark() : m.session_end_mark_mark()}
               </button>

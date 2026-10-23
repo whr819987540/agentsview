@@ -558,6 +558,9 @@ class SessionsStore {
       }
       this.nextCursor = index.next_cursor ?? null;
       this.total = index.total;
+      // The server drops end marks once their row has newer activity;
+      // read them again so a trashed newer session cannot revive one.
+      void sessionEndMarks.refresh();
     } catch {
       // Restore previous state so a transient failure
       // doesn't wipe the visible session list.
