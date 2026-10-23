@@ -4,6 +4,8 @@ import (
 	"net/http"
 	"testing"
 
+	"go.kenn.io/agentsview/internal/db"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -30,31 +32,57 @@ func TestSessionEndMarkHandlers(t *testing.T) {
 	assert.Empty(t, list.Marks)
 	assert.True(t, list.Editable)
 
-	w = te.put(t, "/api/v1/sessions/a1/ended", `{"activity_at":"2025-01-15T12:00:00.250Z"}`)
-	require.Equal(t, http.StatusNoContent, w.Code, "body: %s", w.Body.String())
-	w = te.put(t, "/api/v1/sessions/a2/ended", `{}`)
-	require.Equal(t, http.StatusNoContent, w.Code, "body: %s", w.Body.String())
-	w = te.put(t, "/api/v1/sessions/missing/ended", `{}`)
+	for _, id := range []string{"a1", "a2"} {
+		w = te.put(t, "/api/v1/sessions/"+id+"/ended", "")
+		require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+		assert.Equal(t, sessionEndMarkBody{SessionID: id, ActivityAt: tsSeedEnd},
+			decode[sessionEndMarkBody](t, w), "the response holds the stored mark")
+	}
+	w = te.put(t, "/api/v1/sessions/missing/ended", "")
 	require.Equal(t, http.StatusNotFound, w.Code, "body: %s", w.Body.String())
 	assertErrorResponse(t, w, "session not found")
-
-	w = te.get(t, "/api/v1/session-end-marks")
-	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
-	list = decode[sessionEndMarksBody](t, w)
-	assert.Equal(t, []sessionEndMarkBody{
-		{SessionID: "a1", ActivityAt: "2025-01-15T12:00:00.250Z"},
-		{SessionID: "a2", ActivityAt: tsSeedEnd},
-	}, list.Marks, "an empty body marks the session as of its own last activity")
 
 	w = te.del(t, "/api/v1/sessions/a1/ended")
 	require.Equal(t, http.StatusNoContent, w.Code, "body: %s", w.Body.String())
 	w = te.del(t, "/api/v1/sessions/a1/ended")
 	require.Equal(t, http.StatusNoContent, w.Code, "unmarking twice succeeds: %s", w.Body.String())
 
-	w = te.get(t, "/api/v1/session-end-marks")
+	assert.Equal(t, []sessionEndMarkBody{{SessionID: "a2", ActivityAt: tsSeedEnd}},
+		te.listEndMarks(t).Marks)
+}
+
+func TestSessionEndMarkCoversTheWholeRow(t *testing.T) {
+	te := setup(t)
+	te.seedSession(t, "root", "alpha", 2)
+	te.seedSession(t, "cont", "alpha", 2, func(s *db.Session) {
+		s.ParentSessionID = new("root")
+		s.RelationshipType = "continuation"
+		s.EndedAt = new("2025-01-15T11:30:00Z")
+	})
+
+	// A client that loaded only the root still marks the whole row.
+	w := te.put(t, "/api/v1/sessions/root/ended", "")
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
-	list = decode[sessionEndMarksBody](t, w)
-	assert.Equal(t, []sessionEndMarkBody{{SessionID: "a2", ActivityAt: tsSeedEnd}}, list.Marks)
+	assert.Equal(t, []sessionEndMarkBody{{SessionID: "root", ActivityAt: "2025-01-15T11:30:00Z"}},
+		te.listEndMarks(t).Marks, "the mark holds the continuation's later activity")
+
+	// The continuation is resumed after the mark, then trashed.
+	te.seedSession(t, "cont", "alpha", 2, func(s *db.Session) {
+		s.ParentSessionID = new("root")
+		s.RelationshipType = "continuation"
+		s.EndedAt = new("2025-01-15T12:00:00Z")
+	})
+	assert.Empty(t, te.listEndMarks(t).Marks, "new activity in the row ends the mark")
+	w = te.del(t, "/api/v1/sessions/cont")
+	require.Equal(t, http.StatusNoContent, w.Code, "body: %s", w.Body.String())
+	assert.Empty(t, te.listEndMarks(t).Marks, "trashing the resumed session keeps the mark ended")
+}
+
+func (te *testEnv) listEndMarks(t *testing.T) sessionEndMarksBody {
+	t.Helper()
+	w := te.get(t, "/api/v1/session-end-marks")
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	return decode[sessionEndMarksBody](t, w)
 }
 
 func TestSessionEndMarkWriteReturns503WhileWriterClosed(t *testing.T) {
@@ -63,7 +91,7 @@ func TestSessionEndMarkWriteReturns503WhileWriterClosed(t *testing.T) {
 	require.NoError(t, te.db.CloseWriter())
 	defer func() { assert.NoError(t, te.db.ReopenWriter()) }()
 
-	w := te.put(t, "/api/v1/sessions/a1/ended", `{}`)
+	w := te.put(t, "/api/v1/sessions/a1/ended", "")
 	require.Equal(t, http.StatusServiceUnavailable, w.Code, "body: %s", w.Body.String())
 }
 

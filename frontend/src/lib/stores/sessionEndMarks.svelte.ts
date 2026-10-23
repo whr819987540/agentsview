@@ -89,19 +89,20 @@ class SessionEndMarksStore {
     });
   }
 
-  /** Mark a row's sessions as ended as of their latest activity. The mark
-   *  goes on the first session, the one the row shows. */
+  /** Mark a row's sessions as ended. The mark goes on the first session,
+   *  the one the row shows, and the server stamps it with the whole row's
+   *  latest activity, including sessions this client has not loaded. */
   async mark(sessions: EndMarkSession[]): Promise<void> {
     const first = sessions[0];
     if (!first) return;
-    const activityAt = lastActivity(sessions);
     await this.apply(
-      (marks) => marks.set(first.id, activityAt),
-      () =>
-        SessionEndMarksService.putApiV1SessionsByIdEnded(
-          { id: first.id },
-          { activity_at: activityAt },
-        ),
+      (marks) => marks.set(first.id, lastActivity(sessions)),
+      async (version) => {
+        const mark = await SessionEndMarksService.putApiV1SessionsByIdEnded({ id: first.id });
+        if (this.version === version) {
+          this.marks = new Map(this.marks).set(mark.session_id, mark.activity_at);
+        }
+      },
     );
   }
 
@@ -122,14 +123,14 @@ class SessionEndMarksStore {
    *  marks before rethrowing. */
   private async apply(
     change: (marks: Map<string, string>) => void,
-    request: () => Promise<unknown>,
+    request: (version: number) => Promise<unknown>,
   ): Promise<void> {
     const version = ++this.version;
     const next = new Map(this.marks);
     change(next);
     this.marks = next;
     try {
-      await request();
+      await request(version);
     } catch (error) {
       if (this.version === version) {
         this.version++;

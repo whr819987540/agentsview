@@ -30,7 +30,7 @@ function session(
 }
 
 function mark(sessionId: string, activityAt: string) {
-  return { session_id: sessionId, activity_at: activityAt, created_at: "2026-10-01T12:00:00Z" };
+  return { session_id: sessionId, activity_at: activityAt };
 }
 
 describe("lastActivity", () => {
@@ -70,7 +70,9 @@ describe("SessionEndMarksStore", () => {
       marks: [mark("done", "2026-10-01T10:00:00Z")],
       editable: true,
     });
-    service.putApiV1SessionsByIdEnded.mockResolvedValue(undefined);
+    service.putApiV1SessionsByIdEnded.mockImplementation(({ id }: { id: string }) =>
+      Promise.resolve(mark(id, "2026-10-01T10:00:00Z")),
+    );
     service.deleteApiV1SessionsByIdEnded.mockResolvedValue(undefined);
     store = createSessionEndMarksStore();
     await store.load();
@@ -94,16 +96,17 @@ describe("SessionEndMarksStore", () => {
     expect(store.isEnded(row)).toBe(true);
   });
 
-  it("marks the shown session as of the row's latest activity", async () => {
+  it("marks the shown session and keeps the time the server stamped", async () => {
+    // The server saw a continuation this client has not loaded.
+    service.putApiV1SessionsByIdEnded.mockResolvedValue(mark("root", "2026-10-03T08:00:00Z"));
     const row = [session("root", "2026-10-01T09:00:00Z"), session("cont", "2026-10-02T08:00:00Z")];
 
     await store.mark(row);
 
-    expect(service.putApiV1SessionsByIdEnded).toHaveBeenCalledWith(
-      { id: "root" },
-      { activity_at: "2026-10-02T08:00:00Z" },
-    );
+    expect(service.putApiV1SessionsByIdEnded).toHaveBeenCalledWith({ id: "root" });
     expect(store.isEnded(row)).toBe(true);
+    expect(store.marks.get("root")).toBe("2026-10-03T08:00:00Z");
+    expect(store.isEnded([...row, session("unloaded", "2026-10-03T08:00:00Z")])).toBe(true);
   });
 
   it("removes every mark on the row's sessions", async () => {

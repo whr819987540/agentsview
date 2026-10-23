@@ -430,10 +430,12 @@ session header. The row's status dot becomes a small green check, and the row
 sorts with the Quiet sessions. To remove the mark, hover the row and click the
 filled check, or choose **Unmark as ended**. Session end marks are unreleased.
 
-The mark lasts until the session has new activity. When you resume the
-session, or one of its continuations or subagents writes again, the row shows
-its live status again; mark it again when you are done. A mark applies to the
-whole sidebar row, including the session's continuations and subagents.
+A mark applies to the whole sidebar row, including the session's continuations
+and subagents, even ones the sidebar has not loaded or a filter hides. It lasts
+until the row has new activity. When you resume the session, or one of its
+continuations or subagents writes again, the row shows its live status again
+and the mark is removed, so moving that session to the trash does not bring it
+back. Mark the row again when you are done.
 
 Marks are saved in the SQLite archive, so they survive restarts and full
 resyncs. PostgreSQL, ClickHouse, and DuckDB replicas do not carry marks: a

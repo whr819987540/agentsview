@@ -473,7 +473,6 @@ export * from "./serviceUsagePairwiseComparisonDelta.ts";
 export * from "./serviceUsagePairwiseComparisonResponse.ts";
 export * from "./serviceUsagePairwiseComparisonSide.ts";
 export * from "./sessionDirectoryResponse.ts";
-export * from "./sessionEndMarkInputBody.ts";
 export * from "./sessionEndMarksResponse.ts";
 export * from "./sessionFolderCreateInputBody.ts";
 export * from "./sessionFolderMoveInputBody.ts";
