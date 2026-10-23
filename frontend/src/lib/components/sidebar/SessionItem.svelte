@@ -48,6 +48,10 @@
      * still wins over freshness for awaiting_user (a fork running
      * in parallel doesn't change that the parent is waiting). */
     groupSessions?: SessionGroupInput[];
+    /** Every session of the row's group, including ones a filter such as
+     * starred-only hides. An end mark covers the whole row, so the row
+     * reads and changes its mark across all of them. */
+    endMarkGroup?: SessionGroupInput[];
     /** The session whose parser status the dot reads, when it is not
      * the one the row shows. A continuation chain's row shows its root
      * but the state of its newest continuation. */
@@ -84,6 +88,7 @@
     continuationCount = 1,
     groupSessionIds,
     groupSessions,
+    endMarkGroup,
     statusSession,
     hideAgent = false,
     hideProject = false,
@@ -106,8 +111,9 @@
     getSessionStatus(statusSession ?? session, groupSessions),
   );
 
-  let endMarkSessions = $derived(rowSessions(session, groupSessions));
-  let isEnded = $derived(sessionEndMarks.isEnded(endMarkSessions));
+  let endMarkSessions = $derived(rowSessions(session, endMarkGroup ?? groupSessions));
+  // Child rows show their own live status; the parent row holds the mark.
+  let isEnded = $derived(!compact && sessionEndMarks.isEnded(endMarkSessions));
 
   let isActive = $derived.by(() => {
     const aid = sessions.activeSessionId;
@@ -662,7 +668,7 @@
         {m.sidebar_row_move_to_folder()}
       </button>
     {/if}
-    {#if sessionEndMarks.editable}
+    {#if !compact && sessionEndMarks.editable}
       <button class="context-menu-item" onclick={() => void toggleEnded()}>
         {isEnded ? m.session_end_mark_unmark() : m.session_end_mark_mark()}
       </button>

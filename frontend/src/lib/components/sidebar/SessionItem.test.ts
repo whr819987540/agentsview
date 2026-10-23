@@ -219,6 +219,17 @@ describe("SessionItem end mark", () => {
     expect(unmark).toHaveBeenCalledWith([root, continuation]);
   });
 
+  it("leaves marking to the parent row on child rows", () => {
+    sessionEndMarks.editable = true;
+    sessionEndMarks.marks = new Map([["root", "2024-01-01T01:00:00Z"]]);
+    mountRow({ compact: true, depth: 1 });
+
+    expect(document.querySelector(".ended-mark")).toBeNull();
+    openContextMenu();
+    expect(menuItem("Mark as ended")).toBeUndefined();
+    expect(menuItem("Unmark as ended")).toBeUndefined();
+  });
+
   it("hides the menu item when marks cannot change", () => {
     mountRow();
     openContextMenu();

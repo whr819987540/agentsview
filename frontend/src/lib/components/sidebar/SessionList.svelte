@@ -1017,6 +1017,7 @@
               groupSessions={item.group.sessions.length > 1
                 ? item.group.sessions
                 : undefined}
+              endMarkGroup={item.group.allSessions ?? item.group.sessions}
               hideAgent={groupMode === "agent"}
               hideProject={groupMode === "project"}
               expanded={expandedGroups.has(item.group.key)}

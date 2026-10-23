@@ -431,11 +431,13 @@ sorts with the Quiet sessions. To remove the mark, hover the row and click the
 filled check, or choose **Unmark as ended**. Session end marks are unreleased.
 
 A mark applies to the whole sidebar row, including the session's continuations
-and subagents, even ones the sidebar has not loaded or a filter hides. It lasts
-until the row has new activity. When you resume the session, or one of its
-continuations or subagents writes again, the row shows its live status again
-and the mark is removed, so moving that session to the trash does not bring it
-back. Mark the row again when you are done.
+and subagents, even ones the sidebar has not loaded or a filter such as
+**Starred only** hides. The child rows you see when you expand a session have no
+mark of their own and keep showing their live status. The mark lasts until the
+row has new activity. When you resume the session, or one of its continuations
+or subagents writes again, the row shows its live status again and the mark is
+removed, so moving that session to the trash does not bring it back. Mark the
+row again when you are done.
 
 Marks are saved in the SQLite archive, so they survive restarts and full
 resyncs. PostgreSQL, ClickHouse, and DuckDB replicas do not carry marks: a
