@@ -22,6 +22,7 @@
     CheckIcon,
     ChevronDownIcon,
     ChevronRightIcon,
+    CircleCheckIcon,
     StarIcon,
     UserRoundIcon,
     UsersRoundIcon,
@@ -206,6 +207,11 @@
   function handleStar(e: MouseEvent) {
     e.stopPropagation();
     starred.toggle(session.id);
+  }
+
+  function handleEnd(e: MouseEvent) {
+    e.stopPropagation();
+    void toggleEnded();
   }
 
   function handleToggle(e: MouseEvent) {
@@ -591,6 +597,17 @@
     {/if}
   </div>
 
+  {#if !compact && sessionEndMarks.editable}
+    <button
+      class="end-btn"
+      class:ended={isEnded}
+      onclick={handleEnd}
+      title={isEnded ? m.session_end_mark_unmark() : m.session_end_mark_mark()}
+      aria-label={isEnded ? m.session_end_mark_unmark() : m.session_end_mark_mark()}
+    >
+      <CircleCheckIcon size="12" strokeWidth="1.6" aria-hidden="true" />
+    </button>
+  {/if}
   {#if !compact}
     <button
       class="star-btn"
@@ -1038,6 +1055,43 @@
   .star-btn.starred:hover {
     color: var(--accent-amber);
     background: var(--bg-surface-hover);
+  }
+
+  /* Takes no room until the row is hovered or keyboard-focused, so the
+     title keeps its width at rest. The status slot shows the mark itself. */
+  .end-btn {
+    width: 20px;
+    height: 20px;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    border-radius: var(--radius-sm);
+    color: var(--text-muted);
+    flex-shrink: 0;
+    transition: color 0.12s, background 0.12s;
+  }
+
+  .session-item:hover .end-btn,
+  .session-item:has(:focus-visible) .end-btn,
+  .session-item:focus-visible .end-btn {
+    display: flex;
+  }
+
+  .end-btn:hover {
+    background: var(--bg-surface-hover);
+    color: var(--text-secondary);
+  }
+
+  .end-btn.ended {
+    color: var(--text-secondary);
+  }
+
+  .end-btn.ended :global(circle) {
+    fill: currentColor;
+  }
+
+  .end-btn.ended :global(path) {
+    stroke: var(--bg-surface);
   }
 
   :global(.context-menu) {
