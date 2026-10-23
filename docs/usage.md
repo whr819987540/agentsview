@@ -383,8 +383,9 @@ only navigating inside AgentsView.
 
 As of 0.27.0, the small dot at the left edge of each session row encodes how
 recently the session was written to and how it last ended. The same indicator
-appears in the dashboard's **Top Sessions** list. Hover the dot for a tooltip
-explaining the current state.
+appears in the dashboard's **Top Sessions** list, except for Ended: Top Sessions
+and its unclean count report how each session last ended, whether or not you
+marked it. Hover the dot for a tooltip explaining the current state.
 
 | State   | Indicator         | Meaning                                                                                                                 |
 | ------- | ----------------- | ----------------------------------------------------------------------------------------------------------------------- |
@@ -394,7 +395,7 @@ explaining the current state.
 | Stale   | Amber             | 10–60 minutes idle and last assistant message has an unresolved tool call (or the session file was truncated mid-write) |
 | Unclean | Red               | Same flagged state as Stale, but idle for more than an hour                                                             |
 | Quiet   | Hidden            | Cleanly-ended sessions older than 10 minutes; no dot is rendered                                                        |
-| Ended   | Green check       | You [marked the session as ended](#mark-a-session-as-ended) and it has had no activity since                            |
+| Ended   | Green check       | Sidebar only: you [marked the row as ended](#mark-a-session-as-ended) and it has had no activity since                  |
 
 The sidebar lists sessions by state: Working, Waiting, Idle, Stale, Quiet, then
 Unclean. Ended sessions sort with Quiet. Within a state, the session written to
