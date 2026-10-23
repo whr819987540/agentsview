@@ -348,9 +348,9 @@ class SessionsStore {
     return session?.is_index_only ? undefined : session;
   }
 
-  get groupedSessions(): SessionGroup[] {
-    return buildSessionGroups(this.sessions);
-  }
+  /** The sidebar's rows, rebuilt once per change and shared by every
+   *  reader, such as the sidebar list and the header's end mark. */
+  readonly groupedSessions: SessionGroup[] = $derived(buildSessionGroups(this.sessions));
 
   private get apiParams(): SidebarIndexParams {
     const f = this.filters;
@@ -1997,23 +1997,25 @@ export function buildSessionGroups(sessions: SessionGroupInput[]): SessionGroup[
   //      ordering them by the last write would swap two running
   //      agents on every message. The group that started last
   //      leads instead, so a working group keeps its place.
-  ordered.sort((a, b) => {
-    const sa = statusSortKey(a);
-    const sb = statusSortKey(b);
-    if (sa !== sb) return sa - sb;
-    if (sa === WORKING_SORT_KEY) {
-      const startA = groupStart(a);
-      const startB = groupStart(b);
-      if (startA !== startB) return startA > startB ? -1 : 1;
-      return a.key < b.key ? -1 : a.key > b.key ? 1 : 0;
+  //
+  // Each group's keys are computed once, not on every comparison.
+  const keyed = ordered.map((group) => ({
+    group,
+    status: statusSortKey(group),
+    start: groupStart(group),
+    freshness: groupFreshness(group),
+  }));
+  keyed.sort((a, b) => {
+    if (a.status !== b.status) return a.status - b.status;
+    if (a.status === WORKING_SORT_KEY) {
+      if (a.start !== b.start) return a.start > b.start ? -1 : 1;
+      return a.group.key < b.group.key ? -1 : a.group.key > b.group.key ? 1 : 0;
     }
-    const ra = groupFreshness(a);
-    const rb = groupFreshness(b);
-    if (ra > rb) return -1;
-    if (ra < rb) return 1;
+    if (a.freshness > b.freshness) return -1;
+    if (a.freshness < b.freshness) return 1;
     return 0;
   });
-  return ordered;
+  return keyed.map((k) => k.group);
 }
 
 const WORKING_SORT_KEY = 0;

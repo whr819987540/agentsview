@@ -590,6 +590,17 @@ describe("SessionsStore", () => {
       expect(sessions.nextCursor).toBe("next");
     });
 
+    it("builds the sidebar rows once per change", () => {
+      sessions.sessions = [makeSkinnyRow({ id: "a" }), makeSkinnyRow({ id: "b" })] as Session[];
+
+      const rows = sessions.groupedSessions;
+      expect(sessions.groupedSessions).toBe(rows);
+
+      sessions.sessions = [makeSkinnyRow({ id: "a" })] as Session[];
+      expect(sessions.groupedSessions).not.toBe(rows);
+      expect(sessions.groupedSessions.map((g) => g.key)).toEqual(["a"]);
+    });
+
     it("reads the end marks again after each sidebar load", async () => {
       mockSidebarPage();
       vi.mocked(SessionEndMarksService.getApiV1SessionEndMarks).mockClear();
@@ -3072,6 +3083,19 @@ describe("buildSessionGroups", () => {
       expect(order()).toEqual(["marked", "idle", "quiet"]);
     } finally {
       sessionEndMarks.marks = new Map();
+    }
+  });
+
+  it("reads each group's end mark once per sort", () => {
+    const rows = Array.from({ length: 50 }, (_, i) =>
+      makeSkinnyRow({ id: `s${i}`, ended_at: new Date(Date.now() - i * 60_000).toISOString() }),
+    );
+    const sortsAsEnded = vi.spyOn(sessionEndMarks, "sortsAsEnded");
+    try {
+      buildSessionGroups(rows as any);
+      expect(sortsAsEnded).toHaveBeenCalledTimes(50);
+    } finally {
+      sortsAsEnded.mockRestore();
     }
   });
 
