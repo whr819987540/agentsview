@@ -558,9 +558,7 @@ class SessionsStore {
       }
       this.nextCursor = index.next_cursor ?? null;
       this.total = index.total;
-      // The server drops end marks once their row has newer activity;
-      // read them again so a trashed newer session cannot revive one.
-      void sessionEndMarks.refresh();
+      sessionEndMarks.syncWithRows(this.groupedSessions.map((g) => g.sessions));
     } catch {
       // Restore previous state so a transient failure
       // doesn't wipe the visible session list.
@@ -1495,6 +1493,7 @@ class SessionsStore {
     });
     this.safetyNetTimer = setInterval(() => {
       this.load();
+      void sessionEndMarks.refresh();
       this.refreshActiveChildSessions();
       this.bumpActiveSessionUsageVersion();
     }, SAFETY_NET_REFRESH_MS);

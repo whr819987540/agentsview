@@ -114,6 +114,24 @@ class SessionEndMarksStore {
     }
   }
 
+  /**
+   * Read the marks again after the sidebar loaded these rows, when the
+   * first read never succeeded or when a row has a mark it has outlived.
+   * The server deletes an outlived mark; keeping it here would bring the
+   * check back if the newer session left the row, such as into the trash.
+   */
+  syncWithRows(rows: EndMarkSession[][]): void {
+    if (!this.loaded) {
+      void this.refresh();
+      return;
+    }
+    if (this.marks.size === 0) return;
+    const outlived = rows.some(
+      (row) => row.some((s) => this.marks.has(s.id)) && !this.isEnded(row),
+    );
+    if (outlived) void this.refresh();
+  }
+
   private scheduleRetry() {
     if (this.retryTimer !== null || this.retries >= RETRY_DELAYS_MS.length) return;
     const delay = RETRY_DELAYS_MS[this.retries++]!;

@@ -338,6 +338,20 @@ describe("SessionEndMarksStore loading", () => {
     expect(store.isEnded([session("done", "2026-10-01T10:00:00Z")])).toBe(true);
   });
 
+  it("retries a failed first read on the next sidebar load", async () => {
+    server.down = true;
+    const store = createSessionEndMarksStore();
+    await store.load();
+    server.down = false;
+    service.getApiV1SessionEndMarks.mockClear();
+
+    store.syncWithRows([[session("a", "2026-10-01T10:00:00Z")]]);
+    await settle();
+
+    expect(service.getApiV1SessionEndMarks).toHaveBeenCalledTimes(1);
+    expect(store.editable).toBe(true);
+  });
+
   it("reads again when asked, so marks the server dropped disappear", async () => {
     server.marks.set("done", "2026-10-01T10:00:00Z");
     const store = createSessionEndMarksStore();

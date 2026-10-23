@@ -601,18 +601,33 @@ describe("SessionsStore", () => {
       expect(sessions.groupedSessions.map((g) => g.key)).toEqual(["a"]);
     });
 
-    it("reads the end marks again after each sidebar load", async () => {
-      mockSidebarPage();
-      vi.mocked(SessionEndMarksService.getApiV1SessionEndMarks).mockClear();
-
+    it("reads the end marks again when a loaded row outlived its mark", async () => {
+      const getMarks = vi.mocked(SessionEndMarksService.getApiV1SessionEndMarks);
       const detach = sessions.attachSidebar();
-      await sessions.load();
-      await sessions.load({ force: true });
-      detach();
+      try {
+        await sessionEndMarks.refresh();
+        getMarks.mockClear();
 
-      await vi.waitFor(() =>
-        expect(SessionEndMarksService.getApiV1SessionEndMarks).toHaveBeenCalledTimes(2),
-      );
+        // The row still ends with its mark: nothing to read.
+        sessionEndMarks.marks = new Map([["a", "2024-01-01T02:00:00Z"]]);
+        vi.mocked(api.getSidebarSessionIndex).mockResolvedValue({
+          sessions: [makeSkinnyRow({ id: "a", ended_at: "2024-01-01T02:00:00Z" })],
+          total: 1,
+        });
+        await sessions.load({ force: true });
+        expect(getMarks).not.toHaveBeenCalled();
+
+        // The row was resumed after the mark.
+        vi.mocked(api.getSidebarSessionIndex).mockResolvedValue({
+          sessions: [makeSkinnyRow({ id: "a", ended_at: "2024-01-01T03:00:00Z" })],
+          total: 1,
+        });
+        await sessions.load({ force: true });
+        expect(getMarks).toHaveBeenCalledTimes(1);
+      } finally {
+        detach();
+        sessionEndMarks.marks = new Map();
+      }
     });
 
     it("keeps sidebar rows skinny and carries sidebar classifications", async () => {
