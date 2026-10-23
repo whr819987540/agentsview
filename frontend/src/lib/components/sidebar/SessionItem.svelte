@@ -909,7 +909,7 @@
 
   .ended-mark {
     display: inline-flex;
-    color: var(--text-muted);
+    color: var(--accent-green);
   }
 
   .session-info {
@@ -1083,7 +1083,7 @@
   }
 
   .end-btn.ended {
-    color: var(--text-secondary);
+    color: var(--accent-green);
   }
 
   .end-btn.ended :global(circle) {

@@ -394,7 +394,7 @@ explaining the current state.
 | Stale   | Amber             | 10–60 minutes idle and last assistant message has an unresolved tool call (or the session file was truncated mid-write) |
 | Unclean | Red               | Same flagged state as Stale, but idle for more than an hour                                                             |
 | Quiet   | Hidden            | Cleanly-ended sessions older than 10 minutes; no dot is rendered                                                        |
-| Ended   | Gray check        | You [marked the session as ended](#mark-a-session-as-ended) and it has had no activity since                            |
+| Ended   | Green check       | You [marked the session as ended](#mark-a-session-as-ended) and it has had no activity since                            |
 
 The sidebar lists sessions by state: Working, Waiting, Idle, Stale, Quiet, then
 Unclean. Ended sessions sort with Quiet. Within a state, the session written to
@@ -426,7 +426,7 @@ Mark a session as ended when you are done with it, so the sidebar shows at a
 glance which sessions still need you. Hover the session in the sidebar and
 click the circled check next to the star. You can also right-click the session
 and choose **Mark as ended**, or choose it from the session actions menu in the
-session header. The row's status dot becomes a small gray check, and the row
+session header. The row's status dot becomes a small green check, and the row
 sorts with the Quiet sessions. To remove the mark, hover the row and click the
 filled check, or choose **Unmark as ended**. Session end marks are unreleased.
 
