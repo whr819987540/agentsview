@@ -1919,6 +1919,8 @@
   "session_input_tree_jump_to": "入力へ移動: {preview}",
   "session_input_tree_open": "所属するセッションで開く: {preview}",
   "session_input_tree_current": "現在",
+  "session_input_tree_rewound": "巻き戻し",
+  "session_input_tree_rewound_title": "巻き戻された入力（会話記録には残っていません）：{preview}",
   "session_input_graph_open": "詳細な入力ツリーを開く",
   "session_input_graph_title": "入力ツリー",
   "session_input_graph_close": "閉じる",

@@ -1876,6 +1876,8 @@
   "session_input_tree_jump_to": "입력으로 이동: {preview}",
   "session_input_tree_open": "해당 세션에서 열기: {preview}",
   "session_input_tree_current": "현재",
+  "session_input_tree_rewound": "되돌림",
+  "session_input_tree_rewound_title": "되돌린 입력이며 대화 기록에 남아 있지 않습니다: {preview}",
   "session_input_graph_open": "자세한 입력 트리 열기",
   "session_input_graph_title": "입력 트리",
   "session_input_graph_close": "닫기",

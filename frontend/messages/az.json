@@ -1923,6 +1923,8 @@
   "session_input_tree_jump_to": "Girişə keç: {preview}",
   "session_input_tree_open": "Öz sessiyasında aç: {preview}",
   "session_input_tree_current": "cari",
+  "session_input_tree_rewound": "geri qaytarılıb",
+  "session_input_tree_rewound_title": "Geri qaytarılmış giriş, transkriptdə saxlanmayıb: {preview}",
   "session_input_graph_open": "Ətraflı giriş ağacını aç",
   "session_input_graph_title": "Giriş ağacı",
   "session_input_graph_close": "Bağla",

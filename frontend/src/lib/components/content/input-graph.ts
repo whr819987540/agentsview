@@ -1,6 +1,6 @@
 import { hierarchy, tree } from "d3-hierarchy";
 import type { ServiceInputTreeNode as InputTreeNode } from "../../api/generated/index.js";
-import { INPUT_TREE_COLLAPSE_MIN } from "./input-tree.js";
+import { INPUT_TREE_COLLAPSE_MIN, isRewound } from "./input-tree.js";
 
 // Sizes of the input graph in CSS pixels at 100% zoom. Every card shares one
 // width, and each depth of the tree is one row.
@@ -48,7 +48,7 @@ export interface InputGraphRunItem extends InputGraphItemBase {
 }
 
 // A session whose path ends at the input above it. Every leaf of the graph
-// is a session.
+// is a session, except the last input of a branch that a rewind abandoned.
 export interface InputGraphSessionItem extends InputGraphItemBase {
   kind: "session";
   sessionId: string;
@@ -65,6 +65,8 @@ export interface InputGraphEdge {
   // SVG path data in graph coordinates.
   d: string;
   onActivePath: boolean;
+  // The edge leads to an input that a rewind abandoned.
+  rewound: boolean;
 }
 
 export interface InputGraphLayout {
@@ -313,6 +315,7 @@ function placeDrafts(root: Draft): InputGraphLayout {
       to: item.key,
       d: edgePath(x1, y1, item.x + item.width / 2, item.y, y1 + SPLIT_OFFSET),
       onActivePath: item.onActivePath,
+      rewound: item.kind === "input" && isRewound(item.node),
     });
   }
   edges.sort((a, b) => Number(a.onActivePath) - Number(b.onActivePath));

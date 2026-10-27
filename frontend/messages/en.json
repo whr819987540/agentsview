@@ -1735,6 +1735,8 @@
   "session_input_tree_jump_to": "Jump to input: {preview}",
   "session_input_tree_open": "Open in its session: {preview}",
   "session_input_tree_current": "current",
+  "session_input_tree_rewound": "rewound",
+  "session_input_tree_rewound_title": "Rewound input, not kept in the transcript: {preview}",
   "session_input_graph_open": "Open the detailed input tree",
   "session_input_graph_title": "Input tree",
   "session_input_graph_close": "Close",

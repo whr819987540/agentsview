@@ -517,9 +517,11 @@ workflows easier to navigate without leaving the session list.
 ### Forks and Subagent Sessions
 
 AgentsView automatically detects conversation forks in Claude Code sessions —
-for example, when you use "retry from here" to branch a conversation. Large
-forks (more than 3 user turns) appear as separate session entries grouped with
-their parent. Small retries fold into the main session.
+for example, when you press Esc twice to rewind and send a different prompt.
+Large forks (more than 3 user turns) appear as separate session entries grouped
+with their parent. Smaller ones fold into the main session, which shows the
+conversation as it continued after the rewind. Their prompts are kept as
+rewound prompts for the **Inputs** tree below.
 
 In the sidebar, a group of related sessions always starts with the original
 session, as in the session tree. Expand the group to see its continuations,
@@ -543,6 +545,10 @@ it:
     carries on from the session before it.
 - Runs of prompts without a split fold into one row. Click the row to show
     them. A prompt where a session ends always stays visible.
+- Prompts you rewound past with Esc in Claude Code branch off where you
+    rewound to. They are drawn with dashed lines and muted text, and the
+    branch is labeled **rewound**. AgentsView keeps only those prompts, not
+    the replies to them, so a rewound prompt does not open anything.
 
 For a closer look, click the expand button beside the **Sessions**/**Inputs**
 switch. It opens the same family as a full diagram:
@@ -550,13 +556,25 @@ switch. It opens the same family as a full diagram:
 - Each prompt is a card with its time and first lines. A colored stripe shows
     which session holds it.
 - Every branch ends in a card for its session, with its relationship, agent,
-    and message count. Click it to open that session.
+    and message count. Click it to open that session. A rewound branch ends
+    with its last prompt instead; its cards are dashed and marked
+    **rewound**.
 - Click a prompt to go to it, as in the side panel; the diagram closes. Hover
     a card to trace its path back to the first prompt.
 - Drag the background to pan. Hold Ctrl or Cmd and scroll, or use the zoom
     buttons, to zoom. **Fit to window** shows the whole tree.
 - **Fold unbranched runs** folds long runs of prompts into one card. Turn it
     off to see every prompt.
+
+Rewound prompts have these limits:
+
+- Only the local archive keeps them. A tree served by `pg serve`, or from a
+    ClickHouse or DuckDB copy, shows no rewound branches.
+- An archive with `archive_content = "usage"` does not store them, because
+    they are prompt text.
+- Sessions you rewound before upgrading get their rewound prompts from the
+    one-time re-parse after the upgrade, as long as their Claude Code files
+    still exist.
 
 Subagent sessions spawned by the Task tool are organized under their parent in
 the sidebar's [sub-agent tree](#sub-agent-tree) and are also viewable inline

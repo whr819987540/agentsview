@@ -153,6 +153,54 @@ describe("layoutInputTree", () => {
     expect(rows.map((row) => row.lineBelowOnActivePath)).toEqual([true, false, false]);
   });
 
+  it("draws a rewound branch to the side even when it is the only input after its parent", () => {
+    // 0
+    // ├ 1          session ends here
+    // │ └ 2 ─ 3    rewound after 1
+    // └ 4          rewound after 0
+    const rows = nodeRows(
+      layoutInputTree([
+        inputNode(-1, { on_active_path: true }),
+        inputNode(0, { on_active_path: true, end_session_ids: ["s"] }),
+        inputNode(1, { rewound: true, ordinal: -1 }),
+        inputNode(2, { rewound: true, ordinal: -1 }),
+        inputNode(0, { rewound: true, ordinal: -1 }),
+      ]),
+    );
+
+    expect(rows.map(shape)).toEqual([
+      { index: 0, depth: 0, rails: [], elbow: null, lineAbove: false, lineBelow: true },
+      {
+        index: 1,
+        depth: 1,
+        rails: [],
+        elbow: { top: true, bottom: true },
+        lineAbove: false,
+        lineBelow: true,
+      },
+      {
+        index: 2,
+        depth: 2,
+        rails: [0],
+        elbow: { top: true, bottom: false },
+        lineAbove: false,
+        lineBelow: true,
+      },
+      { index: 3, depth: 2, rails: [0], elbow: null, lineAbove: true, lineBelow: false },
+      {
+        index: 4,
+        depth: 1,
+        rails: [],
+        elbow: { top: true, bottom: false },
+        lineAbove: false,
+        lineBelow: false,
+      },
+    ]);
+    // Only the input where a rewound branch leaves its parent carries the
+    // badge.
+    expect(rows.map((row) => row.startsRewound)).toEqual([false, false, true, false, true]);
+  });
+
   describe("folding", () => {
     // 0 - 1 - 2 - 3 - 4 - 5, then 5 splits into 6 and 7.
     const chain = [

@@ -1922,6 +1922,8 @@
   "session_input_tree_jump_to": "Aller à l'entrée : {preview}",
   "session_input_tree_open": "Ouvrir dans sa session : {preview}",
   "session_input_tree_current": "actuelle",
+  "session_input_tree_rewound": "rembobiné",
+  "session_input_tree_rewound_title": "Entrée rembobinée, absente de la transcription : {preview}",
   "session_input_graph_open": "Ouvrir l'arbre détaillé des saisies",
   "session_input_graph_title": "Arbre des saisies",
   "session_input_graph_close": "Fermer",

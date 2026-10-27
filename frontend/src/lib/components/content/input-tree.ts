@@ -33,6 +33,8 @@ export interface InputTreeNodeRow {
   isLeaf: boolean;
   isBranchPoint: boolean;
   onActivePath: boolean;
+  // The input starts a branch that a rewind abandoned.
+  startsRewound: boolean;
 }
 
 // Stands in for a folded run of inputs.
@@ -59,7 +61,8 @@ export interface InputTreeLayoutOptions {
 // Lays out input tree nodes, which arrive depth first with parents before
 // children, as rows with the lines that connect them. A branch's inputs
 // share one column, and each branch moves one column to the right of the
-// input it branched from.
+// input it branched from. A rewound branch always moves right, even when it
+// is the only input after its parent, so it never reads as the path.
 export function layoutInputTree(
   nodes: readonly InputTreeNode[],
   options: InputTreeLayoutOptions = {},
@@ -82,7 +85,8 @@ export function layoutInputTree(
   nodes.forEach((node, index) => {
     const parent = parents[index]!;
     const siblings = parent < 0 ? topLevel : children[parent]!;
-    const isHead = siblings.length > 1;
+    const startsRewound = isRewound(node) && !(parent >= 0 && isRewound(nodes[parent]!));
+    const isHead = siblings.length > 1 || (startsRewound && parent >= 0);
     const isFirst = siblings[0] === index;
     const isLast = siblings[siblings.length - 1] === index;
     // Separate top-level paths branch from an unseen root in column 0.
@@ -107,6 +111,7 @@ export function layoutInputTree(
       isLeaf: kids.length === 0,
       isBranchPoint: kids.length > 1,
       onActivePath: isOnActivePath(node),
+      startsRewound,
     });
   });
 
@@ -115,6 +120,12 @@ export function layoutInputTree(
 
 function isOnActivePath(node: InputTreeNode): boolean {
   return node.on_active_path;
+}
+
+// Reports whether the input is on a branch that a rewind abandoned. It has
+// no message to open.
+export function isRewound(node: InputTreeNode): boolean {
+  return node.rewound === true;
 }
 
 // An input is foldable when the inputs before and after it on its branch

@@ -1670,6 +1670,8 @@
   "session_input_tree_jump_to": "跳轉到輸入：{preview}",
   "session_input_tree_open": "在所屬會話中開啟：{preview}",
   "session_input_tree_current": "目前",
+  "session_input_tree_rewound": "已回退",
+  "session_input_tree_rewound_title": "已回退的輸入，不在對話紀錄中：{preview}",
   "session_input_graph_open": "開啟詳細輸入樹",
   "session_input_graph_title": "輸入樹",
   "session_input_graph_close": "關閉",

@@ -16,8 +16,10 @@
   import {
     inputGraphPathTo,
     layoutInputGraph,
+    type InputGraphInputItem,
     type InputGraphItem,
   } from "../content/input-graph.js";
+  import { isRewound } from "../content/input-tree.js";
   import { TranscriptRead } from "../content/transcript-read.svelte.js";
 
   interface Props {
@@ -255,6 +257,9 @@
   }
 
   function inputTitle(node: ServiceInputTreeNode): string {
+    if (isRewound(node)) {
+      return m.session_input_tree_rewound_title({ preview: node.preview });
+    }
     return isInActiveView(node)
       ? m.session_input_tree_jump_to({ preview: node.preview })
       : m.session_input_tree_open({ preview: node.preview });
@@ -320,6 +325,26 @@
     hoverKey = key;
   }
 </script>
+
+{#snippet inputCardContent(item: InputGraphInputItem, node: ServiceInputTreeNode)}
+  <span class="node-meta">
+    <span class="node-time">
+      {node.timestamp ? formatTimestamp(node.timestamp) : ""}
+    </span>
+    {#if isRewound(node)}
+      <span class="node-rewound">{m.session_input_tree_rewound()}</span>
+    {/if}
+    {#if item.branches > 1}
+      <span class="node-branches">
+        {m.session_input_graph_branches({
+          count: item.branches,
+          countLabel: formatNumber(item.branches),
+        })}
+      </span>
+    {/if}
+  </span>
+  <span class="node-preview">{node.preview}</span>
+{/snippet}
 
 <Modal
   title={m.session_input_graph_title()}
@@ -426,7 +451,11 @@
               aria-hidden="true"
             >
               {#each layout.edges as edge (edge.key)}
-                <path d={edge.d} class:on-path={edge.onActivePath} />
+                <path
+                  d={edge.d}
+                  class:on-path={edge.onActivePath}
+                  class:rewound={edge.rewound}
+                />
               {/each}
               {#each hoverEdges as edge (edge.key)}
                 <path d={edge.d} class="hover-path" />
@@ -436,38 +465,43 @@
             {#each layout.items as item (item.key)}
               {#if item.kind === "input"}
                 {@const node = item.node}
-                <a
-                  class="graph-node input-node"
-                  class:on-path={item.onActivePath}
-                  class:selected={item.index === selectedIndex}
-                  class:branch-point={item.branches > 1}
-                  class:shell={node.is_shell}
-                  class:hovered={hoverPath.has(item.key)}
-                  href={inputHref(node)}
-                  title={inputTitle(node)}
-                  aria-current={item.index === selectedIndex ? "step" : undefined}
-                  style={itemStyle(item, node.session_id)}
-                  onclick={(event) => openInput(event, node)}
-                  onmouseenter={() => hover(item.key)}
-                  onmouseleave={() => hover(null)}
-                  onfocus={() => hover(item.key)}
-                  onblur={() => hover(null)}
-                >
-                  <span class="node-meta">
-                    <span class="node-time">
-                      {node.timestamp ? formatTimestamp(node.timestamp) : ""}
-                    </span>
-                    {#if item.branches > 1}
-                      <span class="node-branches">
-                        {m.session_input_graph_branches({
-                          count: item.branches,
-                          countLabel: formatNumber(item.branches),
-                        })}
-                      </span>
-                    {/if}
-                  </span>
-                  <span class="node-preview">{node.preview}</span>
-                </a>
+                {#if isRewound(node)}
+                  <!-- A rewound input has no message to open, so its card is
+                       not a link. Hovering only highlights its path. -->
+                  <!-- svelte-ignore a11y_no_static_element_interactions -->
+                  <div
+                    class="graph-node input-node rewound"
+                    class:branch-point={item.branches > 1}
+                    class:shell={node.is_shell}
+                    class:hovered={hoverPath.has(item.key)}
+                    title={inputTitle(node)}
+                    style={itemStyle(item, node.session_id)}
+                    onmouseenter={() => hover(item.key)}
+                    onmouseleave={() => hover(null)}
+                  >
+                    {@render inputCardContent(item, node)}
+                  </div>
+                {:else}
+                  <a
+                    class="graph-node input-node"
+                    class:on-path={item.onActivePath}
+                    class:selected={item.index === selectedIndex}
+                    class:branch-point={item.branches > 1}
+                    class:shell={node.is_shell}
+                    class:hovered={hoverPath.has(item.key)}
+                    href={inputHref(node)}
+                    title={inputTitle(node)}
+                    aria-current={item.index === selectedIndex ? "step" : undefined}
+                    style={itemStyle(item, node.session_id)}
+                    onclick={(event) => openInput(event, node)}
+                    onmouseenter={() => hover(item.key)}
+                    onmouseleave={() => hover(null)}
+                    onfocus={() => hover(item.key)}
+                    onblur={() => hover(null)}
+                  >
+                    {@render inputCardContent(item, node)}
+                  </a>
+                {/if}
               {:else if item.kind === "run"}
                 <button
                   type="button"
@@ -650,6 +684,10 @@
     stroke-width: 2.5;
   }
 
+  .graph-edges path.rewound {
+    stroke-dasharray: 4 3;
+  }
+
   .graph-edges path.hover-path {
     stroke: var(--text-primary);
     stroke-opacity: 0.8;
@@ -737,6 +775,26 @@
     border-radius: var(--radius-xs, 4px);
     background: color-mix(in srgb, var(--accent-blue) 14%, transparent);
     color: var(--accent-blue);
+  }
+
+  /* A rewound input left no transcript: its card is dashed and muted. */
+  .input-node.rewound {
+    border-style: dashed;
+    background: var(--bg-surface);
+    box-shadow: none;
+    color: var(--text-muted);
+    cursor: default;
+  }
+
+  .input-node.rewound:hover {
+    background: var(--bg-surface);
+  }
+
+  .node-rewound {
+    flex-shrink: 0;
+    padding: 0 5px;
+    border: 1px dashed var(--border-default);
+    border-radius: var(--radius-xs, 4px);
   }
 
   .node-preview {

@@ -469,6 +469,46 @@ describe("SessionRelationshipTree", () => {
       expect(ui.pendingScrollSession).toBe("root");
     });
 
+    it("shows rewound inputs as a marked branch that opens nothing", async () => {
+      const navigate = vi
+        .spyOn(router, "navigateToSession")
+        .mockImplementation(() => {});
+      await mountWithInputs(
+        makeInputTree([
+          inputNode(-1, "root", 0, "shared start", { on_active_path: true, active_ordinal: -5 }),
+          inputNode(0, "child", 0, "fork input", {
+            on_active_path: true,
+            active_ordinal: 0,
+            end_session_ids: ["child"],
+          }),
+          inputNode(0, "child", -1, "abandoned plan", { rewound: true }),
+          inputNode(2, "child", -1, "abandoned detail", { rewound: true }),
+        ]),
+      );
+
+      const head = inputRow("abandoned plan")!;
+      const detail = inputRow("abandoned detail")!;
+      for (const row of [head, detail]) {
+        expect(row.tagName).toBe("DIV");
+        expect(row.hasAttribute("href")).toBe(false);
+        expect(row.classList.contains("rewound")).toBe(true);
+      }
+      expect(head.getAttribute("title")).toBe(
+        m.session_input_tree_rewound_title({ preview: "abandoned plan" }),
+      );
+      // The branch is labelled once, where it leaves the path.
+      expect(head.querySelector(".rewound-badge")?.textContent?.trim()).toBe(
+        m.session_input_tree_rewound(),
+      );
+      expect(detail.querySelector(".rewound-badge")).toBeNull();
+      expect(inputRow("fork input")!.tagName).toBe("A");
+
+      head.click();
+
+      expect(navigate).not.toHaveBeenCalled();
+      expect(ui.pendingScrollOrdinal).toBeNull();
+    });
+
     // root ─ child (fork) ─ moved (continuation of child)
     function makeContinuedTree(activeId: string): SessionTreeResponse {
       const moved = {
