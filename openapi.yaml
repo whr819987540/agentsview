@@ -2647,14 +2647,11 @@ components:
       properties:
         activity_at:
           type: string
-        created_at:
-          type: string
         session_id:
           type: string
       required:
         - session_id
         - activity_at
-        - created_at
       type: object
     DbSessionFolder:
       additionalProperties: false
@@ -6920,14 +6917,6 @@ components:
           type: string
       required:
         - path
-      type: object
-    SessionEndMarkInputBody:
-      additionalProperties: false
-      properties:
-        activity_at:
-          description: The session's last activity the user saw; the mark counts until the session has newer activity. Empty uses the session's own last activity
-          maxLength: 64
-          type: string
       type: object
     SessionEndMarksResponse:
       additionalProperties: false
@@ -19569,15 +19558,13 @@ paths:
           schema:
             description: Session ID
             type: string
-      requestBody:
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/SessionEndMarkInputBody"
-        required: true
       responses:
-        "204":
-          description: No Content
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DbSessionEndMark"
+          description: OK
         "400":
           content:
             application/json:

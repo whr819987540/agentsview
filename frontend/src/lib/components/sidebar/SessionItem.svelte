@@ -48,6 +48,10 @@
      * still wins over freshness for awaiting_user (a fork running
      * in parallel doesn't change that the parent is waiting). */
     groupSessions?: SessionGroupInput[];
+    /** Every session of the row's group, including ones a filter such as
+     * starred-only hides. An end mark covers the whole row, so the row
+     * reads and changes its mark across all of them. */
+    endMarkGroup?: SessionGroupInput[];
     /** The session whose parser status the dot reads, when it is not
      * the one the row shows. A continuation chain's row shows its root
      * but the state of its newest continuation. */
@@ -84,6 +88,7 @@
     continuationCount = 1,
     groupSessionIds,
     groupSessions,
+    endMarkGroup,
     statusSession,
     hideAgent = false,
     hideProject = false,
@@ -106,8 +111,9 @@
     getSessionStatus(statusSession ?? session, groupSessions),
   );
 
-  let endMarkSessions = $derived(rowSessions(session, groupSessions));
-  let isEnded = $derived(sessionEndMarks.isEnded(endMarkSessions));
+  let endMarkSessions = $derived(rowSessions(session, endMarkGroup ?? groupSessions));
+  // Child rows show their own live status; the parent row holds the mark.
+  let isEnded = $derived(!compact && sessionEndMarks.isEnded(endMarkSessions));
 
   let isActive = $derived.by(() => {
     const aid = sessions.activeSessionId;
@@ -211,6 +217,9 @@
 
   function handleEnd(e: MouseEvent) {
     e.stopPropagation();
+    // Re-sorting at once would slide the next row, and its button, under
+    // the pointer, and move this button out from under focus.
+    sessionEndMarks.holdSortPlace(endMarkSessions);
     void toggleEnded();
   }
 
@@ -302,11 +311,7 @@
   async function toggleEnded() {
     closeContextMenu();
     try {
-      if (isEnded) {
-        await sessionEndMarks.unmark(endMarkSessions);
-      } else {
-        await sessionEndMarks.mark(endMarkSessions);
-      }
+      await sessionEndMarks.toggle(endMarkSessions);
     } catch {
       showFlash(m.session_end_mark_failed(), { tone: "danger" });
     }
@@ -598,15 +603,17 @@
   </div>
 
   {#if !compact && sessionEndMarks.editable}
-    <button
-      class="end-btn"
-      class:ended={isEnded}
-      onclick={handleEnd}
-      title={isEnded ? m.session_end_mark_unmark() : m.session_end_mark_mark()}
-      aria-label={isEnded ? m.session_end_mark_unmark() : m.session_end_mark_mark()}
-    >
-      <CircleCheckIcon size="12" strokeWidth="1.6" aria-hidden="true" />
-    </button>
+    <span class="end-slot">
+      <IconButton
+        size="sm"
+        tone="success"
+        ariaPressed={isEnded}
+        ariaLabel={isEnded ? m.session_end_mark_unmark() : m.session_end_mark_mark()}
+        onclick={handleEnd}
+      >
+        <CircleCheckIcon size="14" aria-hidden="true" />
+      </IconButton>
+    </span>
   {/if}
   {#if !compact}
     <button
@@ -666,7 +673,7 @@
         {m.sidebar_row_move_to_folder()}
       </button>
     {/if}
-    {#if sessionEndMarks.editable}
+    {#if !compact && sessionEndMarks.editable}
       <button class="context-menu-item" onclick={() => void toggleEnded()}>
         {isEnded ? m.session_end_mark_unmark() : m.session_end_mark_mark()}
       </button>
@@ -1057,41 +1064,24 @@
     background: var(--bg-surface-hover);
   }
 
-  /* Takes no room until the row is hovered or keyboard-focused, so the
-     title keeps its width at rest. The status slot shows the mark itself. */
-  .end-btn {
-    width: 20px;
-    height: 20px;
-    display: none;
-    align-items: center;
-    justify-content: center;
-    border-radius: var(--radius-sm);
-    color: var(--text-muted);
-    flex-shrink: 0;
-    transition: color 0.12s, background 0.12s;
-  }
-
-  .session-item:hover .end-btn,
-  .session-item:has(:focus-visible) .end-btn,
-  .session-item:focus-visible .end-btn {
+  /* The end button takes no room until the row is hovered or keyboard-
+     focused, so titles keep their width at rest; the status slot shows the
+     mark itself. Out of the flow it stays focusable, so Tab reaches it. */
+  .end-slot {
+    position: absolute;
     display: flex;
+    flex-shrink: 0;
+    opacity: 0;
+    pointer-events: none;
   }
 
-  .end-btn:hover {
-    background: var(--bg-surface-hover);
-    color: var(--text-secondary);
-  }
-
-  .end-btn.ended {
-    color: var(--accent-green);
-  }
-
-  .end-btn.ended :global(circle) {
-    fill: currentColor;
-  }
-
-  .end-btn.ended :global(path) {
-    stroke: var(--bg-surface);
+  .session-item:hover .end-slot,
+  .session-item:focus-visible .end-slot,
+  .session-item:has(:focus-visible) .end-slot,
+  .end-slot:focus-within {
+    position: static;
+    opacity: 1;
+    pointer-events: auto;
   }
 
   :global(.context-menu) {

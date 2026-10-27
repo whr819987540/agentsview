@@ -9,6 +9,7 @@ import { readProgress } from "../../stores/read-progress.svelte.js";
 import { sessions } from "../../stores/sessions.svelte.js";
 import type { Session } from "../../api/types.js";
 import { starred } from "../../stores/starred.svelte.js";
+import { lastActivity, sessionEndMarks } from "../../stores/sessionEndMarks.svelte.js";
 import { ui } from "../../stores/ui.svelte.js";
 import { m, setLocale } from "../../i18n/index.js";
 import { ITEM_HEIGHT, OVERSCAN, STORAGE_KEY_GROUP } from "./session-list-utils.js";
@@ -569,6 +570,128 @@ describe("SessionList visible hydration", () => {
     expect(document.body.textContent).toContain("Starred child");
     expect(document.body.textContent).not.toContain("Root");
     expect(document.body.textContent).not.toContain("Unstarred");
+  });
+
+  describe("end marks under starred-only", () => {
+    const root = () =>
+      makeSession({
+        id: "root",
+        display_name: "Root",
+        ended_at: "2024-01-01T01:00:00Z",
+        is_index_only: true,
+      });
+    const continuation = () =>
+      makeSession({
+        id: "cont",
+        parent_session_id: "root",
+        relationship_type: "continuation",
+        display_name: "Continuation",
+        started_at: "2024-01-01T02:00:00Z",
+        ended_at: "2024-01-01T03:00:00Z",
+        is_index_only: true,
+      });
+
+    beforeEach(() => {
+      sessions.sessions = [root(), continuation()];
+      starred.filterOnly = true;
+      sessionEndMarks.editable = true;
+      vi.spyOn(sessions, "hydrateVisibleSessions").mockResolvedValue(undefined);
+    });
+
+    afterEach(() => {
+      sessionEndMarks.marks = new Map();
+      sessionEndMarks.editable = false;
+    });
+
+    function endButton(id: string): HTMLButtonElement | null {
+      return document.querySelector<HTMLButtonElement>(
+        `.session-item[data-session-id="${id}"] .end-slot button`,
+      );
+    }
+
+    it("marks the whole row when only its root is starred", async () => {
+      starred.ids = new Set(["root"]);
+      const mark = vi.spyOn(sessionEndMarks, "mark").mockResolvedValue();
+
+      component = mount(SessionList, { target: document.body });
+      await tick();
+      endButton("root")!.click();
+
+      expect(mark.mock.calls[0]![0].map((s) => s.id)).toEqual(["root", "cont"]);
+    });
+
+    it("shows a mark on a hidden root and removes it", async () => {
+      starred.ids = new Set(["cont"]);
+      sessionEndMarks.marks = new Map([["root", "2024-01-01T03:00:00Z"]]);
+      const unmark = vi.spyOn(sessionEndMarks, "unmark").mockResolvedValue();
+
+      component = mount(SessionList, { target: document.body });
+      await tick();
+
+      expect(
+        document.querySelector('.session-item[data-session-id="cont"] .status-slot .ended-mark'),
+      ).not.toBeNull();
+      endButton("cont")!.click();
+      expect(unmark.mock.calls[0]![0].map((s) => s.id).sort()).toEqual(["cont", "root"]);
+    });
+  });
+
+  describe("end button", () => {
+    const ago = (minutes: number) => new Date(Date.now() - minutes * 60_000).toISOString();
+
+    beforeEach(() => {
+      sessions.sessions = [
+        makeSession({ id: "idle", display_name: "Idle", ended_at: ago(3), is_index_only: true }),
+        makeSession({
+          id: "stale",
+          display_name: "Stale",
+          ended_at: ago(20),
+          termination_status: "tool_call_pending",
+          is_index_only: true,
+        }),
+      ];
+      sessionEndMarks.editable = true;
+      vi.spyOn(sessions, "hydrateVisibleSessions").mockResolvedValue(undefined);
+      vi.spyOn(sessionEndMarks, "mark").mockImplementation(async (row) => {
+        sessionEndMarks.marks = new Map([[row[0]!.id, lastActivity(row)]]);
+      });
+    });
+
+    afterEach(() => {
+      sessionEndMarks.releaseSortHolds();
+      sessionEndMarks.marks = new Map();
+      sessionEndMarks.editable = false;
+    });
+
+    function order(): string[] {
+      return [...document.querySelectorAll<HTMLElement>(".session-item")].map(
+        (el) => el.dataset.sessionId!,
+      );
+    }
+
+    it("keeps the row in place until the pointer leaves the list", async () => {
+      component = mount(SessionList, { target: document.body });
+      await tick();
+      expect(order()).toEqual(["idle", "stale"]);
+      const list = document.querySelector<HTMLElement>(".session-list-scroll")!;
+      list.dispatchEvent(new PointerEvent("pointerover", { bubbles: true }));
+      const button = document.querySelector<HTMLButtonElement>(
+        '.session-item[data-session-id="idle"] .end-slot button',
+      )!;
+
+      button.focus();
+      button.click();
+      await tick();
+
+      expect(document.querySelector('.session-item[data-session-id="idle"] .ended-mark')).not
+        .toBeNull();
+      expect(order()).toEqual(["idle", "stale"]);
+      expect(document.activeElement).toBe(button);
+
+      list.dispatchEvent(new PointerEvent("pointerleave"));
+      await tick();
+      expect(order()).toEqual(["stale", "idle"]);
+    });
   });
 
   it("lists forks under the session they branched from", async () => {

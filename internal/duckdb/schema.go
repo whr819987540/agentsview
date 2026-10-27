@@ -19,8 +19,9 @@ import (
 // reasoning effort to messages. v15 adds explicit session-project
 // assignment state. v16 rebuilds after SQLite data version 111 rewrote
 // stored Devin source identities; pre-111 mirrors would otherwise keep
-// serving bare ids that deduplicate across sessions.
-const SchemaVersion = 16
+// serving bare ids that deduplicate across sessions. v17 adds the
+// archive's session end marks.
+const SchemaVersion = 17
 
 const schemaVersionMetadataKey = "agentsview_schema_version"
 
@@ -40,8 +41,9 @@ const (
 )
 
 // curationFingerprintMetadataKey stores a hash of the local in-scope
-// curation state (starred session ids, pinned message ids) as of the last
-// push that actually refreshed starred_sessions/pinned_messages. It is read
+// curation state (starred session ids, pinned message ids, end marks) as of
+// the last push that actually refreshed starred_sessions, pinned_messages
+// and session_end_marks. It is read
 // and written directly via readMetadataKey/recordMetadataKey rather than
 // through mirrorMetadata/writeMirrorMetadata: unlike the fields in that
 // struct, it is not part of the rebuild-vs-incremental decision (see
@@ -736,6 +738,17 @@ var mirrorTables = []tableSpec{
 		columns: []columnSpec{
 			{"session_id", "session_id TEXT"},
 			{"created_at", "created_at TIMESTAMP"},
+		},
+	},
+	{
+		name: "session_end_marks",
+		create: `CREATE TABLE IF NOT EXISTS session_end_marks (
+			session_id TEXT PRIMARY KEY,
+			activity_at TEXT NOT NULL
+		)`,
+		columns: []columnSpec{
+			{"session_id", "session_id TEXT"},
+			{"activity_at", "activity_at TEXT NOT NULL DEFAULT ''"},
 		},
 	},
 	{

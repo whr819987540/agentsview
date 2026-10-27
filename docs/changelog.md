@@ -17,8 +17,9 @@ The latest published release is
   the session header. The row's status dot becomes a small green check and the
   row sorts with the quiet sessions. The mark clears itself when the
   session has new activity, such as when you resume it. Marks are saved in the
-  local archive and are not shown when serving from a PostgreSQL, ClickHouse,
-  or DuckDB replica.
+  local archive, and DuckDB and ClickHouse pushes copy them for read-only
+  viewing. `pg serve` keeps its own marks in PostgreSQL, like stars; hosted
+  PostgreSQL does not support marks yet.
 - Jump to the end of a session's messages in one click. The **Scroll to
   bottom** button, a down arrow to the left of **Collapse visible blocks** in
   the session header, shows the newest message in oldest-first order and the

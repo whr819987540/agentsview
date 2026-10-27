@@ -7,7 +7,7 @@ import {
   filtersToParams,
   splitExcludeProjectParam,
 } from "./sessions.svelte.js";
-import { SessionsService, type DbSession } from "../api/generated/index";
+import { SessionEndMarksService, SessionsService, type DbSession } from "../api/generated/index";
 import { starred } from "./starred.svelte.js";
 import { sessionEndMarks } from "./sessionEndMarks.svelte.js";
 import { yokedDates } from "./yokedDates.svelte.js";
@@ -80,6 +80,9 @@ vi.mock("../api/generated/index", () => ({
     postApiV1SessionsByIdRestore: vi.fn(({ id }) => api.restoreSession(id)),
     patchApiV1SessionsByIdRename: vi.fn(({ id }, body) => api.renameSession(id, body.display_name)),
     getApiV1SessionsByIdChildren: vi.fn().mockResolvedValue([]),
+  },
+  SessionEndMarksService: {
+    getApiV1SessionEndMarks: vi.fn().mockResolvedValue({ marks: [], editable: false }),
   },
   MetadataService: {
     getApiV1Projects: vi.fn((params) => api.getProjects(params)),
@@ -585,6 +588,46 @@ describe("SessionsStore", () => {
       expect(sessions.sessions).toHaveLength(500);
       expect(sessions.total).toBe(86312);
       expect(sessions.nextCursor).toBe("next");
+    });
+
+    it("builds the sidebar rows once per change", () => {
+      sessions.sessions = [makeSkinnyRow({ id: "a" }), makeSkinnyRow({ id: "b" })] as Session[];
+
+      const rows = sessions.groupedSessions;
+      expect(sessions.groupedSessions).toBe(rows);
+
+      sessions.sessions = [makeSkinnyRow({ id: "a" })] as Session[];
+      expect(sessions.groupedSessions).not.toBe(rows);
+      expect(sessions.groupedSessions.map((g) => g.key)).toEqual(["a"]);
+    });
+
+    it("reads the end marks again when a loaded row outlived its mark", async () => {
+      const getMarks = vi.mocked(SessionEndMarksService.getApiV1SessionEndMarks);
+      const detach = sessions.attachSidebar();
+      try {
+        await sessionEndMarks.refresh();
+        getMarks.mockClear();
+
+        // The row still ends with its mark: nothing to read.
+        sessionEndMarks.marks = new Map([["a", "2024-01-01T02:00:00Z"]]);
+        vi.mocked(api.getSidebarSessionIndex).mockResolvedValue({
+          sessions: [makeSkinnyRow({ id: "a", ended_at: "2024-01-01T02:00:00Z" })],
+          total: 1,
+        });
+        await sessions.load({ force: true });
+        expect(getMarks).not.toHaveBeenCalled();
+
+        // The row was resumed after the mark.
+        vi.mocked(api.getSidebarSessionIndex).mockResolvedValue({
+          sessions: [makeSkinnyRow({ id: "a", ended_at: "2024-01-01T03:00:00Z" })],
+          total: 1,
+        });
+        await sessions.load({ force: true });
+        expect(getMarks).toHaveBeenCalledTimes(1);
+      } finally {
+        detach();
+        sessionEndMarks.marks = new Map();
+      }
     });
 
     it("keeps sidebar rows skinny and carries sidebar classifications", async () => {
@@ -3055,6 +3098,19 @@ describe("buildSessionGroups", () => {
       expect(order()).toEqual(["marked", "idle", "quiet"]);
     } finally {
       sessionEndMarks.marks = new Map();
+    }
+  });
+
+  it("reads each group's end mark once per sort", () => {
+    const rows = Array.from({ length: 50 }, (_, i) =>
+      makeSkinnyRow({ id: `s${i}`, ended_at: new Date(Date.now() - i * 60_000).toISOString() }),
+    );
+    const sortsAsEnded = vi.spyOn(sessionEndMarks, "sortsAsEnded");
+    try {
+      buildSessionGroups(rows as any);
+      expect(sortsAsEnded).toHaveBeenCalledTimes(50);
+    } finally {
+      sortsAsEnded.mockRestore();
     }
   });
 

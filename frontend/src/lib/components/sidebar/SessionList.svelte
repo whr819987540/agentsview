@@ -6,6 +6,7 @@
   import { ui } from "../../stores/ui.svelte.js";
   import { starred } from "../../stores/starred.svelte.js";
   import { sessionFolders } from "../../stores/sessionFolders.svelte.js";
+  import { sessionEndMarks } from "../../stores/sessionEndMarks.svelte.js";
   import SessionItem from "./SessionItem.svelte";
   import SessionFolderRow from "./SessionFolderRow.svelte";
   import SessionFilterControl from "../filters/SessionFilterControl.svelte";
@@ -743,7 +744,34 @@
     );
   });
 
+  // Rows toggled from their end button keep their place while the user
+  // is still working in the list: the pointer is over it, or keyboard
+  // focus is in it.
+  let pointerInList = false;
+
+  function keyboardFocusInList(): boolean {
+    const active = document.activeElement;
+    if (!(active instanceof Element) || !containerRef?.contains(active)) return false;
+    try {
+      return active.matches(":focus-visible");
+    } catch {
+      return true;
+    }
+  }
+
+  function handleListPointerLeave() {
+    pointerInList = false;
+    if (!keyboardFocusInList()) sessionEndMarks.releaseSortHolds();
+  }
+
+  function handleListFocusOut(e: FocusEvent) {
+    const next = e.relatedTarget;
+    if (next instanceof Node && containerRef?.contains(next)) return;
+    if (!pointerInList) sessionEndMarks.releaseSortHolds();
+  }
+
   onDestroy(() => {
+    sessionEndMarks.releaseSortHolds();
     detachSidebar?.();
     detachSidebar = null;
     if (scrollRaf !== null) {
@@ -890,6 +918,9 @@
   bind:this={containerRef}
   onscroll={handleScroll}
   ondragend={() => (dropTarget = undefined)}
+  onpointerover={() => (pointerInList = true)}
+  onpointerleave={handleListPointerLeave}
+  onfocusout={handleListFocusOut}
 >
   <div
     style="height: {renderTotalSize}px; width: 100%; position: relative;"
@@ -1017,6 +1048,7 @@
               groupSessions={item.group.sessions.length > 1
                 ? item.group.sessions
                 : undefined}
+              endMarkGroup={item.group.allSessions ?? item.group.sessions}
               hideAgent={groupMode === "agent"}
               hideProject={groupMode === "project"}
               expanded={expandedGroups.has(item.group.key)}

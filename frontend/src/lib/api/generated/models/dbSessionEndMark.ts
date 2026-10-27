@@ -4,6 +4,5 @@
 
 export interface DbSessionEndMark {
   activity_at: string;
-  created_at: string;
   session_id: string;
 }

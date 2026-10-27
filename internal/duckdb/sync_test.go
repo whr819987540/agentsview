@@ -123,6 +123,48 @@ func TestPushPreservesFilesystemSourceMachineAndCuration(t *testing.T) {
 	)
 }
 
+func TestPushMirrorsSessionEndMarksReadOnly(t *testing.T) {
+	ctx := t.Context()
+	local, path := newPushFixture(t, 2)
+	mark, ok, err := local.MarkSessionEnded(ctx, "sess-1")
+	require.NoError(t, err)
+	require.True(t, ok)
+	_, err = Push(ctx, path, local, "push-machine", storage.MirrorPushOptions{}, false, nil)
+	require.NoError(t, err)
+
+	conn, err := Open(ctx, path)
+	require.NoError(t, err)
+	store := NewStoreFromDB(conn)
+	marks, err := store.ListSessionEndMarks(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, []db.SessionEndMark{mark}, marks)
+	assert.False(t, store.SessionEndMarksEditable(ctx))
+	_, _, err = store.MarkSessionEnded(ctx, "sess-2")
+	require.ErrorIs(t, err, db.ErrReadOnly)
+	require.ErrorIs(t, store.UnmarkSessionEnded(ctx, "sess-1"), db.ErrReadOnly)
+	require.NoError(t, conn.Close())
+
+	// The marked session is resumed: the next push drops the outdated mark.
+	sess, err := local.GetSession(ctx, "sess-1")
+	require.NoError(t, err)
+	require.NotNil(t, sess)
+	modifiedAt := time.Now().UTC().Format(localSyncTimestampLayout)
+	sess.EndedAt = &modifiedAt
+	sess.LocalModifiedAt = &modifiedAt
+	_, err = local.WriteSessionBatchAtomic(ctx, []db.SessionBatchWrite{{Session: *sess}})
+	require.NoError(t, err)
+	res, err := Push(ctx, path, local, "push-machine", storage.MirrorPushOptions{}, false, nil)
+	require.NoError(t, err)
+	assert.True(t, res.Diagnostics.CurationRefreshed)
+
+	conn, err = Open(ctx, path)
+	require.NoError(t, err)
+	defer conn.Close()
+	marks, err = NewStoreFromDB(conn).ListSessionEndMarks(ctx)
+	require.NoError(t, err)
+	assert.Empty(t, marks)
+}
+
 func TestPushRepushesLegacySessionWhenResolvedMachineChanges(t *testing.T) {
 	ctx := t.Context()
 	local, path := newPushFixture(t, 1)

@@ -65,7 +65,7 @@ type sessionFolderRemoveInput struct {
 }
 
 // writableLocalDB returns the local archive for edits that only SQLite
-// stores, such as folders and session end marks.
+// stores, such as folders.
 func (s *Server) writableLocalDB() (*db.DB, error) {
 	localDB, ok := s.db.(*db.DB)
 	if !ok || localDB == nil || localDB.ReadOnly() {

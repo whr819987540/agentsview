@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -307,6 +308,44 @@ func TestPushRefreshesCurationWithoutContentChange(t *testing.T) {
 	assert.Zero(t, res.SessionsPushed, "stars do not change session content")
 	assert.Equal(t, 1, chtest.Count(t, conn, "starred_sessions", ""))
 	assert.Equal(t, 1, chtest.Count(t, conn, "starred_sessions", "session_id = ?", fixtureBetaID))
+}
+
+func TestPushMirrorsSessionEndMarksReadOnly(t *testing.T) {
+	ctx := t.Context()
+	local, target := seedFixture(t)
+	mark, ok, err := local.MarkSessionEnded(ctx, fixtureBetaID)
+	require.NoError(t, err)
+	require.True(t, ok)
+	s := newTestSync(t, local, target, storage.PusherOptions{})
+	_, err = s.Push(ctx, false, nil)
+	require.NoError(t, err)
+
+	store, err := NewStore(ctx, target)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = store.Close() })
+	marks, err := store.ListSessionEndMarks(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, []db.SessionEndMark{mark}, marks)
+	assert.False(t, store.SessionEndMarksEditable(ctx))
+	_, _, err = store.MarkSessionEnded(ctx, fixtureAlphaID)
+	require.ErrorIs(t, err, db.ErrReadOnly)
+	require.ErrorIs(t, store.UnmarkSessionEnded(ctx, fixtureBetaID), db.ErrReadOnly)
+
+	// The marked session is resumed: the next push drops the outdated mark.
+	sess, err := local.GetSession(ctx, fixtureBetaID)
+	require.NoError(t, err)
+	require.NotNil(t, sess)
+	resumedAt := time.Now().UTC().Format("2006-01-02T15:04:05.000Z")
+	sess.EndedAt = &resumedAt
+	sess.LocalModifiedAt = &resumedAt
+	_, err = local.WriteSessionBatchAtomic(ctx, []db.SessionBatchWrite{{Session: *sess}})
+	require.NoError(t, err)
+	_, err = s.Push(ctx, false, nil)
+	require.NoError(t, err)
+
+	marks, err = store.ListSessionEndMarks(ctx)
+	require.NoError(t, err)
+	assert.Empty(t, marks)
 }
 
 func TestEnsureSchemaUpgradesOlderMirrorInPlace(t *testing.T) {

@@ -13,8 +13,8 @@ remote copy, the same operator story as [PostgreSQL sync](/docs/pg-sync/), not a
 disposable local file like [DuckDB](/docs/duckdb/).
 
 The UI includes the session browser, search, analytics, usage, activity, recent
-edits, and project inventory. Rename, trash, insights, stars, and pins stay on
-the SQLite archive; the ClickHouse UI does not write them. Semantic search works
+edits, and project inventory. Rename, trash, insights, stars, pins, and session
+end marks stay on the SQLite archive; the ClickHouse UI does not write them. Semantic search works
 when `[vector]` is enabled locally and the push includes vectors (see
 [Vector Push](#vector-push)). Hosted raw sync is not part of this path.
 

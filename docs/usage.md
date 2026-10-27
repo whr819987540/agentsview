@@ -383,8 +383,9 @@ only navigating inside AgentsView.
 
 As of 0.27.0, the small dot at the left edge of each session row encodes how
 recently the session was written to and how it last ended. The same indicator
-appears in the dashboard's **Top Sessions** list. Hover the dot for a tooltip
-explaining the current state.
+appears in the dashboard's **Top Sessions** list, except for Ended: Top Sessions
+and its unclean count report how each session last ended, whether or not you
+marked it. Hover the dot for a tooltip explaining the current state.
 
 | State   | Indicator         | Meaning                                                                                                                 |
 | ------- | ----------------- | ----------------------------------------------------------------------------------------------------------------------- |
@@ -394,7 +395,7 @@ explaining the current state.
 | Stale   | Amber             | 10–60 minutes idle and last assistant message has an unresolved tool call (or the session file was truncated mid-write) |
 | Unclean | Red               | Same flagged state as Stale, but idle for more than an hour                                                             |
 | Quiet   | Hidden            | Cleanly-ended sessions older than 10 minutes; no dot is rendered                                                        |
-| Ended   | Green check       | You [marked the session as ended](#mark-a-session-as-ended) and it has had no activity since                            |
+| Ended   | Green check       | Sidebar only: you [marked the row as ended](#mark-a-session-as-ended) and it has had no activity since                  |
 
 The sidebar lists sessions by state: Working, Waiting, Idle, Stale, Quiet, then
 Unclean. Ended sessions sort with Quiet. Within a state, the session written to
@@ -423,22 +424,32 @@ where the conversation is now.
 ### Mark a Session as Ended
 
 Mark a session as ended when you are done with it, so the sidebar shows at a
-glance which sessions still need you. Hover the session in the sidebar and
-click the circled check next to the star. You can also right-click the session
-and choose **Mark as ended**, or choose it from the session actions menu in the
-session header. The row's status dot becomes a small green check, and the row
-sorts with the Quiet sessions. To remove the mark, hover the row and click the
-filled check, or choose **Unmark as ended**. Session end marks are unreleased.
+glance which sessions still need you. Hover the session in the sidebar, or tab
+to it, and click the circled check next to the star. You can also right-click
+the session and choose **Mark as ended**, or choose it from the session actions
+menu in the session header. The row's status dot becomes a small green check,
+and the row sorts with the Quiet sessions. When you use the check button, the
+row keeps its place until the pointer, or keyboard focus, leaves the sidebar
+list, so the next row does not slide under the pointer. To remove the mark,
+click the check button again, or choose **Unmark as ended**. Session end marks
+are unreleased.
 
-The mark lasts until the session has new activity. When you resume the
-session, or one of its continuations or subagents writes again, the row shows
-its live status again; mark it again when you are done. A mark applies to the
-whole sidebar row, including the session's continuations and subagents.
+A mark applies to the whole sidebar row, including the session's continuations
+and subagents, even ones the sidebar has not loaded or a filter such as
+**Starred only** hides. The child rows you see when you expand a session have no
+mark of their own and keep showing their live status. The mark lasts until the
+row has new activity. When you resume the session, or one of its continuations
+or subagents writes again, the row shows its live status again and the mark is
+removed, so moving that session to the trash does not bring it back. Mark the
+row again when you are done.
 
 Marks are saved in the SQLite archive, so they survive restarts and full
-resyncs. PostgreSQL, ClickHouse, and DuckDB replicas do not carry marks: a
-sidebar served from a replica shows none and has no button or menu item to add
-them.
+resyncs. `duckdb push` and `clickhouse push` copy the marks still in effect, so
+a sidebar served from a DuckDB mirror or ClickHouse shows them, without the
+button or menu items to change them. `pg serve` keeps its own marks in
+PostgreSQL, shared by everyone who uses that dashboard, as it does for stars;
+`pg push` does not copy the archive's marks. Hosted PostgreSQL does not support
+marks yet.
 
 ### Group by Agent
 
