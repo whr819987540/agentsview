@@ -342,6 +342,15 @@ func SanitizeSession(s *Session) ValidationStats {
 	sanitizeStringPtrField(s.FirstMessage, &stats)
 	sanitizeStringPtrField(s.SessionName, &stats)
 	sanitizeStringPtrField(s.TerminationStatus, &stats)
+	for i := range s.RewoundInputs {
+		input := &s.RewoundInputs[i]
+		sanitizeStringField(&input.SourceUUID, &stats)
+		sanitizeStringField(&input.AfterUUID, &stats)
+		sanitizeStringField(&input.Content, &stats)
+		if BlankImplausibleTimestamp(&input.Timestamp) {
+			stats.TimestampsBlanked++
+		}
+	}
 
 	if next, blanked := BlankImplausibleTimestampPtr(s.StartedAt); blanked {
 		s.StartedAt = next

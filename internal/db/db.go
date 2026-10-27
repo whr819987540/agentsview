@@ -574,7 +574,11 @@ CREATE INDEX IF NOT EXISTS idx_provider_freshness_updated_at
 // rows with source_subtype peer_message instead of user prompts. Re-parse
 // unchanged Claude sources so user-message counts and first messages drop
 // them.)
-const dataVersion = 126
+// (127: Claude user inputs on branches a rewind abandoned, which the parser
+// used to drop with the branch, are stored in sessions.rewound_inputs for the
+// input tree. Re-parse unchanged Claude sources so sessions rewound before
+// the upgrade show them.)
+const dataVersion = 127
 
 const tokenCoverageRepairStatsKey = "token_coverage_repair_v1"
 
@@ -2663,6 +2667,12 @@ func schemaColumnMigrations() []schemaColumnMigration {
 		{
 			"sessions", "sync_marker",
 			"ALTER TABLE sessions ADD COLUMN sync_marker TEXT",
+		},
+		{
+			// Inputs on transcript branches a rewind abandoned, as a
+			// JSON array (NULL = not reported by the parser).
+			"sessions", "rewound_inputs",
+			"ALTER TABLE sessions ADD COLUMN rewound_inputs TEXT",
 		},
 	}
 }

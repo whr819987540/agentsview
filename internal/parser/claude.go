@@ -4,6 +4,7 @@ package parser
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json/jsontext"
 	"encoding/json/v2"
@@ -1581,6 +1582,8 @@ func parseLinear(
 		UserMessageCount:  userCount,
 		File:              fileInfo,
 		ClaudeLinearParse: &linear,
+		// A transcript without a single-rooted DAG has no branches.
+		RewoundInputs: []ParsedRewoundInput{},
 	}
 	meta.applyTo(&sess)
 	if err := accumulateMessageTokenUsageContext(ctx, &sess, messages); err != nil {
@@ -1642,8 +1645,9 @@ func resolveClaudeDAGParents(
 // itself displays after a rewind (esc+esc): the conversation
 // continues from the rewind target and the abandoned branch is
 // hidden. Abandoned branches with enough user turns are preserved
-// as separate fork ParseResults; short ones are retry noise and
-// are dropped.
+// as separate fork ParseResults. Short ones are dropped from the
+// transcript, and their user inputs become the rewound inputs of
+// the session they branch from.
 func parseDAG(
 	ctx context.Context, entries []dagEntry,
 	resolvedParents []string,
@@ -1719,13 +1723,45 @@ func parseDAG(
 
 	var branches []branch
 
+	// rewound holds the inputs of the dropped branches, by the
+	// session whose path they branch from.
+	rewound := map[string][]claudeRewoundEntry{}
+	var uuidIndex map[string]int
+	// lastInputAt returns the uuid of the last user turn at or above
+	// entries[idx] on its path to the root, or "" when there is none.
+	lastInputAt := func(idx int) (string, error) {
+		if uuidIndex == nil {
+			uuidIndex = make(map[string]int, len(entries))
+			for i, e := range entries {
+				if _, ok := uuidIndex[e.uuid]; !ok {
+					uuidIndex[e.uuid] = i
+				}
+			}
+		}
+		for steps := 0; steps <= len(entries); steps++ {
+			if err := contextErrEvery(ctx, steps); err != nil {
+				return "", err
+			}
+			if isCountedClaudeUserTurn(ctx, entries[idx]) {
+				return entries[idx].uuid, nil
+			}
+			next, ok := uuidIndex[resolvedParents[idx]]
+			if !ok {
+				break
+			}
+			idx = next
+		}
+		return "", nil
+	}
+
 	// walkBranch follows the live path from a starting index. At a
 	// fork point the live child is the one whose subtree contains
 	// the latest write: after a rewind Claude Code only appends to
 	// the new branch, so an abandoned branch can never contain the
 	// file's last entry. Each abandoned sibling is preserved as a
 	// fork branch when it carries more than forkThreshold user
-	// turns, and dropped as retry/rewind noise otherwise.
+	// turns. A shorter one is dropped from the transcript, and its
+	// user turns are kept as rewound inputs of the owning session.
 	// ownerID is the session ID of the branch that owns this walk.
 	var walkBranch func(startIdx int, ownerID string) ([]int, error)
 	var forkBranches []branch
@@ -1761,7 +1797,21 @@ func parseDAG(
 				if err != nil {
 					return nil, err
 				}
+				if turns == 0 {
+					continue
+				}
 				if turns <= forkThreshold {
+					after, err := lastInputAt(current)
+					if err != nil {
+						return nil, err
+					}
+					inputs, err := collectClaudeRewoundInputs(
+						ctx, entries, children, kid, after,
+					)
+					if err != nil {
+						return nil, err
+					}
+					rewound[ownerID] = append(rewound[ownerID], inputs...)
 					continue
 				}
 				forkSID := sessionID + "-" + entries[kid].uuid
@@ -1859,6 +1909,7 @@ func parseDAG(
 			UserMessageCount:  userCount,
 			File:              fileInfo,
 			ClaudeLinearParse: &linear,
+			RewoundInputs:     claudeRewoundInputsInFileOrder(rewound[sid]),
 		}
 		meta.applyTo(&sess)
 		if err := accumulateMessageTokenUsageContext(
@@ -1874,6 +1925,72 @@ func parseDAG(
 	}
 
 	return results, nil
+}
+
+// claudeRewoundEntry is a rewound input with the index of its entry.
+type claudeRewoundEntry struct {
+	index int
+	input ParsedRewoundInput
+}
+
+// collectClaudeRewoundInputs returns the user turns in the abandoned
+// branch that starts at entries[start]. Each one follows the closest user
+// turn above it in the branch, or after when the branch has none above it.
+func collectClaudeRewoundInputs(
+	ctx context.Context,
+	entries []dagEntry,
+	children map[string][]int,
+	start int,
+	after string,
+) ([]claudeRewoundEntry, error) {
+	type frame struct {
+		index int
+		after string
+	}
+	var out []claudeRewoundEntry
+	stack := []frame{{index: start, after: after}}
+	for visited := 0; len(stack) > 0; visited++ {
+		if err := contextErrEvery(ctx, visited); err != nil {
+			return nil, err
+		}
+		current := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		entry := entries[current.index]
+		next := current.after
+		if text, ok := claudeUserTurnText(ctx, entry); ok {
+			out = append(out, claudeRewoundEntry{
+				index: current.index,
+				input: ParsedRewoundInput{
+					SourceUUID: entry.uuid,
+					AfterUUID:  current.after,
+					Timestamp:  entry.timestamp,
+					Content:    text,
+				},
+			})
+			next = entry.uuid
+		}
+		for _, kid := range children[entry.uuid] {
+			stack = append(stack, frame{index: kid, after: next})
+		}
+	}
+	return out, ctx.Err()
+}
+
+// claudeRewoundInputsInFileOrder orders rewound inputs as their entries
+// appear in the file, which puts every input after the one it follows. The
+// result is never nil, so a parse with no rewound inputs clears a stored
+// list.
+func claudeRewoundInputsInFileOrder(
+	entries []claudeRewoundEntry,
+) []ParsedRewoundInput {
+	slices.SortFunc(entries, func(a, b claudeRewoundEntry) int {
+		return cmp.Compare(a.index, b.index)
+	})
+	out := make([]ParsedRewoundInput, 0, len(entries))
+	for _, entry := range entries {
+		out = append(out, entry.input)
+	}
+	return out
 }
 
 func collectToolResultAgentID(line string, subagentMap map[string]string) {
@@ -2710,30 +2827,41 @@ func countUserTurnsContext(
 }
 
 func isCountedClaudeUserTurn(ctx context.Context, entry dagEntry) bool {
+	_, ok := claudeUserTurnText(ctx, entry)
+	return ok
+}
+
+// claudeUserTurnText returns the text of an entry that counts as a user
+// turn: the prompt the transcript shows, without command envelopes or a
+// leading IDE context wrapper.
+func claudeUserTurnText(ctx context.Context, entry dagEntry) (string, bool) {
 	// A replayed /branch prefix entry is the parent's turn, not this
 	// session's, so it must not push an abandoned branch past the
 	// fork threshold.
 	if entry.replayed {
-		return false
+		return "", false
 	}
 	if entry.entryType != "user" ||
 		gjson.Get(entry.line, "isMeta").Bool() ||
 		gjson.Get(entry.line, "isCompactSummary").Bool() {
-		return false
+		return "", false
 	}
 	content := gjson.Get(entry.line, "message.content")
 	text, _, _, _, _, _ := ExtractTextContent(ctx, content)
 	text, skip := preprocessClaudeUserText(text)
 	if skip || strings.TrimSpace(text) == "" {
-		return false
+		return "", false
 	}
 	if _, _, remainder, ok := splitClaudeIDEEnvelopePrompt(text); ok {
 		if remainder == "" {
-			return false
+			return "", false
 		}
 		text = remainder
 	}
-	return !isClaudeSystemMessage(text)
+	if isClaudeSystemMessage(text) {
+		return "", false
+	}
+	return text, true
 }
 
 // extractMessages converts dagEntries into ParsedMessages, applying

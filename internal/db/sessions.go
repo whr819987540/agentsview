@@ -386,6 +386,12 @@ type Session struct {
 	// across appends, so the incremental parser skips fork detection
 	// for linear-bound transcripts. Not mirrored to PG/DuckDB.
 	ClaudeLinearParse *bool `json:"-"`
+	// RewoundInputs is SQLite-only: the user inputs on transcript branches
+	// a rewind abandoned, which the input tree draws as side branches. Nil
+	// leaves the stored list unchanged on upsert; a non-nil slice,
+	// including an empty one, replaces it. Session reads do not load it;
+	// use GetSessionRewoundInputs.
+	RewoundInputs []RewoundInput `json:"-"`
 	// LastWriteIncremental is SQLite-only sync bookkeeping (like
 	// NextOrdinal): true when the last write to this row went through
 	// the incremental-append path (updateSessionIncrementalTx) instead
@@ -1412,8 +1418,9 @@ const insertSessionSQL = `
 			last_write_incremental,
 			file_path, file_size, file_mtime,
 			next_ordinal, last_entry_uuid, claude_linear_parse,
+			rewound_inputs,
 			file_inode, file_device, file_hash
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 // insertSessionIfAbsentSQL inserts a session only when its id does not already
 // exist, leaving an existing row untouched.
@@ -1472,6 +1479,10 @@ const upsertSessionBaseSQL = insertSessionSQL + `
 			-- upserts without one (e.g. non-parse session writers).
 			claude_linear_parse = COALESCE(
 				excluded.claude_linear_parse, sessions.claude_linear_parse),
+			-- Only a parse that reports rewound inputs replaces them;
+			-- incremental and non-parse writers pass NULL.
+			rewound_inputs = COALESCE(
+				excluded.rewound_inputs, sessions.rewound_inputs),
 			file_inode = excluded.file_inode,
 			file_device = excluded.file_device,
 			file_hash = excluded.file_hash`
@@ -1516,6 +1527,7 @@ func upsertSessionArgs(s Session) []any {
 		false,
 		s.FilePath, s.FileSize, s.FileMtime,
 		s.NextOrdinal, s.LastEntryUUID, s.ClaudeLinearParse,
+		rewoundInputsColumn(s.RewoundInputs),
 		s.FileInode, s.FileDevice, s.FileHash,
 	}
 }

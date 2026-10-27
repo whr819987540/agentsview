@@ -217,6 +217,21 @@ fixtures retain this field; missing identities remain source-local.
   `internal/parser/testdata/claude/queued_peer_messages.jsonl` mirrors these
   shapes. Data version 126 reparses existing sessions once.
 
+- **Rewind evidence (2026-10-27):** Claude Code 2.1.300 does not rewrite the
+  transcript when the user presses Esc twice and resends from an earlier
+  point. It appends the new prompt with `parentUuid` set to the entry before
+  the rewound prompt, often a `system` `turn_duration` record, so the
+  `uuid`/`parentUuid` chain forks there and the abandoned entries stay in the
+  file. A local corpus of recent transcripts held 9 such fork points in 6
+  files; every abandoned branch held one or two prompts, and two points had
+  three siblings from rewinding twice to the same entry. Native parsing still follows the
+  branch with the latest write and keeps an abandoned branch of more than
+  three prompts as a fork session. A shorter one is left out of the
+  transcript, and its prompts are stored as the session's rewound inputs,
+  each with the source UUID of the prompt it followed.
+  `internal/parser/claude_rewound_test.go` covers these shapes. Data version
+  127 reparses existing sessions once.
+
 - **Evidence:** `no-public-source`.
 
 - **Upstream:** The public

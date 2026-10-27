@@ -345,6 +345,26 @@ pipeline (`HostedStore.curate`), which has no end mark field yet. Remove the
 exception by adding marks to raw curation and implementing
 `db.SessionEndMarkStore` on `HostedStore`.
 
+### Rewound inputs
+
+`sessions.rewound_inputs` holds, as a JSON array of `db.RewoundInput`, the
+prompts on Claude transcript branches that a rewind abandoned and that are too
+short to become fork sessions. Only the input tree reads it, through
+`DB.GetSessionRewoundInputs`; session reads do not load it.
+
+- A full Claude parse always writes the column, with `[]` when there are none.
+  Incremental and non-parse writers pass NULL, and the upsert keeps the stored
+  value.
+- Writes sanitize it like message text. `archive_content = "usage"` stores
+  `[]`, and the usage-only orphan copy clears it.
+- A full resync copies it with orphaned and trashed sessions, since no parse
+  can recover it once the source is gone.
+
+Only the SQLite archive stores the column. PostgreSQL, ClickHouse, and DuckDB
+push no copy, so the input tree they serve has no rewound branches. This is an
+active exception that keeps the first version to the local archive. Remove it
+by adding the column to each replica's session schema and push.
+
 ### Usage cache divergence
 
 SQLite's aggregate usage APIs read timezone-specific daily rollups from a
