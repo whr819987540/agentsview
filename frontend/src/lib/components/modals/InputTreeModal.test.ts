@@ -264,6 +264,40 @@ describe("InputTreeModal", () => {
     expect(ui.activeModal).toBeNull();
   });
 
+  it("draws a rewound input as a marked card that opens nothing", async () => {
+    await open(
+      makeInputTree([
+        inputNode(-1, "root", 0, "shared start", { on_active_path: true, active_ordinal: -5 }),
+        inputNode(0, "root", 2, "root follow-up", { end_session_ids: ["root"] }),
+        inputNode(0, "child", 0, "fork input", {
+          on_active_path: true,
+          active_ordinal: 0,
+          end_session_ids: ["child"],
+        }),
+        inputNode(2, "child", -1, "abandoned plan", { rewound: true }),
+      ]),
+    );
+
+    const card = inputCard("abandoned plan")!;
+    expect(card.tagName).toBe("DIV");
+    expect(card.hasAttribute("href")).toBe(false);
+    expect(card.classList.contains("rewound")).toBe(true);
+    expect(card.getAttribute("title")).toBe(
+      m.session_input_tree_rewound_title({ preview: "abandoned plan" }),
+    );
+    expect(card.textContent).toContain(m.session_input_tree_rewound());
+    expect(inputCard("fork input")!.textContent).not.toContain(m.session_input_tree_rewound());
+    // The rewound card hangs below fork input with no session card of its
+    // own, and only its edge is dashed.
+    expect(document.querySelectorAll(".session-node")).toHaveLength(2);
+    expect(document.querySelectorAll(".graph-edges path.rewound")).toHaveLength(1);
+
+    card.click();
+
+    expect(navigate).not.toHaveBeenCalled();
+    expect(ui.activeModal).toBe("inputTree");
+  });
+
   it("keeps the inputs a continuation carries on on its path and opens their session", async () => {
     // moved continues child, so its path holds child's input, which its
     // message view does not show.

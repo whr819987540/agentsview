@@ -129,6 +129,9 @@ func sessionForStoragePolicy(
 	session.DisplayName = nil
 	session.SessionName = nil
 	session.PreserveSessionName = false
+	// Rewound inputs are prompt text. An empty list also clears any the
+	// row kept from before the policy applied.
+	session.RewoundInputs = []RewoundInput{}
 	session.SecretLeakCount = 0
 	session.SecretsRulesVersion = ""
 	return session
@@ -682,8 +685,8 @@ func compactCopiedSessionsForUsageTx(
 		{"session titles", `
 			UPDATE sessions
 			SET first_message = NULL, display_name = NULL,
-			    session_name = NULL, secret_leak_count = 0,
-			    secrets_rules_version = ''
+			    session_name = NULL, rewound_inputs = NULL,
+			    secret_leak_count = 0, secrets_rules_version = ''
 			WHERE id` + inCopied},
 		{"pin notes", `
 			UPDATE pinned_messages SET note = NULL

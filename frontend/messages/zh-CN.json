@@ -1654,6 +1654,8 @@
   "session_input_tree_jump_to": "跳转到输入：{preview}",
   "session_input_tree_open": "在所属会话中打开：{preview}",
   "session_input_tree_current": "当前",
+  "session_input_tree_rewound": "已回退",
+  "session_input_tree_rewound_title": "已回退的输入，不在对话记录中：{preview}",
   "session_input_graph_open": "打开详细输入树",
   "session_input_graph_title": "输入树",
   "session_input_graph_close": "关闭",

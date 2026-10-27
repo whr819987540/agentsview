@@ -53,6 +53,16 @@ The latest published release is
   its session. Click a prompt to jump to it or a session card to open it. Pan,
   zoom, and fit the tree to the window, hover a card to trace its path, and fold
   or unfold runs of prompts without a split.
+- See the prompts you rewound past. When you press Esc twice in Claude Code
+  and send a different prompt, the **Inputs** view and the full diagram now
+  branch at the point you rewound to and show the abandoned prompts there,
+  with dashed lines and a **rewound** label. Before, a rewind of up to three
+  prompts left no trace in the tree. AgentsView keeps only the prompts, not
+  the replies to them, so a rewound prompt opens nothing. The local archive
+  re-parses once after the upgrade so earlier rewinds appear while their
+  Claude Code files still exist. Trees served from PostgreSQL, ClickHouse, or
+  DuckDB, and archives set to `archive_content = "usage"`, show no rewound
+  prompts.
 - The web UI reports an anonymous `app_opened` event through the server when it
   loads and on the first focus of each later UTC day.
   `AGENTSVIEW_TELEMETRY_ENABLED=0` turns it off with the daemon ping.

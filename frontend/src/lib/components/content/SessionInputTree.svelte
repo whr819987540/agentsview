@@ -10,7 +10,7 @@
   import { router } from "../../stores/router.svelte.js";
   import { ui } from "../../stores/ui.svelte.js";
   import { formatNumber } from "../../utils/format.js";
-  import { layoutInputTree } from "./input-tree.js";
+  import { isRewound, layoutInputTree, type InputTreeNodeRow } from "./input-tree.js";
   import { TranscriptRead } from "./transcript-read.svelte.js";
 
   interface Props {
@@ -116,6 +116,9 @@
   }
 
   function nodeTitle(node: ServiceInputTreeNode): string {
+    if (isRewound(node)) {
+      return m.session_input_tree_rewound_title({ preview: node.preview });
+    }
     return isInActiveView(node)
       ? m.session_input_tree_jump_to({ preview: node.preview })
       : m.session_input_tree_open({ preview: node.preview });
@@ -167,6 +170,54 @@
   }
 </script>
 
+{#snippet rowContent(row: InputTreeNodeRow)}
+  {#each row.rails as col (col)}
+    <span class="rail" style={`--col: ${col};`} aria-hidden="true"></span>
+  {/each}
+  {#if row.elbow}
+    <span
+      class="elbow"
+      class:from-above={row.elbow.top}
+      class:continues={row.elbow.bottom}
+      aria-hidden="true"
+    ></span>
+  {/if}
+  {#if row.lineAbove}
+    <span class="line line-above" aria-hidden="true"></span>
+  {/if}
+  {#if row.lineBelow}
+    <span
+      class="line line-below"
+      class:path-line={row.lineBelowOnActivePath}
+      aria-hidden="true"
+    ></span>
+  {/if}
+  <span class="marker" aria-hidden="true"></span>
+  <span class="input-body">
+    <span class="input-preview" class:shell={row.node.is_shell}>
+      {row.node.preview}
+    </span>
+    {#if row.startsRewound}
+      <span class="input-end">
+        <span class="input-end-rel rewound-badge">
+          {m.session_input_tree_rewound()}
+        </span>
+      </span>
+    {/if}
+    {#each row.node.end_session_ids as endId (endId)}
+      <span class="input-end" title={sessionTitle(endId)}>
+        <span
+          class="input-end-rel"
+          class:current={endId === tree?.active_session_id}
+        >
+          {relationshipLabel(endId)}
+        </span>
+        <span class="input-end-count">{messageCountLabel(endId)}</span>
+      </span>
+    {/each}
+  </span>
+{/snippet}
+
 {#if read.loading}
   <div class="input-state">{m.session_input_tree_loading()}</div>
 {:else if read.failed}
@@ -203,58 +254,34 @@
         </button>
       {:else}
         {@const node = row.node}
-        <a
-          class="input-row"
-          class:on-path={row.onActivePath}
-          class:selected={row.index === selectedIndex}
-          class:focused={row.index === focusIndex}
-          class:leaf={row.isLeaf}
-          class:branch-point={row.isBranchPoint}
-          href={nodeHref(node)}
-          title={nodeTitle(node)}
-          aria-current={row.index === selectedIndex ? "step" : undefined}
-          style={`--tree-depth: ${row.depth};`}
-          onclick={(event) => openNode(event, node)}
-        >
-          {#each row.rails as col (col)}
-            <span class="rail" style={`--col: ${col};`} aria-hidden="true"></span>
-          {/each}
-          {#if row.elbow}
-            <span
-              class="elbow"
-              class:from-above={row.elbow.top}
-              class:continues={row.elbow.bottom}
-              aria-hidden="true"
-            ></span>
-          {/if}
-          {#if row.lineAbove}
-            <span class="line line-above" aria-hidden="true"></span>
-          {/if}
-          {#if row.lineBelow}
-            <span
-              class="line line-below"
-              class:path-line={row.lineBelowOnActivePath}
-              aria-hidden="true"
-            ></span>
-          {/if}
-          <span class="marker" aria-hidden="true"></span>
-          <span class="input-body">
-            <span class="input-preview" class:shell={node.is_shell}>
-              {node.preview}
-            </span>
-            {#each node.end_session_ids as endId (endId)}
-              <span class="input-end" title={sessionTitle(endId)}>
-                <span
-                  class="input-end-rel"
-                  class:current={endId === tree.active_session_id}
-                >
-                  {relationshipLabel(endId)}
-                </span>
-                <span class="input-end-count">{messageCountLabel(endId)}</span>
-              </span>
-            {/each}
-          </span>
-        </a>
+        {#if isRewound(node)}
+          <!-- A rewound input has no message to open, so its row is not a link. -->
+          <div
+            class="input-row rewound"
+            class:leaf={row.isLeaf}
+            class:branch-point={row.isBranchPoint}
+            title={nodeTitle(node)}
+            style={`--tree-depth: ${row.depth};`}
+          >
+            {@render rowContent(row)}
+          </div>
+        {:else}
+          <a
+            class="input-row"
+            class:on-path={row.onActivePath}
+            class:selected={row.index === selectedIndex}
+            class:focused={row.index === focusIndex}
+            class:leaf={row.isLeaf}
+            class:branch-point={row.isBranchPoint}
+            href={nodeHref(node)}
+            title={nodeTitle(node)}
+            aria-current={row.index === selectedIndex ? "step" : undefined}
+            style={`--tree-depth: ${row.depth};`}
+            onclick={(event) => openNode(event, node)}
+          >
+            {@render rowContent(row)}
+          </a>
+        {/if}
       {/if}
     {/each}
   </div>
@@ -437,6 +464,37 @@
   .selected .marker {
     border-color: var(--text-primary);
     background: var(--text-primary);
+  }
+
+  /* A rewound branch is drawn dashed and muted: it left no transcript. */
+  .input-row.rewound {
+    color: var(--text-muted);
+    cursor: default;
+  }
+
+  .input-row.rewound:hover {
+    background: transparent;
+    color: var(--text-secondary);
+  }
+
+  .input-row.rewound .marker {
+    border-style: dashed;
+    border-color: var(--text-muted);
+    background: var(--bg-surface);
+  }
+
+  .rewound .elbow {
+    border-left-style: dashed;
+  }
+
+  .rewound .line-above,
+  .rewound .line-below {
+    background: none;
+    border-left: 1px dashed var(--line);
+  }
+
+  .rewound-badge {
+    border-style: dashed;
   }
 
   .input-body {

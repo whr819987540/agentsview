@@ -28,6 +28,11 @@ CREATE TABLE IF NOT EXISTS sessions (
     -- those read-side stores, and any copy that drops it degrades to
     -- the conservative NULL verdict (full parse re-derives it).
     claude_linear_parse INTEGER,
+    -- JSON array of the user inputs on transcript branches a rewind
+    -- abandoned (RewoundInput rows), for the input tree. NULL when the
+    -- parser does not report them. SQLite-only, like the columns above:
+    -- replicas and mirrors do not carry it.
+    rewound_inputs TEXT,
     file_inode  INTEGER,
     file_device INTEGER,
     file_hash   TEXT,

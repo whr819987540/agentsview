@@ -10,6 +10,7 @@ export interface ServiceInputTreeNode {
   ordinal: number;
   parent: number;
   preview: string;
+  rewound?: boolean;
   session_id: string;
   timestamp?: string;
 }

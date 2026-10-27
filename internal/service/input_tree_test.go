@@ -79,6 +79,7 @@ type inputTreeRow struct {
 	ordinal int
 	preview string
 	ends    []string
+	rewound bool
 }
 
 func inputTreeRows(tree *service.InputTree) []inputTreeRow {
@@ -90,6 +91,7 @@ func inputTreeRows(tree *service.InputTree) []inputTreeRow {
 			ordinal: node.Ordinal,
 			preview: node.Preview,
 			ends:    node.EndSessionIDs,
+			rewound: node.Rewound,
 		})
 	}
 	return rows
@@ -507,4 +509,94 @@ func TestDirectBackend_InputTreeKeepsActiveForkPastSessionLimit(
 	}
 	assert.True(t, ended[lastFork], "the active fork keeps its leaf")
 	assert.Len(t, ended, 200)
+}
+
+func uuidMsg(sid string, ordinal int, role, content, ts, uuid string) db.Message {
+	msg := timedMsg(sid, ordinal, role, content, ts)
+	msg.SourceUUID = uuid
+	return msg
+}
+
+func TestDirectBackend_InputTreeShowsRewoundInputs(t *testing.T) {
+	t.Parallel()
+	reader, env := newInputTreeReader(t)
+	// The user asked "first try", rewound inside that branch to send
+	// "narrower", then rewound past it and asked "second try". A rewound
+	// input whose anchor is gone attaches before the session's inputs, and
+	// one without a preview passes its place to the input after it.
+	dbtest.SeedSession(t, env.db, "solo", "p1", func(s *db.Session) {
+		s.StartedAt = new("2026-07-01T10:00:00Z")
+		s.RewoundInputs = []db.RewoundInput{
+			{SourceUUID: "c", AfterUUID: "b", Timestamp: "2026-07-01T10:02:00Z", Content: "first try"},
+			{SourceUUID: "d", AfterUUID: "c", Timestamp: "2026-07-01T10:03:00Z", Content: "  \n"},
+			{SourceUUID: "e", AfterUUID: "d", Timestamp: "2026-07-01T10:04:00Z", Content: "narrower"},
+			{SourceUUID: "x", AfterUUID: "lost", Timestamp: "2026-07-01T10:05:00Z", Content: "orphaned"},
+		}
+	})
+	dbtest.SeedMessages(t, env.db,
+		uuidMsg("solo", 0, "user", "start", "2026-07-01T10:00:00Z", "a"),
+		uuidMsg("solo", 1, "assistant", "ok", "2026-07-01T10:01:00Z", "b"),
+		uuidMsg("solo", 2, "user", "second try", "2026-07-01T10:06:00Z", "f"),
+		uuidMsg("solo", 3, "assistant", "done", "2026-07-01T10:07:00Z", "g"),
+	)
+
+	tree, err := reader.InputTree(t.Context(), "solo")
+	require.NoError(t, err)
+	require.NotNil(t, tree)
+
+	assert.False(t, tree.Truncated)
+	assert.Equal(t, []inputTreeRow{
+		{parent: -1, session: "solo", ordinal: 0, preview: "start", ends: []string{}},
+		{parent: 0, session: "solo", ordinal: 2, preview: "second try", ends: []string{"solo"}},
+		{parent: 0, session: "solo", ordinal: -1, preview: "first try", ends: []string{}, rewound: true},
+		{parent: 2, session: "solo", ordinal: -1, preview: "narrower", ends: []string{}, rewound: true},
+		{parent: -1, session: "solo", ordinal: -1, preview: "orphaned", ends: []string{}, rewound: true},
+	}, inputTreeRows(tree))
+	assert.Equal(t, []string{"start", "second try"}, activePath(tree),
+		"rewound inputs are off the active path")
+	assert.Equal(t, map[string]int{"start": 0, "second try": 2}, activeOrdinals(tree))
+}
+
+func TestDirectBackend_InputTreeAttachesForkRewindsToInheritedInputs(
+	t *testing.T,
+) {
+	t.Parallel()
+	reader, env := newInputTreeReader(t)
+	// fork-a branched from root after "write the parser". Inside fork-a
+	// the user rewound twice: once to that inherited input, and once to
+	// before every input of fork-a's own transcript.
+	dbtest.SeedSession(t, env.db, "root", "p1", func(s *db.Session) {
+		s.StartedAt = new("2026-07-01T10:00:00Z")
+	})
+	dbtest.SeedSession(t, env.db, "fork-a", "p1", func(s *db.Session) {
+		s.ParentSessionID = new("root")
+		s.RelationshipType = "fork"
+		s.StartedAt = new("2026-07-01T10:04:00Z")
+		s.RewoundInputs = []db.RewoundInput{
+			{SourceUUID: "r1", AfterUUID: "root-u2", Timestamp: "2026-07-01T10:04:30Z", Content: "try a lexer"},
+			{SourceUUID: "r2", Timestamp: "2026-07-01T10:05:30Z", Content: "start fresh"},
+		}
+	})
+	dbtest.SeedMessages(t, env.db,
+		uuidMsg("root", 0, "user", "plan the feature", "2026-07-01T10:00:00Z", "root-u1"),
+		uuidMsg("root", 1, "assistant", "plan", "2026-07-01T10:01:00Z", "root-a1"),
+		uuidMsg("root", 2, "user", "write the parser", "2026-07-01T10:02:00Z", "root-u2"),
+		uuidMsg("root", 3, "assistant", "parser", "2026-07-01T10:03:00Z", "root-a2"),
+		uuidMsg("root", 4, "user", "use a streaming parser", "2026-07-01T10:20:00Z", "root-u3"),
+		uuidMsg("fork-a", 0, "user", "use a recursive parser", "2026-07-01T10:06:00Z", "fork-u1"),
+		uuidMsg("fork-a", 1, "assistant", "recursive", "2026-07-01T10:07:00Z", "fork-a1"),
+	)
+
+	tree, err := reader.InputTree(t.Context(), "fork-a")
+	require.NoError(t, err)
+	require.NotNil(t, tree)
+
+	assert.Equal(t, []inputTreeRow{
+		{parent: -1, session: "root", ordinal: 0, preview: "plan the feature", ends: []string{}},
+		{parent: 0, session: "root", ordinal: 2, preview: "write the parser", ends: []string{}},
+		{parent: 1, session: "root", ordinal: 4, preview: "use a streaming parser", ends: []string{"root"}},
+		{parent: 1, session: "fork-a", ordinal: 0, preview: "use a recursive parser", ends: []string{"fork-a"}},
+		{parent: 1, session: "fork-a", ordinal: -1, preview: "try a lexer", ends: []string{}, rewound: true},
+		{parent: 1, session: "fork-a", ordinal: -1, preview: "start fresh", ends: []string{}, rewound: true},
+	}, inputTreeRows(tree))
 }

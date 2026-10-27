@@ -1473,6 +1473,12 @@ type ParsedSession struct {
 	// linear-bound sessions. Only set by the Claude parser; nil for
 	// all other agents.
 	ClaudeLinearParse *bool
+	// RewoundInputs lists, in file order, the user inputs on branches of
+	// this session's transcript that a rewind abandoned and that are too
+	// short to become fork sessions. Nil means the parse does not report
+	// them, so a stored list is kept; a full Claude parse always sets it,
+	// empty when the transcript has none.
+	RewoundInputs []ParsedRewoundInput
 	// ClaudeSubagentSources records the files that contributed to this full
 	// parse. Sync keeps this local provenance with the archived messages.
 	ClaudeSubagentSources []string
@@ -1635,6 +1641,20 @@ type ParsedMessage struct {
 	// tokenPresenceKnown marks per-message token coverage as
 	// parser-owned and authoritative.
 	tokenPresenceKnown bool
+}
+
+// ParsedRewoundInput is a user input on a transcript branch that a rewind
+// abandoned. In Claude Code, Esc Esc returns the conversation to an earlier
+// point and the next input starts a new branch from there.
+type ParsedRewoundInput struct {
+	// SourceUUID identifies the input's transcript entry.
+	SourceUUID string
+	// AfterUUID is the source UUID of the input it followed: a message of
+	// the session's path, or another rewound input. It is empty when no
+	// input of the transcript came before it.
+	AfterUUID string
+	Timestamp time.Time
+	Content   string
 }
 
 // ParsedUsageEvent records session-level usage emitted by parsers

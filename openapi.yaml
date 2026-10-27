@@ -6086,6 +6086,8 @@ components:
           type: integer
         preview:
           type: string
+        rewound:
+          type: boolean
         session_id:
           type: string
         timestamp:

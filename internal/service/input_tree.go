@@ -21,7 +21,9 @@ const (
 // continuation, form one path that starts at a top-level node. Inputs that
 // sessions share appear once, so the tree branches where a fork's inputs
 // diverge from the session it was forked from, and a continuation's inputs
-// extend the path of the session it continues.
+// extend the path of the session it continues. The inputs of a branch that a
+// rewind abandoned, and that is too short to be a fork session, hang off the
+// session's path as rewound inputs.
 type InputTree struct {
 	ActiveSessionID string `json:"active_session_id"`
 	// RootSessionID is the session the fork family starts from.
@@ -40,7 +42,9 @@ type InputTreeNode struct {
 	// Parent is the index of the parent node in Nodes, or -1 for an input
 	// that starts a path.
 	Parent int `json:"parent"`
-	// SessionID and Ordinal identify the message that holds the input.
+	// SessionID and Ordinal identify the message that holds the input. A
+	// rewound input has no message: SessionID is the session it was
+	// rewound in and Ordinal is -1.
 	SessionID string `json:"session_id"`
 	Ordinal   int    `json:"ordinal"`
 	Timestamp string `json:"timestamp,omitempty"`
@@ -54,8 +58,12 @@ type InputTreeNode struct {
 	// so it is unset for the inputs a continuation inherits.
 	ActiveOrdinal *int `json:"active_ordinal,omitempty"`
 	// EndSessionIDs lists the sessions whose path ends at this input. Every
-	// leaf ends at least one session.
+	// leaf ends at least one session, except on a rewound branch.
 	EndSessionIDs []string `json:"end_session_ids"`
+	// Rewound marks an input on a branch that a rewind abandoned. Rewound
+	// inputs come after their siblings, and only rewound inputs follow
+	// them.
+	Rewound bool `json:"rewound,omitempty"`
 }
 
 // InputTreeReader is implemented by services that can build input trees
@@ -87,6 +95,7 @@ func (b *directBackend) InputTree(
 	}
 
 	tree := newInputTreeBuilder()
+	var rewound []rewoundBranches
 	for _, session := range family {
 		_, own, inherited, err := b.forkContext(ctx, src, session.ID)
 		if err != nil {
@@ -96,8 +105,28 @@ func (b *directBackend) InputTree(
 		if err != nil {
 			return nil, err
 		}
-		steps := inputPathSteps(continued, inherited, own, session.ID == id)
-		if !tree.insert(session.ID, steps) {
+		inputs, err := b.rewoundInputs(ctx, session.ID)
+		if err != nil {
+			return nil, err
+		}
+		path := inputPathSteps(
+			continued, inherited, own, session.ID == id, len(inputs) > 0,
+		)
+		nodes, ok := tree.insert(session.ID, path.steps)
+		if !ok {
+			truncated = true
+			break
+		}
+		if len(inputs) > 0 {
+			rewound = append(rewound, path.rewoundBranches(
+				session.ID, inputs, nodes,
+			))
+		}
+	}
+	// Rewound inputs go in after every session's path, so they follow
+	// the inputs sessions share at each branch point.
+	for _, branches := range rewound {
+		if !tree.insertRewound(branches) {
 			truncated = true
 			break
 		}
@@ -258,31 +287,36 @@ type inputPathStep struct {
 	activeOrdinal *int
 }
 
+// inputPath is a session's path through the tree.
+type inputPath struct {
+	steps []inputPathStep
+	// ownStart is the index of the first step from the session's own
+	// messages.
+	ownStart int
+	// anchors maps the source UUID of each message on the path to the
+	// index of the last step at or before it, or -1 before the first. It
+	// is built only for sessions with rewound inputs, which attach there.
+	anchors map[string]int
+}
+
 // inputPathSteps lists the inputs on a session's path: those it inherits
 // beyond its fork context, those in the fork context, then its own. On the
 // active session's path, each step the message view shows records the
-// ordinal it has there.
+// ordinal it has there. withAnchors also maps the path's messages to steps.
 func inputPathSteps(
-	continued, inherited, own []db.Message, active bool,
-) []inputPathStep {
-	steps := make([]inputPathStep, 0)
+	continued, inherited, own []db.Message, active, withAnchors bool,
+) inputPath {
+	path := inputPath{steps: make([]inputPathStep, 0)}
+	if withAnchors {
+		path.anchors = map[string]int{}
+	}
 	add := func(msg db.Message, viewOrdinal *int) {
-		if !isOutlineInput(msg) {
-			return
+		if step, ok := newInputPathStep(msg, active, viewOrdinal); ok {
+			path.steps = append(path.steps, step)
 		}
-		item, ok := inputOutlineItem(msg.Ordinal, msg.Timestamp, msg.Content)
-		if !ok {
-			return
+		if withAnchors && msg.SourceUUID != "" {
+			path.anchors[msg.SourceUUID] = len(path.steps) - 1
 		}
-		step := inputPathStep{
-			sessionID: msg.SessionID,
-			item:      item,
-			active:    active,
-		}
-		if active {
-			step.activeOrdinal = viewOrdinal
-		}
-		steps = append(steps, step)
 	}
 	for _, msg := range continued {
 		add(msg, nil)
@@ -291,11 +325,81 @@ func inputPathSteps(
 		viewOrdinal := forkContextOrdinal(i, len(inherited))
 		add(msg, &viewOrdinal)
 	}
+	path.ownStart = len(path.steps)
 	for _, msg := range own {
 		viewOrdinal := msg.Ordinal
 		add(msg, &viewOrdinal)
 	}
-	return steps
+	return path
+}
+
+func newInputPathStep(
+	msg db.Message, active bool, viewOrdinal *int,
+) (inputPathStep, bool) {
+	if !isOutlineInput(msg) {
+		return inputPathStep{}, false
+	}
+	item, ok := inputOutlineItem(msg.Ordinal, msg.Timestamp, msg.Content)
+	if !ok {
+		return inputPathStep{}, false
+	}
+	step := inputPathStep{
+		sessionID: msg.SessionID,
+		item:      item,
+		active:    active,
+	}
+	if active {
+		step.activeOrdinal = viewOrdinal
+	}
+	return step, true
+}
+
+// rewoundBranches are a session's rewound inputs with the nodes they can
+// attach to.
+type rewoundBranches struct {
+	sessionID string
+	inputs    []db.RewoundInput
+	// anchors maps the source UUID of each message on the session's path
+	// to the node of the last input at or before it, or -1.
+	anchors map[string]int
+	// start is the node the session's own inputs follow, or -1. Rewound
+	// inputs that follow no input of the transcript, or whose anchor the
+	// path does not hold, attach there.
+	start int
+}
+
+// rewoundBranches resolves the path's anchors to the nodes its steps were
+// inserted as.
+func (p inputPath) rewoundBranches(
+	sessionID string, inputs []db.RewoundInput, nodes []int,
+) rewoundBranches {
+	nodeAt := func(step int) int {
+		if step < 0 || step >= len(nodes) {
+			return -1
+		}
+		return nodes[step]
+	}
+	anchors := make(map[string]int, len(p.anchors))
+	for uuid, step := range p.anchors {
+		anchors[uuid] = nodeAt(step)
+	}
+	return rewoundBranches{
+		sessionID: sessionID,
+		inputs:    inputs,
+		anchors:   anchors,
+		start:     nodeAt(p.ownStart - 1),
+	}
+}
+
+// rewoundInputs returns the inputs on a session's abandoned branches. Only
+// the SQLite archive stores them.
+func (b *directBackend) rewoundInputs(
+	ctx context.Context, id string,
+) ([]db.RewoundInput, error) {
+	if b.local == nil {
+		return nil, nil
+	}
+	return b.local.GetSessionRewoundInputs(ctx, id)
 }
 
 // inputTreeEdge identifies a node by its parent and the message it holds.
@@ -323,10 +427,12 @@ func newInputTreeBuilder() *inputTreeBuilder {
 }
 
 // insert adds a session's path and marks its last input as the session's
-// end. It reports false when the node limit stopped the path short.
+// end. It returns the node of each step, and reports false when the node
+// limit stopped the path short.
 func (t *inputTreeBuilder) insert(
 	sessionID string, steps []inputPathStep,
-) bool {
+) ([]int, bool) {
+	nodes := make([]int, 0, len(steps))
 	parent := -1
 	for _, step := range steps {
 		edge := inputTreeEdge{
@@ -336,29 +442,19 @@ func (t *inputTreeBuilder) insert(
 		}
 		idx, ok := t.edges[edge]
 		if !ok {
-			if len(t.nodes) >= inputTreeMaxNodes {
-				return false
-			}
-			idx = len(t.nodes)
-			t.nodes = append(t.nodes, inputTreeBuildNode{
-				node: InputTreeNode{
-					Parent:        parent,
-					SessionID:     step.sessionID,
-					Ordinal:       step.item.Ordinal,
-					Timestamp:     step.item.Timestamp,
-					Preview:       step.item.Preview,
-					IsShell:       step.item.IsShell,
-					EndSessionIDs: []string{},
-				},
+			idx, ok = t.add(InputTreeNode{
+				Parent:        parent,
+				SessionID:     step.sessionID,
+				Ordinal:       step.item.Ordinal,
+				Timestamp:     step.item.Timestamp,
+				Preview:       step.item.Preview,
+				IsShell:       step.item.IsShell,
+				EndSessionIDs: []string{},
 			})
-			t.edges[edge] = idx
-			if parent < 0 {
-				t.topLevel = append(t.topLevel, idx)
-			} else {
-				t.nodes[parent].children = append(
-					t.nodes[parent].children, idx,
-				)
+			if !ok {
+				return nodes, false
 			}
+			t.edges[edge] = idx
 		}
 		if step.active {
 			t.nodes[idx].node.OnActivePath = true
@@ -366,6 +462,7 @@ func (t *inputTreeBuilder) insert(
 		if step.activeOrdinal != nil {
 			t.nodes[idx].node.ActiveOrdinal = step.activeOrdinal
 		}
+		nodes = append(nodes, idx)
 		parent = idx
 	}
 	if parent >= 0 {
@@ -373,7 +470,61 @@ func (t *inputTreeBuilder) insert(
 			t.nodes[parent].node.EndSessionIDs, sessionID,
 		)
 	}
+	return nodes, true
+}
+
+// insertRewound adds a session's rewound inputs, each after the input it
+// followed. An input without a preview is left out, and the inputs after it
+// attach where it would have. It reports false when the node limit stopped
+// it short.
+func (t *inputTreeBuilder) insertRewound(branches rewoundBranches) bool {
+	inserted := map[string]int{}
+	for _, input := range branches.inputs {
+		parent := branches.start
+		if node, ok := inserted[input.AfterUUID]; ok {
+			parent = node
+		} else if node, ok := branches.anchors[input.AfterUUID]; ok {
+			parent = node
+		}
+		item, ok := inputOutlineItem(-1, input.Timestamp, input.Content)
+		if !ok {
+			inserted[input.SourceUUID] = parent
+			continue
+		}
+		idx, ok := t.add(InputTreeNode{
+			Parent:        parent,
+			SessionID:     branches.sessionID,
+			Ordinal:       item.Ordinal,
+			Timestamp:     item.Timestamp,
+			Preview:       item.Preview,
+			IsShell:       item.IsShell,
+			EndSessionIDs: []string{},
+			Rewound:       true,
+		})
+		if !ok {
+			return false
+		}
+		inserted[input.SourceUUID] = idx
+	}
 	return true
+}
+
+// add appends a node under its parent. It reports false when the tree
+// already holds the most nodes it may.
+func (t *inputTreeBuilder) add(node InputTreeNode) (int, bool) {
+	if len(t.nodes) >= inputTreeMaxNodes {
+		return 0, false
+	}
+	idx := len(t.nodes)
+	t.nodes = append(t.nodes, inputTreeBuildNode{node: node})
+	if node.Parent < 0 {
+		t.topLevel = append(t.topLevel, idx)
+	} else {
+		t.nodes[node.Parent].children = append(
+			t.nodes[node.Parent].children, idx,
+		)
+	}
+	return idx, true
 }
 
 // nodesDepthFirst returns the nodes in depth-first order, with Parent

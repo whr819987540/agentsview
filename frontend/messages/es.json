@@ -1923,6 +1923,8 @@
   "session_input_tree_jump_to": "Ir a la entrada: {preview}",
   "session_input_tree_open": "Abrir en su sesión: {preview}",
   "session_input_tree_current": "actual",
+  "session_input_tree_rewound": "rebobinado",
+  "session_input_tree_rewound_title": "Entrada rebobinada, no se conserva en la transcripción: {preview}",
   "session_input_graph_open": "Abrir el árbol detallado de entradas",
   "session_input_graph_title": "Árbol de entradas",
   "session_input_graph_close": "Cerrar",

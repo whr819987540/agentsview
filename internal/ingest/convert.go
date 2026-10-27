@@ -39,6 +39,7 @@ func ConvertSessionContext(
 		NextOrdinal:       NextParsedOrdinal(0, messages),
 		LastEntryUUID:     stringPtr(LastParsedSourceUUID("", messages)),
 		ClaudeLinearParse: parsed.ClaudeLinearParse,
+		RewoundInputs:     convertRewoundInputs(parsed.RewoundInputs),
 		FileInode:         int64Ptr(parsed.File.Inode),
 		FileDevice:        int64Ptr(parsed.File.Device),
 		FileHash:          stringPtr(parsed.File.Hash),
@@ -57,6 +58,24 @@ func ConvertSessionContext(
 		session.EndedAt = timeutil.Ptr(parsed.EndedAt)
 	}
 	return session, ctx.Err()
+}
+
+// convertRewoundInputs keeps nil as nil, so a parse that does not report
+// rewound inputs leaves the stored list in place.
+func convertRewoundInputs(parsed []parser.ParsedRewoundInput) []db.RewoundInput {
+	if parsed == nil {
+		return nil
+	}
+	out := make([]db.RewoundInput, 0, len(parsed))
+	for _, input := range parsed {
+		out = append(out, db.RewoundInput{
+			SourceUUID: input.SourceUUID,
+			AfterUUID:  input.AfterUUID,
+			Timestamp:  timeutil.Format(input.Timestamp),
+			Content:    input.Content,
+		})
+	}
+	return out
 }
 
 // ConvertMessagesContext converts messages and applies result pairing and
