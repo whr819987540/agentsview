@@ -3,7 +3,6 @@
 package postgres
 
 import (
-	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -20,10 +19,7 @@ func TestStoreSessionEndMarks(t *testing.T) {
 	require.NoError(t, err, "Open")
 	defer pg.Close()
 	defer func() {
-		_, _ = pg.ExecContext(
-			context.Background(),
-			`DROP SCHEMA IF EXISTS `+schema+` CASCADE`,
-		)
+		_, _ = pg.ExecContext(t.Context(), `DROP SCHEMA IF EXISTS `+schema+` CASCADE`)
 	}()
 
 	ctx := t.Context()
@@ -107,10 +103,7 @@ func TestStoreSessionEndMarksWithoutTable(t *testing.T) {
 	require.NoError(t, err, "Open")
 	defer pg.Close()
 	defer func() {
-		_, _ = pg.ExecContext(
-			context.Background(),
-			`DROP SCHEMA IF EXISTS `+schema+` CASCADE`,
-		)
+		_, _ = pg.ExecContext(t.Context(), `DROP SCHEMA IF EXISTS `+schema+` CASCADE`)
 	}()
 
 	ctx := t.Context()

@@ -142,10 +142,7 @@ func TestSessionEndMarksOnMirrorAreListedAndReadOnly(t *testing.T) {
 	database := dbtest.OpenTestDB(t)
 	cfg := config.Config{Host: "127.0.0.1", DataDir: t.TempDir(), WriteTimeout: 30 * time.Second}
 	marks := []db.SessionEndMark{{SessionID: "a1", ActivityAt: tsSeedEnd}}
-	srv := server.New(cfg, mirrorEndMarkStore{
-		readOnlyTestStore: readOnlyTestStore{Store: database},
-		marks:             marks,
-	}, nil)
+	srv := server.New(cfg, mirrorEndMarkStore{Store: database, marks: marks}, nil)
 	te := &testEnv{srv: srv, handler: wrapTestHandler(cfg, srv.Handler()), db: database}
 
 	list := te.listEndMarks(t)

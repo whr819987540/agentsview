@@ -311,7 +311,7 @@ func TestPushRefreshesCurationWithoutContentChange(t *testing.T) {
 }
 
 func TestPushMirrorsSessionEndMarksReadOnly(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	local, target := seedFixture(t)
 	mark, ok, err := local.MarkSessionEnded(ctx, fixtureBetaID)
 	require.NoError(t, err)
