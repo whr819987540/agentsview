@@ -96,20 +96,24 @@ class SessionEndMarksStore {
     while (this.readWanted) {
       this.readWanted = false;
       const writes = this.writes;
-      let res;
+      let marks: Map<string, string>;
+      let editable: boolean;
       try {
-        res = await SessionEndMarksService.getApiV1SessionEndMarks();
+        const res = await SessionEndMarksService.getApiV1SessionEndMarks();
+        marks = new Map(res.marks.map((mark) => [mark.session_id, mark.activity_at]));
+        editable = res.editable;
       } catch {
-        // Keep the current marks; sessions still show their live status.
+        // A failed request or a malformed answer keeps the current marks;
+        // sessions still show their live status.
         this.scheduleRetry();
         return;
       }
       this.loaded = true;
       this.retries = 0;
-      this.editable = res.editable;
+      this.editable = editable;
       // A request that finished meanwhile reads again when it is the last.
       if (this.writes !== writes) continue;
-      this.confirmed = new Map(res.marks.map((mark) => [mark.session_id, mark.activity_at]));
+      this.confirmed = marks;
       this.show();
     }
   }

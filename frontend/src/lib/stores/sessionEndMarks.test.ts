@@ -338,6 +338,19 @@ describe("SessionEndMarksStore loading", () => {
     expect(store.isEnded([session("done", "2026-10-01T10:00:00Z")])).toBe(true);
   });
 
+  it("treats an answer without marks as a failed read", async () => {
+    vi.useFakeTimers();
+    service.getApiV1SessionEndMarks.mockResolvedValueOnce({ entries: [] });
+    server.marks.set("done", "2026-10-01T10:00:00Z");
+    const store = createSessionEndMarksStore();
+
+    await expect(store.refresh()).resolves.toBeUndefined();
+    expect(store.editable).toBe(false);
+
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(store.isEnded([session("done", "2026-10-01T10:00:00Z")])).toBe(true);
+  });
+
   it("retries a failed first read on the next sidebar load", async () => {
     server.down = true;
     const store = createSessionEndMarksStore();
