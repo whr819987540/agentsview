@@ -21,29 +21,39 @@ func (s *Server) registerSessionEndMarkRoutes() {
 
 type sessionEndMarksResponse struct {
 	Marks []db.SessionEndMark `json:"marks"`
-	// Editable is false when the server reads a replica or a read-only
-	// archive, so the UI hides the mark actions.
+	// Editable is false when marks cannot change here, such as on a
+	// read-only archive or a mirror, so the UI hides the mark actions.
 	Editable bool `json:"editable"`
+}
+
+// endMarkStore returns the store's end marks, or false when the backend
+// keeps none, such as hosted PostgreSQL.
+func (s *Server) endMarkStore() (db.SessionEndMarkStore, bool) {
+	store, ok := s.db.(db.SessionEndMarkStore)
+	return store, ok
 }
 
 func (s *Server) humaListSessionEndMarks(
 	ctx context.Context,
 	_ *emptyInput,
 ) (*jsonOutput[sessionEndMarksResponse], error) {
-	localDB, ok := s.db.(*db.DB)
-	if !ok || localDB == nil {
+	store, ok := s.endMarkStore()
+	if !ok {
 		return &jsonOutput[sessionEndMarksResponse]{
 			Body: sessionEndMarksResponse{Marks: []db.SessionEndMark{}},
 		}, nil
 	}
-	marks, err := localDB.ListSessionEndMarks(ctx)
+	marks, err := store.ListSessionEndMarks(ctx)
 	if err != nil {
 		return nil, internalError("list session end marks", err)
+	}
+	if marks == nil {
+		marks = []db.SessionEndMark{}
 	}
 	return &jsonOutput[sessionEndMarksResponse]{
 		Body: sessionEndMarksResponse{
 			Marks:    marks,
-			Editable: !localDB.ReadOnly(),
+			Editable: store.SessionEndMarksEditable(ctx),
 		},
 	}, nil
 }
@@ -52,11 +62,11 @@ func (s *Server) humaMarkSessionEnded(
 	ctx context.Context,
 	in *idPathInput,
 ) (*jsonOutput[db.SessionEndMark], error) {
-	localDB, err := s.writableLocalDB()
-	if err != nil {
-		return nil, err
+	store, ok := s.endMarkStore()
+	if !ok {
+		return nil, handleHumaReadOnly(db.ErrReadOnly)
 	}
-	mark, ok, err := localDB.MarkSessionEnded(ctx, in.ID)
+	mark, ok, err := store.MarkSessionEnded(ctx, in.ID)
 	if err != nil {
 		if handled := handleHumaReadOnly(err); handled != nil {
 			return nil, handled
@@ -73,11 +83,11 @@ func (s *Server) humaUnmarkSessionEnded(
 	ctx context.Context,
 	in *idPathInput,
 ) (*noContentOutput, error) {
-	localDB, err := s.writableLocalDB()
-	if err != nil {
-		return nil, err
+	store, ok := s.endMarkStore()
+	if !ok {
+		return nil, handleHumaReadOnly(db.ErrReadOnly)
 	}
-	if err := localDB.UnmarkSessionEnded(ctx, in.ID); err != nil {
+	if err := store.UnmarkSessionEnded(ctx, in.ID); err != nil {
 		if handled := handleHumaReadOnly(err); handled != nil {
 			return nil, handled
 		}

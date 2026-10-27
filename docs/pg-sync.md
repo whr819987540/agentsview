@@ -382,7 +382,10 @@ agentsview pg serve [flags]
 
 The normal session server is read-only: session uploads, file watching, and
 local sync are disabled. Sessions from all machines appear in a single unified
-view. The same deployment also serves the analytics dashboard and the Usage page
+view. Stars, pins, and
+[session end marks](/docs/usage/#mark-a-session-as-ended) are the exception:
+`pg serve` writes them to PostgreSQL, shared by everyone who uses the dashboard.
+Hosted PostgreSQL does not support end marks yet. The same deployment also serves the analytics dashboard and the Usage page
 from PostgreSQL-backed queries.
 
 When the PostgreSQL role can write the raw-sync tables and ingest-job sequence,

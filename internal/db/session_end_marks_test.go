@@ -198,6 +198,42 @@ func TestListSessionEndMarksDropsOutdatedMarks(t *testing.T) {
 	assert.NotContains(t, endMarkActivity(t, d), "root")
 }
 
+func TestListSessionEndMarksForScope(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+	for _, s := range []struct{ id, project string }{
+		{"a1", "alpha"}, {"b1", "beta"}, {"g1", "gamma"},
+	} {
+		insertSession(t, d, s.id, s.project, func(sess *Session) {
+			sess.EndedAt = new("2026-10-01T10:00:00Z")
+		})
+		_, ok, err := d.MarkSessionEnded(ctx, s.id)
+		require.NoError(t, err)
+		require.True(t, ok)
+	}
+
+	tests := []struct {
+		name              string
+		projects, exclude []string
+		want              []string
+	}{
+		{name: "unscoped", want: []string{"a1", "b1", "g1"}},
+		{name: "projects", projects: []string{"alpha", "gamma"}, want: []string{"a1", "g1"}},
+		{name: "excluded", exclude: []string{"alpha"}, want: []string{"b1", "g1"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			marks, err := d.ListSessionEndMarksForScope(ctx, tt.projects, tt.exclude)
+			require.NoError(t, err)
+			ids := make([]string, 0, len(marks))
+			for _, mark := range marks {
+				ids = append(ids, mark.SessionID)
+			}
+			assert.Equal(t, tt.want, ids)
+		})
+	}
+}
+
 func TestListSessionEndMarksDropsMarksWithoutATime(t *testing.T) {
 	d := testDB(t)
 	insertSession(t, d, "legacy", "alpha", func(s *Session) {

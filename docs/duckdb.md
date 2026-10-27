@@ -68,7 +68,8 @@ and `duckdb serve`.
 `duckdb serve` accepts the same serve flags as
 [`pg serve`](/docs/pg-sync/#agentsview-pg-serve) (`--host`, `--port`, `--base-path`,
 proxy and TLS flags) and is read-only in the same way — no uploads, file
-watching, or local sync.
+watching, or local sync. Stars, pins, and session end marks come from the last
+push and cannot be changed there.
 
 ## Quack Remote Access
 

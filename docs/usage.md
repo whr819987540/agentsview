@@ -444,9 +444,12 @@ removed, so moving that session to the trash does not bring it back. Mark the
 row again when you are done.
 
 Marks are saved in the SQLite archive, so they survive restarts and full
-resyncs. PostgreSQL, ClickHouse, and DuckDB replicas do not carry marks: a
-sidebar served from a replica shows none and has no button or menu item to add
-them.
+resyncs. `duckdb push` and `clickhouse push` copy the marks still in effect, so
+a sidebar served from a DuckDB mirror or ClickHouse shows them, without the
+button or menu items to change them. `pg serve` keeps its own marks in
+PostgreSQL, shared by everyone who uses that dashboard, as it does for stars;
+`pg push` does not copy the archive's marks. Hosted PostgreSQL does not support
+marks yet.
 
 ### Group by Agent
 

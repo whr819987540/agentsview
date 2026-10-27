@@ -789,6 +789,7 @@ func (s *Sync) selectTombstonesToApply(
 type curationSnapshot struct {
 	starred       []string
 	pinsBySession map[string][]db.PinnedMessage
+	endMarks      []db.SessionEndMark
 }
 
 // loadCurationSnapshot reads the scoped starred session IDs and every
@@ -817,7 +818,17 @@ func (s *Sync) loadCurationSnapshot(ctx context.Context) (curationSnapshot, erro
 		return curationSnapshot{}, fmt.Errorf(
 			"loading pinned messages for curation snapshot: %w", err)
 	}
-	return curationSnapshot{starred: starred, pinsBySession: pinsBySession}, nil
+	// Only marks still in effect: the archive drops outdated ones here.
+	endMarks, err := s.local.ListSessionEndMarksForScope(
+		ctx, s.projects, s.excludeProjects,
+	)
+	if err != nil {
+		return curationSnapshot{}, fmt.Errorf(
+			"loading session end marks for curation snapshot: %w", err)
+	}
+	return curationSnapshot{
+		starred: starred, pinsBySession: pinsBySession, endMarks: endMarks,
+	}, nil
 }
 
 // fingerprint hashes the snapshot's starred session ids and pinned
@@ -851,10 +862,13 @@ func (snap curationSnapshot) fingerprint() (string, error) {
 		}
 		return cmp.Compare(a.ID, b.ID)
 	})
+	// EndMarks is left out when empty, so a mirror without marks keeps
+	// the fingerprint it had before marks were mirrored.
 	payload := struct {
-		Starred []string
-		Pinned  []db.PinCurationEntry
-	}{Starred: snap.starred, Pinned: pinned}
+		Starred  []string
+		Pinned   []db.PinCurationEntry
+		EndMarks []db.SessionEndMark `json:",omitempty"`
+	}{Starred: snap.starred, Pinned: pinned, EndMarks: snap.endMarks}
 	// A loaded snapshot holds nil for "no stars" while a restricted one
 	// (see replaceCuration) holds an empty slice; both must hash the same
 	// or an empty curation state would refresh on every push.
@@ -869,25 +883,25 @@ func (snap curationSnapshot) fingerprint() (string, error) {
 	return hex.EncodeToString(sum[:]), nil
 }
 
-// replaceCuration rewrites starred_sessions and pinned_messages from the
-// given snapshot — never from a fresh local read — and returns the
-// fingerprint of the resident-restricted snapshot it actually wrote. The
-// caller records THAT fingerprint, not the full snapshot's: a star or pin
-// for an in-scope session absent from the mirror (push failed, or the
-// session was created after this push enumerated its candidates) is
-// skipped by the residency check, and fingerprinting the full snapshot
-// anyway would make the skipped rows look delivered — once the session
-// lands, the matching fingerprint would suppress the refresh and the
+// replaceCuration rewrites starred_sessions, pinned_messages and
+// session_end_marks from the given snapshot — never from a fresh local read
+// — and returns the fingerprint of the resident-restricted snapshot it
+// actually wrote. The caller records THAT fingerprint, not the full
+// snapshot's: a star or pin for an in-scope session absent from the mirror
+// (push failed, or the session was created after this push enumerated its
+// candidates) is skipped by the residency check, and fingerprinting the full
+// snapshot anyway would make the skipped rows look delivered — once the
+// session lands, the matching fingerprint would suppress the refresh and the
 // star/pin would stay missing until an unrelated curation edit. With the
-// written fingerprint, the local state keeps mismatching until every
-// curated session is resident, so each push retries the (curation-bounded)
-// refresh and converges as soon as the session is mirrored.
+// written fingerprint, the local state keeps mismatching until every curated
+// session is resident, so each push retries the (curation-bounded) refresh
+// and converges as soon as the session is mirrored.
 //
 // All work is bounded by curation size, not mirror size: mirror membership
 // is validated for exactly the snapshot's session IDs (one batched lookup,
 // see mirrorResidentSessionIDs), pin notes are preserved, and the delete
-// side clears both tables for sessions in this source archive, so removed
-// stars/pins disappear without enumerating them.
+// side clears every curation table for sessions in this source archive, so
+// removed stars, pins and end marks disappear without enumerating them.
 func (s *Sync) replaceCuration(
 	ctx context.Context, snap curationSnapshot,
 ) (string, error) {
@@ -896,9 +910,11 @@ func (s *Sync) replaceCuration(
 		pinnedSessions = append(pinnedSessions, id)
 	}
 	slices.Sort(pinnedSessions)
-	resident, err := s.mirrorResidentSessionIDs(
-		ctx, append(append([]string(nil), snap.starred...), pinnedSessions...),
-	)
+	candidates := append(append([]string(nil), snap.starred...), pinnedSessions...)
+	for _, mark := range snap.endMarks {
+		candidates = append(candidates, mark.SessionID)
+	}
+	resident, err := s.mirrorResidentSessionIDs(ctx, candidates)
 	if err != nil {
 		return "", err
 	}
@@ -908,6 +924,11 @@ func (s *Sync) replaceCuration(
 	for _, id := range snap.starred {
 		if resident[id] {
 			written.starred = append(written.starred, id)
+		}
+	}
+	for _, mark := range snap.endMarks {
+		if resident[mark.SessionID] {
+			written.endMarks = append(written.endMarks, mark)
 		}
 	}
 	residentPinned := make([]string, 0, len(pinnedSessions))
@@ -923,7 +944,7 @@ func (s *Sync) replaceCuration(
 	}
 
 	err = s.withDuckTx(ctx, "replace curation rows", func(tx *sql.Tx) error {
-		for _, table := range []string{"pinned_messages", "starred_sessions"} {
+		for _, table := range []string{"pinned_messages", "starred_sessions", "session_end_marks"} {
 			if err := s.execMutation(ctx, tx, `
 				DELETE FROM `+table+`
 				WHERE session_id IN (
@@ -944,6 +965,15 @@ func (s *Sync) replaceCuration(
 				id,
 			); err != nil {
 				return fmt.Errorf("syncing starred session %s: %w", id, err)
+			}
+		}
+		for _, mark := range written.endMarks {
+			if _, err := tx.ExecContext(ctx,
+				`INSERT INTO session_end_marks (session_id, activity_at)
+				 VALUES (?, ?)`,
+				mark.SessionID, mark.ActivityAt,
+			); err != nil {
+				return fmt.Errorf("syncing session end mark %s: %w", mark.SessionID, err)
 			}
 		}
 		return nil
@@ -1057,6 +1087,7 @@ func (s *Sync) deleteMirrorSession(
 	for _, stmt := range []string{
 		`DELETE FROM pinned_messages WHERE session_id = ?`,
 		`DELETE FROM starred_sessions WHERE session_id = ?`,
+		`DELETE FROM session_end_marks WHERE session_id = ?`,
 		`DELETE FROM secret_findings WHERE session_id = ?`,
 		`DELETE FROM tool_result_events WHERE session_id = ?`,
 		`DELETE FROM tool_calls WHERE session_id = ?`,

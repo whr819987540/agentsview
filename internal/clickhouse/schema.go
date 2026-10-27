@@ -14,8 +14,8 @@ import (
 // SchemaVersion is recorded in sync_metadata after EnsureSchema. Columns
 // added later ship as ADD COLUMN IF NOT EXISTS entries in the table specs,
 // so an older mirror upgrades in place; the version tells operators and
-// status output which shape a mirror has.
-const SchemaVersion = 2
+// status output which shape a mirror has. Version 3 adds session end marks.
+const SchemaVersion = 3
 
 // Metadata keys shared by every archive that pushes into the mirror.
 const (
@@ -506,6 +506,11 @@ var mirrorTables = []tableSpec{
 	{
 		name:    "starred_sessions",
 		columns: []columnSpec{col("session_id", tString), col("created_at", tNullTime)},
+		orderBy: []string{"session_id"},
+	},
+	{
+		name:    "session_end_marks",
+		columns: []columnSpec{col("session_id", tString), col("activity_at", tString)},
 		orderBy: []string{"session_id"},
 	},
 	{

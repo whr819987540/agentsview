@@ -24,6 +24,14 @@ var (
 	_ db.Store = (*clickhousestore.Store)(nil)
 )
 
+// Session end marks: hosted PostgreSQL is the documented exception.
+var (
+	_ db.SessionEndMarkStore = (*db.DB)(nil)
+	_ db.SessionEndMarkStore = (*postgresstore.Store)(nil)
+	_ db.SessionEndMarkStore = (*duckdbstore.Store)(nil)
+	_ db.SessionEndMarkStore = (*clickhousestore.Store)(nil)
+)
+
 // Remote replicas: push target and read-only serve.
 var (
 	_ storage.Replica      = postgresstore.Backend{}

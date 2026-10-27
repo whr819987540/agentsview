@@ -325,6 +325,26 @@ Keep identity-only corrections in the reporting digest. The wire contract is in
   in syntax. Each backend explicitly supplies every required SQL operation and
   its typed timestamp, observation and snapshot loaders.
 
+### Session end marks
+
+A session end mark covers a sidebar row: the marked session's topmost ancestor
+through `parent_session_id` and every descendant with messages, trashed ones
+included. Each backend keeps the same behavior:
+
+| Backend           | Marks                                                                                                         |
+| ----------------- | ------------------------------------------------------------------------------------------------------------- |
+| SQLite archive    | Writable. A mark stores the row's latest activity; listing deletes marks whose row has newer activity.        |
+| PostgreSQL        | Writable through `pg serve`, like stars, with the same row walk and cleanup. `pg push` does not copy them.    |
+| DuckDB mirror     | Read-only copy of the marks in effect, written by the curation refresh of `duckdb push`.                      |
+| ClickHouse        | Read-only copy of the marks in effect, written by the curation refresh of `clickhouse push`.                  |
+| Hosted PostgreSQL | None: `HostedStore` does not implement `db.SessionEndMarkStore`, so the API lists no marks and refuses edits. |
+
+Hosted PostgreSQL is an active exception, chosen by the maintainer to keep the
+first version small. Its stars and pins are written through the raw curation
+pipeline (`HostedStore.curate`), which has no end mark field yet. Remove the
+exception by adding marks to raw curation and implementing
+`db.SessionEndMarkStore` on `HostedStore`.
+
 ### Usage cache divergence
 
 SQLite's aggregate usage APIs read timezone-specific daily rollups from a

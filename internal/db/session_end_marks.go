@@ -56,22 +56,38 @@ const endMarkLatestCTE = `
 		)
 	)`
 
+// SessionEndMarksEditable reports whether marks can change: false on a
+// read-only archive.
+func (db *DB) SessionEndMarksEditable(context.Context) bool { return !db.readOnly }
+
 // ListSessionEndMarks returns the end marks still in effect, ordered by
 // session ID. A mark stops being in effect once its row has activity after
 // it, or when it holds no readable time; a writable archive deletes those
 // marks, so trashing or deleting the newer session does not bring the mark
 // back.
 func (db *DB) ListSessionEndMarks(ctx context.Context) ([]SessionEndMark, error) {
+	return db.ListSessionEndMarksForScope(ctx, nil, nil)
+}
+
+// ListSessionEndMarksForScope is ListSessionEndMarks restricted to marks on
+// sessions in the given project scope (see curationScopeWhere), for mirror
+// pushes. Its cost is bounded by the marks and their rows, not the archive.
+func (db *DB) ListSessionEndMarksForScope(
+	ctx context.Context, projects, excludeProjects []string,
+) ([]SessionEndMark, error) {
+	where, args := curationScopeWhere("s", projects, excludeProjects)
 	rows, err := db.getReader().QueryContext(ctx, `
 		WITH RECURSIVE marked(mark_id) AS (
-			SELECT session_id FROM session_end_marks
+			SELECT m.session_id FROM session_end_marks m
+			JOIN sessions s ON s.id = m.session_id`+where+`
 		),`+endMarkLatestCTE+`
 		SELECT m.session_id, m.activity_at,
 			julianday(m.activity_at) IS NULL
 				OR COALESCE(julianday(l.at) > julianday(m.activity_at), 0)
-		FROM session_end_marks m
+		FROM marked k
+		JOIN session_end_marks m ON m.session_id = k.mark_id
 		LEFT JOIN latest l ON l.mark_id = m.session_id
-		ORDER BY m.session_id`)
+		ORDER BY m.session_id`, args...)
 	if err != nil {
 		return nil, fmt.Errorf("listing session end marks: %w", err)
 	}

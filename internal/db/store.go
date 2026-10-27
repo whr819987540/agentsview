@@ -175,6 +175,18 @@ type ActivityReportArtifactStore interface {
 	) (activity.CandidateArtifacts, error)
 }
 
+// SessionEndMarkStore holds the sidebar rows users marked as ended. The
+// SQLite archive and PostgreSQL store marks and change them; the DuckDB
+// mirror and ClickHouse hold the archive's pushed marks read-only. Hosted
+// PostgreSQL does not implement it, so it lists no marks.
+type SessionEndMarkStore interface {
+	ListSessionEndMarks(ctx context.Context) ([]SessionEndMark, error)
+	MarkSessionEnded(ctx context.Context, sessionID string) (SessionEndMark, bool, error)
+	UnmarkSessionEnded(ctx context.Context, sessionID string) error
+	// SessionEndMarksEditable reports whether marks can change here.
+	SessionEndMarksEditable(ctx context.Context) bool
+}
+
 type ActivityReportProbeStore interface {
 	ActivityReportSourceProbe(ctx context.Context) (activity.SourceProbe, error)
 }

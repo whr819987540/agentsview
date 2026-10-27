@@ -13,10 +13,15 @@ import (
 	"go.kenn.io/agentsview/internal/db"
 )
 
-// curationSnapshot is the local in-scope star and pin state.
+// curationTables hold per-session curation rows that only the curation
+// refresh writes; deleting a session clears them too.
+var curationTables = []string{"starred_sessions", "session_end_marks"}
+
+// curationSnapshot is the local in-scope star, pin and end mark state.
 type curationSnapshot struct {
 	starred       []string
 	pinsBySession map[string][]db.PinnedMessage
+	endMarks      []db.SessionEndMark
 }
 
 func (s *Sync) loadCurationSnapshot(ctx context.Context) (curationSnapshot, error) {
@@ -32,7 +37,12 @@ func (s *Sync) loadCurationSnapshot(ctx context.Context) (curationSnapshot, erro
 	if err != nil {
 		return curationSnapshot{}, fmt.Errorf("loading pinned messages: %w", err)
 	}
-	return curationSnapshot{starred: starred, pinsBySession: pinsBySession}, nil
+	// Only marks still in effect: the archive drops outdated ones here.
+	endMarks, err := s.local.ListSessionEndMarksForScope(ctx, s.projects, s.excludeProjects)
+	if err != nil {
+		return curationSnapshot{}, fmt.Errorf("loading session end marks: %w", err)
+	}
+	return curationSnapshot{starred: starred, pinsBySession: pinsBySession, endMarks: endMarks}, nil
 }
 
 // fingerprint hashes starred ids and pin id/note state so a note-only edit
@@ -55,10 +65,13 @@ func (snap curationSnapshot) fingerprint() (string, error) {
 		}
 		return cmp.Compare(a.ID, b.ID)
 	})
+	// EndMarks is left out when empty, so a mirror without marks keeps
+	// the fingerprint it had before marks were mirrored.
 	payload := struct {
-		Starred []string
-		Pinned  []db.PinCurationEntry
-	}{Starred: db.SortedCopy(snap.starred), Pinned: pinned}
+		Starred  []string
+		Pinned   []db.PinCurationEntry
+		EndMarks []db.SessionEndMark `json:",omitempty"`
+	}{Starred: db.SortedCopy(snap.starred), Pinned: pinned, EndMarks: snap.endMarks}
 	data, err := json.Marshal(payload)
 	if err != nil {
 		return "", fmt.Errorf("encoding curation fingerprint: %w", err)
@@ -67,8 +80,8 @@ func (snap curationSnapshot) fingerprint() (string, error) {
 	return hex.EncodeToString(sum[:]), nil
 }
 
-// refreshCurationIfChanged rewrites starred_sessions and pinned_messages
-// for this archive when the local in-scope curation state differs from
+// refreshCurationIfChanged rewrites starred_sessions, pinned_messages and
+// session_end_marks for this archive when the local in-scope curation state differs from
 // what the last refresh wrote. The stored fingerprint covers only the rows
 // written for sessions that were mirror-resident, so a star or pin for a
 // session that has not landed yet keeps the state mismatched and the next
@@ -104,12 +117,16 @@ func (s *Sync) replaceCuration(
 	for id := range snap.pinsBySession {
 		pinnedSessions = append(pinnedSessions, id)
 	}
-	resident, err := s.residentSessionIDs(ctx, append(append([]string(nil), snap.starred...), pinnedSessions...))
+	candidates := append(append([]string(nil), snap.starred...), pinnedSessions...)
+	for _, mark := range snap.endMarks {
+		candidates = append(candidates, mark.SessionID)
+	}
+	resident, err := s.residentSessionIDs(ctx, candidates)
 	if err != nil {
 		return "", err
 	}
 	written := curationSnapshot{pinsBySession: map[string][]db.PinnedMessage{}}
-	var starRows, pinRows [][]any
+	var starRows, pinRows, endMarkRows [][]any
 	now := time.Now().UTC()
 	for _, id := range db.SortedCopy(snap.starred) {
 		if !resident[id] {
@@ -127,6 +144,13 @@ func (s *Sync) replaceCuration(
 			pinRows = append(pinRows, pinnedMessageRow(pin, version))
 		}
 	}
+	for _, mark := range snap.endMarks {
+		if !resident[mark.SessionID] {
+			continue
+		}
+		written.endMarks = append(written.endMarks, mark)
+		endMarkRows = append(endMarkRows, []any{mark.SessionID, mark.ActivityAt, version})
+	}
 	fingerprint, err := written.fingerprint()
 	if err != nil {
 		return "", err
@@ -137,7 +161,10 @@ func (s *Sync) replaceCuration(
 	if err := insertRows(ctx, s.conn, "pinned_messages", pinRows); err != nil {
 		return "", err
 	}
-	for _, table := range []string{"starred_sessions", "pinned_messages"} {
+	if err := insertRows(ctx, s.conn, "session_end_marks", endMarkRows); err != nil {
+		return "", err
+	}
+	for _, table := range append([]string{"pinned_messages"}, curationTables...) {
 		if _, err := s.conn.ExecContext(ctx,
 			"DELETE FROM "+table+" WHERE push_version < ? AND session_id IN "+
 				"(SELECT id FROM sessions WHERE source_archive_id = ?)",
