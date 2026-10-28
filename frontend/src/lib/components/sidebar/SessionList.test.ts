@@ -629,7 +629,7 @@ describe("SessionList visible hydration", () => {
       await tick();
 
       expect(
-        document.querySelector('.session-item[data-session-id="cont"] .status-slot .ended-mark'),
+        document.querySelector('.session-item[data-session-id="cont"] .end-slot.ended'),
       ).not.toBeNull();
       endButton("cont")!.click();
       expect(unmark.mock.calls[0]![0].map((s) => s.id).sort()).toEqual(["cont", "root"]);
@@ -683,8 +683,9 @@ describe("SessionList visible hydration", () => {
       button.click();
       await tick();
 
-      expect(document.querySelector('.session-item[data-session-id="idle"] .ended-mark')).not
-        .toBeNull();
+      expect(
+        document.querySelector('.session-item[data-session-id="idle"] .end-slot.ended'),
+      ).not.toBeNull();
       expect(order()).toEqual(["idle", "stale"]);
       expect(document.activeElement).toBe(button);
 

@@ -19,7 +19,6 @@
     previewMessage,
   } from "../../utils/messages.js";
   import {
-    CheckIcon,
     ChevronDownIcon,
     ChevronRightIcon,
     CircleCheckIcon,
@@ -114,6 +113,9 @@
   let endMarkSessions = $derived(rowSessions(session, endMarkGroup ?? groupSessions));
   // Child rows show their own live status; the parent row holds the mark.
   let isEnded = $derived(!compact && sessionEndMarks.isEnded(endMarkSessions));
+  // An ended row sorts as quiet, so its dot is quiet too; the filled end
+  // button shows the mark.
+  let dotStatus = $derived(isEnded ? "quiet" : sessionStatus);
 
   let isActive = $derived.by(() => {
     const aid = sessions.activeSessionId;
@@ -524,13 +526,7 @@
   {/if}
 
   <span class="status-slot">
-    {#if isEnded}
-      <span class="ended-mark" role="img" title={m.session_end_mark_label()} aria-label={m.session_end_mark_label()}>
-        <CheckIcon size="10" strokeWidth="3" aria-hidden="true" />
-      </span>
-    {:else}
-      <StatusDot status={sessionStatus} label={sessionStatusLabel(sessionStatus)} size={6} />
-    {/if}
+    <StatusDot status={dotStatus} label={sessionStatusLabel(dotStatus)} size={6} />
   </span>
 
 
@@ -603,16 +599,21 @@
   </div>
 
   {#if !compact && sessionEndMarks.editable}
-    <span class="end-slot">
+    <span class="end-slot" class:ended={isEnded}>
       <IconButton
         size="sm"
         tone="success"
-        ariaPressed={isEnded}
         ariaLabel={isEnded ? m.session_end_mark_unmark() : m.session_end_mark_mark()}
         onclick={handleEnd}
       >
         <CircleCheckIcon size="14" aria-hidden="true" />
       </IconButton>
+    </span>
+  {:else if isEnded}
+    <span class="end-slot ended">
+      <span class="end-indicator" role="img" title={m.session_end_mark_label()} aria-label={m.session_end_mark_label()}>
+        <CircleCheckIcon size="14" aria-hidden="true" />
+      </span>
     </span>
   {/if}
   {#if !compact}
@@ -914,11 +915,6 @@
     flex-shrink: 0;
   }
 
-  .ended-mark {
-    display: inline-flex;
-    color: var(--accent-green);
-  }
-
   .session-info {
     min-width: 0;
     flex: 1;
@@ -1064,24 +1060,40 @@
     background: var(--bg-surface-hover);
   }
 
-  /* The end button takes no room until the row is hovered or keyboard-
-     focused, so titles keep their width at rest; the status slot shows the
-     mark itself. Out of the flow it stays focusable, so Tab reaches it. */
+  /* Like the star, the end button keeps its place in the row: it shows on
+     hover or focus, and stays shown, filled, while the row is ended. Read-only
+     servers show only the filled mark. */
   .end-slot {
-    position: absolute;
     display: flex;
     flex-shrink: 0;
     opacity: 0;
-    pointer-events: none;
+    transition: opacity 0.12s;
   }
 
   .session-item:hover .end-slot,
-  .session-item:focus-visible .end-slot,
-  .session-item:has(:focus-visible) .end-slot,
-  .end-slot:focus-within {
-    position: static;
+  .session-item:focus-within .end-slot,
+  .end-slot.ended {
     opacity: 1;
-    pointer-events: auto;
+  }
+
+  .end-slot.ended :global(svg) {
+    color: var(--accent-green);
+  }
+
+  .end-slot.ended :global(circle) {
+    fill: currentColor;
+  }
+
+  .end-slot.ended :global(path) {
+    stroke: var(--bg-surface);
+  }
+
+  .end-indicator {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 24px;
   }
 
   :global(.context-menu) {
