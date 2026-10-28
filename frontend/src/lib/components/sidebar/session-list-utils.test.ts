@@ -4,6 +4,7 @@ import { buildSessionGroups, type SessionGroup } from "../../stores/sessions.sve
 import {
   ITEM_HEIGHT,
   HEADER_HEIGHT,
+  FOLDER_GAP_HEIGHT,
   STORAGE_KEY,
   adjacentVisibleSessionId,
   assignGroupFolders,
@@ -1135,11 +1136,12 @@ function folderView(
   };
 }
 
-/** Rows as short strings: "folder:Name(count)" or "session:id+inset". */
+/** Rows as short strings: "folder:Name(count)", "gap" or "session:id+inset". */
 function rowSummary(items: DisplayItem[]): string[] {
   return items.map((item) => {
     if (item.type === "folder") return `folder:${item.label}(${item.count})`;
     if (item.type === "header") return `header:${item.label}`;
+    if (item.type === "gap") return "gap";
     return `session:${item.group?.primarySessionId}+${item.inset ?? 0}`;
   });
 }
@@ -1212,6 +1214,7 @@ describe("buildDisplayItems (folders)", () => {
       ["folder:1", 0, 1],
       ["session:a2", 1, 1],
       ["child:a2:a2-cont", 1, 1],
+      ["folder-gap:alpha", 0, null],
       ["session:a1", 0, null],
     ]);
   });
@@ -1249,6 +1252,88 @@ describe("buildDisplayItems (folders)", () => {
     const sections = buildGroupSections(groups, "agent");
     const byAgent = buildDisplayItems(groups, sections, "agent", new Set(), new Set(), view);
     expect(rowSummary(byAgent)).toEqual(["header:claude", "session:a1+0"]);
+  });
+
+  it("separates an open last folder from the unfiled sessions below it", () => {
+    const groups = [
+      projectGroup("a1", "alpha"),
+      projectGroup("a2", "alpha"),
+      projectGroup("a3", "alpha"),
+    ];
+    const view = folderView([empty, docs], { a2: 1 }, { project: "alpha", expanded: [1] });
+
+    const items = buildDisplayItems(groups, [], "none", new Set(), new Set(), view);
+
+    expect(rowSummary(items)).toEqual([
+      "folder:Empty(0)",
+      "folder:Docs(1)",
+      "session:a2+1",
+      "gap",
+      "session:a1+0",
+      "session:a3+0",
+    ]);
+    const gap = items[3]!;
+    expect(gap.height).toBe(FOLDER_GAP_HEIGHT);
+    expect([gap.dropFolderId, gap.dropProject]).toEqual([null, "alpha"]);
+    expect(items[4]!.top).toBe(56 + ITEM_HEIGHT + FOLDER_GAP_HEIGHT);
+    expect(adjacentVisibleSessionId(items, "a2", 1)).toBe("a1");
+    expect(adjacentVisibleSessionId(items, "a1", -1)).toBe("a2");
+  });
+
+  it("separates an open last folder inside its project section", () => {
+    const groups = [
+      projectGroup("a1", "alpha"),
+      projectGroup("a2", "alpha"),
+      projectGroup("b1", "beta"),
+    ];
+    const sections = buildGroupSections(groups, "project");
+    const view = folderView([docs], { a2: 1 }, { expanded: [1] });
+
+    const items = buildDisplayItems(groups, sections, "project", new Set(), new Set(), view);
+
+    expect(rowSummary(items)).toEqual([
+      "header:alpha",
+      "folder:Docs(1)",
+      "session:a2+1",
+      "gap",
+      "session:a1+0",
+      "header:beta",
+      "session:b1+0",
+    ]);
+  });
+
+  it.each<{
+    when: string;
+    folders: SidebarFolder[];
+    filed: Record<string, number>;
+    expanded: number[];
+  }>([
+    { when: "the project has no folders", folders: [], filed: {}, expanded: [] },
+    { when: "the last folder is closed", folders: [docs], filed: { a2: 1 }, expanded: [] },
+    {
+      when: "the open last folder is empty",
+      folders: [docs, empty],
+      filed: { a2: 1 },
+      expanded: [1, 2],
+    },
+    {
+      when: "every session is in a folder",
+      folders: [docs],
+      filed: { a1: 1, a2: 1, a3: 1 },
+      expanded: [1],
+    },
+  ])("adds no gap when $when", ({ folders, filed, expanded }) => {
+    const groups = [
+      projectGroup("a1", "alpha"),
+      projectGroup("a2", "alpha"),
+      projectGroup("a3", "alpha"),
+    ];
+    const view = folderView(folders, filed, { project: "alpha", expanded });
+
+    const items = buildDisplayItems(groups, [], "none", new Set(), new Set(), view);
+
+    expect(rowSummary(items)).not.toContain("gap");
+    expect(computeTotalSize(items)).toBe(items.reduce((sum, item) => sum + item.height, 0));
   });
 
   it("steps from a session hidden in a collapsed folder to the next row", () => {

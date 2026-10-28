@@ -6,6 +6,7 @@ const CHILD_ITEM_HEIGHT = 34;
 const TEAM_HEADER_HEIGHT = 28;
 export const HEADER_HEIGHT = 28;
 export const FOLDER_HEADER_HEIGHT = 28;
+export const FOLDER_GAP_HEIGHT = 10;
 export const OVERSCAN = 10;
 export const STORAGE_KEY = "agentsview-group-by-agent";
 export const STORAGE_KEY_GROUP = "agentsview-group-mode";
@@ -44,7 +45,7 @@ export interface FolderView {
 
 export interface DisplayItem {
   id: string;
-  type: "header" | "folder" | "session" | "team-group" | "subagent-group";
+  type: "header" | "folder" | "gap" | "session" | "team-group" | "subagent-group";
   label: string;
   count: number;
   group?: SessionGroup;
@@ -390,7 +391,8 @@ function emitGroupItems(
  * respecting collapsed groups. Continuation chains expand
  * inline when their group key is in expandedGroups. Where folders
  * apply, a project's folders come first, each followed by its
- * sessions when expanded, then the project's unfiled sessions.
+ * sessions when expanded, then the project's unfiled sessions. A gap
+ * row separates an open last folder's sessions from the unfiled ones.
  */
 export function buildDisplayItems(
   groups: SessionGroup[],
@@ -487,8 +489,10 @@ function emitFolderedGroups(
     else unfiled.push(g);
   }
 
+  let lastFolderShown = false;
   for (const folder of projectFolders) {
     const folderGroups = byFolder.get(folder.id)!;
+    lastFolderShown = view.expanded.has(folder.id) && folderGroups.length > 0;
     items.push({
       id: `folder:${folder.id}`,
       type: "folder",
@@ -510,6 +514,23 @@ function emitFolderedGroups(
         dropProject: project,
       });
     }
+  }
+
+  // Without the gap, the open last folder's indented rows run straight
+  // into the unfiled rows. It belongs to the top level, so a drop on it
+  // takes a session out of its folder.
+  if (lastFolderShown && unfiled.length > 0) {
+    items.push({
+      id: `folder-gap:${project}`,
+      type: "gap",
+      label,
+      count: 0,
+      dropFolderId: null,
+      dropProject: project,
+      height: FOLDER_GAP_HEIGHT,
+      top: y.value,
+    });
+    y.value += FOLDER_GAP_HEIGHT;
   }
 
   for (const g of unfiled) {

@@ -948,6 +948,8 @@
               if (renamingFolderId === folderId) renamingFolderId = null;
             }}
           />
+        {:else if item.type === "gap"}
+          <div class="folder-gap" aria-hidden="true"></div>
         {:else if item.type === "header"}
           <button
             class="group-header"
@@ -1207,6 +1209,10 @@
     flex: 1;
     overflow-y: auto;
     overflow-x: hidden;
+  }
+
+  .folder-gap {
+    height: 100%;
   }
 
   /* Group headers (agent and project) */
