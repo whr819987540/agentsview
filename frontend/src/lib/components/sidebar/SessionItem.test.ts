@@ -182,20 +182,34 @@ describe("SessionItem end mark", () => {
     );
   }
 
-  it("shows a check in place of the status dot while the mark holds", () => {
+  it("fills the end button while the mark holds and leaves the title alone", () => {
+    sessionEndMarks.editable = true;
     sessionEndMarks.marks = new Map([["root", "2024-01-01T01:00:00Z"]]);
     mountRow();
 
-    const check = document.querySelector<HTMLElement>(".status-slot .ended-mark");
-    expect(check?.getAttribute("aria-label")).toBe("Marked as ended");
-    expect(document.querySelector(".status-slot .kit-status-dot")).toBeNull();
+    const slot = document.querySelector<HTMLElement>(".end-slot");
+    expect(slot?.classList.contains("ended")).toBe(true);
+    expect(slot?.querySelector("button")?.getAttribute("aria-label")).toBe("Unmark as ended");
+    // The unclean row sorts as quiet once ended, and its dot says so.
+    expect(document.querySelector(".status-slot svg")).toBeNull();
+    expect(document.querySelector(".status-slot .kit-status-dot--quiet")).not.toBeNull();
+  });
+
+  it("shows the mark in the end button's place when marks cannot change", () => {
+    sessionEndMarks.marks = new Map([["root", "2024-01-01T01:00:00Z"]]);
+    mountRow();
+
+    const mark = document.querySelector<HTMLElement>(".end-slot.ended [role='img']");
+    expect(mark?.getAttribute("aria-label")).toBe("Marked as ended");
+    expect(document.querySelector(".end-slot button")).toBeNull();
+    expect(document.querySelector(".status-slot svg")).toBeNull();
   });
 
   it("shows the live status again once the row has newer activity", () => {
     sessionEndMarks.marks = new Map([["root", "2024-01-01T01:00:00Z"]]);
     mountRow({ groupSessions: [root, continuation], statusSession: continuation });
 
-    expect(document.querySelector(".ended-mark")).toBeNull();
+    expect(document.querySelector(".end-slot")).toBeNull();
     expect(document.querySelector(".status-slot .kit-status-dot--unclean")).not.toBeNull();
   });
 
@@ -224,7 +238,7 @@ describe("SessionItem end mark", () => {
     sessionEndMarks.marks = new Map([["root", "2024-01-01T01:00:00Z"]]);
     mountRow({ compact: true, depth: 1 });
 
-    expect(document.querySelector(".ended-mark")).toBeNull();
+    expect(document.querySelector(".end-slot")).toBeNull();
     openContextMenu();
     expect(menuItem("Mark as ended")).toBeUndefined();
     expect(menuItem("Unmark as ended")).toBeUndefined();
@@ -248,13 +262,16 @@ describe("SessionItem end mark", () => {
     const select = vi.spyOn(sessions, "selectSession").mockImplementation(() => {});
     mountRow({ groupSessions: [continuation, root], statusSession: continuation });
 
+    const slot = document.querySelector<HTMLElement>(".end-slot")!;
     expect(rowButton("Unmark as ended")).toBeNull();
+    expect(slot.classList.contains("ended")).toBe(false);
     rowButton("Mark as ended")!.click();
     expect(mark).toHaveBeenCalledWith([root, continuation]);
 
     sessionEndMarks.marks = new Map([["root", "2024-01-01T03:00:00Z"]]);
     flushSync();
     expect(rowButton("Mark as ended")).toBeNull();
+    expect(slot.classList.contains("ended")).toBe(true);
     rowButton("Unmark as ended")!.click();
     expect(unmark).toHaveBeenCalledWith([root, continuation]);
     expect(select).not.toHaveBeenCalled();

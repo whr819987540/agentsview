@@ -13,13 +13,13 @@ The latest published release is
 
 - Mark a session as ended when you are done with it. Hover a session in the
   sidebar and click the circled check next to the star, or choose **Mark as
-  ended** from the session's right-click menu or the session actions menu in
-  the session header. The row's status dot becomes a small green check and the
-  row sorts with the quiet sessions. The mark clears itself when the
-  session has new activity, such as when you resume it. Marks are saved in the
-  local archive, and DuckDB and ClickHouse pushes copy them for read-only
-  viewing. `pg serve` keeps its own marks in PostgreSQL, like stars; hosted
-  PostgreSQL does not support marks yet.
+  ended** from the session's right-click menu or the session actions menu in the
+  session header. The check fills in green and stays shown next to the star,
+  like the star of a starred session, and the row sorts with the quiet sessions.
+  The mark clears itself when the session has new activity, such as when you
+  resume it. Marks are saved in the local archive, and DuckDB and ClickHouse
+  pushes copy them for read-only viewing. `pg serve` keeps its own marks in
+  PostgreSQL, like stars; hosted PostgreSQL does not support marks yet.
 - Jump to the end of a session's messages in one click. The **Scroll to
   bottom** button, a down arrow to the left of **Collapse visible blocks** in
   the session header, shows the newest message in oldest-first order and the

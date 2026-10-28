@@ -364,8 +364,9 @@ Each session item shows:
   (including Codex session models).
 - **Star button** — click the star icon or press `s` to star a session. Starred
   sessions persist in the SQLite database so they survive server restarts.
-- **End mark button** — hover a session and click the circled check next to the
-  star to [mark it as ended](#mark-a-session-as-ended).
+- **End mark button** — the circled check next to the star. Hover a session and
+  click it to [mark the session as ended](#mark-a-session-as-ended). Like the
+  star, it fills in and stays shown while the mark holds.
 - **Agent tag** — agent name on the right side, tinted with the agent's accent
   color.
 - **Machine label** — when using [PostgreSQL sync](/docs/pg-sync/), sessions
@@ -395,7 +396,7 @@ marked it. Hover the dot for a tooltip explaining the current state.
 | Stale   | Amber             | 10–60 minutes idle and last assistant message has an unresolved tool call (or the session file was truncated mid-write) |
 | Unclean | Red               | Same flagged state as Stale, but idle for more than an hour                                                             |
 | Quiet   | Hidden            | Cleanly-ended sessions older than 10 minutes; no dot is rendered                                                        |
-| Ended   | Green check       | Sidebar only: you [marked the row as ended](#mark-a-session-as-ended) and it has had no activity since                  |
+| Ended   | Hidden            | Sidebar only: you [marked the row as ended](#mark-a-session-as-ended) and it has had no activity since                  |
 
 The sidebar lists sessions by state: Working, Waiting, Idle, Stale, Quiet, then
 Unclean. Ended sessions sort with Quiet. Within a state, the session written to
@@ -427,12 +428,12 @@ Mark a session as ended when you are done with it, so the sidebar shows at a
 glance which sessions still need you. Hover the session in the sidebar, or tab
 to it, and click the circled check next to the star. You can also right-click
 the session and choose **Mark as ended**, or choose it from the session actions
-menu in the session header. The row's status dot becomes a small green check,
-and the row sorts with the Quiet sessions. When you use the check button, the
-row keeps its place until the pointer, or keyboard focus, leaves the sidebar
-list, so the next row does not slide under the pointer. To remove the mark,
-click the check button again, or choose **Unmark as ended**. Session end marks
-are unreleased.
+menu in the session header. The check next to the star fills in green and stays
+shown, like the star of a starred session. The row hides its status dot and
+sorts with the Quiet sessions. When you use the check button, the row keeps its
+place until the pointer, or keyboard focus, leaves the sidebar list, so the next
+row does not slide under the pointer. To remove the mark, click the check button
+again, or choose **Unmark as ended**. Session end marks are unreleased.
 
 A mark applies to the whole sidebar row, including the session's continuations
 and subagents, even ones the sidebar has not loaded or a filter such as
