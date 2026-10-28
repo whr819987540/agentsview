@@ -28,7 +28,8 @@ const folderService = SessionFoldersService as unknown as Record<
   | "getApiV1SessionFolders"
   | "postApiV1SessionFolders"
   | "patchApiV1SessionFoldersById"
-  | "putApiV1SessionFoldersByIdSessions",
+  | "putApiV1SessionFoldersByIdSessions"
+  | "postApiV1SessionFoldersRemoveSessions",
   ReturnType<typeof vi.fn>
 >;
 
@@ -207,6 +208,47 @@ describe("SessionList folders", () => {
     component = mount(SessionList, { target: document.body });
     await settle();
     expect(visibleSessionIds()).toEqual(["a2", "a1", "a3"]);
+  });
+
+  it("spaces an open folder's sessions from the unfiled ones only while it is open", async () => {
+    component = mount(SessionList, { target: document.body });
+    await settle();
+    expect(document.querySelector(".folder-gap")).toBeNull();
+
+    const folderRow = document.querySelector<HTMLButtonElement>(".folder-row")!;
+    folderRow.click();
+    await settle();
+    expect(document.querySelectorAll(".folder-gap")).toHaveLength(1);
+
+    folderRow.click();
+    await settle();
+    expect(document.querySelector(".folder-gap")).toBeNull();
+  });
+
+  it("takes a session out of its folder when it is dropped on the gap", async () => {
+    folderService.postApiV1SessionFoldersRemoveSessions.mockResolvedValue({
+      folders: [folder(1, "Docs", [])],
+      editable: true,
+    });
+    component = mount(SessionList, { target: document.body });
+    await settle();
+    document.querySelector<HTMLButtonElement>(".folder-row")!.click();
+    await settle();
+
+    sessionRow("a2").dispatchEvent(dragEvent("dragstart"));
+    const gap = document.querySelector<HTMLElement>(".folder-gap")!;
+    const over = dragEvent("dragover");
+    gap.dispatchEvent(over);
+    expect(over.defaultPrevented).toBe(true);
+
+    gap.dispatchEvent(dragEvent("drop"));
+    await settle();
+
+    expect(folderService.postApiV1SessionFoldersRemoveSessions).toHaveBeenCalledWith({
+      session_ids: ["a2"],
+    });
+    expect(folderRows()).toEqual(["Docs(0)"]);
+    expect(document.querySelector(".folder-gap")).toBeNull();
   });
 
   it("files a dragged session into the folder it is dropped on", async () => {
