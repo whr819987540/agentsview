@@ -117,8 +117,9 @@ Namespace runner 只有 upstream 有，fork 里用它的 job 会一直排队，�
 
 - `ci.yml` 和 `cjk-fts.yml` 的每个 job 加了
   `if: github.repository == 'kenn-io/agentsview'`，在 fork 里跳过。
-  `fork-checks.yml` 在 GitHub 托管 runner 上跑其中的 lint、Go、脚本和前端检查，
-  `fork-cjk-fts.yml` 跑 CJK FTS 检查，并沿用 `cjk-fts.yml` 的路径过滤。
+  `fork-checks.yml` 在 GitHub 托管 runner 上跑其中的 lint、Go、脚本、前端和
+  Playwright E2E 检查，`fork-cjk-fts.yml` 跑 CJK FTS 检查，并沿用 `cjk-fts.yml`
+  的路径过滤。
 - 桌面安装包（`desktop-artifacts.yml`、`desktop-artifacts-pr.yml` 和
   `.github/actions/build-desktop-artifact`）、`ci-macos-main.yml`、`fuzz.yml` 和
   `msys2-update-check.yml` 已经改用 GitHub 托管 runner。`msys2-update-check.yml`
@@ -127,6 +128,13 @@ Namespace runner 只有 upstream 有，fork 里用它的 job 会一直排队，�
   测试只在桌面构建里运行。
 - `.github/actionlint.yaml` 保留，因为 `ci.yml` 和 `cjk-fts.yml` 仍引用 Namespace
   标签。
+
+PR 只改了 Markdown 文件时，`fork-checks.yml` 不运行，也就不跑任何测试。
+`testdata/` 下的 Markdown 是解析器的测试输入，`plugins/` 下的 Markdown 随插件
+发布，改了它们仍会运行检查。GitHub 按整个 PR 相对分叉点的改动来判断，所以 PR
+里只要有代码改动，后面追加的纯文档提交照样触发检查。被路径过滤跳过的检查会一直
+显示 Pending：如果以后给 `main` 开分支保护并把这些检查设为必需，只改文档的 PR
+将无法合并。
 
 fork 只通过命令行安装 AgentsView，不发布桌面安装包，所以 `desktop-artifacts.yml`
 和 `desktop-macos-main.yml` 的 `build` job 也加了同样的 `if` 条件，在 fork 里跳过。
@@ -158,7 +166,9 @@ upstream 从 #2236（`65006001`）起把所有 job 改到了 GitHub 托管 runne
    整个 workflow 都重复时，删掉这个文件，并更新上文"基本做法"里提到它的那句话。
    `fork-checks.yml` 前端 job 里的生产构建（`npm run build`）是 fork 加的；
    upstream CI 没有这一步时，要把它保留下来，因为 Rolling Release 只构建
-   `main`。
+   `main`。只改 Markdown 时跳过检查的路径过滤也是 fork 加的；删掉整个
+   `fork-checks.yml` 后如果还想保留这个行为，就把这段过滤移到 `ci-pr.yml` 的
+   `pull_request` 触发条件上。
 
 ### 多语言文件
 
