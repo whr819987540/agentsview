@@ -1020,9 +1020,13 @@
           <SessionItem
             session={item.session}
             continuationCount={1}
+            endMarkGroup={item.branch
+              ? (item.group?.allSessions ?? item.group?.sessions)
+              : undefined}
             hideAgent={groupMode === "agent"}
             hideProject={groupMode === "project"}
             compact
+            branch={item.branch ?? false}
             depth={item.depth ?? 1}
             inset={item.inset ?? 0}
             isLastChild={item.isLastChild ?? false}
@@ -1037,6 +1041,7 @@
             (s) => s.id === item.group!.liveSessionId,
           )}
           {@const children = item.group.sessions.filter((s) => s.id !== item.group!.primarySessionId)}
+          {@const markGroup = item.group.allSessions ?? item.group.sessions}
           {@const groupHasSubagents = children.some((s) => isSubagentDescendant(s, item.group!.sessions))}
           {@const groupHasTeammates = children.some((s) => s.is_teammate ?? s.first_message?.includes("<teammate-message") ?? false)}
           {#if primary}
@@ -1050,7 +1055,8 @@
               groupSessions={item.group.sessions.length > 1
                 ? item.group.sessions
                 : undefined}
-              endMarkGroup={item.group.allSessions ?? item.group.sessions}
+              endMarkGroup={markGroup}
+              endMarkRoot={markGroup.find((s) => s.id === item.group!.key)}
               hideAgent={groupMode === "agent"}
               hideProject={groupMode === "project"}
               expanded={expandedGroups.has(item.group.key)}

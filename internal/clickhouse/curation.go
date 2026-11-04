@@ -39,7 +39,7 @@ func (s *Store) ListStarredSessionIDs(ctx context.Context) ([]string, error) {
 // held only marks still in effect.
 func (s *Store) ListSessionEndMarks(ctx context.Context) ([]db.SessionEndMark, error) {
 	rows, err := s.queryContext(ctx, `
-		SELECT session_id, activity_at FROM session_end_marks
+		SELECT session_id, activity_at, kind FROM session_end_marks
 		ORDER BY session_id`)
 	if err != nil {
 		return nil, fmt.Errorf("listing clickhouse session end marks: %w", err)
@@ -48,7 +48,7 @@ func (s *Store) ListSessionEndMarks(ctx context.Context) ([]db.SessionEndMark, e
 	marks := []db.SessionEndMark{}
 	for rows.Next() {
 		var mark db.SessionEndMark
-		if err := rows.Scan(&mark.SessionID, &mark.ActivityAt); err != nil {
+		if err := rows.Scan(&mark.SessionID, &mark.ActivityAt, &mark.Kind); err != nil {
 			return nil, err
 		}
 		marks = append(marks, mark)
@@ -57,11 +57,11 @@ func (s *Store) ListSessionEndMarks(ctx context.Context) ([]db.SessionEndMark, e
 }
 
 // MarkSessionEnded is refused: the mirror's marks come from the archive.
-func (s *Store) MarkSessionEnded(context.Context, string) (db.SessionEndMark, bool, error) {
+func (s *Store) MarkSessionEnded(context.Context, string, string) (db.SessionEndMark, bool, error) {
 	return db.SessionEndMark{}, false, db.ErrReadOnly
 }
 
-func (s *Store) UnmarkSessionEnded(context.Context, string) error {
+func (s *Store) UnmarkSessionEnded(context.Context, string, string) error {
 	return db.ErrReadOnly
 }
 

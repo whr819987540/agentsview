@@ -11,7 +11,11 @@
   } from "../../stores/read-progress.svelte.js";
   import { starred } from "../../stores/starred.svelte.js";
   import { sessionFolders } from "../../stores/sessionFolders.svelte.js";
-  import { rowSessions, sessionEndMarks } from "../../stores/sessionEndMarks.svelte.js";
+  import {
+    branchSessions,
+    rowSessions,
+    sessionEndMarks,
+  } from "../../stores/sessionEndMarks.svelte.js";
   import { formatRelativeTime, truncate } from "../../utils/format.js";
   import { agentColor as getAgentColor, agentLabel, entrypointBadge } from "../../utils/agents.js";
   import {
@@ -48,9 +52,14 @@
      * in parallel doesn't change that the parent is waiting). */
     groupSessions?: SessionGroupInput[];
     /** Every session of the row's group, including ones a filter such as
-     * starred-only hides. An end mark covers the whole row, so the row
-     * reads and changes its mark across all of them. */
+     * starred-only hides. A root row's end mark covers the whole row, so the
+     * row reads and changes its mark across all of them; a branch row's mark
+     * covers the branch's sessions among them. */
     endMarkGroup?: SessionGroupInput[];
+    /** The session a root row's end mark goes on: the group's root, so the
+     * row mark never lands on a fork that holds its own branch mark. Defaults
+     * to the shown session. */
+    endMarkRoot?: SessionGroupInput;
     /** The session whose parser status the dot reads, when it is not
      * the one the row shows. A continuation chain's row shows its root
      * but the state of its newest continuation. */
@@ -59,6 +68,10 @@
     hideProject?: boolean;
     /** Render in compact mode (smaller, used for child sessions). */
     compact?: boolean;
+    /** A compact child row that is a branch of the tree, such as a fork. It
+     * holds its own star and end mark; other child rows, such as subagents,
+     * hold neither. */
+    branch?: boolean;
     /** Whether this item's continuation chain is expanded. */
     expanded?: boolean;
     /** Callback to toggle continuation chain expand/collapse. */
@@ -88,10 +101,12 @@
     groupSessionIds,
     groupSessions,
     endMarkGroup,
+    endMarkRoot,
     statusSession,
     hideAgent = false,
     hideProject = false,
     compact = false,
+    branch = false,
     expanded = false,
     onToggleExpand,
     depth = 0,
@@ -110,9 +125,16 @@
     getSessionStatus(statusSession ?? session, groupSessions),
   );
 
-  let endMarkSessions = $derived(rowSessions(session, endMarkGroup ?? groupSessions));
-  // Child rows show their own live status; the parent row holds the mark.
-  let isEnded = $derived(!compact && sessionEndMarks.isEnded(endMarkSessions));
+  // Root rows and branch rows hold a star and an end mark; other child rows
+  // show their own live status and leave both to the row above them.
+  let hasMarks = $derived(!compact || branch);
+  let endMarkKind = $derived(compact && branch ? ("branch" as const) : ("row" as const));
+  let endMarkSessions = $derived(
+    endMarkKind === "branch"
+      ? branchSessions(session, endMarkGroup ?? groupSessions)
+      : rowSessions(endMarkRoot ?? session, endMarkGroup ?? groupSessions),
+  );
+  let isEnded = $derived(hasMarks && sessionEndMarks.isEnded(endMarkSessions, endMarkKind));
   // An ended row sorts as quiet, so its dot is quiet too; the filled end
   // button shows the mark.
   let dotStatus = $derived(isEnded ? "quiet" : sessionStatus);
@@ -220,8 +242,9 @@
   function handleEnd(e: MouseEvent) {
     e.stopPropagation();
     // Re-sorting at once would slide the next row, and its button, under
-    // the pointer, and move this button out from under focus.
-    sessionEndMarks.holdSortPlace(endMarkSessions);
+    // the pointer, and move this button out from under focus. Branch rows
+    // keep their order within the group.
+    if (endMarkKind === "row") sessionEndMarks.holdSortPlace(endMarkSessions);
     void toggleEnded();
   }
 
@@ -313,7 +336,7 @@
   async function toggleEnded() {
     closeContextMenu();
     try {
-      await sessionEndMarks.toggle(endMarkSessions);
+      await sessionEndMarks.toggle(endMarkSessions, endMarkKind);
     } catch {
       showFlash(m.session_end_mark_failed(), { tone: "danger" });
     }
@@ -598,7 +621,7 @@
     {/if}
   </div>
 
-  {#if !compact && sessionEndMarks.editable}
+  {#if hasMarks && sessionEndMarks.editable}
     <span class="end-slot" class:ended={isEnded}>
       <IconButton
         size="sm"
@@ -616,7 +639,7 @@
       </span>
     </span>
   {/if}
-  {#if !compact}
+  {#if hasMarks}
     <button
       class="star-btn"
       class:starred={isStarred}
@@ -674,7 +697,7 @@
         {m.sidebar_row_move_to_folder()}
       </button>
     {/if}
-    {#if !compact && sessionEndMarks.editable}
+    {#if hasMarks && sessionEndMarks.editable}
       <button class="context-menu-item" onclick={() => void toggleEnded()}>
         {isEnded ? m.session_end_mark_unmark() : m.session_end_mark_mark()}
       </button>

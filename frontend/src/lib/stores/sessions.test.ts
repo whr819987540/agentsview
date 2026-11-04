@@ -609,7 +609,9 @@ describe("SessionsStore", () => {
         getMarks.mockClear();
 
         // The row still ends with its mark: nothing to read.
-        sessionEndMarks.marks = new Map([["a", "2024-01-01T02:00:00Z"]]);
+        sessionEndMarks.marks = new Map([
+          ["a", { at: "2024-01-01T02:00:00Z", kind: "row" as const }],
+        ]);
         vi.mocked(api.getSidebarSessionIndex).mockResolvedValue({
           sessions: [makeSkinnyRow({ id: "a", ended_at: "2024-01-01T02:00:00Z" })],
           total: 1,
@@ -3090,11 +3092,13 @@ describe("buildSessionGroups", () => {
     const order = () => buildSessionGroups(rows as any).map((g) => g.primarySessionId);
 
     try {
-      sessionEndMarks.marks = new Map([["marked", markedEnd]]);
+      sessionEndMarks.marks = new Map([["marked", { at: markedEnd, kind: "row" as const }]]);
       expect(order()).toEqual(["idle", "marked", "quiet"]);
 
       // The session wrote again after it was marked.
-      sessionEndMarks.marks = new Map([["marked", isoAgo(10 * 60 * 1000)]]);
+      sessionEndMarks.marks = new Map([
+        ["marked", { at: isoAgo(10 * 60 * 1000), kind: "row" as const }],
+      ]);
       expect(order()).toEqual(["marked", "idle", "quiet"]);
     } finally {
       sessionEndMarks.marks = new Map();

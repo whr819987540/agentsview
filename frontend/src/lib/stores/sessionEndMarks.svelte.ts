@@ -3,9 +3,25 @@ import { SessionEndMarksService } from "../api/generated/index";
 /** The fields of a session that an end mark is compared with. */
 export interface EndMarkSession {
   id: string;
+  parent_session_id?: string | null;
   ended_at?: string | null;
   started_at?: string | null;
   created_at?: string;
+}
+
+/**
+ * What an end mark covers. A row mark covers a whole sidebar row: the
+ * session tree under its root. A branch mark covers one child row of that
+ * tree, such as a fork: the session and its descendants. Each kind is read
+ * and changed on its own, so marking a fork leaves its row unmarked.
+ */
+export type EndMarkKind = "row" | "branch";
+
+/** A mark as the store holds it. */
+export interface EndMark {
+  /** The covered sessions' latest activity when the mark was set. */
+  at: string;
+  kind: EndMarkKind;
 }
 
 /** Delays before retrying a failed read of the marks. */
@@ -28,6 +44,31 @@ export function rowSessions<T extends EndMarkSession>(shown: T, group?: T[]): T[
   return [shown, ...group.filter((s) => s.id !== shown.id)];
 }
 
+/** The sessions a branch mark on `shown` covers: the session first, then
+ *  its descendants in `group` through parent_session_id, as the server
+ *  walks them. */
+export function branchSessions<T extends EndMarkSession>(shown: T, group?: T[]): T[] {
+  if (!group) return [shown];
+  const children = new Map<string, T[]>();
+  for (const s of group) {
+    const parent = s.parent_session_id;
+    if (!parent || s.id === shown.id) continue;
+    const list = children.get(parent);
+    if (list) list.push(s);
+    else children.set(parent, [s]);
+  }
+  const out = [shown];
+  const seen = new Set([shown.id]);
+  for (let i = 0; i < out.length; i++) {
+    for (const child of children.get(out[i]!.id) ?? []) {
+      if (seen.has(child.id)) continue;
+      seen.add(child.id);
+      out.push(child);
+    }
+  }
+  return out;
+}
+
 /** The latest activity across sessions. */
 export function lastActivity(sessions: EndMarkSession[]): string {
   let latest = "";
@@ -44,14 +85,15 @@ export function lastActivity(sessions: EndMarkSession[]): string {
 }
 
 /**
- * Sidebar rows the user marked as ended. A mark holds its row's latest
- * activity when it was set, and stops counting once the row has newer
- * activity, so a resumed session no longer shows as ended.
+ * Sidebar rows the user marked as ended. A mark holds its sessions' latest
+ * activity when it was set, and stops counting once they have newer
+ * activity, so a resumed session no longer shows as ended. A session holds
+ * at most one mark, of either kind.
  */
 class SessionEndMarksStore {
-  /** The activity time of each marked session: the server's marks with
-   *  this client's unfinished changes applied. */
-  marks: Map<string, string> = $state(new Map());
+  /** The mark on each marked session: the server's marks with this
+   *  client's unfinished changes applied. */
+  marks: Map<string, EndMark> = $state(new Map());
   /** False on read-only servers: marks cannot change. */
   editable: boolean = $state(false);
   /** Rows toggled from their sidebar button, by shown session, with
@@ -60,10 +102,10 @@ class SessionEndMarksStore {
    *  not slide under the pointer. */
   sortHolds: Map<string, boolean> = $state(new Map());
   /** The server's marks as last read or written. */
-  private confirmed = new Map<string, string>();
+  private confirmed = new Map<string, EndMark>();
   /** Each session's latest change whose request has not finished: the
-   *  mark's activity time, or null to remove it. */
-  private intents = new Map<string, string | null>();
+   *  mark, or null to remove it. */
+  private intents = new Map<string, EndMark | null>();
   /** Each session's request chain, so its requests reach the server in
    *  the order the user made them. */
   private queues = new Map<string, Promise<void>>();
@@ -96,11 +138,17 @@ class SessionEndMarksStore {
     while (this.readWanted) {
       this.readWanted = false;
       const writes = this.writes;
-      let marks: Map<string, string>;
+      let marks: Map<string, EndMark>;
       let editable: boolean;
       try {
         const res = await SessionEndMarksService.getApiV1SessionEndMarks();
-        marks = new Map(res.marks.map((mark) => [mark.session_id, mark.activity_at]));
+        marks = new Map(
+          res.marks.map((mark) => [
+            mark.session_id,
+            // A server from before kinds sends none; all its marks cover a row.
+            { at: mark.activity_at, kind: mark.kind === "branch" ? "branch" : "row" },
+          ]),
+        );
         editable = res.editable;
       } catch {
         // A failed request or a malformed answer keeps the current marks;
@@ -120,9 +168,10 @@ class SessionEndMarksStore {
 
   /**
    * Read the marks again after the sidebar loaded these rows, when the
-   * first read never succeeded or when a row has a mark it has outlived.
-   * The server deletes an outlived mark; keeping it here would bring the
-   * check back if the newer session left the row, such as into the trash.
+   * first read never succeeded or when a row or one of its branches has a
+   * mark it has outlived. The server deletes an outlived mark; keeping it
+   * here would bring the check back if the newer session left the row, such
+   * as into the trash.
    */
   syncWithRows(rows: EndMarkSession[][]): void {
     if (!this.loaded) {
@@ -131,7 +180,13 @@ class SessionEndMarksStore {
     }
     if (this.marks.size === 0) return;
     const outlived = rows.some(
-      (row) => row.some((s) => this.marks.has(s.id)) && !this.isEnded(row),
+      (row) =>
+        (row.some((s) => this.marks.get(s.id)?.kind === "row") && !this.isEnded(row)) ||
+        row.some(
+          (s) =>
+            this.marks.get(s.id)?.kind === "branch" &&
+            !this.isEnded(branchSessions(s, row), "branch"),
+        ),
     );
     if (outlived) void this.refresh();
   }
@@ -147,21 +202,27 @@ class SessionEndMarksStore {
 
   private show() {
     const next = new Map(this.confirmed);
-    for (const [id, at] of this.intents) {
-      if (at === null) next.delete(id);
-      else next.set(id, at);
+    for (const [id, mark] of this.intents) {
+      if (mark === null) next.delete(id);
+      else next.set(id, mark);
     }
     this.marks = next;
   }
 
-  /** Whether a row standing for these sessions shows as ended: one of
-   *  them is marked, and none has activity after the newest mark. */
-  isEnded(sessions: EndMarkSession[]): boolean {
+  /**
+   * Whether a row standing for these sessions shows as ended. A row is
+   * ended when one of its sessions holds a row mark and none has activity
+   * after the newest one. A branch, listed by branchSessions, is ended when
+   * its first session holds a branch mark and none of its sessions has
+   * activity after it. Marks of the other kind do not count.
+   */
+  isEnded(sessions: EndMarkSession[], kind: EndMarkKind = "row"): boolean {
     if (this.marks.size === 0) return false;
     let markMs: number | null = null;
-    for (const s of sessions) {
-      const at = this.marks.get(s.id);
-      if (at !== undefined) markMs = Math.max(markMs ?? -Infinity, timeMs(at));
+    const candidates = kind === "branch" ? sessions.slice(0, 1) : sessions;
+    for (const s of candidates) {
+      const mark = this.marks.get(s.id);
+      if (mark?.kind === kind) markMs = Math.max(markMs ?? -Infinity, timeMs(mark.at));
     }
     if (markMs === null) return false;
     const latest = markMs;
@@ -191,30 +252,36 @@ class SessionEndMarksStore {
     return this.isEnded(sessions);
   }
 
-  /** Mark the row if it is not ended, else remove its marks. */
-  toggle(sessions: EndMarkSession[]): Promise<void> {
-    return this.isEnded(sessions) ? this.unmark(sessions) : this.mark(sessions);
+  /** Mark the row or branch if it is not ended, else remove its marks. */
+  toggle(sessions: EndMarkSession[], kind: EndMarkKind = "row"): Promise<void> {
+    return this.isEnded(sessions, kind) ? this.unmark(sessions, kind) : this.mark(sessions, kind);
   }
 
-  /** Mark a row's sessions as ended. The mark goes on the first session,
-   *  the one the row shows, and the server stamps it with the whole row's
-   *  latest activity, including sessions this client has not loaded. */
-  mark(sessions: EndMarkSession[]): Promise<void> {
+  /** Mark a row's or branch's sessions as ended. The mark goes on the first
+   *  session, replacing a mark of the other kind there, and the server
+   *  stamps it with the covered sessions' latest activity, including
+   *  sessions this client has not loaded. */
+  mark(sessions: EndMarkSession[], kind: EndMarkKind = "row"): Promise<void> {
     const first = sessions[0];
     if (!first) return Promise.resolve();
-    return this.change(first.id, lastActivity(sessions), async () => {
-      const mark = await SessionEndMarksService.putApiV1SessionsByIdEnded({ id: first.id });
-      this.confirmed.set(mark.session_id, mark.activity_at);
+    return this.change(first.id, { at: lastActivity(sessions), kind }, async () => {
+      const mark = await SessionEndMarksService.putApiV1SessionsByIdEnded(
+        { id: first.id },
+        { kind },
+      );
+      this.confirmed.set(mark.session_id, { at: mark.activity_at, kind });
     });
   }
 
-  /** Remove every mark on a row's sessions. */
-  async unmark(sessions: EndMarkSession[]): Promise<void> {
-    const ids = sessions.map((s) => s.id).filter((id) => this.marks.has(id));
+  /** Remove a row's row marks, or a branch's mark on its first session.
+   *  Marks of the other kind stay. */
+  async unmark(sessions: EndMarkSession[], kind: EndMarkKind = "row"): Promise<void> {
+    const candidates = kind === "branch" ? sessions.slice(0, 1) : sessions;
+    const ids = candidates.map((s) => s.id).filter((id) => this.marks.get(id)?.kind === kind);
     await Promise.all(
       ids.map((id) =>
         this.change(id, null, async () => {
-          await SessionEndMarksService.deleteApiV1SessionsByIdEnded({ id });
+          await SessionEndMarksService.deleteApiV1SessionsByIdEnded({ id }, { kind });
           this.confirmed.delete(id);
         }),
       ),
@@ -227,7 +294,7 @@ class SessionEndMarksStore {
    * shows the server's state, so a failed change does not linger. Once no
    * request is left, the marks are read again to catch any other drift.
    */
-  private change(id: string, intent: string | null, request: () => Promise<void>): Promise<void> {
+  private change(id: string, intent: EndMark | null, request: () => Promise<void>): Promise<void> {
     this.intents.set(id, intent);
     this.show();
     const sent = (this.queues.get(id) ?? Promise.resolve()).then(request);

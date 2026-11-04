@@ -7,26 +7,45 @@ import (
 	"fmt"
 )
 
+// End mark kinds say which sessions a mark covers.
+const (
+	// EndMarkRow covers the marked session's whole sidebar row: its
+	// topmost ancestor and every descendant with messages.
+	EndMarkRow = "row"
+	// EndMarkBranch covers one branch row of the session tree, such as a
+	// fork: the marked session and its descendants with messages. It
+	// leaves the rest of the row unmarked.
+	EndMarkBranch = "branch"
+)
+
+// ValidEndMarkKind reports whether kind names an end mark kind.
+func ValidEndMarkKind(kind string) bool {
+	return kind == EndMarkRow || kind == EndMarkBranch
+}
+
 // SessionEndMark records that the user marked a session as ended. The mark
-// covers the session's whole sidebar row and holds the row's latest
-// activity when it was set, so the mark stops counting once the row has
-// newer activity.
+// covers the sessions its kind names and holds their latest activity when
+// it was set, so the mark stops counting once they have newer activity. A
+// session holds at most one mark.
 type SessionEndMark struct {
 	SessionID  string `json:"session_id"`
 	ActivityAt string `json:"activity_at"`
+	Kind       string `json:"kind" enum:"row,branch"`
 }
 
-// endMarkLatestCTE computes, for each session that marked yields, the
-// latest activity of its sidebar row: the topmost ancestor reachable
-// through parent_session_id and every descendant with messages. Trashed
-// sessions count, since their activity still happened after any mark made
-// before it. A parent cycle has no top, so the marked session seeds its
-// own row. latest(mark_id, at) holds the row's newest activity time as
-// stored, compared by instant rather than by text.
+// endMarkLatestCTE computes, for each session that marked(mark_id, kind)
+// yields, the latest activity of the sessions its mark covers. A row mark
+// covers the topmost ancestor reachable through parent_session_id and every
+// descendant with messages; a branch mark covers the marked session and its
+// descendants with messages. Trashed sessions count, since their activity
+// still happened after any mark made before it. A parent cycle has no top,
+// so the marked session seeds its own row. latest(mark_id, at) holds the
+// newest activity time as stored, compared by instant rather than by text.
 const endMarkLatestCTE = `
 	up(mark_id, id, parent_id) AS (
 		SELECT m.mark_id, s.id, s.parent_session_id
 		FROM marked m JOIN sessions s ON s.id = m.mark_id
+		WHERE m.kind = 'row'
 		UNION
 		SELECT u.mark_id, p.id, p.parent_session_id
 		FROM up u JOIN sessions p ON p.id = u.parent_id
@@ -61,10 +80,10 @@ const endMarkLatestCTE = `
 func (db *DB) SessionEndMarksEditable(context.Context) bool { return !db.readOnly }
 
 // ListSessionEndMarks returns the end marks still in effect, ordered by
-// session ID. A mark stops being in effect once its row has activity after
-// it, or when it holds no readable time; a writable archive deletes those
-// marks, so trashing or deleting the newer session does not bring the mark
-// back.
+// session ID. A mark stops being in effect once the sessions it covers have
+// activity after it, or when it holds no readable time; a writable archive
+// deletes those marks, so trashing or deleting the newer session does not
+// bring the mark back.
 func (db *DB) ListSessionEndMarks(ctx context.Context) ([]SessionEndMark, error) {
 	return db.ListSessionEndMarksForScope(ctx, nil, nil)
 }
@@ -77,11 +96,11 @@ func (db *DB) ListSessionEndMarksForScope(
 ) ([]SessionEndMark, error) {
 	where, args := curationScopeWhere("s", projects, excludeProjects)
 	rows, err := db.getReader().QueryContext(ctx, `
-		WITH RECURSIVE marked(mark_id) AS (
-			SELECT m.session_id FROM session_end_marks m
+		WITH RECURSIVE marked(mark_id, kind) AS (
+			SELECT m.session_id, m.kind FROM session_end_marks m
 			JOIN sessions s ON s.id = m.session_id`+where+`
 		),`+endMarkLatestCTE+`
-		SELECT m.session_id, m.activity_at,
+		SELECT m.session_id, m.activity_at, m.kind,
 			julianday(m.activity_at) IS NULL
 				OR COALESCE(julianday(l.at) > julianday(m.activity_at), 0)
 		FROM marked k
@@ -97,7 +116,7 @@ func (db *DB) ListSessionEndMarksForScope(
 	for rows.Next() {
 		var mark SessionEndMark
 		var stale bool
-		if err := rows.Scan(&mark.SessionID, &mark.ActivityAt, &stale); err != nil {
+		if err := rows.Scan(&mark.SessionID, &mark.ActivityAt, &mark.Kind, &stale); err != nil {
 			return nil, fmt.Errorf("scanning session end mark: %w", err)
 		}
 		if stale {
@@ -142,30 +161,36 @@ func (db *DB) deleteOutdatedSessionEndMarks(
 	return tx.Commit()
 }
 
-// MarkSessionEnded marks a session's sidebar row as ended as of the row's
-// latest activity, replacing an earlier mark on the session. The server
-// reads that activity from the whole row, so a client that loaded only
-// part of the row still marks all of it. It returns false when the session
-// does not exist.
+// MarkSessionEnded marks the sessions a mark of the given kind covers as
+// ended as of their latest activity, replacing an earlier mark of either
+// kind on the session. The server reads that activity from every covered
+// session, so a client that loaded only some of them still marks all of
+// them. It returns false when the session does not exist.
 func (db *DB) MarkSessionEnded(
-	ctx context.Context, sessionID string,
+	ctx context.Context, sessionID, kind string,
 ) (SessionEndMark, bool, error) {
+	if !ValidEndMarkKind(kind) {
+		return SessionEndMark{}, false, fmt.Errorf("unknown end mark kind %q", kind)
+	}
 	if err := db.requireWritable(); err != nil {
 		return SessionEndMark{}, false, err
 	}
 
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	mark := SessionEndMark{SessionID: sessionID}
+	mark := SessionEndMark{SessionID: sessionID, Kind: kind}
 	err := db.getWriter().QueryRow(ctx, `
-		WITH RECURSIVE marked(mark_id) AS (SELECT ?),`+endMarkLatestCTE+`
-		INSERT INTO session_end_marks (session_id, activity_at)
-		SELECT mark_id, at FROM latest WHERE at IS NOT NULL
+		WITH RECURSIVE marked(mark_id, kind) AS (SELECT ?, ?),`+endMarkLatestCTE+`
+		INSERT INTO session_end_marks (session_id, activity_at, kind)
+		SELECT l.mark_id, l.at, m.kind
+		FROM latest l JOIN marked m ON m.mark_id = l.mark_id
+		WHERE l.at IS NOT NULL
 		ON CONFLICT(session_id) DO UPDATE SET
 			activity_at = excluded.activity_at,
+			kind = excluded.kind,
 			created_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
 		RETURNING activity_at`,
-		sessionID,
+		sessionID, kind,
 	).Scan(&mark.ActivityAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return SessionEndMark{}, false, nil
@@ -177,9 +202,13 @@ func (db *DB) MarkSessionEnded(
 	return mark, true, nil
 }
 
-// UnmarkSessionEnded removes a session's end mark. Removing a mark that does
-// not exist succeeds.
-func (db *DB) UnmarkSessionEnded(ctx context.Context, sessionID string) error {
+// UnmarkSessionEnded removes a session's end mark when it has the given
+// kind, and keeps a mark of the other kind. Removing a mark that does not
+// exist succeeds.
+func (db *DB) UnmarkSessionEnded(ctx context.Context, sessionID, kind string) error {
+	if !ValidEndMarkKind(kind) {
+		return fmt.Errorf("unknown end mark kind %q", kind)
+	}
 	if err := db.requireWritable(); err != nil {
 		return err
 	}
@@ -187,7 +216,8 @@ func (db *DB) UnmarkSessionEnded(ctx context.Context, sessionID string) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	if _, err := db.getWriter().Exec(ctx,
-		`DELETE FROM session_end_marks WHERE session_id = ?`, sessionID,
+		`DELETE FROM session_end_marks WHERE session_id = ? AND kind = ?`,
+		sessionID, kind,
 	); err != nil {
 		return fmt.Errorf("unmarking session %s ended: %w", sessionID, err)
 	}

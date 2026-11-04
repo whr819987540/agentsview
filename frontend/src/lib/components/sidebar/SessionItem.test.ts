@@ -5,6 +5,7 @@ import { createClassComponent } from "svelte/legacy";
 import SessionItem from "./SessionItem.svelte";
 import { sessions } from "../../stores/sessions.svelte.js";
 import { sessionEndMarks } from "../../stores/sessionEndMarks.svelte.js";
+import { starred } from "../../stores/starred.svelte.js";
 
 let component: ReturnType<typeof mount> | undefined;
 
@@ -184,7 +185,9 @@ describe("SessionItem end mark", () => {
 
   it("fills the end button while the mark holds and leaves the title alone", () => {
     sessionEndMarks.editable = true;
-    sessionEndMarks.marks = new Map([["root", "2024-01-01T01:00:00Z"]]);
+    sessionEndMarks.marks = new Map([
+      ["root", { at: "2024-01-01T01:00:00Z", kind: "row" as const }],
+    ]);
     mountRow();
 
     const slot = document.querySelector<HTMLElement>(".end-slot");
@@ -196,7 +199,9 @@ describe("SessionItem end mark", () => {
   });
 
   it("shows the mark in the end button's place when marks cannot change", () => {
-    sessionEndMarks.marks = new Map([["root", "2024-01-01T01:00:00Z"]]);
+    sessionEndMarks.marks = new Map([
+      ["root", { at: "2024-01-01T01:00:00Z", kind: "row" as const }],
+    ]);
     mountRow();
 
     const mark = document.querySelector<HTMLElement>(".end-slot.ended [role='img']");
@@ -206,7 +211,9 @@ describe("SessionItem end mark", () => {
   });
 
   it("shows the live status again once the row has newer activity", () => {
-    sessionEndMarks.marks = new Map([["root", "2024-01-01T01:00:00Z"]]);
+    sessionEndMarks.marks = new Map([
+      ["root", { at: "2024-01-01T01:00:00Z", kind: "row" as const }],
+    ]);
     mountRow({ groupSessions: [root, continuation], statusSession: continuation });
 
     expect(document.querySelector(".end-slot")).toBeNull();
@@ -222,20 +229,24 @@ describe("SessionItem end mark", () => {
     openContextMenu();
     menuItem("Mark as ended")!.click();
     flushSync();
-    expect(mark).toHaveBeenCalledWith([root, continuation]);
+    expect(mark).toHaveBeenCalledWith([root, continuation], "row");
     expect(document.querySelector(".context-menu")).toBeNull();
 
-    sessionEndMarks.marks = new Map([["root", "2024-01-01T03:00:00Z"]]);
+    sessionEndMarks.marks = new Map([
+      ["root", { at: "2024-01-01T03:00:00Z", kind: "row" as const }],
+    ]);
     flushSync();
     openContextMenu();
     expect(menuItem("Mark as ended")).toBeUndefined();
     menuItem("Unmark as ended")!.click();
-    expect(unmark).toHaveBeenCalledWith([root, continuation]);
+    expect(unmark).toHaveBeenCalledWith([root, continuation], "row");
   });
 
   it("leaves marking to the parent row on child rows", () => {
     sessionEndMarks.editable = true;
-    sessionEndMarks.marks = new Map([["root", "2024-01-01T01:00:00Z"]]);
+    sessionEndMarks.marks = new Map([
+      ["root", { at: "2024-01-01T01:00:00Z", kind: "row" as const }],
+    ]);
     mountRow({ compact: true, depth: 1 });
 
     expect(document.querySelector(".end-slot")).toBeNull();
@@ -266,14 +277,16 @@ describe("SessionItem end mark", () => {
     expect(rowButton("Unmark as ended")).toBeNull();
     expect(slot.classList.contains("ended")).toBe(false);
     rowButton("Mark as ended")!.click();
-    expect(mark).toHaveBeenCalledWith([root, continuation]);
+    expect(mark).toHaveBeenCalledWith([root, continuation], "row");
 
-    sessionEndMarks.marks = new Map([["root", "2024-01-01T03:00:00Z"]]);
+    sessionEndMarks.marks = new Map([
+      ["root", { at: "2024-01-01T03:00:00Z", kind: "row" as const }],
+    ]);
     flushSync();
     expect(rowButton("Mark as ended")).toBeNull();
     expect(slot.classList.contains("ended")).toBe(true);
     rowButton("Unmark as ended")!.click();
-    expect(unmark).toHaveBeenCalledWith([root, continuation]);
+    expect(unmark).toHaveBeenCalledWith([root, continuation], "row");
     expect(select).not.toHaveBeenCalled();
   });
 
@@ -286,5 +299,141 @@ describe("SessionItem end mark", () => {
     sessionEndMarks.editable = true;
     mountRow({ compact: true, depth: 1 });
     expect(rowButton("Mark as ended")).toBeNull();
+    expect(document.querySelector(".star-btn")).toBeNull();
+  });
+
+  it("puts a row's mark on the group's root when a filter shows another session", () => {
+    sessionEndMarks.editable = true;
+    const mark = vi.spyOn(sessionEndMarks, "mark").mockResolvedValue();
+    // A starred-only filter left only the continuation to show.
+    mountRow({
+      session: continuation,
+      endMarkGroup: [continuation, root],
+      endMarkRoot: root,
+    });
+
+    rowButton("Mark as ended")!.click();
+    expect(mark).toHaveBeenCalledWith([root, continuation], "row");
+  });
+});
+
+describe("SessionItem branch row marks", () => {
+  const root = {
+    id: "root",
+    project: "project",
+    machine: "local",
+    agent: "claude",
+    first_message: "Refactor the exporter",
+    started_at: "2024-01-01T00:00:00Z",
+    ended_at: "2024-01-01T01:00:00Z",
+    created_at: "2024-01-01T00:00:00Z",
+    termination_status: "truncated",
+    message_count: 4,
+    user_message_count: 2,
+  };
+  const fork = {
+    ...root,
+    id: "fork",
+    parent_session_id: "root",
+    relationship_type: "fork",
+    first_message: "Try the other exporter",
+    started_at: "2024-01-01T01:10:00Z",
+    ended_at: "2024-01-01T01:30:00Z",
+  };
+  const forkSub = {
+    ...root,
+    id: "forksub",
+    parent_session_id: "fork",
+    relationship_type: "subagent",
+    started_at: "2024-01-01T01:15:00Z",
+    ended_at: "2024-01-01T01:40:00Z",
+  };
+  const sibling = {
+    ...root,
+    id: "sibling",
+    parent_session_id: "root",
+    relationship_type: "fork",
+    started_at: "2024-01-01T02:00:00Z",
+    ended_at: "2024-01-01T03:00:00Z",
+  };
+  const group = [root, fork, forkSub, sibling];
+
+  afterEach(() => {
+    sessionEndMarks.marks = new Map();
+    sessionEndMarks.editable = false;
+    starred.ids = new Set();
+    vi.restoreAllMocks();
+  });
+
+  function mountChild(props: Record<string, unknown> = {}) {
+    component = mount(SessionItem, {
+      target: document.body,
+      props: { session: fork, compact: true, depth: 1, endMarkGroup: group, ...props },
+    });
+    flushSync();
+  }
+
+  function rowButton(label: string): HTMLButtonElement | null {
+    return document.querySelector<HTMLButtonElement>(`.session-item button[aria-label="${label}"]`);
+  }
+
+  it("marks and unmarks a fork's own branch from its row", () => {
+    sessionEndMarks.editable = true;
+    const mark = vi.spyOn(sessionEndMarks, "mark").mockResolvedValue();
+    const unmark = vi.spyOn(sessionEndMarks, "unmark").mockResolvedValue();
+    const hold = vi.spyOn(sessionEndMarks, "holdSortPlace");
+    mountChild({ branch: true });
+
+    rowButton("Mark as ended")!.click();
+    expect(mark).toHaveBeenCalledWith([fork, forkSub], "branch");
+    expect(hold).not.toHaveBeenCalled();
+
+    sessionEndMarks.marks = new Map([
+      ["fork", { at: "2024-01-01T01:40:00Z", kind: "branch" as const }],
+    ]);
+    flushSync();
+    expect(document.querySelector(".end-slot")?.classList.contains("ended")).toBe(true);
+    expect(document.querySelector(".status-slot .kit-status-dot--quiet")).not.toBeNull();
+    rowButton("Unmark as ended")!.click();
+    expect(unmark).toHaveBeenCalledWith([fork, forkSub], "branch");
+  });
+
+  it("reads only the fork's branch mark, not its row's", () => {
+    sessionEndMarks.editable = true;
+    sessionEndMarks.marks = new Map([
+      ["root", { at: "2024-01-01T03:00:00Z", kind: "row" as const }],
+    ]);
+    mountChild({ branch: true });
+
+    expect(document.querySelector(".end-slot")?.classList.contains("ended")).toBe(false);
+    expect(rowButton("Mark as ended")).not.toBeNull();
+  });
+
+  it("stars and unstars a fork from its row", () => {
+    const toggle = vi.spyOn(starred, "toggle").mockImplementation(() => {});
+    const select = vi.spyOn(sessions, "selectSession").mockImplementation(() => {});
+    mountChild({ branch: true });
+
+    rowButton("Star session")!.click();
+    expect(toggle).toHaveBeenCalledWith("fork");
+    expect(select).not.toHaveBeenCalled();
+
+    starred.ids = new Set(["fork"]);
+    flushSync();
+    expect(document.querySelector(".star-btn")?.classList.contains("starred")).toBe(true);
+    expect(rowButton("Unstar session")).not.toBeNull();
+  });
+
+  it("gives subagent rows neither a star nor an end mark", () => {
+    sessionEndMarks.editable = true;
+    sessionEndMarks.marks = new Map([
+      ["forksub", { at: "2024-01-01T01:40:00Z", kind: "branch" as const }],
+    ]);
+    starred.ids = new Set(["forksub"]);
+    mountChild({ session: forkSub, depth: 2 });
+
+    expect(document.querySelector(".star-btn")).toBeNull();
+    expect(document.querySelector(".end-slot")).toBeNull();
+    expect(document.querySelector(".status-slot .kit-status-dot--quiet")).toBeNull();
   });
 });

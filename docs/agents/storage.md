@@ -327,13 +327,24 @@ Keep identity-only corrections in the reporting digest. The wire contract is in
 
 ### Session end marks
 
-A session end mark covers a sidebar row: the marked session's topmost ancestor
-through `parent_session_id` and every descendant with messages, trashed ones
-included. Each backend keeps the same behavior:
+A session end mark has a `kind` that says which sessions it covers. Both kinds
+count descendants through `parent_session_id` that have messages, trashed ones
+included:
+
+| Kind     | Covers                                                                                 | Set from                   |
+| -------- | -------------------------------------------------------------------------------------- | -------------------------- |
+| `row`    | The marked session's topmost ancestor and every descendant: the whole sidebar row.     | A root row in the sidebar  |
+| `branch` | The marked session and its descendants, not its ancestors or siblings, such as a fork. | A fork or continuation row |
+
+A session holds at most one mark, so marking it with one kind replaces a mark
+of the other. Unmarking removes only a mark of the requested kind. The client
+puts a row mark on the group's root, so it does not replace a fork's branch
+mark. Marks from before kinds, and tables a role could not migrate, count as
+`row`. Each backend keeps the same behavior:
 
 | Backend           | Marks                                                                                                         |
 | ----------------- | ------------------------------------------------------------------------------------------------------------- |
-| SQLite archive    | Writable. A mark stores the row's latest activity; listing deletes marks whose row has newer activity.        |
+| SQLite archive    | Writable. A mark stores its sessions' latest activity; listing deletes marks they have outlived.              |
 | PostgreSQL        | Writable through `pg serve`, like stars, with the same row walk and cleanup. `pg push` does not copy them.    |
 | DuckDB mirror     | Read-only copy of the marks in effect, written by the curation refresh of `duckdb push`.                      |
 | ClickHouse        | Read-only copy of the marks in effect, written by the curation refresh of `clickhouse push`.                  |

@@ -2647,11 +2647,17 @@ components:
       properties:
         activity_at:
           type: string
+        kind:
+          enum:
+            - row
+            - branch
+          type: string
         session_id:
           type: string
       required:
         - session_id
         - activity_at
+        - kind
       type: object
     DbSessionFolder:
       additionalProperties: false
@@ -19478,6 +19484,17 @@ paths:
           schema:
             description: Session ID
             type: string
+        - description: "What the mark covers: row for the session's whole sidebar row, branch for the session and its descendants"
+          explode: false
+          in: query
+          name: kind
+          schema:
+            default: row
+            description: "What the mark covers: row for the session's whole sidebar row, branch for the session and its descendants"
+            enum:
+              - row
+              - branch
+            type: string
       responses:
         "204":
           description: No Content
@@ -19559,6 +19576,17 @@ paths:
           required: true
           schema:
             description: Session ID
+            type: string
+        - description: "What the mark covers: row for the session's whole sidebar row, branch for the session and its descendants"
+          explode: false
+          in: query
+          name: kind
+          schema:
+            default: row
+            description: "What the mark covers: row for the session's whole sidebar row, branch for the session and its descendants"
+            enum:
+              - row
+              - branch
             type: string
       responses:
         "200":

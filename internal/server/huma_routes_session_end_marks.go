@@ -19,6 +19,12 @@ func (s *Server) registerSessionEndMarkRoutes() {
 	s.deleteRoute(group, "/sessions/{id}/ended", "Unmark session ended", s.humaUnmarkSessionEnded)
 }
 
+// sessionEndMarkInput names the session and the kind of mark to change.
+type sessionEndMarkInput struct {
+	ID   string `path:"id" required:"true" doc:"Session ID"`
+	Kind string `query:"kind" enum:"row,branch" default:"row" doc:"What the mark covers: row for the session's whole sidebar row, branch for the session and its descendants"`
+}
+
 type sessionEndMarksResponse struct {
 	Marks []db.SessionEndMark `json:"marks"`
 	// Editable is false when marks cannot change here, such as on a
@@ -60,13 +66,13 @@ func (s *Server) humaListSessionEndMarks(
 
 func (s *Server) humaMarkSessionEnded(
 	ctx context.Context,
-	in *idPathInput,
+	in *sessionEndMarkInput,
 ) (*jsonOutput[db.SessionEndMark], error) {
 	store, ok := s.endMarkStore()
 	if !ok {
 		return nil, handleHumaReadOnly(db.ErrReadOnly)
 	}
-	mark, ok, err := store.MarkSessionEnded(ctx, in.ID)
+	mark, ok, err := store.MarkSessionEnded(ctx, in.ID, in.Kind)
 	if err != nil {
 		if handled := handleHumaReadOnly(err); handled != nil {
 			return nil, handled
@@ -81,13 +87,13 @@ func (s *Server) humaMarkSessionEnded(
 
 func (s *Server) humaUnmarkSessionEnded(
 	ctx context.Context,
-	in *idPathInput,
+	in *sessionEndMarkInput,
 ) (*noContentOutput, error) {
 	store, ok := s.endMarkStore()
 	if !ok {
 		return nil, handleHumaReadOnly(db.ErrReadOnly)
 	}
-	if err := store.UnmarkSessionEnded(ctx, in.ID); err != nil {
+	if err := store.UnmarkSessionEnded(ctx, in.ID, in.Kind); err != nil {
 		if handled := handleHumaReadOnly(err); handled != nil {
 			return nil, handled
 		}

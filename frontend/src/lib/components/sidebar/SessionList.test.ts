@@ -622,7 +622,9 @@ describe("SessionList visible hydration", () => {
 
     it("shows a mark on a hidden root and removes it", async () => {
       starred.ids = new Set(["cont"]);
-      sessionEndMarks.marks = new Map([["root", "2024-01-01T03:00:00Z"]]);
+      sessionEndMarks.marks = new Map([
+        ["root", { at: "2024-01-01T03:00:00Z", kind: "row" as const }],
+      ]);
       const unmark = vi.spyOn(sessionEndMarks, "unmark").mockResolvedValue();
 
       component = mount(SessionList, { target: document.body });
@@ -653,7 +655,9 @@ describe("SessionList visible hydration", () => {
       sessionEndMarks.editable = true;
       vi.spyOn(sessions, "hydrateVisibleSessions").mockResolvedValue(undefined);
       vi.spyOn(sessionEndMarks, "mark").mockImplementation(async (row) => {
-        sessionEndMarks.marks = new Map([[row[0]!.id, lastActivity(row)]]);
+        sessionEndMarks.marks = new Map([
+          [row[0]!.id, { at: lastActivity(row), kind: "row" as const }],
+        ]);
       });
     });
 

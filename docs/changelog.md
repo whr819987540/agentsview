@@ -17,9 +17,12 @@ The latest published release is
   session header. The check fills in green and stays shown next to the star,
   like the star of a starred session, and the row sorts with the quiet sessions.
   The mark clears itself when the session has new activity, such as when you
-  resume it. Marks are saved in the local archive, and DuckDB and ClickHouse
-  pushes copy them for read-only viewing. `pg serve` keeps its own marks in
-  PostgreSQL, like stars; hosted PostgreSQL does not support marks yet.
+  resume it. Forks and continuations listed under an expanded session have
+  their own check and star, so you can mark one branch as done while the rest
+  of the session stays open; subagent and teammate rows have neither. Marks are
+  saved in the local archive, and DuckDB and ClickHouse pushes copy them for
+  read-only viewing. `pg serve` keeps its own marks in PostgreSQL, like stars;
+  hosted PostgreSQL does not support marks yet.
 - Jump to the end of a session's messages in one click. The **Scroll to
   bottom** button, a down arrow to the left of **Collapse visible blocks** in
   the session header, shows the newest message in oldest-first order and the

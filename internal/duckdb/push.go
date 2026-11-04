@@ -969,9 +969,9 @@ func (s *Sync) replaceCuration(
 		}
 		for _, mark := range written.endMarks {
 			if _, err := tx.ExecContext(ctx,
-				`INSERT INTO session_end_marks (session_id, activity_at)
-				 VALUES (?, ?)`,
-				mark.SessionID, mark.ActivityAt,
+				`INSERT INTO session_end_marks (session_id, activity_at, kind)
+				 VALUES (?, ?, ?)`,
+				mark.SessionID, mark.ActivityAt, mark.Kind,
 			); err != nil {
 				return fmt.Errorf("syncing session end mark %s: %w", mark.SessionID, err)
 			}

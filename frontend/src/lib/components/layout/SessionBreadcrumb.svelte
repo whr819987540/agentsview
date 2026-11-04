@@ -50,10 +50,13 @@
   import { fitHeaderDensity } from "./header-density.js";
   import { sessions } from "../../stores/sessions.svelte.js";
   import {
+    branchSessions,
     rowSessions,
     sessionEndMarks,
+    type EndMarkKind,
     type EndMarkSession,
   } from "../../stores/sessionEndMarks.svelte.js";
+  import { isBranchChild } from "../sidebar/session-list-utils.js";
   import { showFlash } from "@kenn-io/kit-ui";
   import { router } from "../../stores/router.svelte.js";
   import { insights } from "../../stores/insights.svelte.js";
@@ -581,21 +584,31 @@
     renaming = false;
   }
 
-  /** The sessions of the sidebar row this session belongs to, the row's
-   *  shown session first, so the header marks the row the sidebar shows. */
-  function endMarkRow(current: Session): EndMarkSession[] {
+  interface EndMarkTarget {
+    sessions: EndMarkSession[];
+    kind: EndMarkKind;
+  }
+
+  /** The sidebar row whose end mark the header changes, as the sidebar
+   *  shows it: a fork's own branch row, else the whole row of the group the
+   *  session belongs to, with the row's shown session first. */
+  function endMarkRow(current: Session): EndMarkTarget {
     const group = sessions.groupedSessions.find((g) =>
       g.sessions.some((s) => s.id === current.id),
     );
-    if (!group) return [current];
+    if (!group) return { sessions: [current], kind: "row" };
+    const own = group.sessions.find((s) => s.id === current.id);
+    if (own && isBranchChild(own, group)) {
+      return { sessions: branchSessions(own, group.sessions), kind: "branch" };
+    }
     const shown = group.sessions.find((s) => s.id === group.primarySessionId) ?? current;
-    return rowSessions(shown, group.sessions);
+    return { sessions: rowSessions(shown, group.sessions), kind: "row" };
   }
 
-  async function toggleEnded(row: EndMarkSession[]) {
+  async function toggleEnded(row: EndMarkTarget) {
     closeMenu();
     try {
-      await sessionEndMarks.toggle(row);
+      await sessionEndMarks.toggle(row.sessions, row.kind);
     } catch {
       showFlash(m.session_end_mark_failed(), { tone: "danger" });
     }
@@ -1315,7 +1328,7 @@
             </button>
             {#if sessionEndMarks.editable}
               {@const endRow = endMarkRow(session)}
-              {@const ended = sessionEndMarks.isEnded(endRow)}
+              {@const ended = sessionEndMarks.isEnded(endRow.sessions, endRow.kind)}
               <button
                 class="actions-menu-item"
                 onclick={() => void toggleEnded(endRow)}

@@ -13,6 +13,7 @@ import {
   bulkExpandKeys,
   computeTotalSize,
   findStart,
+  isBranchChild,
   isSubagentDescendant,
   selectLiveId,
   selectPrimaryId,
@@ -880,6 +881,45 @@ describe("child classification precedence", () => {
     expect(childItems[0]!.session!.id).toBe("sub-new");
     expect(childItems[1]!.session!.id).toBe("sub-mid");
     expect(childItems[2]!.session!.id).toBe("sub-old");
+  });
+
+  it("flags only forks and continuations as branch rows", () => {
+    const root = makeSession({ id: "root" });
+    const fork = makeSession({ id: "fork", parent_session_id: "root", relationship_type: "fork" });
+    const cont = makeSession({
+      id: "cont",
+      parent_session_id: "root",
+      relationship_type: "continuation",
+    });
+    const forkSub = makeSession({
+      id: "forksub",
+      parent_session_id: "fork",
+      relationship_type: "subagent",
+    });
+    const teammate = makeSession({
+      id: "tm",
+      parent_session_id: "root",
+      first_message: "<teammate-message>hi</teammate-message>",
+    });
+    const [group] = buildSessionGroups([root, fork, cont, forkSub, teammate]);
+    const expanded = new Set(["root", "subagent:root", "team:root"]);
+    const items = buildDisplayItems([group!], [], "none", new Set(), expanded);
+
+    const rows = items
+      .filter((i) => i.isChild)
+      .map((i) => [i.session!.id, i.branch ?? false] as const)
+      .sort(([a], [b]) => a.localeCompare(b));
+    expect(rows).toEqual([
+      ["cont", true],
+      ["fork", true],
+      ["forksub", false],
+      ["tm", false],
+    ]);
+    for (const [id, branch] of rows) {
+      const s = group!.sessions.find((x) => x.id === id)!;
+      expect(isBranchChild(s, group!), id).toBe(branch);
+    }
+    expect(isBranchChild(root, group!)).toBe(false);
   });
 
   it("isSubagentDescendant returns true for child of subagent", () => {

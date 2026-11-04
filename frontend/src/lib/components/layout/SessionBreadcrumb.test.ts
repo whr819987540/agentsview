@@ -15,6 +15,7 @@ import { ApiError } from "../../api/runtime.js";
 import { messages } from "../../stores/messages.svelte.js";
 import { sessionTiming } from "../../stores/sessionTiming.svelte.js";
 import { sessions } from "../../stores/sessions.svelte.js";
+import { sessionEndMarks } from "../../stores/sessionEndMarks.svelte.js";
 import { setLocale } from "../../i18n/index.js";
 import { router } from "../../stores/router.svelte.js";
 import { ui, type BlockType } from "../../stores/ui.svelte.js";
@@ -2638,6 +2639,58 @@ describe("SessionBreadcrumb", () => {
     expect(document.querySelector(".actions-menu")).toBeNull();
 
     await unmount(component);
+  });
+
+  it("marks a fork's branch from the actions menu, and a subagent's whole row", async () => {
+    const root = makeSession("claude", { id: "root" });
+    const fork = makeSession("claude", {
+      id: "fork",
+      parent_session_id: "root",
+      relationship_type: "fork",
+      ended_at: "2026-02-20T12:40:00Z",
+    });
+    const forkSub = makeSession("claude", {
+      id: "forksub",
+      parent_session_id: "fork",
+      relationship_type: "subagent",
+      ended_at: "2026-02-20T12:45:00Z",
+    });
+    const rootSub = makeSession("claude", {
+      id: "rootsub",
+      parent_session_id: "root",
+      relationship_type: "subagent",
+    });
+    const before = sessions.sessions;
+    sessions.sessions = [root, fork, forkSub, rootSub];
+    sessionEndMarks.editable = true;
+    const toggle = vi.spyOn(sessionEndMarks, "toggle").mockResolvedValue();
+
+    async function markFrom(session: SessionWithTokenFlags) {
+      const component = mount(SessionBreadcrumb, {
+        target: document.body,
+        props: { session, onBack: () => {} },
+      });
+      await tick();
+      document.querySelector<HTMLButtonElement>(".actions-btn")!.click();
+      await tick();
+      const item = [...document.querySelectorAll<HTMLButtonElement>(".actions-menu-item")].find(
+        (button) => button.textContent?.trim() === "Mark as ended",
+      );
+      item!.click();
+      await tick();
+      await unmount(component);
+      const [rowSessions, kind] = toggle.mock.lastCall!;
+      return [rowSessions.map((s) => s.id), kind];
+    }
+
+    try {
+      expect(await markFrom(fork)).toEqual([["fork", "forksub"], "branch"]);
+      expect(await markFrom(rootSub)).toEqual([["root", "fork", "forksub", "rootsub"], "row"]);
+    } finally {
+      sessions.sessions = before;
+      sessionEndMarks.editable = false;
+      toggle.mockRestore();
+    }
   });
 
   it("issues bulk collapse and expand commands from breadcrumb controls", async () => {

@@ -446,5 +446,11 @@ func schemaColumnMigrations() []columnMigration {
 			`file_path TEXT`,
 			"adding sessions.file_path",
 		},
+		{
+			// Marks made before branch marks existed all cover a row.
+			"session_end_marks", "kind",
+			`kind TEXT NOT NULL DEFAULT 'row'`,
+			"adding session_end_marks.kind",
+		},
 	}
 }

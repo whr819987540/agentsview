@@ -303,13 +303,15 @@ CREATE TABLE IF NOT EXISTS starred_sessions (
         REFERENCES sessions(id) ON DELETE CASCADE
 );
 
--- Session end marks: a user marked the session's sidebar row as ended as of
--- the row's latest activity, activity_at; the mark stops counting once the
--- row has newer activity.
+-- Session end marks: a user marked sessions as ended as of their latest
+-- activity, activity_at; the mark stops counting once they have newer
+-- activity. kind 'row' covers the session's whole sidebar row, 'branch' the
+-- session and its descendants.
 CREATE TABLE IF NOT EXISTS session_end_marks (
     session_id  TEXT PRIMARY KEY,
     activity_at TIMESTAMPTZ NOT NULL,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    kind        TEXT NOT NULL DEFAULT 'row',
     FOREIGN KEY (session_id)
         REFERENCES sessions(id) ON DELETE CASCADE
 );

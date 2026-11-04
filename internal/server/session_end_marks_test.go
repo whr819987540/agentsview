@@ -18,6 +18,7 @@ import (
 type sessionEndMarkBody struct {
 	SessionID  string `json:"session_id"`
 	ActivityAt string `json:"activity_at"`
+	Kind       string `json:"kind"`
 }
 
 type sessionEndMarksBody struct {
@@ -40,7 +41,7 @@ func TestSessionEndMarkHandlers(t *testing.T) {
 	for _, id := range []string{"a1", "a2"} {
 		w = te.put(t, "/api/v1/sessions/"+id+"/ended", "")
 		require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
-		assert.Equal(t, sessionEndMarkBody{SessionID: id, ActivityAt: tsSeedEnd},
+		assert.Equal(t, sessionEndMarkBody{SessionID: id, ActivityAt: tsSeedEnd, Kind: "row"},
 			decode[sessionEndMarkBody](t, w), "the response holds the stored mark")
 	}
 	w = te.put(t, "/api/v1/sessions/missing/ended", "")
@@ -52,8 +53,45 @@ func TestSessionEndMarkHandlers(t *testing.T) {
 	w = te.del(t, "/api/v1/sessions/a1/ended")
 	require.Equal(t, http.StatusNoContent, w.Code, "unmarking twice succeeds: %s", w.Body.String())
 
-	assert.Equal(t, []sessionEndMarkBody{{SessionID: "a2", ActivityAt: tsSeedEnd}},
+	assert.Equal(t, []sessionEndMarkBody{{SessionID: "a2", ActivityAt: tsSeedEnd, Kind: "row"}},
 		te.listEndMarks(t).Marks)
+
+	w = te.put(t, "/api/v1/sessions/a2/ended?kind=thread", "")
+	require.Equal(t, http.StatusBadRequest, w.Code, "body: %s", w.Body.String())
+	w = te.del(t, "/api/v1/sessions/a2/ended?kind=thread")
+	require.Equal(t, http.StatusBadRequest, w.Code, "body: %s", w.Body.String())
+	assert.Len(t, te.listEndMarks(t).Marks, 1, "an unknown kind changes nothing")
+}
+
+func TestSessionEndMarkOnABranchCoversOnlyTheBranch(t *testing.T) {
+	te := setup(t)
+	te.seedSession(t, "root", "alpha", 2)
+	te.seedSession(t, "fork", "alpha", 2, func(s *db.Session) {
+		s.ParentSessionID = new("root")
+		s.RelationshipType = "fork"
+		s.EndedAt = new("2025-01-15T11:30:00Z")
+	})
+	te.seedSession(t, "sibling", "alpha", 2, func(s *db.Session) {
+		s.ParentSessionID = new("root")
+		s.RelationshipType = "fork"
+		s.EndedAt = new("2025-01-15T12:00:00Z")
+	})
+
+	w := te.put(t, "/api/v1/sessions/fork/ended?kind=branch", "")
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	branch := sessionEndMarkBody{SessionID: "fork", ActivityAt: "2025-01-15T11:30:00Z", Kind: "branch"}
+	assert.Equal(t, branch, decode[sessionEndMarkBody](t, w),
+		"the mark holds the fork's activity, not its sibling's later one")
+	assert.Equal(t, []sessionEndMarkBody{branch}, te.listEndMarks(t).Marks,
+		"the sibling's later activity leaves the branch ended")
+
+	w = te.del(t, "/api/v1/sessions/fork/ended")
+	require.Equal(t, http.StatusNoContent, w.Code, "body: %s", w.Body.String())
+	assert.Equal(t, []sessionEndMarkBody{branch}, te.listEndMarks(t).Marks,
+		"removing a row mark keeps the branch mark")
+	w = te.del(t, "/api/v1/sessions/fork/ended?kind=branch")
+	require.Equal(t, http.StatusNoContent, w.Code, "body: %s", w.Body.String())
+	assert.Empty(t, te.listEndMarks(t).Marks)
 }
 
 func TestSessionEndMarkCoversTheWholeRow(t *testing.T) {
@@ -68,7 +106,7 @@ func TestSessionEndMarkCoversTheWholeRow(t *testing.T) {
 	// A client that loaded only the root still marks the whole row.
 	w := te.put(t, "/api/v1/sessions/root/ended", "")
 	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
-	assert.Equal(t, []sessionEndMarkBody{{SessionID: "root", ActivityAt: "2025-01-15T11:30:00Z"}},
+	assert.Equal(t, []sessionEndMarkBody{{SessionID: "root", ActivityAt: "2025-01-15T11:30:00Z", Kind: "row"}},
 		te.listEndMarks(t).Marks, "the mark holds the continuation's later activity")
 
 	// The continuation is resumed after the mark, then trashed.
@@ -128,11 +166,11 @@ func (m mirrorEndMarkStore) ListSessionEndMarks(context.Context) ([]db.SessionEn
 	return m.marks, nil
 }
 
-func (mirrorEndMarkStore) MarkSessionEnded(context.Context, string) (db.SessionEndMark, bool, error) {
+func (mirrorEndMarkStore) MarkSessionEnded(context.Context, string, string) (db.SessionEndMark, bool, error) {
 	return db.SessionEndMark{}, false, db.ErrReadOnly
 }
 
-func (mirrorEndMarkStore) UnmarkSessionEnded(context.Context, string) error {
+func (mirrorEndMarkStore) UnmarkSessionEnded(context.Context, string, string) error {
 	return db.ErrReadOnly
 }
 
@@ -141,12 +179,12 @@ func (mirrorEndMarkStore) SessionEndMarksEditable(context.Context) bool { return
 func TestSessionEndMarksOnMirrorAreListedAndReadOnly(t *testing.T) {
 	database := dbtest.OpenTestDB(t)
 	cfg := config.Config{Host: "127.0.0.1", DataDir: t.TempDir(), WriteTimeout: 30 * time.Second}
-	marks := []db.SessionEndMark{{SessionID: "a1", ActivityAt: tsSeedEnd}}
+	marks := []db.SessionEndMark{{SessionID: "a1", ActivityAt: tsSeedEnd, Kind: db.EndMarkRow}}
 	srv := server.New(cfg, mirrorEndMarkStore{Store: database, marks: marks}, nil)
 	te := &testEnv{srv: srv, handler: wrapTestHandler(cfg, srv.Handler()), db: database}
 
 	list := te.listEndMarks(t)
-	assert.Equal(t, []sessionEndMarkBody{{SessionID: "a1", ActivityAt: tsSeedEnd}}, list.Marks)
+	assert.Equal(t, []sessionEndMarkBody{{SessionID: "a1", ActivityAt: tsSeedEnd, Kind: "row"}}, list.Marks)
 	assert.False(t, list.Editable)
 
 	w := te.put(t, "/api/v1/sessions/a1/ended", "")
