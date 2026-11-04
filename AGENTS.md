@@ -59,7 +59,9 @@ Before reviewing CI runner security, read the
    push, and again as soon as a pull request is opened, whether you or the
    user opened it. Watch every run for the head commit: the runs its push
    started, such as the rolling release build of `main`, and the pull
-   request's checks, such as CI and fork checks. Local commits start no runs.
+   request's checks, such as CI and fork checks. Local commits start no runs,
+   and a pull request that changes only Markdown starts no fork checks; see
+   [CI workflow runners](docs/fork/upstream-merge.md#ci-workflow-的-runner).
    Find the runs with
    `gh run list --branch <branch> --commit "$(git rev-parse HEAD)"`; the
    filter needs the full SHA, and new runs can take a few seconds to appear.
