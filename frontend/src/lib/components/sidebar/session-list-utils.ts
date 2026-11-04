@@ -66,6 +66,10 @@ export interface DisplayItem {
   session?: SessionGroupInput;
   /** True when this is a child session inside an expanded group. */
   isChild?: boolean;
+  /** True for a child row that is a branch of its group's tree, a fork or
+   *  a continuation, rather than a subagent or teammate. A branch row holds
+   *  its own star and end mark. */
+  branch?: boolean;
   /** Nesting depth: 0 = root, 1 = child/team-group, 2 = teammate. */
   depth?: number;
   /** True when this is the last sibling at its depth level. */
@@ -184,6 +188,17 @@ export function isSubagentDescendant(
   return sessionAncestryMatches(s, groupSessions, isSubagent);
 }
 
+/**
+ * Whether a session is a branch of its group's tree: a fork or a
+ * continuation that the sidebar lists inline below the group's row, not the
+ * row's own session and not a subagent or teammate.
+ */
+export function isBranchChild(s: SessionGroupInput, g: SessionGroup): boolean {
+  if (s.id === g.primarySessionId) return false;
+  const ancestryPool = g.allSessions ?? g.sessions;
+  return !isSubagentDescendant(s, ancestryPool) && !isTeammate(s, ancestryPool);
+}
+
 interface GroupChildren {
   subagents: SessionGroupInput[];
   teammates: SessionGroupInput[];
@@ -206,6 +221,7 @@ function classifyChildren(g: SessionGroup): GroupChildren {
     } else if (isTeammate(s, ancestryPool)) {
       out.teammates.push(s);
     } else {
+      // Keep in step with isBranchChild.
       out.continuations.push(s);
     }
   }
@@ -288,6 +304,7 @@ function emitGroupItems(
       group: g,
       session: s,
       isChild: true,
+      branch: true,
       depth: 1,
       isLastChild: isLast,
       height: CHILD_ITEM_HEIGHT,

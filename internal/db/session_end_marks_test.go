@@ -22,17 +22,17 @@ func TestSessionEndMarkLifecycle(t *testing.T) {
 	assert.Empty(t, marks)
 	assert.NotNil(t, marks, "an empty list encodes as [] for the API")
 
-	mark, ok, err := d.MarkSessionEnded(ctx, "ended")
+	mark, ok, err := d.MarkSessionEnded(ctx, "ended", EndMarkRow)
 	require.NoError(t, err)
 	require.True(t, ok)
-	assert.Equal(t, SessionEndMark{SessionID: "ended", ActivityAt: "2026-10-01T10:00:00Z"}, mark,
+	assert.Equal(t, SessionEndMark{SessionID: "ended", ActivityAt: "2026-10-01T10:00:00Z", Kind: EndMarkRow}, mark,
 		"the mark returns what it stored")
-	_, ok, err = d.MarkSessionEnded(ctx, "missing")
+	_, ok, err = d.MarkSessionEnded(ctx, "missing", EndMarkRow)
 	require.NoError(t, err)
 	assert.False(t, ok, "a mark needs an existing session")
 
 	// A session with neither start nor end falls back to its creation time.
-	_, ok, err = d.MarkSessionEnded(ctx, "unstarted")
+	_, ok, err = d.MarkSessionEnded(ctx, "unstarted", EndMarkRow)
 	require.NoError(t, err)
 	require.True(t, ok)
 	assert.Equal(t, map[string]string{
@@ -45,13 +45,13 @@ func TestSessionEndMarkLifecycle(t *testing.T) {
 		s.StartedAt = new("2026-10-01T09:00:00Z")
 		s.EndedAt = new("2026-10-03T12:00:00Z")
 	})
-	_, ok, err = d.MarkSessionEnded(ctx, "ended")
+	_, ok, err = d.MarkSessionEnded(ctx, "ended", EndMarkRow)
 	require.NoError(t, err)
 	require.True(t, ok)
 	assert.Equal(t, "2026-10-03T12:00:00Z", endMarkActivity(t, d)["ended"])
 
-	require.NoError(t, d.UnmarkSessionEnded(ctx, "ended"))
-	require.NoError(t, d.UnmarkSessionEnded(ctx, "ended"), "unmarking twice succeeds")
+	require.NoError(t, d.UnmarkSessionEnded(ctx, "ended", EndMarkRow))
+	require.NoError(t, d.UnmarkSessionEnded(ctx, "ended", EndMarkRow), "unmarking twice succeeds")
 	assert.NotContains(t, endMarkActivity(t, d), "ended")
 
 	require.NoError(t, d.DeleteSession(ctx, "unstarted"))
@@ -128,13 +128,159 @@ func TestMarkSessionEndedTakesTheWholeRowsLatestActivity(t *testing.T) {
 				require.NoError(t, d.SoftDeleteSession(ctx, "trashed"))
 			}
 
-			mark, ok, err := d.MarkSessionEnded(ctx, tt.target)
+			mark, ok, err := d.MarkSessionEnded(ctx, tt.target, EndMarkRow)
 			require.NoError(t, err)
 			require.True(t, ok)
 			assert.Equal(t, tt.want, mark.ActivityAt)
 			assert.Equal(t, map[string]string{tt.target: tt.want}, endMarkActivity(t, d))
 		})
 	}
+}
+
+// seedBranchRow stores a sidebar row with two forks of the root: "fork",
+// whose subagent is its latest activity, and "sibling", the row's latest.
+func seedBranchRow(t *testing.T, d *DB) {
+	t.Helper()
+	insertSession(t, d, "root", "alpha", func(s *Session) {
+		s.StartedAt = new("2026-10-01T09:00:00Z")
+		s.EndedAt = new("2026-10-01T10:00:00Z")
+	})
+	insertSession(t, d, "fork", "alpha", func(s *Session) {
+		s.ParentSessionID = new("root")
+		s.RelationshipType = "fork"
+		s.StartedAt = new("2026-10-01T10:05:00Z")
+		s.EndedAt = new("2026-10-01T10:20:00Z")
+	})
+	insertSession(t, d, "forksub", "alpha", func(s *Session) {
+		s.ParentSessionID = new("fork")
+		s.RelationshipType = "subagent"
+		s.StartedAt = new("2026-10-01T10:10:00Z")
+		s.EndedAt = new("2026-10-01T10:40:00Z")
+	})
+	insertSession(t, d, "sibling", "alpha", func(s *Session) {
+		s.ParentSessionID = new("root")
+		s.RelationshipType = "fork"
+		s.StartedAt = new("2026-10-01T10:30:00Z")
+		s.EndedAt = new("2026-10-01T11:00:00Z")
+	})
+}
+
+func TestMarkSessionEndedTakesTheCoveredSessionsLatestActivity(t *testing.T) {
+	tests := []struct {
+		name   string
+		target string
+		kind   string
+		want   string
+	}{
+		{
+			name:   "a branch mark covers the fork and its subagent, not its sibling",
+			target: "fork",
+			kind:   EndMarkBranch,
+			want:   "2026-10-01T10:40:00Z",
+		},
+		{
+			name:   "a row mark on the fork covers the whole row",
+			target: "fork",
+			kind:   EndMarkRow,
+			want:   "2026-10-01T11:00:00Z",
+		},
+		{
+			name:   "a branch mark on the root covers every descendant",
+			target: "root",
+			kind:   EndMarkBranch,
+			want:   "2026-10-01T11:00:00Z",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := testDB(t)
+			seedBranchRow(t, d)
+
+			mark, ok, err := d.MarkSessionEnded(t.Context(), tt.target, tt.kind)
+			require.NoError(t, err)
+			require.True(t, ok)
+			want := SessionEndMark{SessionID: tt.target, ActivityAt: tt.want, Kind: tt.kind}
+			assert.Equal(t, want, mark)
+			marks, err := d.ListSessionEndMarks(t.Context())
+			require.NoError(t, err)
+			assert.Equal(t, []SessionEndMark{want}, marks)
+		})
+	}
+}
+
+func TestListSessionEndMarksDropsOutdatedBranchMarks(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+	seedBranchRow(t, d)
+	_, ok, err := d.MarkSessionEnded(ctx, "fork", EndMarkBranch)
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	// The sibling is resumed: the branch mark still holds.
+	insertSession(t, d, "sibling", "alpha", func(s *Session) {
+		s.ParentSessionID = new("root")
+		s.RelationshipType = "fork"
+		s.EndedAt = new("2026-10-01T15:00:00Z")
+	})
+	assert.Equal(t, map[string]string{"fork": "2026-10-01T10:40:00Z"}, endMarkActivity(t, d),
+		"activity outside the branch keeps its mark")
+
+	// The fork's subagent runs again: the branch has newer activity.
+	insertSession(t, d, "forksub", "alpha", func(s *Session) {
+		s.ParentSessionID = new("fork")
+		s.RelationshipType = "subagent"
+		s.EndedAt = new("2026-10-01T16:00:00Z")
+	})
+	assert.Empty(t, endMarkActivity(t, d), "activity inside the branch ends its mark")
+	assert.Empty(t, storedEndMarkIDs(t, d), "listing deletes the outdated mark")
+}
+
+func TestSessionEndMarkKindsOnOneSession(t *testing.T) {
+	d := testDB(t)
+	ctx := t.Context()
+	seedBranchRow(t, d)
+
+	_, ok, err := d.MarkSessionEnded(ctx, "fork", EndMarkRow)
+	require.NoError(t, err)
+	require.True(t, ok)
+	_, ok, err = d.MarkSessionEnded(ctx, "fork", EndMarkBranch)
+	require.NoError(t, err)
+	require.True(t, ok)
+	marks, err := d.ListSessionEndMarks(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, []SessionEndMark{
+		{SessionID: "fork", ActivityAt: "2026-10-01T10:40:00Z", Kind: EndMarkBranch},
+	}, marks, "a session holds one mark; the newer kind replaces the older")
+
+	require.NoError(t, d.UnmarkSessionEnded(ctx, "fork", EndMarkRow))
+	assert.Equal(t, []string{"fork"}, storedEndMarkIDs(t, d),
+		"removing a row mark keeps the branch mark")
+	require.NoError(t, d.UnmarkSessionEnded(ctx, "fork", EndMarkBranch))
+	assert.Empty(t, storedEndMarkIDs(t, d))
+
+	_, _, err = d.MarkSessionEnded(ctx, "fork", "thread")
+	require.ErrorContains(t, err, `unknown end mark kind "thread"`)
+	require.ErrorContains(t, d.UnmarkSessionEnded(ctx, "fork", ""), "unknown end mark kind")
+}
+
+func TestSessionEndMarkKindMigrationKeepsLegacyMarksAsRowMarks(t *testing.T) {
+	path := createClosedTestDB(t, tempDBPath(t, "sessions.db"), func(d *DB) {
+		seedBranchRow(t, d)
+		_, ok, err := d.MarkSessionEnded(t.Context(), "fork", EndMarkRow)
+		require.NoError(t, err)
+		require.True(t, ok)
+	})
+	execRawSQLite(t, path, "ALTER TABLE session_end_marks DROP COLUMN kind")
+
+	d, err := Open(t.Context(), path)
+	require.NoError(t, err)
+	t.Cleanup(func() { assert.NoError(t, d.Close()) })
+
+	marks, err := d.ListSessionEndMarks(t.Context())
+	require.NoError(t, err)
+	assert.Equal(t, []SessionEndMark{
+		{SessionID: "fork", ActivityAt: "2026-10-01T11:00:00Z", Kind: EndMarkRow},
+	}, marks)
 }
 
 func TestMarkSessionEndedSkipsEmptyTimestamps(t *testing.T) {
@@ -144,7 +290,7 @@ func TestMarkSessionEndedSkipsEmptyTimestamps(t *testing.T) {
 		s.EndedAt = new("")
 	})
 
-	mark, ok, err := d.MarkSessionEnded(t.Context(), "legacy")
+	mark, ok, err := d.MarkSessionEnded(t.Context(), "legacy", EndMarkRow)
 	require.NoError(t, err)
 	require.True(t, ok)
 	assert.Equal(t, "2026-10-01T09:00:00Z", mark.ActivityAt,
@@ -162,7 +308,7 @@ func TestMarkSessionEndedSurvivesAParentCycle(t *testing.T) {
 		s.EndedAt = new("2026-10-01T11:00:00Z")
 	})
 
-	mark, ok, err := d.MarkSessionEnded(t.Context(), "a")
+	mark, ok, err := d.MarkSessionEnded(t.Context(), "a", EndMarkRow)
 	require.NoError(t, err)
 	require.True(t, ok)
 	assert.Equal(t, "2026-10-01T11:00:00Z", mark.ActivityAt)
@@ -173,7 +319,7 @@ func TestListSessionEndMarksDropsOutdatedMarks(t *testing.T) {
 	ctx := t.Context()
 	seedEndMarkRow(t, d)
 	for _, id := range []string{"root", "unrelated"} {
-		_, ok, err := d.MarkSessionEnded(ctx, id)
+		_, ok, err := d.MarkSessionEnded(ctx, id, EndMarkRow)
 		require.NoError(t, err)
 		require.True(t, ok)
 	}
@@ -207,7 +353,7 @@ func TestListSessionEndMarksForScope(t *testing.T) {
 		insertSession(t, d, s.id, s.project, func(sess *Session) {
 			sess.EndedAt = new("2026-10-01T10:00:00Z")
 		})
-		_, ok, err := d.MarkSessionEnded(ctx, s.id)
+		_, ok, err := d.MarkSessionEnded(ctx, s.id, EndMarkRow)
 		require.NoError(t, err)
 		require.True(t, ok)
 	}
@@ -248,32 +394,58 @@ func TestListSessionEndMarksDropsMarksWithoutATime(t *testing.T) {
 }
 
 func TestCopySessionMetadataFromPreservesSessionEndMarks(t *testing.T) {
-	ctx := t.Context()
-	dir := t.TempDir()
-	srcPath := filepath.Join(dir, "src.db")
-	src, err := Open(ctx, srcPath)
-	require.NoError(t, err)
-	for _, id := range []string{"kept", "gone"} {
-		insertSession(t, src, id, "alpha", func(s *Session) {
-			s.EndedAt = new("2026-10-01T10:00:00Z")
-		})
-		_, ok, err := src.MarkSessionEnded(ctx, id)
-		require.NoError(t, err)
-		require.True(t, ok)
+	tests := []struct {
+		name       string
+		legacy     bool
+		branchKind string
+	}{
+		{name: "kinds are kept", branchKind: EndMarkBranch},
+		{name: "marks from before kinds cover a row", legacy: true, branchKind: EndMarkRow},
 	}
-	require.NoError(t, src.Close())
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := t.Context()
+			dir := t.TempDir()
+			srcPath := filepath.Join(dir, "src.db")
+			src, err := Open(ctx, srcPath)
+			require.NoError(t, err)
+			for _, id := range []string{"kept", "branch", "gone"} {
+				insertSession(t, src, id, "alpha", func(s *Session) {
+					s.EndedAt = new("2026-10-01T10:00:00Z")
+				})
+			}
+			for id, kind := range map[string]string{
+				"kept": EndMarkRow, "branch": EndMarkBranch, "gone": EndMarkRow,
+			} {
+				_, ok, err := src.MarkSessionEnded(ctx, id, kind)
+				require.NoError(t, err)
+				require.True(t, ok)
+			}
+			require.NoError(t, src.Close())
+			if tt.legacy {
+				execRawSQLite(t, srcPath, "ALTER TABLE session_end_marks DROP COLUMN kind")
+			}
 
-	// The rebuilt archive re-synced only "kept".
-	dst, err := Open(ctx, filepath.Join(dir, "dst.db"))
-	require.NoError(t, err)
-	t.Cleanup(func() { assert.NoError(t, dst.Close()) })
-	insertSession(t, dst, "kept", "alpha", func(s *Session) {
-		s.EndedAt = new("2026-10-01T10:00:00Z")
-	})
+			// The rebuilt archive re-synced only "kept" and "branch".
+			dst, err := Open(ctx, filepath.Join(dir, "dst.db"))
+			require.NoError(t, err)
+			t.Cleanup(func() { assert.NoError(t, dst.Close()) })
+			for _, id := range []string{"kept", "branch"} {
+				insertSession(t, dst, id, "alpha", func(s *Session) {
+					s.EndedAt = new("2026-10-01T10:00:00Z")
+				})
+			}
 
-	require.NoError(t, dst.CopySessionMetadataFrom(srcPath))
+			require.NoError(t, dst.CopySessionMetadataFrom(srcPath))
 
-	assert.Equal(t, map[string]string{"kept": "2026-10-01T10:00:00Z"}, endMarkActivity(t, dst))
+			marks, err := dst.ListSessionEndMarks(ctx)
+			require.NoError(t, err)
+			assert.Equal(t, []SessionEndMark{
+				{SessionID: "branch", ActivityAt: "2026-10-01T10:00:00Z", Kind: tt.branchKind},
+				{SessionID: "kept", ActivityAt: "2026-10-01T10:00:00Z", Kind: EndMarkRow},
+			}, marks)
+		})
+	}
 }
 
 func TestOpenReadOnlyListsSessionEndMarksAndRejectsEdits(t *testing.T) {
@@ -282,7 +454,7 @@ func TestOpenReadOnlyListsSessionEndMarksAndRejectsEdits(t *testing.T) {
 			insertSession(t, d, id, "alpha", func(s *Session) {
 				s.EndedAt = new("2026-10-01T10:00:00Z")
 			})
-			_, ok, err := d.MarkSessionEnded(t.Context(), id)
+			_, ok, err := d.MarkSessionEnded(t.Context(), id, EndMarkRow)
 			require.NoError(t, err)
 			require.True(t, ok)
 		}
@@ -300,11 +472,11 @@ func TestOpenReadOnlyListsSessionEndMarksAndRejectsEdits(t *testing.T) {
 
 	ctx := t.Context()
 	requireReadOnlyOp(t, "MarkSessionEnded", func() error {
-		_, _, err := readonly.MarkSessionEnded(ctx, "a1")
+		_, _, err := readonly.MarkSessionEnded(ctx, "a1", EndMarkRow)
 		return err
 	})
 	requireReadOnlyOp(t, "UnmarkSessionEnded", func() error {
-		return readonly.UnmarkSessionEnded(ctx, "a1")
+		return readonly.UnmarkSessionEnded(ctx, "a1", EndMarkRow)
 	})
 }
 

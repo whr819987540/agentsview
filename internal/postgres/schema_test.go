@@ -1158,6 +1158,9 @@ func TestEnsureSchemaGroupsMissingColumnMigrationsByTable(t *testing.T) {
 		"model_pricing_bands": {
 			"cache_creation_1h_microdollars_per_mtok",
 		},
+		"session_end_marks": {
+			"kind",
+		},
 	})
 
 	require.NoError(t, EnsureSchema(t.Context(), db, "agentsview"))
@@ -1166,9 +1169,9 @@ func TestEnsureSchemaGroupsMissingColumnMigrationsByTable(t *testing.T) {
 	// messages: source_parent_uuid, is_sidechain, is_compact_boundary,
 	// thinking_text; usage_events: provider_id;
 	// source_project_identity_observations: repository/worktree/checkout/remote
-	// context). Per-table batching means one ALTER each. tool_calls
-	// lists all its migration columns (call_index, file_path) as present, so
-	// it contributes no ALTER. Already-present raw job columns are probed
+	// context). Per-table batching means one ALTER each. tool_calls and
+	// session_end_marks list all their migration columns as present, so they
+	// contribute no ALTER. Already-present raw job columns are probed
 	// without issuing a redundant ALTER.
 	assert.Equal(t, 4, state.alterTableExecCount(), "ALTER TABLE execs")
 }

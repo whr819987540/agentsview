@@ -364,6 +364,8 @@ Each session item shows:
   (including Codex session models).
 - **Star button** — click the star icon or press `s` to star a session. Starred
   sessions persist in the SQLite database so they survive server restarts.
+  Forks and continuations listed under an expanded session have their own star;
+  subagent and teammate rows do not.
 - **End mark button** — the circled check next to the star. Hover a session and
   click it to [mark the session as ended](#mark-a-session-as-ended). Like the
   star, it fills in and stays shown while the mark holds.
@@ -396,7 +398,7 @@ marked it. Hover the dot for a tooltip explaining the current state.
 | Stale   | Amber             | 10–60 minutes idle and last assistant message has an unresolved tool call (or the session file was truncated mid-write) |
 | Unclean | Red               | Same flagged state as Stale, but idle for more than an hour                                                             |
 | Quiet   | Hidden            | Cleanly-ended sessions older than 10 minutes; no dot is rendered                                                        |
-| Ended   | Hidden            | Sidebar only: you [marked the row as ended](#mark-a-session-as-ended) and it has had no activity since                  |
+| Ended   | Hidden            | Sidebar only: you [marked the row or fork as ended](#mark-a-session-as-ended) and it has had no activity since          |
 
 The sidebar lists sessions by state: Working, Waiting, Idle, Stale, Quiet, then
 Unclean. Ended sessions sort with Quiet. Within a state, the session written to
@@ -435,14 +437,23 @@ place until the pointer, or keyboard focus, leaves the sidebar list, so the next
 row does not slide under the pointer. To remove the mark, click the check button
 again, or choose **Unmark as ended**. Session end marks are unreleased.
 
-A mark applies to the whole sidebar row, including the session's continuations
-and subagents, even ones the sidebar has not loaded or a filter such as
-**Starred only** hides. The child rows you see when you expand a session have no
-mark of their own and keep showing their live status. The mark lasts until the
-row has new activity. When you resume the session, or one of its continuations
-or subagents writes again, the row shows its live status again and the mark is
-removed, so moving that session to the trash does not bring it back. Mark the
-row again when you are done.
+A mark on a session's row applies to the whole sidebar row, including the
+session's continuations, forks and subagents, even ones the sidebar has not
+loaded or a filter such as **Starred only** hides.
+
+When you expand a session, its fork and continuation rows have their own check
+button and star. Marking one of them covers that branch: the fork and its own
+subagents and continuations. It leaves the row above it and the other branches
+unmarked, and marking the row above does not mark its branches. Subagent and
+teammate rows have no mark of their own and keep showing their live status. In
+the session header, the actions menu marks the branch while you view a fork or
+continuation, and the whole row otherwise.
+
+A mark lasts until the sessions it covers have new activity. When you resume
+the session, or one of its continuations or subagents writes again, the row
+shows its live status again and the mark is removed, so moving that session to
+the trash does not bring it back. A branch mark stays when only another branch
+has new activity. Mark the row or branch again when you are done.
 
 Marks are saved in the SQLite archive, so they survive restarts and full
 resyncs. `duckdb push` and `clickhouse push` copy the marks still in effect, so

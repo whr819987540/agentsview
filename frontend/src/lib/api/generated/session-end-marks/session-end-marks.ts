@@ -3,7 +3,9 @@
  */
 import type {
   DbSessionEndMark,
+  DeleteApiV1SessionsByIdEndedParams,
   DeleteApiV1SessionsByIdEndedPathParameters,
+  PutApiV1SessionsByIdEndedParams,
   PutApiV1SessionsByIdEndedPathParameters,
   SessionEndMarksResponse,
 } from "../models";
@@ -26,10 +28,23 @@ export const getApiV1SessionEndMarks = async (
   });
 };
 
-export const getDeleteApiV1SessionsByIdEndedUrl = ({
-  id,
-}: DeleteApiV1SessionsByIdEndedPathParameters) => {
-  return `/api/v1/sessions/${encodeURIComponent(String(id))}/ended`;
+export const getDeleteApiV1SessionsByIdEndedUrl = (
+  { id }: DeleteApiV1SessionsByIdEndedPathParameters,
+  params?: DeleteApiV1SessionsByIdEndedParams,
+) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+    if (value !== undefined) {
+      normalizedParams.append(key, value === null ? "null" : String(value));
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0
+    ? `/api/v1/sessions/${encodeURIComponent(String(id))}/ended?${stringifiedParams}`
+    : `/api/v1/sessions/${encodeURIComponent(String(id))}/ended`;
 };
 
 /**
@@ -37,18 +52,32 @@ export const getDeleteApiV1SessionsByIdEndedUrl = ({
  */
 export const deleteApiV1SessionsByIdEnded = async (
   { id }: DeleteApiV1SessionsByIdEndedPathParameters,
+  params?: DeleteApiV1SessionsByIdEndedParams,
   options?: Parameters<typeof orvalFetch>[1],
 ): Promise<void> => {
-  return orvalFetch<void>(getDeleteApiV1SessionsByIdEndedUrl({ id }), {
+  return orvalFetch<void>(getDeleteApiV1SessionsByIdEndedUrl({ id }, params), {
     ...options,
     method: "DELETE",
   });
 };
 
-export const getPutApiV1SessionsByIdEndedUrl = ({
-  id,
-}: PutApiV1SessionsByIdEndedPathParameters) => {
-  return `/api/v1/sessions/${encodeURIComponent(String(id))}/ended`;
+export const getPutApiV1SessionsByIdEndedUrl = (
+  { id }: PutApiV1SessionsByIdEndedPathParameters,
+  params?: PutApiV1SessionsByIdEndedParams,
+) => {
+  const normalizedParams = new URLSearchParams();
+
+  Object.entries(params || {}).forEach(([key, value]) => {
+    if (value !== undefined) {
+      normalizedParams.append(key, value === null ? "null" : String(value));
+    }
+  });
+
+  const stringifiedParams = normalizedParams.toString();
+
+  return stringifiedParams.length > 0
+    ? `/api/v1/sessions/${encodeURIComponent(String(id))}/ended?${stringifiedParams}`
+    : `/api/v1/sessions/${encodeURIComponent(String(id))}/ended`;
 };
 
 /**
@@ -56,9 +85,10 @@ export const getPutApiV1SessionsByIdEndedUrl = ({
  */
 export const putApiV1SessionsByIdEnded = async (
   { id }: PutApiV1SessionsByIdEndedPathParameters,
+  params?: PutApiV1SessionsByIdEndedParams,
   options?: Parameters<typeof orvalFetch>[1],
 ): Promise<DbSessionEndMark> => {
-  return orvalFetch<DbSessionEndMark>(getPutApiV1SessionsByIdEndedUrl({ id }), {
+  return orvalFetch<DbSessionEndMark>(getPutApiV1SessionsByIdEndedUrl({ id }, params), {
     ...options,
     method: "PUT",
   });

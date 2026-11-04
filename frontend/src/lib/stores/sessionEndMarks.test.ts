@@ -2,9 +2,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test"
 import { SessionEndMarksService } from "../api/generated/index";
 import { ApiError } from "../api/runtime.js";
 import {
+  branchSessions,
   createSessionEndMarksStore,
   lastActivity,
   rowSessions,
+  type EndMarkKind,
   type EndMarkSession,
 } from "./sessionEndMarks.svelte.js";
 
@@ -25,8 +27,15 @@ function session(
   id: string,
   endedAt: string | null,
   startedAt: string | null = null,
+  parent: string | null = null,
 ): EndMarkSession {
-  return { id, ended_at: endedAt, started_at: startedAt, created_at: "2026-10-01T00:00:00Z" };
+  return {
+    id,
+    parent_session_id: parent,
+    ended_at: endedAt,
+    started_at: startedAt,
+    created_at: "2026-10-01T00:00:00Z",
+  };
 }
 
 /**
@@ -36,6 +45,9 @@ function session(
  */
 class FakeServer {
   marks = new Map<string, string>();
+  /** The kind of each mark; a mark without one is listed without a kind,
+   *  as a server from before kinds does. */
+  kinds = new Map<string, EndMarkKind>();
   /** The time the server stamps on new marks. */
   stampAt = "2026-10-01T10:00:00Z";
   down = false;
@@ -47,7 +59,11 @@ class FakeServer {
   list() {
     if (this.down) return Promise.reject(new TypeError("Failed to fetch"));
     return Promise.resolve({
-      marks: [...this.marks].map(([session_id, activity_at]) => ({ session_id, activity_at })),
+      marks: [...this.marks].map(([session_id, activity_at]) => ({
+        session_id,
+        activity_at,
+        kind: this.kinds.get(session_id),
+      })),
       editable: true,
     });
   }
@@ -91,16 +107,22 @@ beforeEach(() => {
   vi.clearAllMocks();
   server = new FakeServer();
   service.getApiV1SessionEndMarks.mockImplementation(() => server.list());
-  service.putApiV1SessionsByIdEnded.mockImplementation(({ id }: { id: string }) =>
-    server.write(`put ${id}`, () => {
-      server.marks.set(id, server.stampAt);
-      return { session_id: id, activity_at: server.stampAt };
-    }),
+  service.putApiV1SessionsByIdEnded.mockImplementation(
+    ({ id }: { id: string }, params?: { kind?: EndMarkKind }) =>
+      server.write(`put ${id}`, () => {
+        const kind = params?.kind ?? "row";
+        server.marks.set(id, server.stampAt);
+        server.kinds.set(id, kind);
+        return { session_id: id, activity_at: server.stampAt, kind };
+      }),
   );
-  service.deleteApiV1SessionsByIdEnded.mockImplementation(({ id }: { id: string }) =>
-    server.write(`delete ${id}`, () => {
-      server.marks.delete(id);
-    }),
+  service.deleteApiV1SessionsByIdEnded.mockImplementation(
+    ({ id }: { id: string }, params?: { kind?: EndMarkKind }) =>
+      server.write(`delete ${id}`, () => {
+        if ((server.kinds.get(id) ?? "row") !== (params?.kind ?? "row")) return;
+        server.marks.delete(id);
+        server.kinds.delete(id);
+      }),
   );
 });
 
@@ -140,6 +162,28 @@ describe("rowSessions", () => {
   });
 });
 
+describe("branchSessions", () => {
+  it("lists the shown session, then its descendants, not its parent or siblings", () => {
+    const root = session("root", null);
+    const fork = session("fork", null, null, "root");
+    const forkSub = session("forksub", null, null, "fork");
+    const nested = session("nested", null, null, "forksub");
+    const sibling = session("sibling", null, null, "root");
+    expect(branchSessions(fork, [root, nested, sibling, fork, forkSub]).map((s) => s.id)).toEqual([
+      "fork",
+      "forksub",
+      "nested",
+    ]);
+    expect(branchSessions(fork).map((s) => s.id)).toEqual(["fork"]);
+  });
+
+  it("stops at a parent cycle", () => {
+    const a = session("a", null, null, "b");
+    const b = session("b", null, null, "a");
+    expect(branchSessions(a, [a, b]).map((s) => s.id)).toEqual(["a", "b"]);
+  });
+});
+
 describe("SessionEndMarksStore", () => {
   let store: ReturnType<typeof createSessionEndMarksStore>;
 
@@ -174,8 +218,8 @@ describe("SessionEndMarksStore", () => {
 
     await store.mark(row);
 
-    expect(service.putApiV1SessionsByIdEnded).toHaveBeenCalledWith({ id: "root" });
-    expect(store.marks.get("root")).toBe("2026-10-03T08:00:00Z");
+    expect(service.putApiV1SessionsByIdEnded).toHaveBeenCalledWith({ id: "root" }, { kind: "row" });
+    expect(store.marks.get("root")).toEqual({ at: "2026-10-03T08:00:00Z", kind: "row" });
     expect(store.isEnded([...row, session("unloaded", "2026-10-03T08:00:00Z")])).toBe(true);
   });
 
@@ -296,6 +340,121 @@ describe("SessionEndMarksStore", () => {
 
     expect(store.isEnded(row)).toBe(true);
     expect(server.marks.has("open")).toBe(true);
+  });
+});
+
+describe("SessionEndMarksStore kinds", () => {
+  const root = session("root", "2026-10-01T09:00:00Z");
+  const fork = session("fork", "2026-10-01T10:00:00Z", null, "root");
+  const forkSub = session("forksub", "2026-10-01T10:30:00Z", null, "fork");
+  const sibling = session("sibling", "2026-10-01T11:00:00Z", null, "root");
+  const row = [root, fork, forkSub, sibling];
+  const branch = branchSessions(fork, row);
+  let store: ReturnType<typeof createSessionEndMarksStore>;
+
+  beforeEach(async () => {
+    store = createSessionEndMarksStore();
+    await store.load();
+  });
+
+  it("marks a branch without marking its row", async () => {
+    server.stampAt = "2026-10-01T10:30:00Z";
+
+    await store.mark(branch, "branch");
+
+    expect(service.putApiV1SessionsByIdEnded).toHaveBeenCalledWith(
+      { id: "fork" },
+      { kind: "branch" },
+    );
+    expect(store.isEnded(branch, "branch")).toBe(true);
+    expect(store.isEnded(row)).toBe(false);
+    expect(store.sortsAsEnded(row)).toBe(false);
+  });
+
+  it("leaves branches unmarked when their row is marked", async () => {
+    server.stampAt = "2026-10-01T11:00:00Z";
+
+    await store.mark(row);
+
+    expect(store.isEnded(row)).toBe(true);
+    expect(store.isEnded(branch, "branch")).toBe(false);
+  });
+
+  it("ends a branch mark with new activity inside the branch only", async () => {
+    server.stampAt = "2026-10-01T10:30:00Z";
+    await store.mark(branch, "branch");
+
+    const resumedSibling = session("sibling", "2026-10-01T12:00:00Z", null, "root");
+    expect(
+      store.isEnded(branchSessions(fork, [root, fork, forkSub, resumedSibling]), "branch"),
+    ).toBe(true);
+    const resumedSub = session("forksub", "2026-10-01T12:00:00Z", null, "fork");
+    expect(store.isEnded(branchSessions(fork, [root, fork, resumedSub, sibling]), "branch")).toBe(
+      false,
+    );
+  });
+
+  it("reads a branch mark only on the branch's own session", async () => {
+    server.marks.set("forksub", "2026-10-01T10:30:00Z");
+    server.kinds.set("forksub", "branch");
+    await store.refresh();
+
+    expect(store.isEnded(branchSessions(forkSub, row), "branch")).toBe(true);
+    expect(store.isEnded(branch, "branch")).toBe(false);
+  });
+
+  it("removes only the marks of the kind it toggles", async () => {
+    server.marks.set("root", "2026-10-01T11:00:00Z");
+    server.marks.set("fork", "2026-10-01T10:30:00Z");
+    server.kinds.set("fork", "branch");
+    await store.refresh();
+    expect(store.isEnded(row)).toBe(true);
+
+    await store.toggle(row);
+
+    expect(service.deleteApiV1SessionsByIdEnded.mock.calls).toEqual([
+      [{ id: "root" }, { kind: "row" }],
+    ]);
+    expect(store.isEnded(row)).toBe(false);
+    expect(store.isEnded(branch, "branch")).toBe(true);
+
+    await store.toggle(branch, "branch");
+
+    expect(service.deleteApiV1SessionsByIdEnded).toHaveBeenLastCalledWith(
+      { id: "fork" },
+      { kind: "branch" },
+    );
+    expect(store.isEnded(branch, "branch")).toBe(false);
+    expect(server.marks.size).toBe(0);
+  });
+
+  it("replaces a row mark on the same session with a branch mark", async () => {
+    server.marks.set("fork", "2026-10-01T11:00:00Z");
+    await store.refresh();
+    expect(store.marks.get("fork")).toEqual({ at: "2026-10-01T11:00:00Z", kind: "row" });
+    server.stampAt = "2026-10-01T10:30:00Z";
+
+    await store.mark(branch, "branch");
+
+    expect(store.marks.get("fork")).toEqual({ at: "2026-10-01T10:30:00Z", kind: "branch" });
+    expect(store.isEnded(row)).toBe(false);
+  });
+
+  it("reads the marks again when a branch outlives its mark", async () => {
+    server.marks.set("fork", "2026-10-01T10:30:00Z");
+    server.kinds.set("fork", "branch");
+    await store.refresh();
+    service.getApiV1SessionEndMarks.mockClear();
+
+    store.syncWithRows([row]);
+    await settle();
+    expect(service.getApiV1SessionEndMarks).not.toHaveBeenCalled();
+
+    store.syncWithRows([
+      [root, fork, session("forksub", "2026-10-01T12:00:00Z", null, "fork"), sibling],
+    ]);
+    await settle();
+    expect(service.getApiV1SessionEndMarks).toHaveBeenCalledTimes(1);
   });
 });
 

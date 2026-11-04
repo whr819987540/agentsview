@@ -2674,6 +2674,11 @@ func schemaColumnMigrations() []schemaColumnMigration {
 			"sessions", "rewound_inputs",
 			"ALTER TABLE sessions ADD COLUMN rewound_inputs TEXT",
 		},
+		{
+			// Marks made before branch marks existed all cover a row.
+			"session_end_marks", "kind",
+			"ALTER TABLE session_end_marks ADD COLUMN kind TEXT NOT NULL DEFAULT 'row'",
+		},
 	}
 }
 

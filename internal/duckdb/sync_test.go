@@ -126,7 +126,10 @@ func TestPushPreservesFilesystemSourceMachineAndCuration(t *testing.T) {
 func TestPushMirrorsSessionEndMarksReadOnly(t *testing.T) {
 	ctx := t.Context()
 	local, path := newPushFixture(t, 2)
-	mark, ok, err := local.MarkSessionEnded(ctx, "sess-1")
+	mark, ok, err := local.MarkSessionEnded(ctx, "sess-1", db.EndMarkRow)
+	require.NoError(t, err)
+	require.True(t, ok)
+	branchMark, ok, err := local.MarkSessionEnded(ctx, "sess-2", db.EndMarkBranch)
 	require.NoError(t, err)
 	require.True(t, ok)
 	_, err = Push(ctx, path, local, "push-machine", storage.MirrorPushOptions{}, false, nil)
@@ -137,11 +140,11 @@ func TestPushMirrorsSessionEndMarksReadOnly(t *testing.T) {
 	store := NewStoreFromDB(conn)
 	marks, err := store.ListSessionEndMarks(ctx)
 	require.NoError(t, err)
-	assert.Equal(t, []db.SessionEndMark{mark}, marks)
+	assert.Equal(t, []db.SessionEndMark{mark, branchMark}, marks, "marks keep their kind")
 	assert.False(t, store.SessionEndMarksEditable(ctx))
-	_, _, err = store.MarkSessionEnded(ctx, "sess-2")
+	_, _, err = store.MarkSessionEnded(ctx, "sess-2", db.EndMarkRow)
 	require.ErrorIs(t, err, db.ErrReadOnly)
-	require.ErrorIs(t, store.UnmarkSessionEnded(ctx, "sess-1"), db.ErrReadOnly)
+	require.ErrorIs(t, store.UnmarkSessionEnded(ctx, "sess-1", db.EndMarkRow), db.ErrReadOnly)
 	require.NoError(t, conn.Close())
 
 	// The marked session is resumed: the next push drops the outdated mark.
@@ -162,7 +165,7 @@ func TestPushMirrorsSessionEndMarksReadOnly(t *testing.T) {
 	defer conn.Close()
 	marks, err = NewStoreFromDB(conn).ListSessionEndMarks(ctx)
 	require.NoError(t, err)
-	assert.Empty(t, marks)
+	assert.Equal(t, []db.SessionEndMark{branchMark}, marks)
 }
 
 func TestPushRepushesLegacySessionWhenResolvedMachineChanges(t *testing.T) {

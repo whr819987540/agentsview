@@ -1189,12 +1189,16 @@ func (d *DB) CopySessionMetadataFrom(
 	}
 
 	// Copy end marks of sessions the fresh DB still holds (table may not
-	// exist in older DBs).
+	// exist in older DBs). Marks from before branch marks all cover a row.
 	if oldDBHasTable(ctx, tx, "session_end_marks") {
+		kind := "'row'"
+		if oldDBHasColumn(ctx, tx, "session_end_marks", "kind") {
+			kind = "kind"
+		}
 		if _, err := tx.ExecContext(ctx, `
 			INSERT OR IGNORE INTO main.session_end_marks
-				(session_id, activity_at, created_at)
-			SELECT session_id, activity_at, created_at
+				(session_id, activity_at, created_at, kind)
+			SELECT session_id, activity_at, created_at, `+kind+`
 			FROM old_db.session_end_marks
 			WHERE session_id IN (SELECT id FROM main.sessions)`); err != nil {
 			return fmt.Errorf("copying session end marks: %w", err)

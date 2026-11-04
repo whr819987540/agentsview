@@ -20,8 +20,8 @@ import (
 // assignment state. v16 rebuilds after SQLite data version 111 rewrote
 // stored Devin source identities; pre-111 mirrors would otherwise keep
 // serving bare ids that deduplicate across sessions. v17 adds the
-// archive's session end marks.
-const SchemaVersion = 17
+// archive's session end marks. v18 adds their kind, row or branch.
+const SchemaVersion = 18
 
 const schemaVersionMetadataKey = "agentsview_schema_version"
 
@@ -744,11 +744,13 @@ var mirrorTables = []tableSpec{
 		name: "session_end_marks",
 		create: `CREATE TABLE IF NOT EXISTS session_end_marks (
 			session_id TEXT PRIMARY KEY,
-			activity_at TEXT NOT NULL
+			activity_at TEXT NOT NULL,
+			kind TEXT NOT NULL DEFAULT 'row'
 		)`,
 		columns: []columnSpec{
 			{"session_id", "session_id TEXT"},
 			{"activity_at", "activity_at TEXT NOT NULL DEFAULT ''"},
+			{"kind", "kind TEXT NOT NULL DEFAULT 'row'"},
 		},
 	},
 	{

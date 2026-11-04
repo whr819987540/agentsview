@@ -149,7 +149,7 @@ func (s *Sync) replaceCuration(
 			continue
 		}
 		written.endMarks = append(written.endMarks, mark)
-		endMarkRows = append(endMarkRows, []any{mark.SessionID, mark.ActivityAt, version})
+		endMarkRows = append(endMarkRows, []any{mark.SessionID, mark.ActivityAt, mark.Kind, version})
 	}
 	fingerprint, err := written.fingerprint()
 	if err != nil {
