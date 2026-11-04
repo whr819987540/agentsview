@@ -43,11 +43,11 @@ export class SessionsPage {
     });
   }
 
+  // Click the session's title link, as a user does. A plain click on the row
+  // lands on its center, which on a narrow sidebar row with a wide machine
+  // tag is the end-mark toggle rather than the title.
   async selectSession(index: number = 0) {
-    await this.sessionItems.nth(index).click();
-    await expect(this.messageRows.first()).toBeVisible({
-      timeout: 3_000,
-    });
+    await this.openSessionFrom(this.sessionItems.nth(index));
   }
 
   async selectFirstSession() {
@@ -55,7 +55,11 @@ export class SessionsPage {
   }
 
   async selectLastSession() {
-    await this.sessionItems.last().click();
+    await this.openSessionFrom(this.sessionItems.last());
+  }
+
+  private async openSessionFrom(item: Locator) {
+    await item.locator(".session-info-link").click();
     await expect(this.messageRows.first()).toBeVisible({
       timeout: 3_000,
     });
