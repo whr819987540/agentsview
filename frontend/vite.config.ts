@@ -116,6 +116,14 @@ export default defineConfig(({ command }) => {
       // cytoscape) are already lazy chunks; the main entry sits just above
       // the default 500 kB threshold.
       chunkSizeWarningLimit: 1200,
+      // Keep all CSS in the entry stylesheet. When a lazy chunk has its own
+      // CSS, Vite's preload helper adds a <link> with load and error
+      // listeners that are never removed, and those listeners keep the
+      // component that first imported the chunk alive. layerchart's Chart
+      // lazy-loads its brush and transform layers this way, so the first
+      // dashboard a page showed stayed in memory for the page's lifetime.
+      // The lazy CSS is a few kilobytes.
+      cssCodeSplit: false,
       rolldownOptions: {
         checks: {
           // Plugin time is dominated by vite-plus's internal vitest-resolver
