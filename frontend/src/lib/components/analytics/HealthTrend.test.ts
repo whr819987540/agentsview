@@ -46,11 +46,28 @@ describe("HealthTrend", () => {
     expect(document.querySelector(".tooltip")?.textContent).toContain(
       "2026-08-18: 92 (4 sessions)",
     );
-    const accessibleRows = document.querySelectorAll("table tbody tr");
+    // The data table renders only on request.
+    const chart = document.querySelector<HTMLElement>("[aria-label='Health Trend'][role='img']");
+    expect(document.querySelector("table")).toBeNull();
+    expect(chart?.hasAttribute("aria-describedby")).toBe(false);
+    const toggle = document.querySelector<HTMLButtonElement>(
+      "button[aria-label='Show data table for Health Trend']",
+    )!;
+    expect(toggle.getAttribute("aria-expanded")).toBe("false");
+    toggle.click();
+    await tick();
+    expect(toggle.getAttribute("aria-expanded")).toBe("true");
+    expect(chart?.getAttribute("aria-describedby")).toBe("health-trend-data");
+    const accessibleRows = document.querySelectorAll("#health-trend-data table tbody tr");
     expect(accessibleRows).toHaveLength(2);
     expect(accessibleRows[0]?.textContent).toContain("2026-08-18");
     expect(accessibleRows[0]?.textContent).toContain("92");
     expect(accessibleRows[0]?.textContent).toContain("4");
+
+    toggle.click();
+    await tick();
+    expect(document.querySelector("table")).toBeNull();
+    expect(chart?.hasAttribute("aria-describedby")).toBe(false);
 
     await unmount(component);
   });

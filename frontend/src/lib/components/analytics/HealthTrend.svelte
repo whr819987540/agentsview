@@ -5,12 +5,16 @@
   import { getGradeStyle, scoreToGrade } from "../../utils/grade.js";
   import { m } from "../../i18n/index.js";
   import LargeChartFrame from "../shared/LargeChartFrame.svelte";
+  import ChartDataTable from "../shared/ChartDataTable.svelte";
+  import { TableHeaderCell } from "@kenn-io/kit-ui";
 
   interface Props {
     trend: SignalsTrendBucket[];
   }
 
   let { trend }: Props = $props();
+
+  let dataTableOpen = $state(false);
 
   const chartData = $derived(
     trend.map((bucket) => ({
@@ -68,7 +72,7 @@
       class="health-chart"
       role="img"
       aria-label={m.analytics_health_trend_title()}
-      aria-describedby="health-trend-data"
+      aria-describedby={dataTableOpen ? "health-trend-data" : undefined}
     >
       <Layer>
         <LargeChartFrame
@@ -90,29 +94,6 @@
         </LargeChartFrame>
       </Layer>
     </Chart>
-    <table id="health-trend-data" class="kit-sr-only">
-      <caption>{m.analytics_health_trend_title()}</caption>
-      <thead>
-        <tr>
-          <th scope="col">{m.analytics_skill_trend_date()}</th>
-          <th scope="col">{m.analytics_session_health_avg_score()}</th>
-          <th scope="col">{m.analytics_col_sessions()}</th>
-        </tr>
-      </thead>
-      <tbody>
-        {#each trend as bucket (bucket.date)}
-          <tr>
-            <th scope="row">{bucket.date}</th>
-            <td>
-              {bucket.avg_health_score != null
-                ? Math.round(bucket.avg_health_score)
-                : m.analytics_health_trend_no_scored_sessions()}
-            </td>
-            <td>{bucket.session_count.toLocaleString()}</td>
-          </tr>
-        {/each}
-      </tbody>
-    </table>
     {#if tooltip}
       <div
         class="tooltip"
@@ -124,6 +105,32 @@
     <div class="chart-caption">
       {m.analytics_health_trend_caption()}
     </div>
+    <ChartDataTable
+      id="health-trend-data"
+      label={m.analytics_health_trend_title()}
+      showLabel={m.analytics_chart_data_show()}
+      hideLabel={m.analytics_chart_data_hide()}
+      showAriaLabel={m.analytics_chart_data_show_for({ chart: m.analytics_health_trend_title() })}
+      hideAriaLabel={m.analytics_chart_data_hide_for({ chart: m.analytics_health_trend_title() })}
+      bind:open={dataTableOpen}
+    >
+      {#snippet header()}
+        <TableHeaderCell label={m.analytics_skill_trend_date()} />
+        <TableHeaderCell label={m.analytics_session_health_avg_score()} numeric />
+        <TableHeaderCell label={m.analytics_col_sessions()} numeric />
+      {/snippet}
+      {#each trend as bucket (bucket.date)}
+        <tr>
+          <th scope="row">{bucket.date}</th>
+          <td>
+            {bucket.avg_health_score != null
+              ? Math.round(bucket.avg_health_score)
+              : m.analytics_health_trend_no_scored_sessions()}
+          </td>
+          <td>{bucket.session_count.toLocaleString()}</td>
+        </tr>
+      {/each}
+    </ChartDataTable>
   {:else}
     <div class="empty">{m.analytics_no_trend_data()}</div>
   {/if}

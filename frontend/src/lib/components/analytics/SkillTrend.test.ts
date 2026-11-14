@@ -250,6 +250,13 @@ describe("SkillTrend", () => {
     const chart = document.querySelector<HTMLElement>(".chart")!;
     expect(chart.getAttribute("role")).toBe("slider");
     expect(chart.getAttribute("tabindex")).toBe("0");
+    // The data table renders only on request.
+    expect(chart.hasAttribute("aria-describedby")).toBe(false);
+    expect(document.querySelector("#skill-trend-data")).toBeNull();
+    document
+      .querySelector<HTMLButtonElement>("button[aria-label='Show data table for Skill Usage Over Time']")!
+      .click();
+    await tick();
     expect(chart.getAttribute("aria-describedby")).toBe("skill-trend-data");
 
     const dataTable = document.querySelector("#skill-trend-data")!;
