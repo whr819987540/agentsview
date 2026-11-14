@@ -65,6 +65,21 @@ async function waitForApp(page: Page) {
   await page.waitForTimeout(3000);
 }
 
+// Dashboard panels below the first row mount as they scroll into view.
+// Scroll through the dashboard once so every panel is in the DOM.
+async function mountDashboardPanels(page: Page) {
+  await page.locator('.analytics-content').evaluate(async (el) => {
+    for (let y = 0; y <= el.scrollHeight; y += el.clientHeight) {
+      el.scrollTo(0, y);
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    el.scrollTo(0, 0);
+  });
+  await expect(
+    page.locator('.analytics-content .lazy-mount-placeholder')
+  ).toHaveCount(0);
+}
+
 async function setDateRange1Y(page: Page) {
   const btn = page.locator('.preset-btn', { hasText: '1y' });
   if (await btn.count() > 0) {
@@ -102,6 +117,7 @@ test.describe('Dashboard', () => {
     await page.getByRole('button', { name: 'Open dashboard' }).click();
     await page.waitForSelector('.analytics-page');
     await page.waitForTimeout(3000);
+    await mountDashboardPanels(page);
     await setDateRange1Y(page);
   });
 

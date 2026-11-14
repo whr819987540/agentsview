@@ -65,6 +65,21 @@ test.describe("Navigation", () => {
     await expect(sp.exportBtn).toContainText("Export CSV");
   });
 
+  test("dashboard panels further down mount as they scroll into view", async ({ page }) => {
+    await sp.openDashboard();
+    const content = page.locator(".analytics-content");
+    const placeholders = content.locator(".lazy-mount-placeholder");
+    await expect(placeholders.first()).toBeAttached();
+
+    await content.evaluate(async (el) => {
+      for (let y = 0; y <= el.scrollHeight; y += el.clientHeight) {
+        el.scrollTo(0, y);
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+    });
+    await expect(placeholders).toHaveCount(0);
+  });
+
   test("search result for an unlisted session keeps the breadcrumb project (#1190)", async ({
     page,
   }) => {
