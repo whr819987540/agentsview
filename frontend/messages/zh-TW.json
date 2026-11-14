@@ -604,6 +604,16 @@
   "analytics_chart_data_hide": "隱藏資料表",
   "analytics_chart_data_show_for": "顯示資料表：{chart}",
   "analytics_chart_data_hide_for": "隱藏資料表：{chart}",
+  "analytics_session_health_projects_show_all": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=other": "顯示全部 {countLabel} 個專案"
+      }
+    }
+  ],
+  "analytics_session_health_projects_show_fewer": "收合",
   "analytics_activity_by_day_hour": "按日期和小時查看活動",
   "analytics_summary_sessions": "對話",
   "analytics_summary_messages": "訊息",

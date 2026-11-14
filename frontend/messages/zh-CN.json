@@ -593,6 +593,16 @@
   "analytics_chart_data_hide": "隐藏数据表",
   "analytics_chart_data_show_for": "显示数据表：{chart}",
   "analytics_chart_data_hide_for": "隐藏数据表：{chart}",
+  "analytics_session_health_projects_show_all": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=other": "显示全部 {countLabel} 个项目"
+      }
+    }
+  ],
+  "analytics_session_health_projects_show_fewer": "收起",
   "analytics_activity_by_day_hour": "按日期和小时查看活动",
   "analytics_summary_sessions": "会话",
   "analytics_summary_messages": "消息",

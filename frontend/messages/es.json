@@ -694,6 +694,17 @@
   "analytics_chart_data_hide": "Ocultar tabla de datos",
   "analytics_chart_data_show_for": "Mostrar tabla de datos de {chart}",
   "analytics_chart_data_hide_for": "Ocultar tabla de datos de {chart}",
+  "analytics_session_health_projects_show_all": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "Mostrar el proyecto ({countLabel})",
+        "countPlural=other": "Mostrar los {countLabel} proyectos"
+      }
+    }
+  ],
+  "analytics_session_health_projects_show_fewer": "Mostrar menos",
   "analytics_activity_by_day_hour": "Actividad por día y hora",
   "analytics_summary_sessions": "Sesiones",
   "analytics_summary_messages": "Mensajes",

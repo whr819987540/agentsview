@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { Card } from "@kenn-io/kit-ui";
+  import { Button, Card } from "@kenn-io/kit-ui";
   import { analytics } from "../../stores/analytics.svelte.js";
   import { scoreToGrade } from "../../utils/grade.js";
   import GradeDistribution
@@ -14,6 +14,23 @@
     signals != null &&
     (signals.scored_sessions > 0 ||
      signals.unscored_sessions > 0),
+  );
+
+  // A long archive has hundreds of projects. The table starts with the
+  // busiest ones so the dashboard does not build a row for every project.
+  const PROJECT_ROW_LIMIT = 20;
+  let showAllProjects = $state(false);
+  const sortedProjects = $derived(
+    signals
+      ? [...signals.by_project].sort(
+          (a, b) => b.session_count - a.session_count,
+        )
+      : [],
+  );
+  const shownProjects = $derived(
+    showAllProjects
+      ? sortedProjects
+      : sortedProjects.slice(0, PROJECT_ROW_LIMIT),
   );
 
   function formatSessionCount(count: number): string {
@@ -188,9 +205,7 @@
               </tr>
             </thead>
             <tbody>
-              {#each [...signals.by_project].sort(
-                (a, b) => b.session_count - a.session_count,
-              ) as row}
+              {#each shownProjects as row}
                 <tr>
                   <td>{row.project}</td>
                   <td class="num">{row.session_count}</td>
@@ -207,6 +222,23 @@
             </tbody>
             </table>
           </div>
+          {#if sortedProjects.length > PROJECT_ROW_LIMIT}
+            <div class="table-more">
+              <Button
+                size="sm"
+                surface="soft"
+                ariaExpanded={showAllProjects}
+                onclick={() => (showAllProjects = !showAllProjects)}
+              >
+                {showAllProjects
+                  ? m.analytics_session_health_projects_show_fewer()
+                  : m.analytics_session_health_projects_show_all({
+                      count: sortedProjects.length,
+                      countLabel: sortedProjects.length.toLocaleString(),
+                    })}
+              </Button>
+            </div>
+          {/if}
         </div>
       </Card>
     </div>
@@ -280,6 +312,10 @@
   .table-scroll {
     min-height: 0;
     overflow: auto;
+  }
+  .table-more {
+    flex-shrink: 0;
+    padding: 6px 12px 10px;
   }
   .table-title {
     font-weight: 600;
