@@ -61,6 +61,7 @@
   import InputTreeModal from "./lib/components/modals/InputTreeModal.svelte";
   import PerfDebugPanel from "./lib/components/debug/PerfDebugPanel.svelte";
   import AnalyticsPage from "./lib/components/analytics/AnalyticsPage.svelte";
+  import DashboardLauncher from "./lib/components/analytics/DashboardLauncher.svelte";
   import UsagePage from "./lib/components/usage/UsagePage.svelte";
   import ActivityPage from "./lib/components/activity/ActivityPage.svelte";
   import TrendsPage from "./lib/components/trends/TrendsPage.svelte";
@@ -945,6 +946,8 @@
           onBack={() => sessions.deselectSession()}
         />
         <MessageList bind:this={messageListRef} />
+      {:else if !ui.dashboardOpened}
+        <DashboardLauncher />
       {:else}
         <AnalyticsPage
           suppressSessionDateRestore={rootDetailDateRestoreSuppressed}

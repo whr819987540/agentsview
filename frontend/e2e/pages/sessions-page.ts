@@ -21,6 +21,7 @@ export class SessionsPage {
   readonly analyticsPage: Locator;
   readonly analyticsToolbar: Locator;
   readonly exportBtn: Locator;
+  readonly openDashboardButton: Locator;
 
   constructor(readonly page: Page) {
     this.sessionItems = page.locator(".session-item");
@@ -34,6 +35,13 @@ export class SessionsPage {
     this.analyticsPage = page.locator(".analytics-page");
     this.analyticsToolbar = page.locator(".analytics-toolbar");
     this.exportBtn = page.locator(".export-btn");
+    this.openDashboardButton = page.getByRole("button", { name: "Open dashboard" });
+  }
+
+  // The Sessions page shows a launcher until the dashboard is opened once.
+  async openDashboard() {
+    await this.openDashboardButton.click();
+    await expect(this.analyticsPage).toBeVisible();
   }
 
   async goto() {

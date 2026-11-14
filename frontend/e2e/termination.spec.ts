@@ -16,7 +16,8 @@ test.describe("session termination status", () => {
     await page.locator(".filter-dropdown .pill-btn", { hasText: /^Unclean$/ }).click();
 
     // Active-filter chip surfaces in the AnalyticsPage right pane
-    // (no session selected).
+    // (no session selected) once the dashboard is open.
+    await sp.openDashboard();
     await expect(page.getByText(/Status:\s*Unclean/i)).toBeVisible();
 
     // The fixture has exactly one unclean session.
@@ -29,8 +30,10 @@ test.describe("session termination status", () => {
 
   test("Top Sessions table renders unclean status dot", async ({ page }) => {
     // AnalyticsPage renders inside the right pane on bare "/"
-    // when no session is selected.
-    await page.goto("/");
+    // when no session is selected and the dashboard is open.
+    const sp = new SessionsPage(page);
+    await sp.goto();
+    await sp.openDashboard();
     await expect(page.locator(".kit-status-dot--unclean").first()).toBeVisible();
   });
 

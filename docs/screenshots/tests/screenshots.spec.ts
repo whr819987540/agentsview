@@ -62,7 +62,6 @@ async function waitForApp(page: Page) {
   await page.waitForSelector('.session-item', {
     timeout: 15_000,
   });
-  // Let analytics charts render
   await page.waitForTimeout(3000);
 }
 
@@ -99,6 +98,10 @@ test.describe('Dashboard', () => {
   test.beforeEach(async ({ page }) => {
     await page.setViewportSize(FULL);
     await waitForApp(page);
+    // The Sessions page shows a launcher until the dashboard is opened.
+    await page.getByRole('button', { name: 'Open dashboard' }).click();
+    await page.waitForSelector('.analytics-page');
+    await page.waitForTimeout(3000);
     await setDateRange1Y(page);
   });
 

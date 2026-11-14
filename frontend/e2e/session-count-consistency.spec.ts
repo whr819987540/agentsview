@@ -32,7 +32,8 @@ test.describe("Session count consistency", () => {
     const statsCount = parseInt(statsMatch![1].replace(/,/g, ""), 10);
 
     // 3. Analytics summary card — uses /api/v1/analytics/summary
-    //    The analytics page is visible by default (no session selected).
+    //    The analytics page opens from the launcher (no session selected).
+    await sp.openDashboard();
     const summaryCards = page.locator(".summary-cards");
     await expect(summaryCards).toBeVisible({ timeout: 5_000 });
 

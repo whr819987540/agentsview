@@ -57,8 +57,10 @@ test.describe("Navigation", () => {
     await expect(page).toHaveURL(new RegExp(`/sessions/${belowRoot}$`));
   });
 
-  test("analytics page shows when no session selected", async () => {
-    await expect(sp.analyticsPage).toBeVisible();
+  test("analytics page opens from the launcher when no session is selected", async () => {
+    await expect(sp.openDashboardButton).toBeVisible();
+    await expect(sp.analyticsPage).toHaveCount(0);
+    await sp.openDashboard();
     await expect(sp.analyticsToolbar).toBeVisible();
     await expect(sp.exportBtn).toContainText("Export CSV");
   });

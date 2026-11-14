@@ -178,6 +178,7 @@ test.describe("Session list", () => {
   });
 
   test("restored rolling dates reach the first Sessions request", async ({ page }) => {
+    await sp.openDashboard();
     await page.locator(".kit-date-range-picker__trigger").click();
     await page.getByRole("button", { name: "90d", exact: true }).click();
     await expect(page).toHaveURL(/window_days=90/);
@@ -204,6 +205,7 @@ test.describe("Session list", () => {
     const sessionId = await sp.sessionItems.first().getAttribute("data-session-id");
     expect(sessionId).toBeTruthy();
 
+    await sp.openDashboard();
     await page.locator(".kit-date-range-picker__trigger").click();
     await page.getByRole("button", { name: "90d", exact: true }).click();
     await expect(page).toHaveURL(/window_days=90/);
@@ -256,6 +258,7 @@ test.describe("Session list", () => {
     const sessionId = await sp.sessionItems.first().getAttribute("data-session-id");
     expect(sessionId).toBeTruthy();
 
+    await sp.openDashboard();
     await page.locator(".kit-date-range-picker__trigger").click();
     await page.getByRole("button", { name: "90d", exact: true }).click();
     await page.getByRole("button", { name: "Settings" }).click();

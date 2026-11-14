@@ -4,7 +4,10 @@ import { test, expect, type CDPSession, type Page } from "@playwright/test";
 // detached DOM tree alive, so the transcript view would carry a dead copy of
 // the dashboard for the rest of the page's life.
 test.describe("dashboard memory", () => {
-  test.skip(({ browserName }) => browserName !== "chromium", "DOM counters come from the Chromium DevTools protocol");
+  test.skip(
+    ({ browserName }) => browserName !== "chromium",
+    "DOM counters come from the Chromium DevTools protocol",
+  );
 
   async function domCounters(cdp: CDPSession) {
     // Two collections: the first can only queue finalizers for wrappers.
@@ -36,6 +39,7 @@ test.describe("dashboard memory", () => {
     const baseline = await domCounters(cdp);
 
     await page.locator(".breadcrumb-link").click();
+    await page.getByRole("button", { name: "Open dashboard" }).click();
     await expect(page.locator(".analytics-content")).toHaveAttribute("aria-busy", "false");
     await expect(page.locator(".lc-root-container").first()).toBeVisible();
     const dashboard = await domCounters(cdp);
