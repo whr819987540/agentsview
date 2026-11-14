@@ -687,6 +687,24 @@
   "shared_unknown": "inconnu",
   "analytics_refresh": "Actualiser les analytics",
   "analytics_export_csv": "Exporter en CSV",
+  "analytics_launcher_title": "Sélectionnez une session ou ouvrez le tableau de bord",
+  "analytics_launcher_description": "Le tableau de bord ne se charge que lorsque vous l'ouvrez : une page qui n'affiche que des transcriptions consomme ainsi moins de mémoire.",
+  "analytics_launcher_open": "Ouvrir le tableau de bord",
+  "analytics_chart_data_show": "Afficher le tableau de données",
+  "analytics_chart_data_hide": "Masquer le tableau de données",
+  "analytics_chart_data_show_for": "Afficher le tableau de données pour {chart}",
+  "analytics_chart_data_hide_for": "Masquer le tableau de données pour {chart}",
+  "analytics_session_health_projects_show_all": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "Afficher le projet ({countLabel})",
+        "countPlural=other": "Afficher les {countLabel} projets"
+      }
+    }
+  ],
+  "analytics_session_health_projects_show_fewer": "Afficher moins",
   "analytics_activity_by_day_hour": "Activité par jour et par heure",
   "analytics_summary_sessions": "Sessions",
   "analytics_summary_messages": "Messages",

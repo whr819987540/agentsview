@@ -9,9 +9,12 @@ interface.
 
 ## Dashboard
 
-When you open AgentsView with no session selected, you see the analytics
-dashboard. It provides a high-level overview of your agent activity across all
-projects.
+The analytics dashboard gives a high-level overview of your agent activity
+across all projects. With no session selected, the Sessions page asks you to
+pick a session or click **Open dashboard**. The dashboard loads only when you
+open it, so a tab that only shows transcripts uses less memory. Once opened, it
+comes back whenever you return to the Sessions page with no session selected,
+until you reload the tab.
 
 ![Analytics dashboard](/docs/assets/generated/screenshots/dashboard.png)
 

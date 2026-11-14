@@ -57,10 +57,27 @@ test.describe("Navigation", () => {
     await expect(page).toHaveURL(new RegExp(`/sessions/${belowRoot}$`));
   });
 
-  test("analytics page shows when no session selected", async () => {
-    await expect(sp.analyticsPage).toBeVisible();
+  test("analytics page opens from the launcher when no session is selected", async () => {
+    await expect(sp.openDashboardButton).toBeVisible();
+    await expect(sp.analyticsPage).toHaveCount(0);
+    await sp.openDashboard();
     await expect(sp.analyticsToolbar).toBeVisible();
     await expect(sp.exportBtn).toContainText("Export CSV");
+  });
+
+  test("dashboard panels further down mount as they scroll into view", async ({ page }) => {
+    await sp.openDashboard();
+    const content = page.locator(".analytics-content");
+    const placeholders = content.locator(".lazy-mount-placeholder");
+    await expect(placeholders.first()).toBeAttached();
+
+    await content.evaluate(async (el) => {
+      for (let y = 0; y <= el.scrollHeight; y += el.clientHeight) {
+        el.scrollTo(0, y);
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+    });
+    await expect(placeholders).toHaveCount(0);
   });
 
   test("search result for an unlisted session keeps the breadcrumb project (#1190)", async ({

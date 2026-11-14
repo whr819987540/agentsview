@@ -5,6 +5,8 @@ import "@kenn-io/kit-ui/mermaid.css";
 import "./app.css";
 import { initI18n } from "./lib/i18n/index.js";
 import { installPerfFetchInstrumentation } from "./lib/stores/perf.svelte.js";
+// kit-ui-check-ignore: primes runed's debounce for layerchart; not a local debounce implementation
+import { primeChartDebounce } from "./lib/utils/chart-debounce.js";
 
 const target = document.getElementById("app");
 
@@ -14,5 +16,7 @@ if (!target) {
 
 installPerfFetchInstrumentation();
 initI18n();
+// Must run before any chart mounts; see chart-debounce.ts.
+primeChartDebounce();
 
 mount(App, { target });

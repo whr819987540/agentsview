@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { afterEach, describe, expect, it, vi } from "vite-plus/test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { mount, tick, unmount } from "svelte";
 import { analytics } from "./lib/stores/analytics.svelte.js";
 import { activity } from "./lib/stores/activity.svelte.js";
@@ -83,11 +83,18 @@ function stubAppDependencies() {
   vi.spyOn(usage, "fetchAll").mockResolvedValue();
 }
 
+// Most suites cover the dashboard's behavior once it is open. The
+// "App dashboard launcher" suite covers the closed state.
+beforeEach(() => {
+  ui.dashboardOpened = true;
+});
+
 afterEach(() => {
   if (component) {
     unmount(component);
     component = undefined;
   }
+  ui.dashboardOpened = false;
   vi.restoreAllMocks();
   vi.useRealTimers();
   vi.unstubAllGlobals();
@@ -667,6 +674,65 @@ describe("App session URL date state", () => {
 
     expect(undoBlock).toContain("await sessions.restoreRecentlyDeleted(last);");
     expect(undoBlock).not.toContain("await sessions.restoreSession(last.id);");
+  });
+});
+
+describe("App dashboard launcher", () => {
+  function launcherButton(): HTMLButtonElement | undefined {
+    return [...document.querySelectorAll<HTMLButtonElement>("button")].find(
+      (button) => button.textContent?.trim() === "Open dashboard",
+    );
+  }
+
+  function mountRoot() {
+    stubAppDependencies();
+    vi.spyOn(sessions, "load").mockResolvedValue();
+    sessions.loading = false;
+    window.history.replaceState(null, "", "/");
+    router.route = "sessions";
+    router.params = {};
+    router.sessionId = null;
+    router.isRootPath = true;
+    ui.dashboardOpened = false;
+    component = mount(App, { target: document.body });
+  }
+
+  it("shows a launcher instead of the dashboard and reads no analytics", async () => {
+    mountRoot();
+    await flushEffects();
+
+    expect(document.querySelector(".analytics-page")).toBeNull();
+    expect(document.body.textContent).toContain("Select a session, or open the dashboard");
+    expect(launcherButton()).not.toBeUndefined();
+    expect(analytics.fetchAll).not.toHaveBeenCalled();
+  });
+
+  it("builds the dashboard and loads its data when the launcher is clicked", async () => {
+    mountRoot();
+    await flushEffects();
+
+    launcherButton()!.click();
+    await flushEffects();
+
+    expect(document.querySelector(".analytics-page")).not.toBeNull();
+    expect(launcherButton()).toBeUndefined();
+    expect(analytics.fetchAll).toHaveBeenCalledTimes(1);
+  });
+
+  it("returns to the open dashboard after a session without asking again", async () => {
+    mountRoot();
+    await flushEffects();
+    launcherButton()!.click();
+    await flushEffects();
+
+    sessions.activeSessionId = "session-a";
+    await flushEffects();
+    expect(document.querySelector(".analytics-page")).toBeNull();
+
+    sessions.activeSessionId = null;
+    await flushEffects();
+    expect(document.querySelector(".analytics-page")).not.toBeNull();
+    expect(launcherButton()).toBeUndefined();
   });
 });
 

@@ -687,6 +687,24 @@
   "shared_unknown": "未知",
   "analytics_refresh": "分析を更新する",
   "analytics_export_csv": "CSVのエクスポート",
+  "analytics_launcher_title": "セッションを選択するか、ダッシュボードを開いてください",
+  "analytics_launcher_description": "ダッシュボードは開いたときにだけ読み込まれるため、トランスクリプトだけを表示するページのメモリ使用量が少なくなります。",
+  "analytics_launcher_open": "ダッシュボードを開く",
+  "analytics_chart_data_show": "データ表を表示",
+  "analytics_chart_data_hide": "データ表を非表示",
+  "analytics_chart_data_show_for": "データ表を表示：{chart}",
+  "analytics_chart_data_hide_for": "データ表を非表示：{chart}",
+  "analytics_session_health_projects_show_all": [
+    {
+      "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],
+      "selectors": ["countPlural"],
+      "match": {
+        "countPlural=one": "{countLabel} 件のプロジェクトをすべて表示",
+        "countPlural=other": "{countLabel} 件のプロジェクトをすべて表示"
+      }
+    }
+  ],
+  "analytics_session_health_projects_show_fewer": "表示を減らす",
   "analytics_activity_by_day_hour": "日別および時間別の活動",
   "analytics_summary_sessions": "セッション",
   "analytics_summary_messages": "メッセージ",

@@ -8,6 +8,8 @@
   import { parseLocalDate } from "../../utils/dates.js";
   import { chartSeriesColorMap } from "../../utils/chartPalette.js";
   import LargeChartFrame from "../shared/LargeChartFrame.svelte";
+  import ChartDataTable from "../shared/ChartDataTable.svelte";
+  import { TableHeaderCell } from "@kenn-io/kit-ui";
 
   // Soft cap from the series-count ladder: past six skills the tail folds
   // into "Other" instead of generating more hues.
@@ -178,6 +180,7 @@
 
   // Crosshair: snap the pointer to the nearest bucket and read out every
   // visible series at that X in one tooltip.
+  let dataTableOpen = $state(false);
   let hoverIndex = $state<number | null>(null);
   let tooltipPos = $state<{ x: number; y: number } | null>(null);
 
@@ -309,7 +312,7 @@
       role="slider"
       tabindex="0"
       aria-label={m.analytics_skill_trend_chart_label()}
-      aria-describedby="skill-trend-data"
+      aria-describedby={dataTableOpen ? "skill-trend-data" : undefined}
       aria-valuemin="0"
       aria-valuemax={Math.max(trendEntries.length - 1, 0)}
       aria-valuenow={hoverIndex ?? 0}
@@ -386,28 +389,32 @@
           </LargeChartFrame>
         </Layer>
       </Chart>
-      <table id="skill-trend-data" class="kit-sr-only">
-        <caption>{m.analytics_skill_trend_title()}</caption>
-        <thead>
-          <tr>
-            <th scope="col">{m.analytics_skill_trend_date()}</th>
-            {#each allSeries as series (series.key)}
-              <th scope="col">{series.label}</th>
-            {/each}
-          </tr>
-        </thead>
-        <tbody>
-          {#each trendEntries as entry, index (entry.date)}
-            <tr>
-              <th scope="row">{bucketDateLabel(entry.date)}</th>
-              {#each allSeries as series (series.key)}
-                <td>{(series.values[index] ?? 0).toLocaleString(getLocale())}</td>
-              {/each}
-            </tr>
-          {/each}
-        </tbody>
-      </table>
     </div>
+
+    <ChartDataTable
+      id="skill-trend-data"
+      label={m.analytics_skill_trend_title()}
+      showLabel={m.analytics_chart_data_show()}
+      hideLabel={m.analytics_chart_data_hide()}
+      showAriaLabel={m.analytics_chart_data_show_for({ chart: m.analytics_skill_trend_title() })}
+      hideAriaLabel={m.analytics_chart_data_hide_for({ chart: m.analytics_skill_trend_title() })}
+      bind:open={dataTableOpen}
+    >
+      {#snippet header()}
+        <TableHeaderCell label={m.analytics_skill_trend_date()} />
+        {#each allSeries as series (series.key)}
+          <TableHeaderCell label={series.label} numeric />
+        {/each}
+      {/snippet}
+      {#each trendEntries as entry, index (entry.date)}
+        <tr>
+          <th scope="row">{bucketDateLabel(entry.date)}</th>
+          {#each allSeries as series (series.key)}
+            <td>{(series.values[index] ?? 0).toLocaleString(getLocale())}</td>
+          {/each}
+        </tr>
+      {/each}
+    </ChartDataTable>
 
     {#if hoverIndex !== null && tooltipPos}
       <div

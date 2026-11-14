@@ -356,6 +356,11 @@ class UIStore {
   pendingScrollSession: string | null = $state(null);
   /** The tool call a pending jump expects at its message; null when any message at the ordinal will do. */
   pendingScrollCall: ScrollCall | null = $state(null);
+  /** Whether this page has opened the dashboard. The Sessions page shows a
+   *  launcher until then, so a page that only reads transcripts never
+   *  builds the dashboard's charts. Once opened, it stays opened for the
+   *  page's lifetime. */
+  dashboardOpened: boolean = $state(false);
 
   private localZoomLevel = readStoredZoom();
   zoomLevel: ZoomLevel = $state(this.localZoomLevel ?? ZOOM_DEFAULT);
@@ -685,6 +690,10 @@ class UIStore {
 
   clearSelection() {
     this.selectedOrdinal = null;
+  }
+
+  openDashboard() {
+    this.dashboardOpened = true;
   }
 
   clearScrollState() {

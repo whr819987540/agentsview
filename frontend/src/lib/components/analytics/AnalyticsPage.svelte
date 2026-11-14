@@ -52,6 +52,7 @@
   import { parseLocalDate, rollingRange } from "../../utils/dates.js";
   import { exportAnalyticsCSV } from "../../utils/csv-export.js";
   import RefreshControl from "../shared/RefreshControl.svelte";
+  import LazyMount from "../shared/LazyMount.svelte";
   import { m } from "../../i18n/index.js";
 
   interface Props {
@@ -321,6 +322,8 @@
   }
 
   let unsubEvents: (() => void) | undefined;
+  // Panels below the first row mount as they near this scroll container.
+  let contentEl: HTMLDivElement | undefined = $state(undefined);
   let analyticsDateUrlInitRan = $state(false);
   let analyticsDateUrlInitComplete = $state(false);
   let lastAnalyticsDateUrlSignature: string | null = $state(null);
@@ -685,6 +688,7 @@
   <ActiveFilters />
 
   <div
+    bind:this={contentEl}
     class="analytics-content"
     class:querying={analytics.isQuerying}
     aria-busy={analytics.isQuerying}
@@ -719,54 +723,74 @@
       </Card>
 
       <Card level="default" padding="none" class="chart-panel">
-        <TopSessions />
+        <LazyMount root={contentEl}>
+          <TopSessions />
+        </LazyMount>
       </Card>
 
       <Card level="default" padding="none" class="chart-panel wide">
-        <ProjectBreakdown />
+        <LazyMount root={contentEl}>
+          <ProjectBreakdown />
+        </LazyMount>
       </Card>
 
       <Card level="default" padding="none" class="chart-panel">
-        <SessionShape />
+        <LazyMount root={contentEl}>
+          <SessionShape />
+        </LazyMount>
       </Card>
 
       <Card level="default" padding="none" class="chart-panel">
-        <ToolUsage />
+        <LazyMount root={contentEl}>
+          <ToolUsage />
+        </LazyMount>
       </Card>
 
       <Card level="default" padding="none" class="chart-panel wide">
-        <TopSkills />
+        <LazyMount root={contentEl}>
+          <TopSkills />
+        </LazyMount>
       </Card>
 
       <Card level="default" padding="none" class="chart-panel wide">
-        <SkillTrend />
+        <LazyMount root={contentEl}>
+          <SkillTrend />
+        </LazyMount>
       </Card>
 
       <Card level="default" padding="none" class="chart-panel wide">
-        <VelocityMetrics />
+        <LazyMount root={contentEl}>
+          <VelocityMetrics />
+        </LazyMount>
       </Card>
 
       <Card level="default" padding="none" class="chart-panel wide">
-        <AgentComparison />
+        <LazyMount root={contentEl}>
+          <AgentComparison />
+        </LazyMount>
       </Card>
 
       <Card level="default" padding="none" class="chart-panel wide">
-        <OutcomeTotals
-          stats={outcomeTotals.stats}
-          loading={outcomeTotals.loading}
-          unavailable={outcomeFiltersUnsupported}
-          backendAvailable={sync.serverVersion?.session_stats_available}
-          githubConfigured={settings.githubConfigured}
-          error={outcomeTotals.error}
-          includePullRequests={outcomeTotals.includePullRequests}
-          onIncludePullRequests={() => {
-            if (outcomeWindow) void outcomeTotals.loadWithPullRequests(outcomeWindow);
-          }}
-        />
+        <LazyMount root={contentEl}>
+          <OutcomeTotals
+            stats={outcomeTotals.stats}
+            loading={outcomeTotals.loading}
+            unavailable={outcomeFiltersUnsupported}
+            backendAvailable={sync.serverVersion?.session_stats_available}
+            githubConfigured={settings.githubConfigured}
+            error={outcomeTotals.error}
+            includePullRequests={outcomeTotals.includePullRequests}
+            onIncludePullRequests={() => {
+              if (outcomeWindow) void outcomeTotals.loadWithPullRequests(outcomeWindow);
+            }}
+          />
+        </LazyMount>
       </Card>
     </div>
 
-    <SessionHealthSection />
+    <LazyMount root={contentEl}>
+      <SessionHealthSection />
+    </LazyMount>
   </div>
 </div>
 
