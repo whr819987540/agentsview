@@ -88,6 +88,9 @@
     selectMode?: boolean;
     /** Whether this item is currently selected in multi-select mode. */
     selected?: boolean;
+    /** Extends the selection to this session on a shift-click in
+     * multi-select mode. Without it, a shift-click toggles the row. */
+    onRangeSelect?: (id: string) => void;
     /** Sessions this row files into a folder, primary first. Set on
      * root rows; enables dragging and "Move to folder". */
     folderSessionIds?: string[];
@@ -115,6 +118,7 @@
     hasTeammates = false,
     selectMode = false,
     selected = false,
+    onRangeSelect,
     folderSessionIds,
     inset = 0,
   }: Props = $props();
@@ -393,7 +397,34 @@
     startRename();
   }
 
+  /** Shift alone extends the selection in multi-select mode. Shift
+   * combined with Ctrl, Cmd, or Alt keeps its browser meaning, such
+   * as opening the link in a new tab. */
+  function isRangeClick(e: MouseEvent): boolean {
+    return (
+      selectMode &&
+      e.shiftKey &&
+      !e.metaKey &&
+      !e.ctrlKey &&
+      !e.altKey &&
+      e.button === 0
+    );
+  }
+
+  function selectRange() {
+    if (onRangeSelect) {
+      onRangeSelect(session.id);
+    } else {
+      sessions.toggleSelection(session.id);
+    }
+  }
+
   function handleSessionClick(e: MouseEvent) {
+    if (isRangeClick(e)) {
+      e.preventDefault();
+      selectRange();
+      return;
+    }
     if (
       e.metaKey ||
       e.ctrlKey ||
@@ -412,6 +443,17 @@
   }
 
   function handleRowClick(e: MouseEvent) {
+    const target = e.target;
+    if (!(target instanceof Element)) {
+      return;
+    }
+    if (target.closest("a, button, input")) {
+      return;
+    }
+    if (isRangeClick(e)) {
+      selectRange();
+      return;
+    }
     if (
       e.metaKey ||
       e.ctrlKey ||
@@ -419,13 +461,6 @@
       e.altKey ||
       e.button !== 0
     ) {
-      return;
-    }
-    const target = e.target;
-    if (!(target instanceof Element)) {
-      return;
-    }
-    if (target.closest("a, button, input")) {
       return;
     }
     if (selectMode) {
@@ -438,7 +473,11 @@
   function handleSelectClick(e: MouseEvent) {
     e.stopPropagation();
     e.preventDefault();
-    sessions.toggleSelection(session.id);
+    if (isRangeClick(e)) {
+      selectRange();
+    } else {
+      sessions.toggleSelection(session.id);
+    }
   }
 
   $effect(() => {

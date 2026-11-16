@@ -1289,9 +1289,13 @@ class SessionsStore {
   /** Multi-select state for batch operations. */
   selectedIds: Set<string> = $state(new Set());
   selectMode: boolean = $state(false);
+  /** The last session toggled by a click, where a shift-click range
+   * starts. Null until a click in the current select mode. */
+  private selectionAnchorId: string | null = null;
 
   toggleSelectMode() {
     this.selectMode = !this.selectMode;
+    this.selectionAnchorId = null;
     if (!this.selectMode) {
       this.selectedIds = new Set();
     }
@@ -1305,6 +1309,33 @@ class SessionsStore {
       next.add(id);
     }
     this.selectedIds = next;
+    this.selectionAnchorId = id;
+  }
+
+  /**
+   * Applies the anchor's state to every session from the anchor to
+   * targetId in orderedIds, the sidebar's visible order. A checked
+   * anchor checks the range and an unchecked one clears it. Sessions
+   * outside the range keep their state. Without an anchor in
+   * orderedIds, or when targetId is the anchor, this toggles targetId.
+   */
+  selectRange(orderedIds: readonly string[], targetId: string) {
+    const anchor = this.selectionAnchorId;
+    const from = anchor === null ? -1 : orderedIds.indexOf(anchor);
+    const to = orderedIds.indexOf(targetId);
+    if (anchor === null || from < 0 || to < 0 || from === to) {
+      this.toggleSelection(targetId);
+      return;
+    }
+    const check = this.selectedIds.has(anchor);
+    const next = new Set(this.selectedIds);
+    for (let i = Math.min(from, to); i <= Math.max(from, to); i++) {
+      const id = orderedIds[i]!;
+      if (check) next.add(id);
+      else next.delete(id);
+    }
+    this.selectedIds = next;
+    this.selectionAnchorId = targetId;
   }
 
   selectAll(ids: string[]) {
@@ -1313,6 +1344,7 @@ class SessionsStore {
 
   clearSelection() {
     this.selectedIds = new Set();
+    this.selectionAnchorId = null;
   }
 
   async deleteSession(id: string) {

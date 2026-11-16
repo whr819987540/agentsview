@@ -1235,6 +1235,14 @@ shows how many are selected and a **Delete** action that moves the whole
 selection to the trash at once. Toggle multi-select off to return to normal
 browsing.
 
+To check a run of sessions, click the first one, then hold `Shift` and click the
+last one. Every session from the first click through the `Shift`-click gets the
+first session's state, so a `Shift`-click after you uncheck a session clears the
+run instead. The run skips sessions inside collapsed groups and sessions hidden
+by filters. In selection mode, `Shift`-click no longer opens a session in a new
+window; `Ctrl`-click and `Ctrl`+`Shift`-click (`Cmd` on macOS) still open it in
+a new tab.
+
 ### Pinned Messages
 
 Click the pin icon on any message header to pin it. Pinned messages are saved to
