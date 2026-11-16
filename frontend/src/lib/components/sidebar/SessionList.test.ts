@@ -1254,6 +1254,206 @@ describe("SessionList visible hydration", () => {
     expect(selectSession).toHaveBeenCalledWith("row-session");
   });
 
+  describe("shift-click range selection", () => {
+    function rangeSessions(): Session[] {
+      return ["s1", "s2", "s3", "s4"].map((id, i) =>
+        makeSession({
+          id,
+          display_name: `Range ${id}`,
+          started_at: `2024-01-0${5 - i}T00:00:00Z`,
+          ended_at: `2024-01-0${5 - i}T00:01:00Z`,
+          is_index_only: false,
+        }),
+      );
+    }
+
+    async function mountSessions(list: Session[], selectMode: boolean) {
+      sessions.sessions = list;
+      vi.spyOn(sessions, "hydrateVisibleSessions").mockResolvedValue(undefined);
+      component = mount(SessionList, { target: document.body });
+      await tick();
+      if (selectMode) {
+        const toggle = document.querySelector<HTMLButtonElement>(
+          `[aria-label="${m.sidebar_multi_select()}"]`,
+        );
+        expect(toggle).not.toBeNull();
+        toggle!.click();
+        await tick();
+      }
+    }
+
+    function part(sessionId: string, selector: string): HTMLElement {
+      const el = document.querySelector<HTMLElement>(
+        `[data-session-id="${sessionId}"] ${selector}`,
+      );
+      expect(el).not.toBeNull();
+      return el!;
+    }
+
+    function click(el: HTMLElement, init: MouseEventInit = {}): MouseEvent {
+      const event = new MouseEvent("click", { bubbles: true, cancelable: true, ...init });
+      el.dispatchEvent(event);
+      return event;
+    }
+
+    function selected(): string[] {
+      return [...sessions.selectedIds].sort();
+    }
+
+    it.each([
+      { target: "title link", selector: ".session-info-link", preventsDefault: true },
+      { target: "checkbox", selector: ".select-checkbox", preventsDefault: true },
+      // A row click has no browser default to cancel.
+      { target: "row body", selector: ".side-meta", preventsDefault: false },
+    ])(
+      "selects every row from the last clicked one through a shift-clicked $target",
+      async ({ selector, preventsDefault }) => {
+        const selectSession = vi.spyOn(sessions, "selectSession").mockImplementation(() => {});
+        await mountSessions(rangeSessions(), true);
+
+        click(part("s1", ".session-info-link"));
+        const shiftClick = click(part("s3", selector), { shiftKey: true });
+
+        expect(selected()).toEqual(["s1", "s2", "s3"]);
+        expect(shiftClick.defaultPrevented).toBe(preventsDefault);
+        expect(selectSession).not.toHaveBeenCalled();
+      },
+    );
+
+    it("selects a range above the last clicked row", async () => {
+      await mountSessions(rangeSessions(), true);
+
+      click(part("s3", ".select-checkbox"));
+      click(part("s1", ".select-checkbox"), { shiftKey: true });
+
+      expect(selected()).toEqual(["s1", "s2", "s3"]);
+    });
+
+    it("toggles the last clicked row when it is shift-clicked again", async () => {
+      await mountSessions(rangeSessions(), true);
+
+      click(part("s2", ".select-checkbox"));
+      click(part("s2", ".select-checkbox"), { shiftKey: true });
+
+      expect(selected()).toEqual([]);
+    });
+
+    it("clears the range when the last clicked row was unchecked", async () => {
+      await mountSessions(rangeSessions(), true);
+      document.querySelector<HTMLButtonElement>(".batch-select-all-btn")!.click();
+      await tick();
+      expect(selected()).toEqual(["s1", "s2", "s3", "s4"]);
+
+      click(part("s3", ".select-checkbox"));
+      click(part("s1", ".session-info-link"), { shiftKey: true });
+
+      expect(selected()).toEqual(["s4"]);
+    });
+
+    it("leaves sessions inside a collapsed group out of the range", async () => {
+      await mountSessions(
+        [
+          makeSession({
+            id: "top",
+            display_name: "Top session",
+            started_at: "2024-01-05T00:00:00Z",
+            ended_at: "2024-01-05T00:01:00Z",
+            is_index_only: false,
+          }),
+          makeSession({
+            id: "parent",
+            display_name: "Parent session",
+            started_at: "2024-01-03T00:00:00Z",
+            ended_at: "2024-01-03T00:01:00Z",
+            is_index_only: false,
+          }),
+          makeSession({
+            id: "child",
+            parent_session_id: "parent",
+            display_name: "Hidden continuation",
+            started_at: "2024-01-03T00:02:00Z",
+            ended_at: "2024-01-03T00:03:00Z",
+            is_index_only: false,
+          }),
+          makeSession({
+            id: "bottom",
+            display_name: "Bottom session",
+            started_at: "2024-01-01T00:00:00Z",
+            ended_at: "2024-01-01T00:01:00Z",
+            is_index_only: false,
+          }),
+        ],
+        true,
+      );
+      const rendered = [...document.querySelectorAll<HTMLElement>(".session-item")].map(
+        (row) => row.dataset.sessionId,
+      );
+      expect(rendered).toEqual(["top", "parent", "bottom"]);
+
+      click(part("top", ".select-checkbox"));
+      click(part("bottom", ".select-checkbox"), { shiftKey: true });
+
+      expect(selected()).toEqual(["bottom", "parent", "top"]);
+    });
+
+    it.each([
+      {
+        reset: "clearing the selection",
+        run: async () => {
+          const allButton = document.querySelector<HTMLButtonElement>(".batch-select-all-btn")!;
+          allButton.click();
+          await tick();
+          allButton.click();
+          await tick();
+        },
+      },
+      {
+        reset: "leaving and re-entering select mode",
+        run: async () => {
+          document.querySelector<HTMLButtonElement>(".batch-cancel-btn")!.click();
+          await tick();
+          document
+            .querySelector<HTMLButtonElement>(`[aria-label="${m.sidebar_multi_select()}"]`)!
+            .click();
+          await tick();
+        },
+      },
+    ])("shift-click toggles only its row after $reset", async ({ run }) => {
+      await mountSessions(rangeSessions(), true);
+      click(part("s1", ".select-checkbox"));
+
+      await run();
+      expect(selected()).toEqual([]);
+      click(part("s3", ".select-checkbox"), { shiftKey: true });
+
+      expect(selected()).toEqual(["s3"]);
+    });
+
+    it.each([
+      { combo: "Ctrl+Shift", init: { shiftKey: true, ctrlKey: true } },
+      { combo: "Cmd+Shift", init: { shiftKey: true, metaKey: true } },
+    ])("leaves $combo clicks on the title to the browser in select mode", async ({ init }) => {
+      await mountSessions(rangeSessions(), true);
+      click(part("s1", ".session-info-link"));
+
+      const modifiedClick = click(part("s3", ".session-info-link"), init);
+
+      expect(modifiedClick.defaultPrevented).toBe(false);
+      expect(selected()).toEqual(["s1"]);
+    });
+
+    it("leaves shift-clicks on the title to the browser outside select mode", async () => {
+      const selectSession = vi.spyOn(sessions, "selectSession").mockImplementation(() => {});
+      await mountSessions(rangeSessions(), false);
+
+      const shiftClick = click(part("s3", ".session-info-link"), { shiftKey: true });
+
+      expect(shiftClick.defaultPrevented).toBe(false);
+      expect(selectSession).not.toHaveBeenCalled();
+      expect(selected()).toEqual([]);
+    });
+  });
+
   it("keeps button-discoverable rows alongside native session links", async () => {
     sessions.sessions = [
       makeSession({

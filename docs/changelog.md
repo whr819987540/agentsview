@@ -11,6 +11,13 @@ The latest published release is
 
 **New features**
 
+- Check a run of sessions in one go before deleting them. In the sidebar's
+  multi-select mode, click a session, then hold `Shift` and click another:
+  every session listed between them is checked too. If you had just unchecked
+  the first session, the `Shift`-click clears the run instead. Sessions inside
+  collapsed groups or hidden by filters stay out of the run. While multi-select
+  is on, `Shift`-click no longer opens a session in a new window; `Ctrl`-click
+  and `Ctrl`+`Shift`-click (`Cmd` on macOS) still open it in a new tab.
 - Mark a session as ended when you are done with it. Hover a session in the
   sidebar and click the circled check next to the star, or choose **Mark as
   ended** from the session's right-click menu or the session actions menu in the

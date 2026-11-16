@@ -616,6 +616,12 @@
     }
   }
 
+  // Ranges follow the rendered order, so rows inside collapsed groups
+  // and filtered-out sessions stay out of a shift-click range.
+  function selectRangeTo(id: string) {
+    sessions.selectRange(allVisibleSessionIds, id);
+  }
+
   function handleSelectAllVisible() {
     if (allSelected) {
       sessions.clearSelection();
@@ -1032,6 +1038,7 @@
             isLastChild={item.isLastChild ?? false}
             selectMode={sessions.selectMode}
             selected={sessions.selectedIds.has(item.session.id)}
+            onRangeSelect={selectRangeTo}
           />
         {:else if item.group}
           {@const primary = item.group.sessions.find(
@@ -1070,6 +1077,7 @@
               hasTeammates={groupHasTeammates}
               selectMode={sessions.selectMode}
               selected={primary ? sessions.selectedIds.has(primary.id) : false}
+              onRangeSelect={selectRangeTo}
             />
           {/if}
         {/if}
