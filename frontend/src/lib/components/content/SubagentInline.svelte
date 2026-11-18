@@ -19,6 +19,7 @@ import type { ServiceMessageList as MessagesResponse } from "../../api/generated
   } from "../../icons.js";
   import { m } from "../../i18n/index.js";
   import { LatestRead } from "../../utils/latest-read.js";
+  import { shareSoleToolResults } from "../../utils/messages.js";
   import { onDestroy } from "svelte";
 
   interface Props {
@@ -27,7 +28,8 @@ import type { ServiceMessageList as MessagesResponse } from "../../api/generated
 
   let { sessionId }: Props = $props();
   let expanded = $state(false);
-  let messages = $state<Message[] | null>(null);
+  // Replaced on each load, never edited, so it needs no deep proxy.
+  let messages = $state.raw<Message[] | null>(null);
   let sessionMeta = $state<Session | null>(null);
   let loading = $state(false);
   let error = $state<string | null>(null);
@@ -72,7 +74,7 @@ import type { ServiceMessageList as MessagesResponse } from "../../api/generated
           }),
         ]);
         if (!nestedRead.isCurrent(signal)) return;
-        messages = resp.messages;
+        messages = shareSoleToolResults(resp.messages);
         sessionMeta = meta;
       } catch (e) {
         if (isAbortError(e) || !nestedRead.isCurrent(signal)) return;

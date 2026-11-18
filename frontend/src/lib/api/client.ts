@@ -164,6 +164,8 @@ export interface WatchEventsOptions {
    * recover on their own.
    */
   onPermanentFailure?: () => void;
+  /** Called each time the stream connects or reconnects. */
+  onOpen?: () => void;
 }
 
 export function watchEvents(
@@ -194,6 +196,7 @@ export function watchEvents(
   es.addEventListener("open", () => {
     hasOpened = true;
     consecutiveErrors = 0;
+    opts.onOpen?.();
   });
 
   es.addEventListener("data_changed", (msg) => {
@@ -374,26 +377,18 @@ async function readImportResponse(response: Response, cb?: ImportCallbacks): Pro
 
 export async function importClaudeAI(file: File, cb?: ImportCallbacks): Promise<ImportStats> {
   return readImportResponse(
-    await ImportService.postApiV1ImportClaudeAi(
-      { file },
-      undefined,
-      {
-        headers: { Accept: "text/event-stream" },
-      },
-    ),
+    await ImportService.postApiV1ImportClaudeAi({ file }, undefined, {
+      headers: { Accept: "text/event-stream" },
+    }),
     cb,
   );
 }
 
 export async function importChatGPT(file: File, cb?: ImportCallbacks): Promise<ImportStats> {
   return readImportResponse(
-    await ImportService.postApiV1ImportChatgpt(
-      { file },
-      undefined,
-      {
-        headers: { Accept: "text/event-stream" },
-      },
-    ),
+    await ImportService.postApiV1ImportChatgpt({ file }, undefined, {
+      headers: { Accept: "text/event-stream" },
+    }),
     cb,
   );
 }

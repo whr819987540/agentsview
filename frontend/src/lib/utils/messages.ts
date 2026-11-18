@@ -1,5 +1,26 @@
 import type { DbMessage as Message } from "../api/generated/index.js";
 
+/**
+ * The messages API repeats a call's only result in result_content and in
+ * result_events[0].content, and parsing the response makes them two
+ * strings. Tool output is often most of a transcript, so pointing
+ * result_content at the event's string keeps one copy. Call this on rows
+ * fresh from the API, before they reach any state.
+ */
+export function shareSoleToolResults(messages: Message[]): Message[] {
+  for (const message of messages) {
+    for (const call of message.tool_calls ?? []) {
+      const events = call.result_events;
+      if (events?.length !== 1) continue;
+      const content = events[0]!.content;
+      if (content !== undefined && content === call.result_content) {
+        call.result_content = content;
+      }
+    }
+  }
+  return messages;
+}
+
 const SYSTEM_MSG_PREFIXES = [
   "This session is being continued",
   "[Request interrupted",

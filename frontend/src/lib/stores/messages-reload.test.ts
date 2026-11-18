@@ -93,6 +93,7 @@ function serve(
     arrived: () => void;
     gate: Promise<void>;
   } | null = null;
+  let sessionHold: { arrived: () => void; gate: Promise<void> } | null = null;
   const revision = () => (revisions ? String(state.revision) : "");
   const record = (request: Shown["request"]) =>
     shown.push({
@@ -103,6 +104,12 @@ function serve(
     });
   api.getSession.mockImplementation(async (id: string) => {
     record("session");
+    if (sessionHold) {
+      const current = sessionHold;
+      sessionHold = null;
+      current.arrived();
+      await current.gate;
+    }
     return { id, ...state.meta, transcript_revision: revision() };
   });
   api.getMessages.mockImplementation(async (_id: string, params: PageParams = {}) => {
@@ -119,9 +126,16 @@ function serve(
         throw new ApiError(409, "transcript revision does not match");
       }
       const limit = params.limit ?? 1000;
-      const page = state.rows
-        .filter((message) => params.from === undefined || message.ordinal >= params.from)
-        .slice(0, limit);
+      // Descending reads end at `from` (or the last row) and come back newest first.
+      const page =
+        params.direction === "desc"
+          ? state.rows
+              .filter((message) => params.from === undefined || message.ordinal <= params.from)
+              .slice(-limit)
+              .reverse()
+          : state.rows
+              .filter((message) => params.from === undefined || message.ordinal >= params.from)
+              .slice(0, limit);
       servedOrdinals.push(...page.map((message) => message.ordinal));
       return { messages: page, count: page.length, transcript_revision: revision() };
     } finally {
@@ -137,6 +151,15 @@ function serve(
     reset() {
       shown.length = 0;
       servedOrdinals.length = 0;
+    },
+    /** Hold the next session read until release is called. */
+    holdNextSession() {
+      let arrived!: () => void;
+      const arrival = new Promise<void>((resolve) => (arrived = resolve));
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => (release = resolve));
+      sessionHold = { arrived, gate };
+      return { arrived: arrival, release };
     },
     /** Hold the next page request that matches until release is called. */
     holdNext(matches: (params: PageParams) => boolean) {
@@ -255,6 +278,45 @@ describe("a reload of a transcript already on screen", () => {
     expect(backend.servedOrdinals.length, "rows the reload read").toBe(
       new Set(backend.servedOrdinals).size,
     );
+  });
+});
+
+describe("older history that lands during a reload", () => {
+  // The reload compares the rows it read with the rows on screen to find where
+  // unread messages start. A page of older history that joins the window
+  // while the reload waits for the session is not new to the reader.
+  it("marks only the appended rows as unread", async () => {
+    const store = newStore();
+    const backend = serve(
+      store,
+      ordinals(0, 3499).map((ordinal) => row("live", ordinal)),
+      { message_count: 3500 },
+    );
+    await store.loadSession("live");
+    await store.loadOlder();
+    await store.loadOlder();
+    expect(store.messages[0]?.ordinal).toBe(500);
+
+    // The last page of history is in flight when the reload starts.
+    const lastPage = backend.holdNext((params) => params.direction === "desc");
+    const older = store.loadOlder();
+    await lastPage.arrived;
+    const sessionRead = backend.holdNextSession();
+    const reload = store.reload();
+    await sessionRead.arrived;
+
+    lastPage.release();
+    await older;
+    expect(store.messages[0]?.ordinal).toBe(0);
+
+    backend.state.rows = [...backend.state.rows, row("live", 3500)];
+    backend.state.revision++;
+    backend.state.meta = { message_count: 3501 };
+    sessionRead.release();
+    await reload;
+
+    expect(store.messages.at(-1)?.ordinal).toBe(3500);
+    expect(store.activeSessionUnreadOrdinal).toBe(3500);
   });
 });
 

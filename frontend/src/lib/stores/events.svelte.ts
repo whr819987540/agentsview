@@ -1,5 +1,8 @@
 import type { EventSource } from "eventsource";
 import { watchEvents, type DataChangedEvent } from "../api/client.js";
+import { getGeneratedBase } from "../api/runtime.js";
+import { isPageHidden, onPageVisible } from "../utils/page-visibility.js";
+import { joinSharedEvents, sharedEventsSupported, type SharedEvents } from "./shared-events.js";
 
 type Listener = (e: DataChangedEvent) => void;
 
@@ -27,6 +30,22 @@ class EventsStore {
   private permanentlyFailed = false;
   private available = false;
   private visibilityHandlerInstalled = false;
+  // Events that arrived while the tab was hidden, latest per scope. A
+  // hidden tab shows nothing, so its subscribers refetch once when it is
+  // shown again instead of on every change. Events carry only a scope,
+  // so keeping the latest one per scope loses nothing.
+  private deferred = new Map<DataChangedEvent["scope"], DataChangedEvent>();
+  // Tabs that talk to the same backend share one stream (see
+  // shared-events.ts): only the leader tab opens `es`, and the others
+  // receive its events over a BroadcastChannel.
+  private shared: SharedEvents | null = null;
+  private sharedName = "";
+  private leader = false;
+  private sharingUnavailable = false;
+  // A tab that took over the stream after waiting for the lock refreshes
+  // every tab once its stream opens: events sent during the handover went
+  // to no one.
+  private catchUpOnOpen = false;
 
   /** Enable or disable the live event stream for the current backend mode. */
   setAvailable(available: boolean) {
@@ -89,6 +108,52 @@ class EventsStore {
     // permanently unavailable. The safety-net polls on each view
     // still keep data fresh in that mode.
     if (this.permanentlyFailed) return;
+    // A tab that does not lead the shared stream opens nothing; the
+    // leader relays its events.
+    if (!this.sharingUnavailable && sharedEventsSupported()) {
+      if (this.shared === null) {
+        this.sharedName = sharedEventsName();
+        this.shared = joinSharedEvents({
+          name: this.sharedName,
+          onLeader: (handover) => {
+            this.leader = true;
+            this.catchUpOnOpen = handover;
+            this.openStream();
+          },
+          onRelayed: (e) => this.dispatch(e),
+          onUnavailable: () => {
+            this.sharingUnavailable = true;
+            this.leaveShared();
+            this.ensureOpen();
+          },
+          // The browser dropped this tab's lock, as WebKit does for a page
+          // it caches. The tab rejoins the next time it is shown.
+          onLost: () => {
+            this.leaveShared();
+            this.closeStream();
+          },
+        });
+      }
+      if (!this.leader) return;
+    }
+    this.openStream();
+  }
+
+  private leaveShared() {
+    this.shared?.leave();
+    this.shared = null;
+    this.leader = false;
+    this.catchUpOnOpen = false;
+  }
+
+  private closeStream() {
+    if (this.es === null) return;
+    this.es.close();
+    this.es = null;
+  }
+
+  private openStream() {
+    if (!this.available || this.permanentlyFailed) return;
     // watchEvents trips a circuit breaker and calls es.close() on
     // repeated errors; the store's cached handle then points at a
     // CLOSED EventSource. Treat that as "not open" and build a
@@ -105,24 +170,63 @@ class EventsStore {
     }
     this.es = watchEvents(
       (e) => {
-        for (const fn of this.listeners.values()) fn(e);
+        // The stream reconnects to whatever server this tab now talks to.
+        // After a switch, its events belong to another group of tabs.
+        if (this.shared !== null && this.sharedName !== sharedEventsName()) {
+          this.leaveShared();
+          this.closeStream();
+          this.dispatch(e);
+          this.ensureOpen();
+          return;
+        }
+        this.shared?.relay(e);
+        this.dispatch(e);
       },
       {
+        onOpen: () => {
+          if (!this.catchUpOnOpen) return;
+          this.catchUpOnOpen = false;
+          const catchUp: DataChangedEvent = { scope: "sync" };
+          this.shared?.relay(catchUp);
+          this.dispatch(catchUp);
+        },
         onPermanentFailure: () => {
           this.permanentlyFailed = true;
           if (this.healTimer !== null) {
             clearInterval(this.healTimer);
             this.healTimer = null;
           }
+          // Let a waiting tab take the lock and try its own stream; this
+          // tab rejoins when it is shown again.
+          this.leaveShared();
         },
       },
     );
   }
 
+  private dispatch(e: DataChangedEvent) {
+    if (isPageHidden()) {
+      this.deferred.delete(e.scope);
+      this.deferred.set(e.scope, e);
+      return;
+    }
+    for (const fn of this.listeners.values()) fn(e);
+  }
+
+  private flushDeferred() {
+    if (this.deferred.size === 0) return;
+    const pending = [...this.deferred.values()];
+    this.deferred.clear();
+    for (const e of pending) {
+      for (const fn of this.listeners.values()) fn(e);
+    }
+  }
+
   private close() {
-    if (this.es === null) return;
-    this.es.close();
-    this.es = null;
+    this.deferred.clear();
+    // Leaving releases the lock, so another tab takes over the stream.
+    this.leaveShared();
+    this.closeStream();
     if (this.healTimer !== null) {
       clearInterval(this.healTimer);
       this.healTimer = null;
@@ -161,29 +265,56 @@ class EventsStore {
     }, EVENTS_STORE_HEAL_INTERVAL_MS);
   }
 
-  // installVisibilityHandler wires a one-time document listener
-  // that gives permanently-failed SSE one more retry when the user
-  // refocuses the tab. This absorbs false-positive "permanent"
-  // classifications (slow startup, tunnel handshake, transient
-  // network hiccup at mount time) without running a periodic
-  // retry storm in the background. Installed lazily on first
-  // subscribe so module import has no global side effect.
+  // installVisibilityHandler wires one-time page listeners. When the
+  // tab becomes visible it delivers the events deferred while the tab
+  // was hidden, rejoins the shared stream if it left, and gives
+  // permanently-failed SSE one more retry. The retry absorbs
+  // false-positive "permanent" classifications (slow startup, tunnel
+  // handshake, transient network hiccup at mount time) without running
+  // a periodic retry storm in the background. A page moved into the
+  // back/forward cache lets go of its stream and lock, and catches up
+  // when it is restored. Installed lazily on first subscribe so module
+  // import has no global side effect.
   private installVisibilityHandler() {
     if (this.visibilityHandlerInstalled) return;
     if (typeof document === "undefined" || typeof document.addEventListener !== "function") {
       return;
     }
     this.visibilityHandlerInstalled = true;
-    document.addEventListener("visibilitychange", () => {
-      if (document.hidden) return;
-      if (!this.permanentlyFailed) return;
-      if (this.listeners.size === 0) return;
-      this.permanentlyFailed = false;
-      this.es = null;
-      this.ensureOpen();
-      this.ensureHealTimer();
+    onPageVisible(() => {
+      this.flushDeferred();
+      this.reopen();
+    });
+    window.addEventListener("pagehide", () => {
+      this.leaveShared();
+      this.closeStream();
+    });
+    window.addEventListener("pageshow", (ev: PageTransitionEvent) => {
+      if (!ev.persisted) return;
+      this.reopen();
+      this.dispatch({ scope: "sync" });
     });
   }
+
+  private reopen() {
+    if (this.listeners.size === 0 || !this.available) return;
+    if (this.permanentlyFailed) {
+      this.permanentlyFailed = false;
+      this.es = null;
+    }
+    this.ensureOpen();
+    this.ensureHealTimer();
+  }
+}
+
+/** Tabs that talk to the same backend share a lock and channel name. */
+function sharedEventsName(): string {
+  return `agentsview-events:${getGeneratedBase()}`;
+}
+
+/** A separate store, as another tab would have; for tests. */
+export function createEventsStore(): EventsStore {
+  return new EventsStore();
 }
 
 export const events = new EventsStore();

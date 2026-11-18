@@ -1076,11 +1076,28 @@ once.
 
 ### Live Updates
 
-When viewing an active session, AgentsView uses Server-Sent Events to stream new
-messages in real time. The message list updates incrementally — only new
-activity is fetched, rather than reloading the entire session — so updates
-arrive faster and with less overhead. When the stream connects or reconnects,
-the session refreshes once to pick up anything that synced in between.
+When viewing an active session, AgentsView listens for changes over
+Server-Sent Events and refreshes the session's loaded messages as new ones
+sync. Rows that did not change stay as they are. When the stream connects or
+reconnects, the session refreshes once to pick up anything that synced in
+between.
+
+A tab in the background holds its live updates until you return to it. The
+open session and the session list then refresh once, usually within a second,
+and so do the Quality and Data pages. Pages that refresh on a timer, such as the
+dashboard, Usage and Activity, skip their timed refreshes while hidden and run
+one when you return if one came due. After about 30 seconds in the background,
+a tab also closes its session stream and reopens it when you come back. A tab
+opened in the background opens its stream when you first switch to it.
+
+Browsers allow only six connections to one server over plain HTTP, and each tab
+showing a session keeps one open for that session. When AgentsView runs at
+`localhost` or `127.0.0.1`, or over HTTPS, tabs open on the same server share
+one connection for session-list and dashboard updates, which leaves room for
+several session tabs at once. Over plain HTTP from another machine, browsers do
+not offer the locks that sharing needs, so each tab keeps its own connection; a
+[Managed Caddy](remote-access.md#managed-caddy-mode) HTTPS setup avoids the
+limit entirely.
 
 New messages do not move the message you are reading. In oldest-first order
 they arrive below it. In newest-first order they arrive above it, and a reader

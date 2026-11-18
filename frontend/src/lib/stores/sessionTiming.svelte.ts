@@ -6,7 +6,8 @@ import { LatestRead } from "../utils/latest-read.js";
  *  GET /api/v1/sessions/{id}/timing and refreshed live by the
  *  session.timing SSE event on the watch stream. */
 class SessionTimingStore {
-  timing: SessionTiming | null = $state(null);
+  // Replaced by each fetch and live event, never edited.
+  timing: SessionTiming | null = $state.raw(null);
   loading: boolean = $state(false);
   error: string | null = $state(null);
 
@@ -21,8 +22,8 @@ class SessionTimingStore {
 
   /** Fetch the timing snapshot for sessionId. Cached per session;
    *  calling load() again for the same session is a no-op once a
-   *  snapshot is in memory. SSE events update the cached snapshot
-   *  in place. */
+   *  snapshot is in memory. SSE events replace the cached snapshot
+   *  (applyEvent); it is raw state, so never edit it in place. */
   async load(sessionId: string): Promise<void> {
     if (this.currentSessionId === sessionId && this.timing !== null) {
       return;

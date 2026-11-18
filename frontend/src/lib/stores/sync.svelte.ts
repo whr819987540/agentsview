@@ -3,6 +3,7 @@ import { triggerResync, triggerSync, watchSession, type SyncHandle } from "../ap
 import { MetadataService, SyncService } from "../api/generated/index";
 import { ApiError, isRemoteConnection } from "../api/runtime.js";
 import { events } from "./events.svelte.js";
+import { isPageHidden, onPageHidden, onPageVisible } from "../utils/page-visibility.js";
 import type {
   SyncProgress,
   SyncSyncStats as SyncStats,
@@ -20,6 +21,15 @@ interface WatchedSession {
 }
 
 const POLL_INTERVAL_MS = 10_000;
+
+/**
+ * How long a hidden tab keeps its session watch open. A quick tab switch
+ * keeps the stream. A tab left in the background closes it, which frees one
+ * of the browser's few connections to the daemon and stops the daemon's
+ * watcher for this tab; showing the tab reopens it, and reopening refreshes
+ * the session.
+ */
+export const HIDDEN_WATCH_GRACE_MS = 30_000;
 
 // EventSource.CLOSED per the HTML spec, without touching the global,
 // which not every test environment defines.
@@ -79,6 +89,14 @@ class SyncStore {
   private statusHydrated = false;
   private pendingHydration = false;
   private statusProgressActive = false;
+  // Hidden tabs skip the status poll and the watch's refreshes, then catch
+  // up once when shown.
+  private pollMissed = false;
+  private watchUpdatePending = false;
+  private pendingTiming: SessionTiming | null = null;
+  private watchParked = false;
+  private parkTimer: ReturnType<typeof setTimeout> | null = null;
+  private visibilityInstalled = false;
 
   /** Register a callback invoked after any sync completes. */
   onSyncComplete(listener: SyncCompleteListener) {
@@ -101,11 +119,89 @@ class SyncStore {
   private resumeSessionWatch(refresh: boolean) {
     const watched = this.watchedSession;
     if (!watched) return;
+    // A watch closed for a hidden tab has no stream here and reopens when
+    // the tab is shown; a refresh asked for meanwhile waits for that.
     const gaveUp = this.watchEventSource?.readyState === EVENT_SOURCE_CLOSED;
-    if (gaveUp) {
-      this.watchEventSource = watchSession(watched.id, watched.onUpdate, watched.onTiming);
+    if (gaveUp) this.openWatch(watched);
+    if (refresh || gaveUp) this.deliverWatchUpdate(watched);
+  }
+
+  private installVisibility() {
+    if (this.visibilityInstalled) return;
+    this.visibilityInstalled = true;
+    onPageHidden(() => this.scheduleWatchPark());
+    onPageVisible(() => this.catchUpAfterHidden());
+  }
+
+  private catchUpAfterHidden() {
+    this.cancelWatchPark();
+    if (this.pollTimer !== null && this.pollMissed) {
+      this.pollMissed = false;
+      void this.loadStatus();
     }
-    if (refresh || gaveUp) watched.onUpdate();
+    const watched = this.watchedSession;
+    if (!watched) return;
+    if (this.watchParked) {
+      this.watchParked = false;
+      this.watchUpdatePending = false;
+      this.pendingTiming = null;
+      // The reopened watch refreshes the session on open, and the
+      // daemon sends the current timing with it.
+      this.openWatch(watched);
+      return;
+    }
+    if (this.watchUpdatePending) {
+      this.watchUpdatePending = false;
+      watched.onUpdate();
+    }
+    if (this.pendingTiming !== null) {
+      const timing = this.pendingTiming;
+      this.pendingTiming = null;
+      watched.onTiming?.(timing);
+    }
+  }
+
+  private openWatch(watched: WatchedSession) {
+    this.watchEventSource = watchSession(
+      watched.id,
+      () => this.deliverWatchUpdate(watched),
+      watched.onTiming ? (t) => this.deliverWatchTiming(watched, t) : undefined,
+    );
+  }
+
+  private deliverWatchUpdate(watched: WatchedSession) {
+    if (this.watchedSession !== watched) return;
+    if (isPageHidden()) {
+      this.watchUpdatePending = true;
+      return;
+    }
+    watched.onUpdate();
+  }
+
+  private deliverWatchTiming(watched: WatchedSession, timing: SessionTiming) {
+    if (this.watchedSession !== watched) return;
+    if (isPageHidden()) {
+      this.pendingTiming = timing;
+      return;
+    }
+    watched.onTiming?.(timing);
+  }
+
+  private scheduleWatchPark() {
+    if (this.parkTimer !== null || this.watchedSession === null || this.watchParked) return;
+    this.parkTimer = setTimeout(() => {
+      this.parkTimer = null;
+      if (!isPageHidden() || this.watchedSession === null) return;
+      this.watchParked = true;
+      this.watchEventSource?.close();
+      this.watchEventSource = null;
+    }, HIDDEN_WATCH_GRACE_MS);
+  }
+
+  private cancelWatchPark() {
+    if (this.parkTimer === null) return;
+    clearTimeout(this.parkTimer);
+    this.parkTimer = null;
   }
 
   /** Record whether the backend process responded. Only flags a
@@ -193,10 +289,18 @@ class SyncStore {
 
   startPolling() {
     this.stopPolling();
-    this.pollTimer = setInterval(() => this.loadStatus(), POLL_INTERVAL_MS);
+    this.installVisibility();
+    this.pollTimer = setInterval(() => {
+      if (isPageHidden()) {
+        this.pollMissed = true;
+        return;
+      }
+      void this.loadStatus();
+    }, POLL_INTERVAL_MS);
   }
 
   stopPolling() {
+    this.pollMissed = false;
     if (this.pollTimer) {
       clearInterval(this.pollTimer);
       this.pollTimer = null;
@@ -331,14 +435,31 @@ class SyncStore {
     return true;
   }
 
+  /**
+   * Watch one session for changes. While the tab is hidden, updates and
+   * timing wait until it is shown, and after HIDDEN_WATCH_GRACE_MS the
+   * stream closes until then. A tab opened in the background does not open
+   * the stream until it is first shown; opening it then refreshes the
+   * session.
+   */
   watchSession(sessionId: string, onUpdate: () => void, onTiming?: (t: SessionTiming) => void) {
     this.unwatchSession();
-    this.watchedSession = { id: sessionId, onUpdate, onTiming };
-    this.watchEventSource = watchSession(sessionId, onUpdate, onTiming);
+    this.installVisibility();
+    const watched: WatchedSession = { id: sessionId, onUpdate, onTiming };
+    this.watchedSession = watched;
+    if (isPageHidden()) {
+      this.watchParked = true;
+      return;
+    }
+    this.openWatch(watched);
   }
 
   unwatchSession() {
+    this.cancelWatchPark();
     this.watchedSession = null;
+    this.watchParked = false;
+    this.watchUpdatePending = false;
+    this.pendingTiming = null;
     if (this.watchEventSource) {
       this.watchEventSource.close();
       this.watchEventSource = null;

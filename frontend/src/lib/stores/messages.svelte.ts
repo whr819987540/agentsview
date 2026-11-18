@@ -3,6 +3,7 @@ import type { DbMessage as Message } from "../api/generated/index.js";
 import { ApiError, isAbortError } from "../api/runtime.js";
 import { clearContentCaches } from "../utils/content-parser.js";
 import { computeMainModelInfo, type ModelEffort } from "../utils/model.js";
+import { shareSoleToolResults } from "../utils/messages.js";
 import { buildReadProgressToken, readProgress } from "./read-progress.svelte.js";
 import { sessions } from "./sessions.svelte.js";
 
@@ -42,7 +43,11 @@ function isRevisionChange(err: unknown): boolean {
 }
 
 export class MessagesStore {
-  messages: Message[] = $state([]);
+  // Raw, not deep, state: every change replaces the array, and rows are
+  // replaced rather than edited. A deep proxy would wrap each message,
+  // tool call and result event the UI reads, with a signal per field,
+  // which cost more memory than the transcript text itself.
+  messages: Message[] = $state.raw([]);
   loading: boolean = $state(false);
   sessionId: string | null = $state(null);
   messageCount: number = $state(0);
@@ -306,7 +311,10 @@ export class MessagesStore {
       revision ? { ...params, expected_revision: revision } : params,
       { signal },
     );
-    return { messages: res.messages, revision: res.transcript_revision ?? "" };
+    return {
+      messages: shareSoleToolResults(res.messages),
+      revision: res.transcript_revision ?? "",
+    };
   }
 
   /** Take a refreshed window that starts at the loaded window's oldest row; false when a later-started load already replaced it. */
@@ -558,7 +566,7 @@ export class MessagesStore {
         return;
       }
       const chunk = [...res.messages].reverse();
-      this.messages.unshift(...chunk);
+      this.messages = [...chunk, ...this.messages];
       this.hasOlder = chunk[0]!.ordinal > 0;
       this.historyComplete = !this.hasOlder;
       this.publishPendingSessionToken(id);
@@ -802,11 +810,13 @@ export class MessagesStore {
     if (!signal || signal.aborted) return;
 
     const previousToken = this.activeSessionToken;
-    const previousMessages = this.messages;
 
     try {
       const sess = await SessionsService.getApiV1SessionsById({ id }, { signal });
       if (this.sessionId !== id) return;
+      // Taken after the session read: older history that joined the window
+      // meanwhile shares its revision, so the reader has already seen it.
+      const previousMessages = this.messages;
 
       this.includeForkContext = sess.relationship_type === "fork";
       const pendingToken = buildReadProgressToken(sess);

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vite-plus/test";
-import { LRUCache } from "./cache.js";
+import { detachedString, LRUCache } from "./cache.js";
 
 describe("LRUCache", () => {
   it("stores and retrieves values", () => {
@@ -135,5 +135,76 @@ describe("LRUCache", () => {
 
   it("throws on non-integer capacity", () => {
     expect(() => new LRUCache<string, number>(2.5)).toThrow(/capacity must be a positive integer/);
+  });
+});
+
+describe("LRUCache with a size budget", () => {
+  const budget = (maxSize: number) => ({
+    maxSize,
+    sizeOf: (key: string, value: string) => key.length + value.length,
+  });
+
+  it("evicts least recently used entries until the total fits", () => {
+    const c = new LRUCache<string, string>(100, budget(10));
+    c.set("a", "1111"); // 5
+    c.set("b", "2222"); // 5, total 10
+    c.get("a"); // "b" is now least recent
+    c.set("c", "33"); // 3: evicts "b" to fit
+    expect(c.get("b")).toBeUndefined();
+    expect(c.get("a")).toBe("1111");
+    expect(c.get("c")).toBe("33");
+    expect(c.weight).toBe(8);
+  });
+
+  it("does not keep an entry larger than the whole budget", () => {
+    const c = new LRUCache<string, string>(100, budget(10));
+    c.set("a", "1");
+    c.set("big", "0123456789");
+    expect(c.get("big")).toBeUndefined();
+    expect(c.get("a")).toBe("1");
+    expect(c.weight).toBe(2);
+  });
+
+  it("evicts nothing for an entry larger than the whole budget", () => {
+    const c = new LRUCache<string, string>(2, budget(10));
+    c.set("a", "1");
+    c.set("b", "2");
+    c.set("big", "0123456789");
+    expect(c.get("a")).toBe("1");
+    expect(c.get("b")).toBe("2");
+    expect(c.size).toBe(2);
+    expect(c.weight).toBe(4);
+  });
+
+  it("accounts for a replaced entry once", () => {
+    const c = new LRUCache<string, string>(100, budget(10));
+    c.set("a", "1");
+    c.set("a", "12345");
+    expect(c.weight).toBe(6);
+    expect(c.size).toBe(1);
+  });
+
+  it("frees the weight of entries evicted by count", () => {
+    const c = new LRUCache<string, string>(2, budget(100));
+    c.set("a", "1");
+    c.set("b", "2");
+    c.set("c", "3");
+    expect(c.weight).toBe(4);
+    c.clear();
+    expect(c.weight).toBe(0);
+    expect(c.size).toBe(0);
+  });
+
+  it("rejects a budget that is not positive", () => {
+    expect(() => new LRUCache<string, string>(2, budget(0))).toThrow(/budget must be positive/);
+  });
+});
+
+describe("detachedString", () => {
+  it("returns an equal string", () => {
+    const parent = "prefix " + "x".repeat(100) + " suffix";
+    const slice = parent.slice(7, 107);
+    expect(detachedString(slice)).toBe(slice);
+    expect(detachedString("")).toBe("");
   });
 });

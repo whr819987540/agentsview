@@ -2,6 +2,7 @@
 import { untrack } from "svelte";
 import type { DbMessage as Message } from "../api/generated/index.js";
 import { buildSessionIndex, type Match, type SessionIndex } from "../search/session-index.js";
+import { releaseSearchBlocks } from "../search/block-text.js";
 import {
   cursorFor,
   matchesInDisplayOrder,
@@ -48,6 +49,13 @@ export interface SearchView {
 
 const EMPTY_MATCHES: Match[] = [];
 
+/**
+ * How long closed find keeps the search blocks it built for every message.
+ * Reopening within this time searches without rebuilding them; after it,
+ * their rendered and folded copies of the transcript's text are released.
+ */
+export const FIND_BLOCKS_KEPT_MS = 60_000;
+
 export class InSessionSearchStore {
   isOpen = $state(false);
   query = $state("");
@@ -66,6 +74,7 @@ export class InSessionSearchStore {
   private disposeEffects: () => void;
   private previousSessionId: string | null;
   private historyRequest: { sessionId: string; promise: Promise<void> } | null = null;
+  private releaseTimer: ReturnType<typeof setTimeout> | null = null;
 
   private historyIncomplete = $derived(
     this.source.hasOlder || this.source.historyComplete === false,
@@ -74,7 +83,7 @@ export class InSessionSearchStore {
   isActive = $derived(this.isOpen && this.debouncedQuery.trim() !== "");
   /** What the transcript renders right now: filters and focused mode included. */
   scope: SessionScope | null = $derived.by(() => {
-    if (!this.source.sessionId) return null;
+    if (!this.isOpen || !this.source.sessionId) return null;
     return projectSessionScope({
       messages: this.source.messages,
       transcriptMode: this.view.transcriptMode,
@@ -271,6 +280,7 @@ export class InSessionSearchStore {
   }
 
   open(): void {
+    this.cancelBlockRelease();
     if (!this.isOpen) {
       this.anchorOrdinal = this.view.selectedOrdinal;
       this.current = null;
@@ -289,6 +299,25 @@ export class InSessionSearchStore {
     this.current = null;
     this.resultsOpen = false;
     this.navigationRevision++;
+    // Nothing reads the projected transcript or the index while find is
+    // closed, so they would keep their last values, even past a session
+    // switch. Reading them once drops those values. The per-message blocks
+    // find built, with their rendered and folded text, go a little later.
+    untrack(() => {
+      void this.scope;
+      void this.index;
+    });
+    this.cancelBlockRelease();
+    this.releaseTimer = setTimeout(() => {
+      this.releaseTimer = null;
+      releaseSearchBlocks();
+    }, FIND_BLOCKS_KEPT_MS);
+  }
+
+  private cancelBlockRelease() {
+    if (this.releaseTimer === null) return;
+    clearTimeout(this.releaseTimer);
+    this.releaseTimer = null;
   }
 
   toggleWholeWord(): void {
@@ -350,6 +379,7 @@ export class InSessionSearchStore {
     this.disposeEffects();
     this.historyRequest = null;
     this.close();
+    this.cancelBlockRelease();
   }
 }
 

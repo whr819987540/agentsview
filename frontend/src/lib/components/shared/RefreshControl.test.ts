@@ -5,6 +5,7 @@ import { setLocale } from "../../i18n/index.js";
 // @ts-ignore
 import RefreshControl from "./RefreshControl.svelte";
 import { LiveQuery } from "../../utils/liveQuery.svelte.js";
+import { VISIBLE_CATCH_UP_DELAY_MS } from "../../utils/page-visibility.js";
 
 // The wrapper's whole job is injecting the app's localized age formatter
 // into kit-ui's RefreshControl (whose built-in default is English).
@@ -214,6 +215,44 @@ describe("RefreshControl", () => {
 
     unmount(component);
     document.body.innerHTML = "";
+  });
+
+  it("holds timed refreshes while the tab is hidden and runs one when shown", async () => {
+    const setVisibility = (state: DocumentVisibilityState) => {
+      Object.defineProperty(document, "visibilityState", { configurable: true, get: () => state });
+      document.dispatchEvent(new Event("visibilitychange"));
+    };
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    try {
+      const onRefresh = vi.fn();
+      const component = mount(RefreshControl, {
+        target: document.body,
+        props: { lastUpdatedAt: Date.now(), onRefresh, intervalMs: 1000 },
+      });
+      await tick();
+      vi.advanceTimersByTime(1000);
+      expect(onRefresh).toHaveBeenCalledTimes(1);
+
+      setVisibility("hidden");
+      vi.advanceTimersByTime(5000);
+      expect(onRefresh).toHaveBeenCalledTimes(1);
+
+      setVisibility("visible");
+      vi.advanceTimersByTime(VISIBLE_CATCH_UP_DELAY_MS);
+      expect(onRefresh).toHaveBeenCalledTimes(2);
+
+      // A refresh held for a page that has gone away is dropped.
+      setVisibility("hidden");
+      vi.advanceTimersByTime(1000);
+      unmount(component);
+      setVisibility("visible");
+      vi.advanceTimersByTime(VISIBLE_CATCH_UP_DELAY_MS);
+      expect(onRefresh).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+      setVisibility("visible");
+      document.body.innerHTML = "";
+    }
   });
 
   it("counts a running query up and grows its running steps", async () => {

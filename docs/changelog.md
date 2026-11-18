@@ -182,6 +182,18 @@ The latest published release is
 
 **Improvements**
 
+- Tabs you are not looking at stay quiet. A tab in the background no longer
+  refetches its session and session list on every change while agents run, and
+  pages that refresh on a timer skip those refreshes while hidden; the tab
+  catches up once when you switch back, usually within a second. With several
+  tabs open, the browser and the daemon do far less work. A background tab also
+  closes its session's live-update stream after about 30 seconds and reopens it
+  when you return.
+- Each tab needs less memory. A long session with 1,000 messages loaded takes
+  about a third less JavaScript memory, in-session find frees the text it
+  indexed a minute after you close it, the cache of rendered messages now has a
+  size limit as well as an entry limit, and the app's scripts take less memory
+  to keep loaded.
 - `agentsview update` shows the download speed and the elapsed time against
   the estimated total next to the downloaded size, for example
   `2.1 MB/s  0:19 elapsed / ~1:06 total`. The line redraws about five times a
@@ -295,6 +307,13 @@ The latest published release is
 
 **Bug fixes**
 
+- A third AgentsView tab no longer stays blank while two tabs with sessions are
+  open at `localhost`, `127.0.0.1` or over HTTPS. Browsers allow six connections
+  to one server, and every tab held one or two of them open for live updates,
+  so the third tab's requests never started. Tabs now share one connection for
+  session-list and dashboard updates. Over plain HTTP from another machine,
+  browsers do not allow the sharing, but a tab in the background still releases
+  its session's connection after about 30 seconds.
 - Sessions with a working agent keep their places in the sidebar when new
   messages arrive. Before, with two or more agents running, each message moved
   the session that wrote it above the others, so the top of the list kept
