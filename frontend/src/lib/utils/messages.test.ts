@@ -1,5 +1,10 @@
 import { describe, it, expect } from "vite-plus/test";
-import { isSystemMessage, normalizeMessagePreview, previewMessage } from "./messages.js";
+import {
+  isSystemMessage,
+  normalizeMessagePreview,
+  previewMessage,
+  shareSoleToolResults,
+} from "./messages.js";
 import type { DbMessage as Message } from "../api/generated/index.js";
 
 function msg(overrides: Partial<Message>): Message {
@@ -276,7 +281,8 @@ describe("previewMessage", () => {
   });
 
   it("preserves the original preview when stripped shell output is empty", () => {
-    const raw = '<system-reminder data-role="user-context">ctx</system-reminder><bash-stdout></bash-stdout>';
+    const raw =
+      '<system-reminder data-role="user-context">ctx</system-reminder><bash-stdout></bash-stdout>';
     expect(previewMessage(raw)).toEqual({
       text: '<system-reminder data-role="user-context">ctx</system-reminder>',
       isShell: true,
@@ -284,7 +290,7 @@ describe("previewMessage", () => {
   });
 
   it("preserves the original preview when stripped shell output is whitespace", () => {
-    const raw = '<system-reminder>ctx</system-reminder><bash-stderr>   </bash-stderr>';
+    const raw = "<system-reminder>ctx</system-reminder><bash-stderr>   </bash-stderr>";
     expect(previewMessage(raw)).toEqual({
       text: "<system-reminder>ctx</system-reminder>",
       isShell: true,
@@ -304,5 +310,73 @@ describe("previewMessage", () => {
     for (const c of cases) {
       expect(normalizeMessagePreview(c)).toBe(previewMessage(c).text);
     }
+  });
+});
+
+describe("shareSoleToolResults", () => {
+  function withCall(call: NonNullable<Message["tool_calls"]>[number]): Message {
+    return {
+      id: 1,
+      session_id: "s",
+      ordinal: 0,
+      role: "assistant",
+      content: "[Bash]",
+      content_length: 6,
+      timestamp: "2026-01-01T00:00:00Z",
+      has_thinking: false,
+      thinking_text: "",
+      has_tool_use: true,
+      model: "",
+      context_tokens: 0,
+      has_context_tokens: false,
+      output_tokens: 0,
+      has_output_tokens: false,
+      is_system: false,
+      tool_calls: [call],
+    };
+  }
+
+  it("keeps the shown result when the only event repeats it", () => {
+    const [message] = shareSoleToolResults([
+      withCall({
+        tool_name: "Bash",
+        category: "Bash",
+        result_content: "line 1\nline 2",
+        result_events: [{ content: "line 1\nline 2", content_length: 13 }],
+      } as NonNullable<Message["tool_calls"]>[number]),
+    ]);
+    expect(message!.tool_calls![0]!.result_content).toBe("line 1\nline 2");
+    expect(message!.tool_calls![0]!.result_events![0]!.content).toBe("line 1\nline 2");
+  });
+
+  it("leaves a result that differs from its only event", () => {
+    const [message] = shareSoleToolResults([
+      withCall({
+        tool_name: "Task",
+        category: "Task",
+        result_content: "summary",
+        result_events: [{ content: "full transcript", content_length: 15 }],
+      } as NonNullable<Message["tool_calls"]>[number]),
+    ]);
+    expect(message!.tool_calls![0]!.result_content).toBe("summary");
+  });
+
+  it("leaves results with several events or none", () => {
+    const [several, none] = shareSoleToolResults([
+      withCall({
+        tool_name: "Bash",
+        category: "Bash",
+        result_content: "second",
+        result_events: [
+          { content: "first", content_length: 5 },
+          { content: "second", content_length: 6 },
+        ],
+      } as NonNullable<Message["tool_calls"]>[number]),
+      withCall({ tool_name: "Read", category: "Read", result_content: "body" } as NonNullable<
+        Message["tool_calls"]
+      >[number]),
+    ]);
+    expect(several!.tool_calls![0]!.result_content).toBe("second");
+    expect(none!.tool_calls![0]!.result_content).toBe("body");
   });
 });

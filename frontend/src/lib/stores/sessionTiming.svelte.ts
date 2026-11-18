@@ -6,7 +6,8 @@ import { LatestRead } from "../utils/latest-read.js";
  *  GET /api/v1/sessions/{id}/timing and refreshed live by the
  *  session.timing SSE event on the watch stream. */
 class SessionTimingStore {
-  timing: SessionTiming | null = $state(null);
+  // Replaced by each fetch and live event, never edited.
+  timing: SessionTiming | null = $state.raw(null);
   loading: boolean = $state(false);
   error: string | null = $state(null);
 
