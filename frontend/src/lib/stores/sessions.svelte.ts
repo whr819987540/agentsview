@@ -1527,6 +1527,18 @@ class SessionsStore {
     this.unsubEvents = events.subscribe((event) => {
       this.handleLiveRefreshEvent(event);
     });
+    this.startSafetyNet();
+    this.unsubVisible = onPageVisible(() => {
+      if (!this.safetyNetMissed) return;
+      this.safetyNetMissed = false;
+      this.runSafetyNet();
+      // Count the next run from this catch-up, not from the missed tick.
+      this.startSafetyNet();
+    });
+  }
+
+  private startSafetyNet() {
+    if (this.safetyNetTimer !== null) clearInterval(this.safetyNetTimer);
     this.safetyNetTimer = setInterval(() => {
       if (isPageHidden()) {
         this.safetyNetMissed = true;
@@ -1534,18 +1546,22 @@ class SessionsStore {
       }
       this.runSafetyNet();
     }, SAFETY_NET_REFRESH_MS);
-    this.unsubVisible = onPageVisible(() => {
-      if (!this.safetyNetMissed) return;
-      this.safetyNetMissed = false;
-      this.runSafetyNet();
-    });
   }
 
   private runSafetyNet() {
-    this.load();
+    this.reloadRows();
     void sessionEndMarks.refresh();
     this.refreshActiveChildSessions();
     this.bumpActiveSessionUsageVersion();
+  }
+
+  /** Reload the sidebar rows, then move the status clock with them. */
+  private reloadRows() {
+    rowReloadsInFlight++;
+    void this.load().finally(() => {
+      rowReloadsInFlight--;
+      now = Date.now();
+    });
   }
 
   private handleLiveRefreshEvent(event: DataChangedEvent) {
@@ -1567,10 +1583,13 @@ class SessionsStore {
     if (this.sidebarConsumers === 0) return;
     if (this.liveRefreshTimer !== null) {
       clearTimeout(this.liveRefreshTimer);
+    } else {
+      rowReloadsInFlight++;
     }
     this.liveRefreshTimer = setTimeout(() => {
       this.liveRefreshTimer = null;
-      this.load();
+      rowReloadsInFlight--;
+      this.reloadRows();
     }, LIVE_REFRESH_DEBOUNCE_MS);
   }
 
@@ -1625,6 +1644,7 @@ class SessionsStore {
     if (this.liveRefreshTimer !== null) {
       clearTimeout(this.liveRefreshTimer);
       this.liveRefreshTimer = null;
+      rowReloadsInFlight--;
     }
     if (this.safetyNetTimer !== null) {
       clearInterval(this.safetyNetTimer);
@@ -1742,15 +1762,23 @@ const STALE_MS = 60 * 60 * 1000;
 
 /** Ticking timestamp that updates every 30s so derived
  *  recency checks stay reactive without manual triggers. Each tick
- *  regroups the sidebar, so a hidden tab skips it and catches up the
- *  moment it is shown. */
+ *  regroups the sidebar, so a hidden tab skips it. A sidebar reload
+ *  also moves the clock when its rows land, so statuses never pair the
+ *  current time with rows read long before it. */
 let now = $state(Date.now());
+// Sidebar reloads scheduled or in flight; each moves the clock when it lands.
+let rowReloadsInFlight = 0;
 setInterval(() => {
   if (isPageHidden()) return;
   now = Date.now();
 }, 30_000);
 onPageVisible(() => {
-  now = Date.now();
+  // The events held while the tab was hidden are delivered in this same
+  // turn. If they schedule a sidebar reload, the clock waits for its rows;
+  // otherwise the rows are current and only the time moved on.
+  queueMicrotask(() => {
+    if (rowReloadsInFlight === 0) now = Date.now();
+  });
 });
 
 export type SessionStatus = "working" | "waiting" | "idle" | "stale" | "unclean" | "quiet";

@@ -5,6 +5,7 @@ import { setLocale } from "../../i18n/index.js";
 // @ts-ignore
 import RefreshControl from "./RefreshControl.svelte";
 import { LiveQuery } from "../../utils/liveQuery.svelte.js";
+import { VISIBLE_CATCH_UP_DELAY_MS } from "../../utils/page-visibility.js";
 
 // The wrapper's whole job is injecting the app's localized age formatter
 // into kit-ui's RefreshControl (whose built-in default is English).
@@ -237,6 +238,7 @@ describe("RefreshControl", () => {
       expect(onRefresh).toHaveBeenCalledTimes(1);
 
       setVisibility("visible");
+      vi.advanceTimersByTime(VISIBLE_CATCH_UP_DELAY_MS);
       expect(onRefresh).toHaveBeenCalledTimes(2);
 
       // A refresh held for a page that has gone away is dropped.
@@ -244,6 +246,7 @@ describe("RefreshControl", () => {
       vi.advanceTimersByTime(1000);
       unmount(component);
       setVisibility("visible");
+      vi.advanceTimersByTime(VISIBLE_CATCH_UP_DELAY_MS);
       expect(onRefresh).toHaveBeenCalledTimes(2);
     } finally {
       vi.useRealTimers();

@@ -118,8 +118,9 @@ class SyncStore {
   /** Reopen the open session's watch after it gave up, and refresh the session when asked or when the watch missed updates. */
   private resumeSessionWatch(refresh: boolean) {
     const watched = this.watchedSession;
-    // A watch closed for a hidden tab reopens when the tab is shown.
-    if (!watched || this.watchParked) return;
+    if (!watched) return;
+    // A watch closed for a hidden tab has no stream here and reopens when
+    // the tab is shown; a refresh asked for meanwhile waits for that.
     const gaveUp = this.watchEventSource?.readyState === EVENT_SOURCE_CLOSED;
     if (gaveUp) this.openWatch(watched);
     if (refresh || gaveUp) this.deliverWatchUpdate(watched);
@@ -437,15 +438,20 @@ class SyncStore {
   /**
    * Watch one session for changes. While the tab is hidden, updates and
    * timing wait until it is shown, and after HIDDEN_WATCH_GRACE_MS the
-   * stream closes until then.
+   * stream closes until then. A tab opened in the background does not open
+   * the stream until it is first shown; opening it then refreshes the
+   * session.
    */
   watchSession(sessionId: string, onUpdate: () => void, onTiming?: (t: SessionTiming) => void) {
     this.unwatchSession();
     this.installVisibility();
     const watched: WatchedSession = { id: sessionId, onUpdate, onTiming };
     this.watchedSession = watched;
+    if (isPageHidden()) {
+      this.watchParked = true;
+      return;
+    }
     this.openWatch(watched);
-    if (isPageHidden()) this.scheduleWatchPark();
   }
 
   unwatchSession() {

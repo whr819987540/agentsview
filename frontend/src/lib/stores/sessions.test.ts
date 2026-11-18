@@ -1,4 +1,10 @@
 import { describe, it, expect, vi, beforeEach } from "vite-plus/test";
+import { VISIBLE_CATCH_UP_DELAY_MS } from "../utils/page-visibility.js";
+
+function setTabVisibility(state: DocumentVisibilityState) {
+  Object.defineProperty(document, "visibilityState", { configurable: true, get: () => state });
+  document.dispatchEvent(new Event("visibilitychange"));
+}
 import {
   createSessionsStore,
   buildSessionGroups,
@@ -3806,29 +3812,97 @@ describe("SessionsStore live refresh", () => {
 
   it("skips the safety-net refresh while hidden and runs it once when shown", async () => {
     vi.useFakeTimers();
-    const setVisibility = (state: DocumentVisibilityState) => {
-      Object.defineProperty(document, "visibilityState", { configurable: true, get: () => state });
-      document.dispatchEvent(new Event("visibilitychange"));
-    };
     const { events } = await import("./events.svelte.js");
     const spy = vi.spyOn(events, "subscribe").mockReturnValue(() => {});
-
     const sessions = createSessionsStore();
     const detach = sessions.attachSidebar();
-    await sessions.load();
-    expect(api.getSidebarSessionIndex).toHaveBeenCalledTimes(1);
+    try {
+      await sessions.load();
+      expect(api.getSidebarSessionIndex).toHaveBeenCalledTimes(1);
 
-    setVisibility("hidden");
-    await vi.advanceTimersByTimeAsync(3 * 5 * 60 * 1000);
-    expect(api.getSidebarSessionIndex).toHaveBeenCalledTimes(1);
+      setTabVisibility("hidden");
+      await vi.advanceTimersByTimeAsync(3 * 5 * 60 * 1000);
+      expect(api.getSidebarSessionIndex).toHaveBeenCalledTimes(1);
 
-    setVisibility("visible");
-    await vi.advanceTimersByTimeAsync(0);
-    expect(api.getSidebarSessionIndex).toHaveBeenCalledTimes(2);
+      setTabVisibility("visible");
+      await vi.advanceTimersByTimeAsync(VISIBLE_CATCH_UP_DELAY_MS);
+      expect(api.getSidebarSessionIndex).toHaveBeenCalledTimes(2);
+      // The next run counts from the catch-up, not from the missed tick.
+      await vi.advanceTimersByTimeAsync(5 * 60 * 1000 - 1);
+      expect(api.getSidebarSessionIndex).toHaveBeenCalledTimes(2);
+    } finally {
+      setTabVisibility("visible");
+      await vi.advanceTimersByTimeAsync(VISIBLE_CATCH_UP_DELAY_MS);
+      detach();
+      spy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
 
-    detach();
-    spy.mockRestore();
-    vi.useRealTimers();
+  /** Hide and show the tab once, so the status clock reads the fake time. */
+  async function alignStatusClock() {
+    setTabVisibility("hidden");
+    setTabVisibility("visible");
+    await vi.advanceTimersByTimeAsync(VISIBLE_CATCH_UP_DELAY_MS);
+  }
+
+  it("moves the status clock with the rows a returning tab reloads", async () => {
+    vi.useFakeTimers({ now: new Date("2026-03-01T10:00:00Z") });
+    const { events } = await import("./events.svelte.js");
+    let registered: ((e: { scope: string }) => void) | null = null;
+    const spy = vi.spyOn(events, "subscribe").mockImplementation((fn) => {
+      registered = fn as (e: { scope: string }) => void;
+      return () => {};
+    });
+    const sessions = createSessionsStore();
+    const detach = sessions.attachSidebar();
+    const row = { ended_at: "2026-03-01T10:00:00Z", termination_status: null };
+    let offVisible = () => {};
+    try {
+      await sessions.load();
+      await alignStatusClock();
+      expect(getSessionStatus(row)).toBe("working");
+      // Stands in for the events store, which delivers the events it held
+      // while the tab was hidden in the same turn as the other catch-ups.
+      const { onPageVisible } = await import("../utils/page-visibility.js");
+      const off = onPageVisible(() => registered?.({ scope: "sessions" }));
+      offVisible = () => void off();
+
+      setTabVisibility("hidden");
+      await vi.advanceTimersByTimeAsync(4 * 60 * 1000);
+      setTabVisibility("visible");
+      await vi.advanceTimersByTimeAsync(VISIBLE_CATCH_UP_DELAY_MS);
+      // The reload waits on its debounce, so the rows on screen are from
+      // before the hide, and the clock stays with them.
+      expect(getSessionStatus(row)).toBe("working");
+
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(api.getSidebarSessionIndex).toHaveBeenCalledTimes(2);
+      expect(getSessionStatus(row)).toBe("idle");
+    } finally {
+      offVisible();
+      detach();
+      spy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it("moves the status clock at once for a returning tab with nothing to reload", async () => {
+    vi.useFakeTimers({ now: new Date("2026-03-01T10:00:00Z") });
+    const row = { ended_at: "2026-03-01T10:00:00Z", termination_status: null };
+    try {
+      await alignStatusClock();
+      expect(getSessionStatus(row)).toBe("working");
+
+      setTabVisibility("hidden");
+      await vi.advanceTimersByTimeAsync(4 * 60 * 1000);
+      expect(getSessionStatus(row)).toBe("working");
+      setTabVisibility("visible");
+      await vi.advanceTimersByTimeAsync(VISIBLE_CATCH_UP_DELAY_MS);
+      expect(getSessionStatus(row)).toBe("idle");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("refreshes active child sessions on the 5-minute safety-net interval", async () => {

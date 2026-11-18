@@ -8,9 +8,19 @@
 
 type Listener = () => void;
 
+/**
+ * How long after the tab becomes visible the catch-up starts. The visibility
+ * health check (health.ts) and the desktop app probe the daemon the moment a
+ * tab is shown and reload the page when the probe takes more than 3 s, so
+ * their requests go first rather than queueing behind the catch-up burst for
+ * the browser's few connections to the daemon.
+ */
+export const VISIBLE_CATCH_UP_DELAY_MS = 250;
+
 const visibleListeners = new Set<Listener>();
 const hiddenListeners = new Set<Listener>();
 let installed = false;
+let catchUpTimer: ReturnType<typeof setTimeout> | null = null;
 
 /** True while the browser reports this tab as hidden. */
 export function isPageHidden(): boolean {
@@ -22,12 +32,27 @@ function install() {
   if (typeof document.addEventListener !== "function") return;
   installed = true;
   document.addEventListener("visibilitychange", () => {
-    const listeners = isPageHidden() ? hiddenListeners : visibleListeners;
-    for (const fn of [...listeners]) fn();
+    if (isPageHidden()) {
+      if (catchUpTimer !== null) {
+        clearTimeout(catchUpTimer);
+        catchUpTimer = null;
+      }
+      for (const fn of [...hiddenListeners]) fn();
+      return;
+    }
+    if (catchUpTimer !== null) return;
+    catchUpTimer = setTimeout(() => {
+      catchUpTimer = null;
+      if (isPageHidden()) return;
+      for (const fn of [...visibleListeners]) fn();
+    }, VISIBLE_CATCH_UP_DELAY_MS);
   });
 }
 
-/** Calls fn every time the tab becomes visible. Returns an unsubscribe. */
+/**
+ * Calls fn every time the tab becomes visible, VISIBLE_CATCH_UP_DELAY_MS
+ * later, unless the tab was hidden again meanwhile. Returns an unsubscribe.
+ */
 export function onPageVisible(fn: Listener): () => void {
   install();
   visibleListeners.add(fn);

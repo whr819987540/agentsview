@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vite-plus/test";
 import { commitsDisagree, HIDDEN_WATCH_GRACE_MS, sync } from "./sync.svelte.js";
+import { VISIBLE_CATCH_UP_DELAY_MS } from "../utils/page-visibility.js";
 import type {
   SyncSyncStats as SyncStats,
   UpdateCheckResponse as UpdateCheck,
@@ -974,8 +975,20 @@ describe("SyncStore in a hidden tab", () => {
     document.dispatchEvent(new Event("visibilitychange"));
   }
 
+  /** Show the tab and run the catch-up that follows. */
+  async function showTab() {
+    setVisibility("visible");
+    await vi.advanceTimersByTimeAsync(VISIBLE_CATCH_UP_DELAY_MS);
+  }
+
   function liveStream() {
-    return { readyState: 1, close: vi.fn() } as unknown as ReturnType<typeof api.watchSession>;
+    const stream = {
+      readyState: 1,
+      close: vi.fn(() => {
+        stream.readyState = 2;
+      }),
+    };
+    return stream as unknown as ReturnType<typeof api.watchSession> & { close: () => void };
   }
 
   function lastWatchCallbacks() {
@@ -984,6 +997,7 @@ describe("SyncStore in a hidden tab", () => {
   }
 
   beforeEach(() => {
+    vi.useFakeTimers();
     vi.clearAllMocks();
     sync.unwatchSession();
     sync.stopPolling();
@@ -999,15 +1013,14 @@ describe("SyncStore in a hidden tab", () => {
     });
   });
 
-  afterEach(() => {
+  afterEach(async () => {
     sync.unwatchSession();
     sync.stopPolling();
-    setVisibility("visible");
+    await showTab();
     vi.useRealTimers();
   });
 
   it("skips status polls while hidden and checks once when shown", async () => {
-    vi.useFakeTimers();
     sync.startPolling();
     await vi.advanceTimersByTimeAsync(10_000);
     expect(api.getSyncStatus).toHaveBeenCalledTimes(1);
@@ -1016,12 +1029,11 @@ describe("SyncStore in a hidden tab", () => {
     await vi.advanceTimersByTimeAsync(60_000);
     expect(api.getSyncStatus).toHaveBeenCalledTimes(1);
 
-    setVisibility("visible");
-    await vi.advanceTimersByTimeAsync(0);
+    await showTab();
     expect(api.getSyncStatus).toHaveBeenCalledTimes(2);
   });
 
-  it("holds session updates while hidden and applies one when shown", () => {
+  it("holds session updates while hidden and applies one when shown", async () => {
     vi.mocked(api.watchSession).mockReturnValue(liveStream());
     const onUpdate = vi.fn();
     sync.watchSession("s1", onUpdate);
@@ -1036,11 +1048,11 @@ describe("SyncStore in a hidden tab", () => {
     update();
     expect(onUpdate).toHaveBeenCalledTimes(1);
 
-    setVisibility("visible");
+    await showTab();
     expect(onUpdate).toHaveBeenCalledTimes(2);
   });
 
-  it("applies only the latest timing that arrived while hidden", () => {
+  it("applies only the latest timing that arrived while hidden", async () => {
     vi.mocked(api.watchSession).mockReturnValue(liveStream());
     const onTiming = vi.fn();
     sync.watchSession("s1", vi.fn(), onTiming);
@@ -1053,13 +1065,12 @@ describe("SyncStore in a hidden tab", () => {
     timing(newer);
     expect(onTiming).not.toHaveBeenCalled();
 
-    setVisibility("visible");
+    await showTab();
     expect(onTiming).toHaveBeenCalledTimes(1);
     expect(onTiming).toHaveBeenCalledWith(newer);
   });
 
-  it("closes the watch after the hidden grace period and reopens it when shown", () => {
-    vi.useFakeTimers();
+  it("closes the watch after the hidden grace period and reopens it when shown", async () => {
     const first = liveStream();
     vi.mocked(api.watchSession).mockReturnValueOnce(first).mockReturnValueOnce(liveStream());
     const onUpdate = vi.fn();
@@ -1071,7 +1082,7 @@ describe("SyncStore in a hidden tab", () => {
     vi.advanceTimersByTime(HIDDEN_WATCH_GRACE_MS);
     expect(first.close).toHaveBeenCalledTimes(1);
 
-    setVisibility("visible");
+    await showTab();
     expect(api.watchSession).toHaveBeenCalledTimes(2);
     expect(vi.mocked(api.watchSession).mock.lastCall![0]).toBe("s1");
     // The reopened stream refreshes on open instead of replaying the held update.
@@ -1080,24 +1091,54 @@ describe("SyncStore in a hidden tab", () => {
     expect(onUpdate).toHaveBeenCalledTimes(1);
   });
 
-  it("keeps the watch open across a quick tab switch", () => {
-    vi.useFakeTimers();
+  it("keeps the watch open across a quick tab switch", async () => {
     const stream = liveStream();
     vi.mocked(api.watchSession).mockReturnValue(stream);
     sync.watchSession("s1", vi.fn());
 
     setVisibility("hidden");
     vi.advanceTimersByTime(HIDDEN_WATCH_GRACE_MS - 1);
-    setVisibility("visible");
+    await showTab();
     vi.advanceTimersByTime(HIDDEN_WATCH_GRACE_MS * 2);
 
     expect(stream.close).not.toHaveBeenCalled();
     expect(api.watchSession).toHaveBeenCalledTimes(1);
   });
 
-  it("leaves a closed hidden-tab watch closed when a poll sees a sync", async () => {
-    vi.useFakeTimers();
+  it("counts the grace period from the latest hide", async () => {
+    const stream = liveStream();
+    vi.mocked(api.watchSession).mockReturnValue(stream);
+    sync.watchSession("s1", vi.fn());
+
+    setVisibility("hidden");
+    vi.advanceTimersByTime(HIDDEN_WATCH_GRACE_MS / 3);
+    await showTab();
+    setVisibility("hidden");
+    vi.advanceTimersByTime(HIDDEN_WATCH_GRACE_MS - 1);
+    expect(stream.close).not.toHaveBeenCalled();
+
+    vi.advanceTimersByTime(1);
+    expect(stream.close).toHaveBeenCalledTimes(1);
+  });
+
+  it("waits to watch a session in a tab opened in the background until it is shown", async () => {
+    setVisibility("hidden");
     vi.mocked(api.watchSession).mockReturnValue(liveStream());
+    const onUpdate = vi.fn();
+    sync.watchSession("s1", onUpdate);
+    vi.advanceTimersByTime(HIDDEN_WATCH_GRACE_MS * 2);
+    expect(api.watchSession).not.toHaveBeenCalled();
+
+    await showTab();
+    expect(api.watchSession).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(api.watchSession).mock.lastCall![0]).toBe("s1");
+    lastWatchCallbacks().update();
+    expect(onUpdate).toHaveBeenCalledTimes(1);
+  });
+
+  it("leaves a closed hidden-tab watch closed when a poll sees a sync", async () => {
+    const first = liveStream();
+    vi.mocked(api.watchSession).mockReturnValue(first);
     vi.mocked(api.getStats).mockResolvedValue({
       earliest_session: null,
       machine_count: 1,
@@ -1109,6 +1150,7 @@ describe("SyncStore in a hidden tab", () => {
     sync.watchSession("s1", onUpdate);
     setVisibility("hidden");
     vi.advanceTimersByTime(HIDDEN_WATCH_GRACE_MS);
+    expect(first.close).toHaveBeenCalledTimes(1);
 
     vi.mocked(api.getSyncStatus).mockResolvedValue({
       last_sync: "2024-01-01T00:05:00Z",
