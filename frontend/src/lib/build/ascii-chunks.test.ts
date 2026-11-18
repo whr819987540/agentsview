@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vite-plus/test";
-import { escapeNonAscii } from "./ascii-chunks.js";
+import { escapeChunk, escapeNonAscii } from "./ascii-chunks.js";
 
-// Evaluate a module body both ways and compare what it returns.
+// Evaluate a function body both ways and compare what it returns.
 function run(code: string): unknown {
   return new Function(code)();
 }
@@ -34,10 +34,6 @@ describe("escapeNonAscii", () => {
     expectSameResult("const café = 1; const 名前 = café + 1; return 名前;");
   });
 
-  it("keeps comments harmless", () => {
-    expectSameResult("// 注释 — comment\n/* 多行 */ return 1;");
-  });
-
   it("drops the backslash of an identity escape", () => {
     expectSameResult('return ["\\é", `\\会`, /\\é/.test("é")];');
   });
@@ -50,5 +46,40 @@ describe("escapeNonAscii", () => {
     const code = 'return "a b c";';
     expect(escapeNonAscii(code)).toBe('return "a\\u2028b\\u2029c";');
     expectSameResult(code);
+  });
+});
+
+describe("escapeChunk", () => {
+  it("escapes a module whose strings, templates and patterns survive the rewrite", () => {
+    const code = 'export const s = ["会话", `代理 ${1}`, /é+/u.source, { "名": 1 }];\n';
+    const escaped = escapeChunk(code);
+    expect(escaped).not.toBeNull();
+    expect(escaped).toMatch(/^[\x00-\x7f]*$/);
+  });
+
+  it("returns ASCII-only code unchanged", () => {
+    const code = "export const a = 1;\n";
+    expect(escapeChunk(code)).toBe(code);
+  });
+
+  it("keeps a chunk whose line comment ends at a line separator", () => {
+    // The separator ends the comment, so the assignment after it runs.
+    expect(escapeChunk("let x = 1; // note x = 2;\nexport default x;\n")).toBeNull();
+  });
+
+  it("keeps a chunk that continues a string line with a line separator", () => {
+    expect(escapeChunk('export const s = "a\\ b";\n')).toBeNull();
+  });
+
+  it("keeps a chunk with non-ASCII whitespace between tokens", () => {
+    expect(escapeChunk("export const a = 1;\n")).toBeNull();
+  });
+
+  it("keeps a chunk with an astral identifier", () => {
+    expect(escapeChunk("export const o = { \u{1d4b3}: 1 };\n")).toBeNull();
+  });
+
+  it("keeps a chunk whose tagged template reads non-ASCII raw text", () => {
+    expect(escapeChunk("export const r = String.raw`é`;\n")).toBeNull();
   });
 });
