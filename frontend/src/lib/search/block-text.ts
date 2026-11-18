@@ -1,6 +1,6 @@
 /** Collect the searchable text blocks rendered by one transcript message. */
 import type { DbMessage as Message, DbToolCall as ToolCall } from "../api/generated/index.js";
-import { LRUCache } from "../utils/cache.js";
+import { detachedString, LRUCache } from "../utils/cache.js";
 import { enrichSegments, parseContent } from "../utils/content-parser.js";
 import { renderMarkdown, type MarkdownRenderOptions } from "../utils/markdown.js";
 import { isSystemMessage } from "../utils/messages.js";
@@ -27,11 +27,28 @@ export interface SearchBlock {
   label?: string;
 }
 
-const messageBlocks = [
-  new WeakMap<Message, SearchBlock[]>(),
-  new WeakMap<Message, SearchBlock[]>(),
+let messageBlocks = [new WeakMap<Message, SearchBlock[]>(), new WeakMap<Message, SearchBlock[]>()];
+// Rendered plain text by source text, bounded by entry count and by about
+// a million UTF-16 code units of source and text per render mode.
+const TEXT_CACHE_MAX_UNITS = 1_000_000;
+const textBudget = {
+  maxSize: TEXT_CACHE_MAX_UNITS,
+  sizeOf: (content: string, text: string) => content.length + text.length,
+};
+const markdownText = [
+  new LRUCache<string, string>(500, textBudget),
+  new LRUCache<string, string>(500, textBudget),
 ];
-const markdownText = [new LRUCache<string, string>(500), new LRUCache<string, string>(500)];
+
+/**
+ * Forget the search blocks built for the loaded messages. Find builds them
+ * for every message it searches, with rendered and folded copies of their
+ * text, so closing find releases them; anything that needs blocks again
+ * rebuilds them on demand.
+ */
+export function releaseSearchBlocks(): void {
+  messageBlocks = [new WeakMap(), new WeakMap()];
+}
 
 /** Keys are independent of filters, mount state, and search query. */
 export function blockKey(ordinal: number, kind: SearchBlockKind, index: number | string): string {
@@ -44,7 +61,7 @@ function renderedText(content: string, options: MarkdownRenderOptions): string {
   if (cached !== undefined) return cached;
   const root = new DOMParser().parseFromString(renderMarkdown(content, options), "text/html");
   const text = domText(root.body);
-  cache.set(content, text);
+  cache.set(detachedString(content), text);
   return text;
 }
 

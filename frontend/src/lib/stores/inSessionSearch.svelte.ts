@@ -2,6 +2,7 @@
 import { untrack } from "svelte";
 import type { DbMessage as Message } from "../api/generated/index.js";
 import { buildSessionIndex, type Match, type SessionIndex } from "../search/session-index.js";
+import { releaseSearchBlocks } from "../search/block-text.js";
 import {
   cursorFor,
   matchesInDisplayOrder,
@@ -74,7 +75,7 @@ export class InSessionSearchStore {
   isActive = $derived(this.isOpen && this.debouncedQuery.trim() !== "");
   /** What the transcript renders right now: filters and focused mode included. */
   scope: SessionScope | null = $derived.by(() => {
-    if (!this.source.sessionId) return null;
+    if (!this.isOpen || !this.source.sessionId) return null;
     return projectSessionScope({
       messages: this.source.messages,
       transcriptMode: this.view.transcriptMode,
@@ -289,6 +290,15 @@ export class InSessionSearchStore {
     this.current = null;
     this.resultsOpen = false;
     this.navigationRevision++;
+    // Nothing reads the projected transcript or the index while find is
+    // closed, so they would keep their last values, even past a session
+    // switch. Reading them once drops those values. The per-message blocks
+    // find built, with their rendered and folded text, go too.
+    untrack(() => {
+      void this.scope;
+      void this.index;
+    });
+    releaseSearchBlocks();
   }
 
   toggleWholeWord(): void {

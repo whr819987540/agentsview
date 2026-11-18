@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test"
 import { tick } from "svelte";
 import type { DbMessage as Message } from "../api/generated/index.js";
 import { InSessionSearchStore } from "./inSessionSearch.svelte.js";
+import { collectSearchBlocks } from "../search/block-text.js";
 import { reactiveSource, reactiveView } from "./__fixtures__/search-state.svelte.js";
 
 vi.mock("./messages.svelte.js", () => ({
@@ -89,6 +90,22 @@ afterEach(() => {
 });
 
 describe("local in-session search", () => {
+  it("releases the search blocks it built when it closes", async () => {
+    const first = message(0, "needle needle");
+    const { store } = setup([first, message(2, "needle")]);
+    await search(store);
+    expect(store.total).toBe(3);
+    const built = collectSearchBlocks(first);
+    expect(collectSearchBlocks(first)).toBe(built);
+
+    store.close();
+    const rebuilt = collectSearchBlocks(first);
+    expect(rebuilt).not.toBe(built);
+    expect(rebuilt).toEqual(built);
+    expect(store.scope).toBeNull();
+    expect(store.total).toBe(0);
+  });
+
   it("debounces text before building an occurrence index", async () => {
     const { store } = setup();
     store.open();

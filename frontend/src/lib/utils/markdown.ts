@@ -9,7 +9,7 @@ import {
 } from "marked"; // kit-ui-check-ignore: app renderer preserves agent XML and shell wrappers; migration needs a behavior-preserving pass.
 // kit-ui-check-ignore: app renderer sanitizes the custom marked output above; migrating to kit-ui createMarkdownRenderer needs a dedicated behavior-preserving pass.
 import DOMPurify from "dompurify";
-import { LRUCache } from "./cache.js";
+import { detachedString, LRUCache } from "./cache.js";
 import { escapeHtml as escapeHTML } from "@kenn-io/kit-ui";
 import { AssetsService } from "../api/generated/index.js";
 
@@ -784,7 +784,16 @@ const preformattedParser = createParser(true);
 
 type RenderCacheEntry = [string | undefined, string | undefined];
 
-const cache = new LRUCache<string, RenderCacheEntry>(6000);
+// Rendered HTML for recently shown text, keyed by the source text. A
+// long-lived tab renders text from every session it opens, so besides the
+// entry count the cache is bounded by size: about 4 million UTF-16 code
+// units of source and HTML, at most 8 MB.
+const RENDER_CACHE_MAX_UNITS = 4_000_000;
+const cache = new LRUCache<string, RenderCacheEntry>(6000, {
+  maxSize: RENDER_CACHE_MAX_UNITS,
+  sizeOf: (text, [html, preformatted]) =>
+    text.length + (html?.length ?? 0) + (preformatted?.length ?? 0),
+});
 
 const ASSET_PLACEHOLDER_PREFIX = "/__agentsview_asset__/";
 
@@ -981,6 +990,6 @@ export function renderMarkdown(text: string, options: MarkdownRenderOptions = {}
 
   const entry: RenderCacheEntry = cache.get(text) ?? [undefined, undefined];
   entry[modeIndex] = safe;
-  cache.set(text, entry);
+  cache.set(detachedString(text), entry);
   return safe;
 }
