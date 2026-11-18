@@ -3,6 +3,7 @@ import { fileURLToPath } from "node:url";
 import { defineConfig } from "vite-plus";
 import { svelte } from "@sveltejs/vite-plugin-svelte";
 import { paraglideVitePlugin } from "@inlang/paraglide-js";
+import { asciiOnlyChunks } from "./src/lib/build/ascii-chunks.ts";
 
 function gitCommit(): string {
   try {
@@ -77,6 +78,10 @@ export default defineConfig(({ command }) => {
         strategy: ["localStorage", "preferredLanguage", "baseLocale"],
         localStorageKey: "agentsview-locale",
       }),
+      // Every locale's messages ship in the entry chunk. Escaping their
+      // non-ASCII characters lets the browser keep each chunk's source at one
+      // byte per character instead of two (see ascii-chunks.ts).
+      asciiOnlyChunks(),
     ],
     define: {
       "import.meta.env.VITE_BUILD_COMMIT": JSON.stringify(gitCommit()),
