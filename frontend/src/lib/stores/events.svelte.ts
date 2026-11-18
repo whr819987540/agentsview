@@ -1,6 +1,8 @@
 import type { EventSource } from "eventsource";
 import { watchEvents, type DataChangedEvent } from "../api/client.js";
+import { getGeneratedBase } from "../api/runtime.js";
 import { isPageHidden, onPageVisible } from "../utils/page-visibility.js";
+import { joinSharedEvents, sharedEventsSupported, type SharedEvents } from "./shared-events.js";
 
 type Listener = (e: DataChangedEvent) => void;
 
@@ -33,6 +35,12 @@ class EventsStore {
   // shown again instead of on every change. Events carry only a scope,
   // so keeping the latest one per scope loses nothing.
   private deferred = new Map<DataChangedEvent["scope"], DataChangedEvent>();
+  // Tabs that talk to the same backend share one stream (see
+  // shared-events.ts): only the leader tab opens `es`, and the others
+  // receive its events over a BroadcastChannel.
+  private shared: SharedEvents | null = null;
+  private leader = false;
+  private sharingUnavailable = false;
 
   /** Enable or disable the live event stream for the current backend mode. */
   setAvailable(available: boolean) {
@@ -95,6 +103,30 @@ class EventsStore {
     // permanently unavailable. The safety-net polls on each view
     // still keep data fresh in that mode.
     if (this.permanentlyFailed) return;
+    // A tab that does not lead the shared stream opens nothing; the
+    // leader relays its events.
+    if (!this.sharingUnavailable && sharedEventsSupported()) {
+      this.shared ??= joinSharedEvents({
+        name: `agentsview-events:${getGeneratedBase()}`,
+        onLeader: () => {
+          this.leader = true;
+          this.openStream();
+        },
+        onRelayed: (e) => this.dispatch(e),
+        onUnavailable: () => {
+          this.sharingUnavailable = true;
+          this.shared?.leave();
+          this.shared = null;
+          this.ensureOpen();
+        },
+      });
+      if (!this.leader) return;
+    }
+    this.openStream();
+  }
+
+  private openStream() {
+    if (!this.available || this.permanentlyFailed) return;
     // watchEvents trips a circuit breaker and calls es.close() on
     // repeated errors; the store's cached handle then points at a
     // CLOSED EventSource. Treat that as "not open" and build a
@@ -109,15 +141,21 @@ class EventsStore {
     if (this.es !== null && this.es.readyState !== CLOSED) {
       return;
     }
-    this.es = watchEvents((e) => this.dispatch(e), {
-      onPermanentFailure: () => {
-        this.permanentlyFailed = true;
-        if (this.healTimer !== null) {
-          clearInterval(this.healTimer);
-          this.healTimer = null;
-        }
+    this.es = watchEvents(
+      (e) => {
+        this.shared?.relay(e);
+        this.dispatch(e);
       },
-    });
+      {
+        onPermanentFailure: () => {
+          this.permanentlyFailed = true;
+          if (this.healTimer !== null) {
+            clearInterval(this.healTimer);
+            this.healTimer = null;
+          }
+        },
+      },
+    );
   }
 
   private dispatch(e: DataChangedEvent) {
@@ -140,9 +178,14 @@ class EventsStore {
 
   private close() {
     this.deferred.clear();
-    if (this.es === null) return;
-    this.es.close();
-    this.es = null;
+    // Leaving releases the lock, so another tab takes over the stream.
+    this.shared?.leave();
+    this.shared = null;
+    this.leader = false;
+    if (this.es !== null) {
+      this.es.close();
+      this.es = null;
+    }
     if (this.healTimer !== null) {
       clearInterval(this.healTimer);
       this.healTimer = null;
@@ -205,6 +248,11 @@ class EventsStore {
       this.ensureHealTimer();
     });
   }
+}
+
+/** A separate store, as another tab would have; for tests. */
+export function createEventsStore(): EventsStore {
+  return new EventsStore();
 }
 
 export const events = new EventsStore();

@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test"
 // Import the store statically: it pulls in the generated API client, which
 // can take longer than a hook's 10 s limit to transform while the full suite
 // runs in parallel. Collection has no such limit.
-import { events, EVENTS_STORE_HEAL_INTERVAL_MS } from "./events.svelte.js";
+import { createEventsStore, events, EVENTS_STORE_HEAL_INTERVAL_MS } from "./events.svelte.js";
 
 vi.mock("eventsource", () => ({ EventSource: vi.fn() }));
 
@@ -254,5 +254,157 @@ describe("events store", () => {
     expect(received).toEqual(["sessions"]); // last-write-wins
     unsub();
     vi.useRealTimers();
+  });
+});
+
+// Web Locks with exclusive locks granted in request order, as browsers do.
+class FakeLocks {
+  refuse = false;
+  private held = new Set<string>();
+  private queues = new Map<string, { run: () => void }[]>();
+
+  request(
+    name: string,
+    options: { signal?: AbortSignal },
+    callback: (lock: { name: string }) => unknown,
+  ): Promise<unknown> {
+    if (this.refuse) return Promise.reject(new DOMException("denied", "SecurityError"));
+    return new Promise((resolve, reject) => {
+      const queue = this.queues.get(name) ?? [];
+      this.queues.set(name, queue);
+      const entry = {
+        run: () => {
+          this.held.add(name);
+          Promise.resolve()
+            .then(() => callback({ name }))
+            .then(
+              (value) => {
+                this.release(name);
+                resolve(value);
+              },
+              (err: unknown) => {
+                this.release(name);
+                reject(err);
+              },
+            );
+        },
+      };
+      options.signal?.addEventListener("abort", () => {
+        const index = queue.indexOf(entry);
+        if (index === -1) return;
+        queue.splice(index, 1);
+        reject(new DOMException("aborted", "AbortError"));
+      });
+      queue.push(entry);
+      if (!this.held.has(name)) this.queues.get(name)!.shift()!.run();
+    });
+  }
+
+  private release(name: string) {
+    this.held.delete(name);
+    this.queues.get(name)?.shift()?.run();
+  }
+}
+
+// BroadcastChannel that delivers to the other same-named channels later.
+class FakeBroadcastChannel {
+  static open = new Set<FakeBroadcastChannel>();
+  onmessage: ((ev: MessageEvent) => void) | null = null;
+
+  constructor(public name: string) {
+    FakeBroadcastChannel.open.add(this);
+  }
+
+  postMessage(data: unknown) {
+    for (const other of FakeBroadcastChannel.open) {
+      if (other === this || other.name !== this.name) continue;
+      queueMicrotask(() => other.onmessage?.({ data } as MessageEvent));
+    }
+  }
+
+  close() {
+    FakeBroadcastChannel.open.delete(this);
+  }
+}
+
+describe("events store shared across tabs", () => {
+  let locks: FakeLocks;
+
+  beforeEach(() => {
+    locks = new FakeLocks();
+    Object.defineProperty(navigator, "locks", { configurable: true, value: locks });
+    vi.stubGlobal("BroadcastChannel", FakeBroadcastChannel);
+  });
+
+  afterEach(() => {
+    delete (navigator as { locks?: unknown }).locks;
+    FakeBroadcastChannel.open.clear();
+  });
+
+  function openTab(received: string[]) {
+    const tab = createEventsStore();
+    tab.setAvailable(true);
+    return tab.subscribe((e) => received.push(e.scope));
+  }
+
+  it("opens one stream for two tabs and delivers its events to both", async () => {
+    const a: string[] = [];
+    const b: string[] = [];
+    const unsubA = openTab(a);
+    const unsubB = openTab(b);
+    await vi.waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
+
+    FakeEventSource.instances[0]!.fire("data_changed", { scope: "sessions" });
+    await vi.waitFor(() => {
+      expect(a).toEqual(["sessions"]);
+      expect(b).toEqual(["sessions"]);
+    });
+    expect(FakeEventSource.instances).toHaveLength(1);
+    unsubA();
+    unsubB();
+  });
+
+  it("hands the stream to the next tab when the leader stops listening", async () => {
+    const a: string[] = [];
+    const b: string[] = [];
+    const unsubA = openTab(a);
+    const unsubB = openTab(b);
+    await vi.waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
+
+    unsubA();
+    expect(FakeEventSource.instances[0]!.closed).toBe(true);
+    await vi.waitFor(() => expect(FakeEventSource.instances).toHaveLength(2));
+
+    FakeEventSource.instances[1]!.fire("data_changed", { scope: "messages" });
+    await vi.waitFor(() => expect(b).toEqual(["messages"]));
+    expect(a).toEqual([]);
+    unsubB();
+  });
+
+  it("holds relayed events while the tab is hidden", async () => {
+    const a: string[] = [];
+    const b: string[] = [];
+    const unsubA = openTab(a);
+    const unsubB = openTab(b);
+    await vi.waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
+
+    setVisibility("hidden");
+    FakeEventSource.instances[0]!.fire("data_changed", { scope: "sync" });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(b).toEqual([]);
+
+    setVisibility("visible");
+    expect(a).toEqual(["sync"]);
+    expect(b).toEqual(["sync"]);
+    unsubA();
+    unsubB();
+  });
+
+  it("keeps a stream of its own when the browser refuses the lock", async () => {
+    locks.refuse = true;
+    const unsub = openTab([]);
+    await vi.waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
+    unsub();
   });
 });
