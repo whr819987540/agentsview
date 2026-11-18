@@ -190,9 +190,10 @@ The latest published release is
   closes its session's live-update stream after about 30 seconds and reopens it
   when you return.
 - Each tab needs less memory. A long session with 1,000 messages loaded takes
-  about a third less JavaScript memory, closing in-session find frees the text
-  it indexed, the cache of rendered messages now has a size limit as well as an
-  entry limit, and the app's scripts take less memory to keep loaded.
+  about a third less JavaScript memory, in-session find frees the text it
+  indexed a minute after you close it, the cache of rendered messages now has a
+  size limit as well as an entry limit, and the app's scripts take less memory
+  to keep loaded.
 - `agentsview update` shows the download speed and the elapsed time against
   the estimated total next to the downloaded size, for example
   `2.1 MB/s  0:19 elapsed / ~1:06 total`. The line redraws about five times a
