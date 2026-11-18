@@ -2,7 +2,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { tick } from "svelte";
 import type { DbMessage as Message } from "../api/generated/index.js";
-import { InSessionSearchStore } from "./inSessionSearch.svelte.js";
+import { FIND_BLOCKS_KEPT_MS, InSessionSearchStore } from "./inSessionSearch.svelte.js";
 import { collectSearchBlocks } from "../search/block-text.js";
 import { reactiveSource, reactiveView } from "./__fixtures__/search-state.svelte.js";
 
@@ -90,7 +90,7 @@ afterEach(() => {
 });
 
 describe("local in-session search", () => {
-  it("releases the search blocks it built when it closes", async () => {
+  it("releases the search blocks it built a while after it closes", async () => {
     const first = message(0, "needle needle");
     const { store } = setup([first, message(2, "needle")]);
     await search(store);
@@ -99,11 +99,28 @@ describe("local in-session search", () => {
     expect(collectSearchBlocks(first)).toBe(built);
 
     store.close();
+    expect(store.scope).toBeNull();
+    expect(store.total).toBe(0);
+    await vi.advanceTimersByTimeAsync(FIND_BLOCKS_KEPT_MS - 1);
+    expect(collectSearchBlocks(first)).toBe(built);
+
+    await vi.advanceTimersByTimeAsync(1);
     const rebuilt = collectSearchBlocks(first);
     expect(rebuilt).not.toBe(built);
     expect(rebuilt).toEqual(built);
-    expect(store.scope).toBeNull();
-    expect(store.total).toBe(0);
+  });
+
+  it("keeps the search blocks when find reopens soon after closing", async () => {
+    const first = message(0, "needle");
+    const { store } = setup([first]);
+    await search(store);
+    const built = collectSearchBlocks(first);
+
+    store.close();
+    await vi.advanceTimersByTimeAsync(FIND_BLOCKS_KEPT_MS / 2);
+    store.open();
+    await vi.advanceTimersByTimeAsync(FIND_BLOCKS_KEPT_MS);
+    expect(collectSearchBlocks(first)).toBe(built);
   });
 
   it("debounces text before building an occurrence index", async () => {

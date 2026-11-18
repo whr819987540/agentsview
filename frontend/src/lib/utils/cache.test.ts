@@ -165,6 +165,17 @@ describe("LRUCache with a size budget", () => {
     expect(c.weight).toBe(2);
   });
 
+  it("evicts nothing for an entry larger than the whole budget", () => {
+    const c = new LRUCache<string, string>(2, budget(10));
+    c.set("a", "1");
+    c.set("b", "2");
+    c.set("big", "0123456789");
+    expect(c.get("a")).toBe("1");
+    expect(c.get("b")).toBe("2");
+    expect(c.size).toBe(2);
+    expect(c.weight).toBe(4);
+  });
+
   it("accounts for a replaced entry once", () => {
     const c = new LRUCache<string, string>(100, budget(10));
     c.set("a", "1");

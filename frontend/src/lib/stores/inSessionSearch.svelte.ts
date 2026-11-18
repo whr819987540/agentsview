@@ -49,6 +49,13 @@ export interface SearchView {
 
 const EMPTY_MATCHES: Match[] = [];
 
+/**
+ * How long closed find keeps the search blocks it built for every message.
+ * Reopening within this time searches without rebuilding them; after it,
+ * their rendered and folded copies of the transcript's text are released.
+ */
+export const FIND_BLOCKS_KEPT_MS = 60_000;
+
 export class InSessionSearchStore {
   isOpen = $state(false);
   query = $state("");
@@ -67,6 +74,7 @@ export class InSessionSearchStore {
   private disposeEffects: () => void;
   private previousSessionId: string | null;
   private historyRequest: { sessionId: string; promise: Promise<void> } | null = null;
+  private releaseTimer: ReturnType<typeof setTimeout> | null = null;
 
   private historyIncomplete = $derived(
     this.source.hasOlder || this.source.historyComplete === false,
@@ -272,6 +280,7 @@ export class InSessionSearchStore {
   }
 
   open(): void {
+    this.cancelBlockRelease();
     if (!this.isOpen) {
       this.anchorOrdinal = this.view.selectedOrdinal;
       this.current = null;
@@ -293,12 +302,22 @@ export class InSessionSearchStore {
     // Nothing reads the projected transcript or the index while find is
     // closed, so they would keep their last values, even past a session
     // switch. Reading them once drops those values. The per-message blocks
-    // find built, with their rendered and folded text, go too.
+    // find built, with their rendered and folded text, go a little later.
     untrack(() => {
       void this.scope;
       void this.index;
     });
-    releaseSearchBlocks();
+    this.cancelBlockRelease();
+    this.releaseTimer = setTimeout(() => {
+      this.releaseTimer = null;
+      releaseSearchBlocks();
+    }, FIND_BLOCKS_KEPT_MS);
+  }
+
+  private cancelBlockRelease() {
+    if (this.releaseTimer === null) return;
+    clearTimeout(this.releaseTimer);
+    this.releaseTimer = null;
   }
 
   toggleWholeWord(): void {
@@ -360,6 +379,7 @@ export class InSessionSearchStore {
     this.disposeEffects();
     this.historyRequest = null;
     this.close();
+    this.cancelBlockRelease();
   }
 }
 

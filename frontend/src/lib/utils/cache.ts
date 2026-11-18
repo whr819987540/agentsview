@@ -6,6 +6,14 @@ export interface LRUCacheBudget<K, V> {
   sizeOf: (key: K, value: V) => number;
 }
 
+interface Entry<K, V> {
+  // The key as stored. A lookup can pass an equal string that is a view
+  // into a larger one; reinserting under that would keep the larger alive.
+  key: K;
+  value: V;
+  size: number;
+}
+
 /**
  * Map-based LRU cache. Exploits the insertion-order guarantee
  * of ES2015 Map: the least-recently-used entry is always first.
@@ -13,8 +21,7 @@ export interface LRUCacheBudget<K, V> {
  * than the whole budget is not kept.
  */
 export class LRUCache<K, V> {
-  private map = new Map<K, V>();
-  private sizes = new Map<K, number>();
+  private map = new Map<K, Entry<K, V>>();
   private totalSize = 0;
 
   constructor(
@@ -30,37 +37,28 @@ export class LRUCache<K, V> {
   }
 
   get(key: K): V | undefined {
-    if (!this.map.has(key)) return undefined;
-    const value = this.map.get(key)!;
+    const entry = this.map.get(key);
+    if (entry === undefined) return undefined;
     // Delete and re-insert to mark as most recently used
     this.map.delete(key);
-    this.map.set(key, value);
-    return value;
+    this.map.set(entry.key, entry);
+    return entry.value;
   }
 
   set(key: K, value: V): void {
-    if (this.map.has(key)) {
-      this.remove(key);
-    } else if (this.map.size >= this.capacity) {
-      this.remove(this.map.keys().next().value!);
+    const size = this.budget ? this.budget.sizeOf(key, value) : 0;
+    this.remove(key);
+    if (this.budget && size > this.budget.maxSize) return;
+    if (this.map.size >= this.capacity) this.removeOldest();
+    while (this.budget && this.map.size > 0 && this.totalSize + size > this.budget.maxSize) {
+      this.removeOldest();
     }
-    if (!this.budget) {
-      this.map.set(key, value);
-      return;
-    }
-    const size = this.budget.sizeOf(key, value);
-    if (size > this.budget.maxSize) return;
-    while (this.map.size > 0 && this.totalSize + size > this.budget.maxSize) {
-      this.remove(this.map.keys().next().value!);
-    }
-    this.map.set(key, value);
-    this.sizes.set(key, size);
+    this.map.set(key, { key, value, size });
     this.totalSize += size;
   }
 
   clear(): void {
     this.map.clear();
-    this.sizes.clear();
     this.totalSize = 0;
   }
 
@@ -73,12 +71,16 @@ export class LRUCache<K, V> {
     return this.totalSize;
   }
 
+  private removeOldest() {
+    const oldest = this.map.keys().next();
+    if (!oldest.done) this.remove(oldest.value);
+  }
+
   private remove(key: K) {
+    const entry = this.map.get(key);
+    if (entry === undefined) return;
     this.map.delete(key);
-    const size = this.sizes.get(key);
-    if (size === undefined) return;
-    this.sizes.delete(key);
-    this.totalSize -= size;
+    this.totalSize -= entry.size;
   }
 }
 
