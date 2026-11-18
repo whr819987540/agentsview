@@ -1083,14 +1083,21 @@ reconnects, the session refreshes once to pick up anything that synced in
 between.
 
 A tab in the background holds its live updates until you return to it. The
-open session, the session list and dashboard pages then refresh once, usually
-within a second. After about 30 seconds in the background, the tab also closes
-its session stream and reopens it when you come back.
+open session and the session list then refresh once, usually within a second,
+and so do the Quality and Data pages. Pages that refresh on a timer, such as the
+dashboard, Usage and Activity, skip their timed refreshes while hidden and run
+one when you return if one came due. After about 30 seconds in the background,
+a tab also closes its session stream and reopens it when you come back. A tab
+opened in the background opens its stream when you first switch to it.
 
-Tabs open on the same server share one connection for session-list and
-dashboard updates. Browsers allow only six connections to one server over plain
-HTTP, and each tab showing a session also keeps one open for that session, so
-sharing leaves room for several session tabs at once.
+Browsers allow only six connections to one server over plain HTTP, and each tab
+showing a session keeps one open for that session. When AgentsView runs at
+`localhost` or `127.0.0.1`, or over HTTPS, tabs open on the same server share
+one connection for session-list and dashboard updates, which leaves room for
+several session tabs at once. Over plain HTTP from another machine, browsers do
+not offer the locks that sharing needs, so each tab keeps its own connection; a
+[Managed Caddy](remote-access.md#managed-caddy-mode) HTTPS setup avoids the
+limit entirely.
 
 New messages do not move the message you are reading. In oldest-first order
 they arrive below it. In newest-first order they arrive above it, and a reader

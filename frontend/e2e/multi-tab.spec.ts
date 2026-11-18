@@ -1,16 +1,12 @@
-import { expect, test, type Page, type Route } from "@playwright/test";
+import { expect, test, type Route } from "@playwright/test";
 import type { DbMessage as Message } from "../src/lib/api/generated/index.js";
 
 // Chromium shares about six HTTP/1.1 connections per host among all tabs of a
 // profile, and the daemon serves plain HTTP. Long-lived streams count against
 // that pool for as long as they stay open.
 test.describe("several open tabs", () => {
-  test.skip(
-    ({ browserName }) => browserName !== "chromium",
-    "The per-host connection pool and the hidden-tab override are Chromium specific",
-  );
-
-  test("a third session tab loads while two others stay open", async ({ context }) => {
+  test("a third session tab loads while two others stay open", async ({ context, browserName }) => {
+    test.skip(browserName !== "chromium", "WebKit sizes its per-host connection pool differently");
     const response = await context.request.get("/api/v1/sessions?limit=20");
     expect(response.ok()).toBe(true);
     const body = (await response.json()) as { sessions: { id: string; message_count: number }[] };
