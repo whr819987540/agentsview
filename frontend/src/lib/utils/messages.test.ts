@@ -313,7 +313,10 @@ describe("previewMessage", () => {
   });
 });
 
-describe("shareSoleToolResults", () => {
+// shareSoleToolResults only changes which string object result_content
+// holds. JavaScript cannot observe string identity, so these cases guard the
+// part that can break: the value every consumer reads stays the same.
+describe("shareSoleToolResults keeps the values consumers read", () => {
   function withCall(call: NonNullable<Message["tool_calls"]>[number]): Message {
     return {
       id: 1,
@@ -336,7 +339,7 @@ describe("shareSoleToolResults", () => {
     };
   }
 
-  it("keeps the shown result when the only event repeats it", () => {
+  it("keeps the result when the only event repeats it", () => {
     const [message] = shareSoleToolResults([
       withCall({
         tool_name: "Bash",

@@ -22,8 +22,8 @@ class SessionTimingStore {
 
   /** Fetch the timing snapshot for sessionId. Cached per session;
    *  calling load() again for the same session is a no-op once a
-   *  snapshot is in memory. SSE events update the cached snapshot
-   *  in place. */
+   *  snapshot is in memory. SSE events replace the cached snapshot
+   *  (applyEvent); it is raw state, so never edit it in place. */
   async load(sessionId: string): Promise<void> {
     if (this.currentSessionId === sessionId && this.timing !== null) {
       return;

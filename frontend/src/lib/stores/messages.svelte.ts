@@ -810,11 +810,13 @@ export class MessagesStore {
     if (!signal || signal.aborted) return;
 
     const previousToken = this.activeSessionToken;
-    const previousMessages = this.messages;
 
     try {
       const sess = await SessionsService.getApiV1SessionsById({ id }, { signal });
       if (this.sessionId !== id) return;
+      // Taken after the session read: older history that joined the window
+      // meanwhile shares its revision, so the reader has already seen it.
+      const previousMessages = this.messages;
 
       this.includeForkContext = sess.relationship_type === "fork";
       const pendingToken = buildReadProgressToken(sess);
