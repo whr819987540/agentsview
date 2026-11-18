@@ -1076,11 +1076,21 @@ once.
 
 ### Live Updates
 
-When viewing an active session, AgentsView uses Server-Sent Events to stream new
-messages in real time. The message list updates incrementally — only new
-activity is fetched, rather than reloading the entire session — so updates
-arrive faster and with less overhead. When the stream connects or reconnects,
-the session refreshes once to pick up anything that synced in between.
+When viewing an active session, AgentsView listens for changes over
+Server-Sent Events and refreshes the session's loaded messages as new ones
+sync. Rows that did not change stay as they are. When the stream connects or
+reconnects, the session refreshes once to pick up anything that synced in
+between.
+
+A tab in the background holds its live updates until you return to it. The
+open session, the session list and dashboard pages then refresh once, usually
+within a second. After about 30 seconds in the background, the tab also closes
+its session stream and reopens it when you come back.
+
+Tabs open on the same server share one connection for session-list and
+dashboard updates. Browsers allow only six connections to one server over plain
+HTTP, and each tab showing a session also keeps one open for that session, so
+sharing leaves room for several session tabs at once.
 
 New messages do not move the message you are reading. In oldest-first order
 they arrive below it. In newest-first order they arrive above it, and a reader
