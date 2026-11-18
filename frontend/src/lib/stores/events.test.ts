@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test"
 // can take longer than a hook's 10 s limit to transform while the full suite
 // runs in parallel. Collection has no such limit.
 import { createEventsStore, events, EVENTS_STORE_HEAL_INTERVAL_MS } from "./events.svelte.js";
+import { VISIBLE_CATCH_UP_DELAY_MS } from "../utils/page-visibility.js";
 
 vi.mock("eventsource", () => ({ EventSource: vi.fn() }));
 
@@ -57,14 +58,28 @@ beforeEach(() => {
   events.setAvailable(true);
 });
 
+let visibilityChanged = false;
 function setVisibility(state: DocumentVisibilityState) {
+  visibilityChanged = true;
   Object.defineProperty(document, "visibilityState", { configurable: true, get: () => state });
   Object.defineProperty(document, "hidden", { configurable: true, get: () => state === "hidden" });
   document.dispatchEvent(new Event("visibilitychange"));
 }
 
-afterEach(() => {
+const pause = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+/** Show the tab and wait for the catch-up that follows. */
+async function showTab() {
   setVisibility("visible");
+  await pause(VISIBLE_CATCH_UP_DELAY_MS + 20);
+}
+
+afterEach(async () => {
+  vi.useRealTimers();
+  if (visibilityChanged) {
+    visibilityChanged = false;
+    await showTab();
+  }
   vi.unstubAllGlobals();
 });
 
@@ -207,7 +222,7 @@ describe("events store", () => {
     unsub2();
   });
 
-  it("holds events while the tab is hidden and delivers the latest per scope once shown", () => {
+  it("holds events while the tab is hidden and delivers the latest per scope once shown", async () => {
     const received: string[] = [];
     const unsub = events.subscribe((e) => received.push(e.scope));
     const es = FakeEventSource.instances[0]!;
@@ -218,17 +233,17 @@ describe("events store", () => {
     es.fire("data_changed", { scope: "messages" });
     expect(received).toEqual([]);
 
-    setVisibility("visible");
+    await showTab();
     expect(received).toEqual(["sessions", "messages"]);
 
     // Delivered once: a second visibility change has nothing left.
     setVisibility("hidden");
-    setVisibility("visible");
+    await showTab();
     expect(received).toEqual(["sessions", "messages"]);
     unsub();
   });
 
-  it("drops held events when the last subscriber leaves", () => {
+  it("drops held events when the last subscriber leaves", async () => {
     const unsub = events.subscribe(() => {});
     setVisibility("hidden");
     FakeEventSource.instances[0]!.fire("data_changed", { scope: "sync" });
@@ -236,9 +251,22 @@ describe("events store", () => {
 
     const received: string[] = [];
     const unsub2 = events.subscribe((e) => received.push(e.scope));
-    setVisibility("visible");
+    await showTab();
     expect(received).toEqual([]);
     unsub2();
+  });
+
+  it("reopens a stream the circuit breaker closed when the tab is shown", async () => {
+    const unsub = events.subscribe(() => {});
+    const first = FakeEventSource.instances[0]!;
+    first.fireOpen();
+    for (let i = 0; i < 5; i++) first.fireError();
+    expect(first.closed).toBe(true);
+
+    setVisibility("hidden");
+    await showTab();
+    expect(FakeEventSource.instances).toHaveLength(2);
+    unsub();
   });
 
   it("debounces rapid events into one callback per debounce window", () => {
@@ -260,30 +288,48 @@ describe("events store", () => {
 // Web Locks with exclusive locks granted in request order, as browsers do.
 class FakeLocks {
   refuse = false;
-  private held = new Set<string>();
+  private holders = new Map<string, { reject: (err: unknown) => void; release: () => void }>();
   private queues = new Map<string, { run: () => void }[]>();
 
   request(
     name: string,
-    options: { signal?: AbortSignal },
-    callback: (lock: { name: string }) => unknown,
+    options: { signal?: AbortSignal; ifAvailable?: boolean },
+    callback: (lock: { name: string } | null) => unknown,
   ): Promise<unknown> {
     if (this.refuse) return Promise.reject(new DOMException("denied", "SecurityError"));
+    if (options.ifAvailable && this.holders.has(name)) {
+      return Promise.resolve().then(() => callback(null));
+    }
     return new Promise((resolve, reject) => {
       const queue = this.queues.get(name) ?? [];
       this.queues.set(name, queue);
       const entry = {
         run: () => {
-          this.held.add(name);
+          let settled = false;
+          const release = () => {
+            if (settled) return;
+            settled = true;
+            this.holders.delete(name);
+            this.queues.get(name)?.shift()?.run();
+          };
+          this.holders.set(name, {
+            reject: (err) => {
+              release();
+              reject(err);
+            },
+            release,
+          });
           Promise.resolve()
             .then(() => callback({ name }))
             .then(
               (value) => {
-                this.release(name);
+                if (settled) return;
+                release();
                 resolve(value);
               },
               (err: unknown) => {
-                this.release(name);
+                if (settled) return;
+                release();
                 reject(err);
               },
             );
@@ -296,13 +342,13 @@ class FakeLocks {
         reject(new DOMException("aborted", "AbortError"));
       });
       queue.push(entry);
-      if (!this.held.has(name)) this.queues.get(name)!.shift()!.run();
+      if (!this.holders.has(name)) queue.shift()!.run();
     });
   }
 
-  private release(name: string) {
-    this.held.delete(name);
-    this.queues.get(name)?.shift()?.run();
+  /** Take the lock away from its holder, as WebKit does for a cached page. */
+  drop(name: string) {
+    this.holders.get(name)?.reject(new DOMException("going away", "AbortError"));
   }
 }
 
@@ -390,15 +436,81 @@ describe("events store shared across tabs", () => {
 
     setVisibility("hidden");
     FakeEventSource.instances[0]!.fire("data_changed", { scope: "sync" });
-    await Promise.resolve();
-    await Promise.resolve();
+    await pause(0);
     expect(b).toEqual([]);
 
-    setVisibility("visible");
+    await showTab();
     expect(a).toEqual(["sync"]);
     expect(b).toEqual(["sync"]);
     unsubA();
     unsubB();
+  });
+
+  it("refreshes every tab once after another tab takes the stream over", async () => {
+    const a: string[] = [];
+    const b: string[] = [];
+    const c: string[] = [];
+    const unsubA = openTab(a);
+    const unsubB = openTab(b);
+    const unsubC = openTab(c);
+    await vi.waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
+    // The first leader found the lock free, so it has nothing to catch up.
+    FakeEventSource.instances[0]!.fireOpen();
+    await pause(0);
+    expect([a, b, c]).toEqual([[], [], []]);
+
+    unsubA();
+    await vi.waitFor(() => expect(FakeEventSource.instances).toHaveLength(2));
+    FakeEventSource.instances[1]!.fireOpen();
+    await vi.waitFor(() => {
+      expect(b).toEqual(["sync"]);
+      expect(c).toEqual(["sync"]);
+    });
+    unsubB();
+    unsubC();
+  });
+
+  it("lets another tab lead when the leader's stream fails for good", async () => {
+    const b: string[] = [];
+    const unsubA = openTab([]);
+    const unsubB = openTab(b);
+    await vi.waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
+
+    // Errors before any successful open: the endpoint looks unreachable.
+    for (let i = 0; i < 5; i++) FakeEventSource.instances[0]!.fireError();
+    await vi.waitFor(() => expect(FakeEventSource.instances).toHaveLength(2));
+    FakeEventSource.instances[1]!.fire("data_changed", { scope: "messages" });
+    await vi.waitFor(() => expect(b).toEqual(["messages"]));
+    unsubA();
+    unsubB();
+  });
+
+  it("rejoins when shown after the browser takes the lock away", async () => {
+    const unsub = openTab([]);
+    await vi.waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
+
+    locks.drop("agentsview-events:");
+    await vi.waitFor(() => expect(FakeEventSource.instances[0]!.closed).toBe(true));
+    setVisibility("hidden");
+    await showTab();
+    await vi.waitFor(() => expect(FakeEventSource.instances).toHaveLength(2));
+    unsub();
+  });
+
+  it("catches up after the page comes back from the back/forward cache", async () => {
+    const received: string[] = [];
+    const unsub = openTab(received);
+    await vi.waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
+
+    window.dispatchEvent(new Event("pagehide"));
+    expect(FakeEventSource.instances[0]!.closed).toBe(true);
+    const restored = new Event("pageshow");
+    Object.defineProperty(restored, "persisted", { value: true });
+    window.dispatchEvent(restored);
+
+    expect(received).toEqual(["sync"]);
+    await vi.waitFor(() => expect(FakeEventSource.instances).toHaveLength(2));
+    unsub();
   });
 
   it("keeps a stream of its own when the browser refuses the lock", async () => {

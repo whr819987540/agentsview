@@ -39,8 +39,13 @@ class EventsStore {
   // shared-events.ts): only the leader tab opens `es`, and the others
   // receive its events over a BroadcastChannel.
   private shared: SharedEvents | null = null;
+  private sharedName = "";
   private leader = false;
   private sharingUnavailable = false;
+  // A tab that took over the stream after waiting for the lock refreshes
+  // every tab once its stream opens: events sent during the handover went
+  // to no one.
+  private catchUpOnOpen = false;
 
   /** Enable or disable the live event stream for the current backend mode. */
   setAvailable(available: boolean) {
@@ -106,23 +111,45 @@ class EventsStore {
     // A tab that does not lead the shared stream opens nothing; the
     // leader relays its events.
     if (!this.sharingUnavailable && sharedEventsSupported()) {
-      this.shared ??= joinSharedEvents({
-        name: `agentsview-events:${getGeneratedBase()}`,
-        onLeader: () => {
-          this.leader = true;
-          this.openStream();
-        },
-        onRelayed: (e) => this.dispatch(e),
-        onUnavailable: () => {
-          this.sharingUnavailable = true;
-          this.shared?.leave();
-          this.shared = null;
-          this.ensureOpen();
-        },
-      });
+      if (this.shared === null) {
+        this.sharedName = sharedEventsName();
+        this.shared = joinSharedEvents({
+          name: this.sharedName,
+          onLeader: (handover) => {
+            this.leader = true;
+            this.catchUpOnOpen = handover;
+            this.openStream();
+          },
+          onRelayed: (e) => this.dispatch(e),
+          onUnavailable: () => {
+            this.sharingUnavailable = true;
+            this.leaveShared();
+            this.ensureOpen();
+          },
+          // The browser dropped this tab's lock, as WebKit does for a page
+          // it caches. The tab rejoins the next time it is shown.
+          onLost: () => {
+            this.leaveShared();
+            this.closeStream();
+          },
+        });
+      }
       if (!this.leader) return;
     }
     this.openStream();
+  }
+
+  private leaveShared() {
+    this.shared?.leave();
+    this.shared = null;
+    this.leader = false;
+    this.catchUpOnOpen = false;
+  }
+
+  private closeStream() {
+    if (this.es === null) return;
+    this.es.close();
+    this.es = null;
   }
 
   private openStream() {
@@ -143,16 +170,35 @@ class EventsStore {
     }
     this.es = watchEvents(
       (e) => {
+        // The stream reconnects to whatever server this tab now talks to.
+        // After a switch, its events belong to another group of tabs.
+        if (this.shared !== null && this.sharedName !== sharedEventsName()) {
+          this.leaveShared();
+          this.closeStream();
+          this.dispatch(e);
+          this.ensureOpen();
+          return;
+        }
         this.shared?.relay(e);
         this.dispatch(e);
       },
       {
+        onOpen: () => {
+          if (!this.catchUpOnOpen) return;
+          this.catchUpOnOpen = false;
+          const catchUp: DataChangedEvent = { scope: "sync" };
+          this.shared?.relay(catchUp);
+          this.dispatch(catchUp);
+        },
         onPermanentFailure: () => {
           this.permanentlyFailed = true;
           if (this.healTimer !== null) {
             clearInterval(this.healTimer);
             this.healTimer = null;
           }
+          // Let a waiting tab take the lock and try its own stream; this
+          // tab rejoins when it is shown again.
+          this.leaveShared();
         },
       },
     );
@@ -179,13 +225,8 @@ class EventsStore {
   private close() {
     this.deferred.clear();
     // Leaving releases the lock, so another tab takes over the stream.
-    this.shared?.leave();
-    this.shared = null;
-    this.leader = false;
-    if (this.es !== null) {
-      this.es.close();
-      this.es = null;
-    }
+    this.leaveShared();
+    this.closeStream();
     if (this.healTimer !== null) {
       clearInterval(this.healTimer);
       this.healTimer = null;
@@ -224,14 +265,16 @@ class EventsStore {
     }, EVENTS_STORE_HEAL_INTERVAL_MS);
   }
 
-  // installVisibilityHandler wires a one-time listener for the tab
-  // becoming visible. It delivers the events deferred while the tab
-  // was hidden, and gives permanently-failed SSE one more retry when
-  // the user refocuses the tab. The retry absorbs false-positive
-  // "permanent" classifications (slow startup, tunnel handshake,
-  // transient network hiccup at mount time) without running a
-  // periodic retry storm in the background. Installed lazily on first
-  // subscribe so module import has no global side effect.
+  // installVisibilityHandler wires one-time page listeners. When the
+  // tab becomes visible it delivers the events deferred while the tab
+  // was hidden, rejoins the shared stream if it left, and gives
+  // permanently-failed SSE one more retry. The retry absorbs
+  // false-positive "permanent" classifications (slow startup, tunnel
+  // handshake, transient network hiccup at mount time) without running
+  // a periodic retry storm in the background. A page moved into the
+  // back/forward cache lets go of its stream and lock, and catches up
+  // when it is restored. Installed lazily on first subscribe so module
+  // import has no global side effect.
   private installVisibilityHandler() {
     if (this.visibilityHandlerInstalled) return;
     if (typeof document === "undefined" || typeof document.addEventListener !== "function") {
@@ -240,14 +283,33 @@ class EventsStore {
     this.visibilityHandlerInstalled = true;
     onPageVisible(() => {
       this.flushDeferred();
-      if (!this.permanentlyFailed) return;
-      if (this.listeners.size === 0) return;
-      this.permanentlyFailed = false;
-      this.es = null;
-      this.ensureOpen();
-      this.ensureHealTimer();
+      this.reopen();
+    });
+    window.addEventListener("pagehide", () => {
+      this.leaveShared();
+      this.closeStream();
+    });
+    window.addEventListener("pageshow", (ev: PageTransitionEvent) => {
+      if (!ev.persisted) return;
+      this.reopen();
+      this.dispatch({ scope: "sync" });
     });
   }
+
+  private reopen() {
+    if (this.listeners.size === 0 || !this.available) return;
+    if (this.permanentlyFailed) {
+      this.permanentlyFailed = false;
+      this.es = null;
+    }
+    this.ensureOpen();
+    this.ensureHealTimer();
+  }
+}
+
+/** Tabs that talk to the same backend share a lock and channel name. */
+function sharedEventsName(): string {
+  return `agentsview-events:${getGeneratedBase()}`;
 }
 
 /** A separate store, as another tab would have; for tests. */
