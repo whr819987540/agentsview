@@ -1,5 +1,5 @@
-import { describe, it, expect, vi, beforeEach } from "vite-plus/test";
-import { commitsDisagree, sync } from "./sync.svelte.js";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vite-plus/test";
+import { commitsDisagree, HIDDEN_WATCH_GRACE_MS, sync } from "./sync.svelte.js";
 import type {
   SyncSyncStats as SyncStats,
   UpdateCheckResponse as UpdateCheck,
@@ -813,6 +813,10 @@ describe("SyncStore.remoteUnreachable", () => {
   });
 });
 
+const TIMING = { running: true } as unknown as Parameters<
+  NonNullable<Parameters<typeof sync.watchSession>[2]>
+>[0];
+
 describe("SyncStore open session refresh", () => {
   const LIVE = 1;
   const GAVE_UP = 2;
@@ -891,8 +895,14 @@ describe("SyncStore open session refresh", () => {
       expect(sync.lastSync).toBe("2024-01-01T00:05:00Z");
     });
     expect(api.watchSession).toHaveBeenCalledTimes(2);
-    expect(api.watchSession).toHaveBeenLastCalledWith("s1", onUpdate, onTiming);
     expect(onUpdate).toHaveBeenCalledTimes(1);
+    // The reopened stream watches the same session and reports to the same callbacks.
+    const [id, update, timing] = vi.mocked(api.watchSession).mock.lastCall!;
+    expect(id).toBe("s1");
+    update();
+    expect(onUpdate).toHaveBeenCalledTimes(2);
+    timing!(TIMING);
+    expect(onTiming).toHaveBeenCalledWith(TIMING);
   });
 
   it("reopens a watch that gave up and catches up when polling sees a sync", async () => {
@@ -909,8 +919,12 @@ describe("SyncStore open session refresh", () => {
     await sync.loadStatus();
 
     expect(api.watchSession).toHaveBeenCalledTimes(2);
-    expect(api.watchSession).toHaveBeenLastCalledWith("s1", onUpdate, undefined);
     expect(onUpdate).toHaveBeenCalledTimes(1);
+    const [id, update, timing] = vi.mocked(api.watchSession).mock.lastCall!;
+    expect(id).toBe("s1");
+    expect(timing).toBeUndefined();
+    update();
+    expect(onUpdate).toHaveBeenCalledTimes(2);
   });
 
   it("leaves a live watch to report a sync that polling sees", async () => {
@@ -947,5 +961,162 @@ describe("SyncStore open session refresh", () => {
     });
     expect(onUpdate).not.toHaveBeenCalled();
     expect(api.watchSession).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("SyncStore in a hidden tab", () => {
+  function setVisibility(state: DocumentVisibilityState) {
+    Object.defineProperty(document, "visibilityState", { configurable: true, get: () => state });
+    Object.defineProperty(document, "hidden", {
+      configurable: true,
+      get: () => state === "hidden",
+    });
+    document.dispatchEvent(new Event("visibilitychange"));
+  }
+
+  function liveStream() {
+    return { readyState: 1, close: vi.fn() } as unknown as ReturnType<typeof api.watchSession>;
+  }
+
+  function lastWatchCallbacks() {
+    const [, update, timing] = vi.mocked(api.watchSession).mock.lastCall!;
+    return { update, timing: timing! };
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    sync.unwatchSession();
+    sync.stopPolling();
+    const s = sync as unknown as Record<string, unknown>;
+    s.lastSync = "2024-01-01T00:00:00Z";
+    s.statusHydrated = true;
+    s.pendingHydration = false;
+    s.statusProgressActive = false;
+    s.syncCompleteListeners = [];
+    vi.mocked(api.getSyncStatus).mockResolvedValue({
+      last_sync: "2024-01-01T00:00:00Z",
+      stats: MOCK_STATS,
+    });
+  });
+
+  afterEach(() => {
+    sync.unwatchSession();
+    sync.stopPolling();
+    setVisibility("visible");
+    vi.useRealTimers();
+  });
+
+  it("skips status polls while hidden and checks once when shown", async () => {
+    vi.useFakeTimers();
+    sync.startPolling();
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(api.getSyncStatus).toHaveBeenCalledTimes(1);
+
+    setVisibility("hidden");
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(api.getSyncStatus).toHaveBeenCalledTimes(1);
+
+    setVisibility("visible");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(api.getSyncStatus).toHaveBeenCalledTimes(2);
+  });
+
+  it("holds session updates while hidden and applies one when shown", () => {
+    vi.mocked(api.watchSession).mockReturnValue(liveStream());
+    const onUpdate = vi.fn();
+    sync.watchSession("s1", onUpdate);
+    const { update } = lastWatchCallbacks();
+
+    update();
+    expect(onUpdate).toHaveBeenCalledTimes(1);
+
+    setVisibility("hidden");
+    update();
+    update();
+    update();
+    expect(onUpdate).toHaveBeenCalledTimes(1);
+
+    setVisibility("visible");
+    expect(onUpdate).toHaveBeenCalledTimes(2);
+  });
+
+  it("applies only the latest timing that arrived while hidden", () => {
+    vi.mocked(api.watchSession).mockReturnValue(liveStream());
+    const onTiming = vi.fn();
+    sync.watchSession("s1", vi.fn(), onTiming);
+    const { timing } = lastWatchCallbacks();
+    const older = { ...TIMING, running: true };
+    const newer = { ...TIMING, running: false };
+
+    setVisibility("hidden");
+    timing(older);
+    timing(newer);
+    expect(onTiming).not.toHaveBeenCalled();
+
+    setVisibility("visible");
+    expect(onTiming).toHaveBeenCalledTimes(1);
+    expect(onTiming).toHaveBeenCalledWith(newer);
+  });
+
+  it("closes the watch after the hidden grace period and reopens it when shown", () => {
+    vi.useFakeTimers();
+    const first = liveStream();
+    vi.mocked(api.watchSession).mockReturnValueOnce(first).mockReturnValueOnce(liveStream());
+    const onUpdate = vi.fn();
+    sync.watchSession("s1", onUpdate);
+    const stale = lastWatchCallbacks().update;
+
+    setVisibility("hidden");
+    stale();
+    vi.advanceTimersByTime(HIDDEN_WATCH_GRACE_MS);
+    expect(first.close).toHaveBeenCalledTimes(1);
+
+    setVisibility("visible");
+    expect(api.watchSession).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(api.watchSession).mock.lastCall![0]).toBe("s1");
+    // The reopened stream refreshes on open instead of replaying the held update.
+    expect(onUpdate).not.toHaveBeenCalled();
+    lastWatchCallbacks().update();
+    expect(onUpdate).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps the watch open across a quick tab switch", () => {
+    vi.useFakeTimers();
+    const stream = liveStream();
+    vi.mocked(api.watchSession).mockReturnValue(stream);
+    sync.watchSession("s1", vi.fn());
+
+    setVisibility("hidden");
+    vi.advanceTimersByTime(HIDDEN_WATCH_GRACE_MS - 1);
+    setVisibility("visible");
+    vi.advanceTimersByTime(HIDDEN_WATCH_GRACE_MS * 2);
+
+    expect(stream.close).not.toHaveBeenCalled();
+    expect(api.watchSession).toHaveBeenCalledTimes(1);
+  });
+
+  it("leaves a closed hidden-tab watch closed when a poll sees a sync", async () => {
+    vi.useFakeTimers();
+    vi.mocked(api.watchSession).mockReturnValue(liveStream());
+    vi.mocked(api.getStats).mockResolvedValue({
+      earliest_session: null,
+      machine_count: 1,
+      message_count: 100,
+      project_count: 3,
+      session_count: 8,
+    });
+    const onUpdate = vi.fn();
+    sync.watchSession("s1", onUpdate);
+    setVisibility("hidden");
+    vi.advanceTimersByTime(HIDDEN_WATCH_GRACE_MS);
+
+    vi.mocked(api.getSyncStatus).mockResolvedValue({
+      last_sync: "2024-01-01T00:05:00Z",
+      stats: MOCK_STATS,
+    });
+    await sync.loadStatus();
+
+    expect(api.watchSession).toHaveBeenCalledTimes(1);
+    expect(onUpdate).not.toHaveBeenCalled();
   });
 });

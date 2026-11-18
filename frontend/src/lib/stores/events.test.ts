@@ -57,7 +57,14 @@ beforeEach(() => {
   events.setAvailable(true);
 });
 
+function setVisibility(state: DocumentVisibilityState) {
+  Object.defineProperty(document, "visibilityState", { configurable: true, get: () => state });
+  Object.defineProperty(document, "hidden", { configurable: true, get: () => state === "hidden" });
+  document.dispatchEvent(new Event("visibilitychange"));
+}
+
 afterEach(() => {
+  setVisibility("visible");
   vi.unstubAllGlobals();
 });
 
@@ -197,6 +204,40 @@ describe("events store", () => {
     expect(received).toContain("b:messages");
 
     unsub();
+    unsub2();
+  });
+
+  it("holds events while the tab is hidden and delivers the latest per scope once shown", () => {
+    const received: string[] = [];
+    const unsub = events.subscribe((e) => received.push(e.scope));
+    const es = FakeEventSource.instances[0]!;
+
+    setVisibility("hidden");
+    es.fire("data_changed", { scope: "messages" });
+    es.fire("data_changed", { scope: "sessions" });
+    es.fire("data_changed", { scope: "messages" });
+    expect(received).toEqual([]);
+
+    setVisibility("visible");
+    expect(received).toEqual(["sessions", "messages"]);
+
+    // Delivered once: a second visibility change has nothing left.
+    setVisibility("hidden");
+    setVisibility("visible");
+    expect(received).toEqual(["sessions", "messages"]);
+    unsub();
+  });
+
+  it("drops held events when the last subscriber leaves", () => {
+    const unsub = events.subscribe(() => {});
+    setVisibility("hidden");
+    FakeEventSource.instances[0]!.fire("data_changed", { scope: "sync" });
+    unsub();
+
+    const received: string[] = [];
+    const unsub2 = events.subscribe((e) => received.push(e.scope));
+    setVisibility("visible");
+    expect(received).toEqual([]);
     unsub2();
   });
 

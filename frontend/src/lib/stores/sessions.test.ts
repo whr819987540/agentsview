@@ -3804,6 +3804,33 @@ describe("SessionsStore live refresh", () => {
     vi.useRealTimers();
   });
 
+  it("skips the safety-net refresh while hidden and runs it once when shown", async () => {
+    vi.useFakeTimers();
+    const setVisibility = (state: DocumentVisibilityState) => {
+      Object.defineProperty(document, "visibilityState", { configurable: true, get: () => state });
+      document.dispatchEvent(new Event("visibilitychange"));
+    };
+    const { events } = await import("./events.svelte.js");
+    const spy = vi.spyOn(events, "subscribe").mockReturnValue(() => {});
+
+    const sessions = createSessionsStore();
+    const detach = sessions.attachSidebar();
+    await sessions.load();
+    expect(api.getSidebarSessionIndex).toHaveBeenCalledTimes(1);
+
+    setVisibility("hidden");
+    await vi.advanceTimersByTimeAsync(3 * 5 * 60 * 1000);
+    expect(api.getSidebarSessionIndex).toHaveBeenCalledTimes(1);
+
+    setVisibility("visible");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(api.getSidebarSessionIndex).toHaveBeenCalledTimes(2);
+
+    detach();
+    spy.mockRestore();
+    vi.useRealTimers();
+  });
+
   it("refreshes active child sessions on the 5-minute safety-net interval", async () => {
     vi.useFakeTimers();
     const { events } = await import("./events.svelte.js");

@@ -16,6 +16,7 @@ import { SESSION_ANALYTICS_WINDOW_PARAM, parseWindowDaysParam } from "./sessionR
 import { rollingRange } from "../utils/dates.js";
 import { LatestRead } from "../utils/latest-read.js";
 import { selectLiveId, selectPrimaryId } from "../utils/session-primary.js";
+import { isPageHidden, onPageVisible } from "../utils/page-visibility.js";
 
 type SidebarIndexParams = NonNullable<
   Parameters<typeof SessionsService.getApiV1SessionsSidebarIndex>[0]
@@ -342,6 +343,9 @@ class SessionsStore {
   private unsubEvents: (() => void) | null = null;
   private liveRefreshTimer: ReturnType<typeof setTimeout> | null = null;
   private safetyNetTimer: ReturnType<typeof setInterval> | null = null;
+  // A hidden tab skips the safety-net refresh and runs it once when shown.
+  private safetyNetMissed = false;
+  private unsubVisible: (() => void) | null = null;
 
   get activeSession(): Session | undefined {
     const session = this.sessions.find((s) => s.id === this.activeSessionId);
@@ -1524,11 +1528,24 @@ class SessionsStore {
       this.handleLiveRefreshEvent(event);
     });
     this.safetyNetTimer = setInterval(() => {
-      this.load();
-      void sessionEndMarks.refresh();
-      this.refreshActiveChildSessions();
-      this.bumpActiveSessionUsageVersion();
+      if (isPageHidden()) {
+        this.safetyNetMissed = true;
+        return;
+      }
+      this.runSafetyNet();
     }, SAFETY_NET_REFRESH_MS);
+    this.unsubVisible = onPageVisible(() => {
+      if (!this.safetyNetMissed) return;
+      this.safetyNetMissed = false;
+      this.runSafetyNet();
+    });
+  }
+
+  private runSafetyNet() {
+    this.load();
+    void sessionEndMarks.refresh();
+    this.refreshActiveChildSessions();
+    this.bumpActiveSessionUsageVersion();
   }
 
   private handleLiveRefreshEvent(event: DataChangedEvent) {
@@ -1613,6 +1630,9 @@ class SessionsStore {
       clearInterval(this.safetyNetTimer);
       this.safetyNetTimer = null;
     }
+    this.unsubVisible?.();
+    this.unsubVisible = null;
+    this.safetyNetMissed = false;
     this.cancelRouteReads();
     this.liveRefreshStarted = false;
   }
@@ -1721,11 +1741,17 @@ const RECENTLY_ACTIVE_MS = 10 * 60 * 1000;
 const STALE_MS = 60 * 60 * 1000;
 
 /** Ticking timestamp that updates every 30s so derived
- *  recency checks stay reactive without manual triggers. */
+ *  recency checks stay reactive without manual triggers. Each tick
+ *  regroups the sidebar, so a hidden tab skips it and catches up the
+ *  moment it is shown. */
 let now = $state(Date.now());
 setInterval(() => {
+  if (isPageHidden()) return;
   now = Date.now();
 }, 30_000);
+onPageVisible(() => {
+  now = Date.now();
+});
 
 export type SessionStatus = "working" | "waiting" | "idle" | "stale" | "unclean" | "quiet";
 

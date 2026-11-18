@@ -1,5 +1,6 @@
 import type { EventSource } from "eventsource";
 import { watchEvents, type DataChangedEvent } from "../api/client.js";
+import { isPageHidden, onPageVisible } from "../utils/page-visibility.js";
 
 type Listener = (e: DataChangedEvent) => void;
 
@@ -27,6 +28,11 @@ class EventsStore {
   private permanentlyFailed = false;
   private available = false;
   private visibilityHandlerInstalled = false;
+  // Events that arrived while the tab was hidden, latest per scope. A
+  // hidden tab shows nothing, so its subscribers refetch once when it is
+  // shown again instead of on every change. Events carry only a scope,
+  // so keeping the latest one per scope loses nothing.
+  private deferred = new Map<DataChangedEvent["scope"], DataChangedEvent>();
 
   /** Enable or disable the live event stream for the current backend mode. */
   setAvailable(available: boolean) {
@@ -103,23 +109,37 @@ class EventsStore {
     if (this.es !== null && this.es.readyState !== CLOSED) {
       return;
     }
-    this.es = watchEvents(
-      (e) => {
-        for (const fn of this.listeners.values()) fn(e);
+    this.es = watchEvents((e) => this.dispatch(e), {
+      onPermanentFailure: () => {
+        this.permanentlyFailed = true;
+        if (this.healTimer !== null) {
+          clearInterval(this.healTimer);
+          this.healTimer = null;
+        }
       },
-      {
-        onPermanentFailure: () => {
-          this.permanentlyFailed = true;
-          if (this.healTimer !== null) {
-            clearInterval(this.healTimer);
-            this.healTimer = null;
-          }
-        },
-      },
-    );
+    });
+  }
+
+  private dispatch(e: DataChangedEvent) {
+    if (isPageHidden()) {
+      this.deferred.delete(e.scope);
+      this.deferred.set(e.scope, e);
+      return;
+    }
+    for (const fn of this.listeners.values()) fn(e);
+  }
+
+  private flushDeferred() {
+    if (this.deferred.size === 0) return;
+    const pending = [...this.deferred.values()];
+    this.deferred.clear();
+    for (const e of pending) {
+      for (const fn of this.listeners.values()) fn(e);
+    }
   }
 
   private close() {
+    this.deferred.clear();
     if (this.es === null) return;
     this.es.close();
     this.es = null;
@@ -161,12 +181,13 @@ class EventsStore {
     }, EVENTS_STORE_HEAL_INTERVAL_MS);
   }
 
-  // installVisibilityHandler wires a one-time document listener
-  // that gives permanently-failed SSE one more retry when the user
-  // refocuses the tab. This absorbs false-positive "permanent"
-  // classifications (slow startup, tunnel handshake, transient
-  // network hiccup at mount time) without running a periodic
-  // retry storm in the background. Installed lazily on first
+  // installVisibilityHandler wires a one-time listener for the tab
+  // becoming visible. It delivers the events deferred while the tab
+  // was hidden, and gives permanently-failed SSE one more retry when
+  // the user refocuses the tab. The retry absorbs false-positive
+  // "permanent" classifications (slow startup, tunnel handshake,
+  // transient network hiccup at mount time) without running a
+  // periodic retry storm in the background. Installed lazily on first
   // subscribe so module import has no global side effect.
   private installVisibilityHandler() {
     if (this.visibilityHandlerInstalled) return;
@@ -174,8 +195,8 @@ class EventsStore {
       return;
     }
     this.visibilityHandlerInstalled = true;
-    document.addEventListener("visibilitychange", () => {
-      if (document.hidden) return;
+    onPageVisible(() => {
+      this.flushDeferred();
       if (!this.permanentlyFailed) return;
       if (this.listeners.size === 0) return;
       this.permanentlyFailed = false;

@@ -1,4 +1,5 @@
 import { sessionTiming } from "./sessionTiming.svelte.js";
+import { isPageHidden, onPageVisible } from "../utils/page-visibility.js";
 
 /** Reactive Date.now() that ticks every second while the loaded
  *  session has `running: true`. A $derived that reads
@@ -17,6 +18,8 @@ class LiveTickStore {
           if (this.timer == null) {
             this.now = Date.now();
             this.timer = setInterval(() => {
+              // A hidden tab shows no labels; showing it catches up.
+              if (isPageHidden()) return;
               this.now = Date.now();
             }, 1000);
           }
@@ -26,6 +29,9 @@ class LiveTickStore {
           this.now = Date.now();
         }
       });
+    });
+    onPageVisible(() => {
+      if (this.timer != null) this.now = Date.now();
     });
   }
 }

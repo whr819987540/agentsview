@@ -1,7 +1,8 @@
 <script lang="ts">
   import { RefreshControl as KitRefreshControl } from "@kenn-io/kit-ui";
-  import { untrack, type ComponentProps } from "svelte";
+  import { onDestroy, untrack, type ComponentProps } from "svelte";
   import { formatDateTime, getLocale, m } from "../../i18n/index.js";
+  import { deferWhileHidden } from "../../utils/page-visibility.js";
   import type { LiveQuery } from "../../utils/liveQuery.svelte.js";
   import {
     formatQueryDuration,
@@ -52,8 +53,14 @@
     querySteps = [],
     liveQuery = undefined,
     lastUpdatedAt,
+    onRefresh,
     ...rest
   }: Props = $props();
+
+  // kit-ui's timer refreshes on every interval. A hidden tab shows nothing,
+  // so its timed refreshes collapse into one when the tab is shown again.
+  const refresh = deferWhileHidden(() => onRefresh());
+  onDestroy(() => refresh.dispose());
 
   // Locale is fixed for the life of a page load (a language change reloads),
   // so the samples are computed once per mount.
@@ -140,6 +147,7 @@
 
 <KitRefreshControl
   {...rest}
+  onRefresh={refresh.run}
   lastUpdatedAt={status === undefined ? lastUpdatedAt : null}
   formatAge={status === undefined
     ? (at, now) => formatRefreshStatus(at, durationMs, now)
