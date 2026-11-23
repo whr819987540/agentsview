@@ -109,6 +109,9 @@ fork 给共享接口加的方法（例如 `db.Store.GetInputOutline`）要在 up
 - Git and Delivery 一节中"每次 push 后监控它触发的全部 workflow 运行"的规则。
   upstream 的 Pull Requests 一节有"除非用户要求，不要监控 GitHub Actions"的两条
   规则，与它相反，合并时不要把这两条加回来。
+- Git and Delivery 一节中"功能分支改好后自动推送、开 PR、检查通过后合并"的交付
+  规则，以及允许推送功能分支的那句。upstream 写的是"除非用户要求，不要 push"和
+  "不要合并 PR，合并由用户决定"，合并时保留 fork 的写法。
 
 ### CI workflow 的 runner
 

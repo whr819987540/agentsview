@@ -54,7 +54,9 @@ Before reviewing CI runner security, read the
    turn is read-only or changes only ignored files, say that no commit was
    made.
 1. Keep commits focused and use clear conventional commit messages.
-1. Do not amend, squash, rebase, push, or pull unless the user asks.
+1. Do not amend, squash, rebase, or pull unless the user asks. Push feature
+   branches as the delivery rule below describes; push anything else only when
+   the user asks.
 1. Watch GitHub Actions runs without being asked. Start right after every
    push, and again as soon as a pull request is opened, whether you or the
    user opened it. Watch every run for the head commit: the runs its push
@@ -72,8 +74,25 @@ Before reviewing CI runner security, read the
    change caused it.
 1. Do not add generated-with lines, attribution blocks, validation footers, or
    command transcripts to commit messages.
-1. Deliver changes through pull requests from feature branches. Never merge a
-   pull request; merging is the user's decision.
+1. Deliver every change through a pull request from its feature branch, and
+   merge it without waiting to be asked: the user asks for a branch to land its
+   change on `main`. Once the change is committed and its local checks pass:
+   1. Push the branch with `git push -u origin <branch>`.
+   1. Open a pull request against `main` of `origin`, never upstream. Pass
+      `origin`'s repository to `gh pr create --repo <owner>/<name>`, because
+      `gh` can default to upstream in a fork.
+   1. Watch the runs for the head commit as the rule above describes. When a
+      run fails because of the change, fix it, push, and watch again.
+   1. Merge with `gh pr merge <number> --merge --match-head-commit <sha>` once
+      every run for the head commit has succeeded and GitHub reports the pull
+      request as mergeable. A pull request that changes only Markdown starts no
+      checks, so it can merge as soon as it is mergeable.
+   1. Watch the runs the merge commit starts on `main` and report them. Then
+      remove the worktree and delete its local branch.
+
+   Stop and report instead of merging when a run fails for a reason the change
+   did not cause, when the pull request has conflicts, or when the user asked to
+   review it first.
 
 ## Safety
 
