@@ -198,6 +198,13 @@ The latest published release is
   the estimated total next to the downloaded size, for example
   `2.1 MB/s  0:19 elapsed / ~1:06 total`. The line redraws about five times a
   second.
+- `agentsview update` downloads faster on slow or throttled links by fetching
+  the release over 8 parallel connections. It uses `aria2c` when it is on your
+  `PATH`. Without it, the update says so and splits the download into HTTP Range
+  requests itself, and it does the same when `aria2c` fails. A part that drops
+  or stalls for 60 seconds resumes where it stopped, and a slow download no
+  longer fails after 10 minutes. `aria2c` runs without your `aria2.conf`, so set
+  a proxy in `https_proxy`.
 - Dashboard repository discovery reuses unchanged Git trust settings, reducing repeated Git launches.
 - Dashboard Git totals reuse discovery for ordinary checkouts owned by the
   server's user. Other layouts use fresh Git discovery. Directories with no

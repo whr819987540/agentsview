@@ -155,7 +155,6 @@ func PerformUpdate(ctx context.Context,
 		)
 	}
 
-	fmt.Printf("Downloading %s...\n", info.AssetName)
 	tempDir, err := os.MkdirTemp("", "agentsview-update-*")
 	if err != nil {
 		return fmt.Errorf("create temp dir: %w", err)
@@ -163,16 +162,13 @@ func PerformUpdate(ctx context.Context,
 	defer os.RemoveAll(tempDir)
 
 	archivePath := filepath.Join(tempDir, info.AssetName)
-	downloadChecksum, err := downloadFile(ctx,
+	downloadChecksum, err := downloadAsset(ctx,
 		info.DownloadURL, archivePath, info.Size, progressFn,
 	)
 	if err != nil {
 		return fmt.Errorf("download: %w", err)
 	}
 
-	if progressFn != nil {
-		fmt.Println()
-	}
 	fmt.Println("Verifying and installing...")
 	dstPath, err := installTarget(info.rawBinary)
 	if err != nil {
@@ -451,65 +447,6 @@ func fetchContentLength(ctx context.Context, url string) (int64, error) {
 		return 0, nil
 	}
 	return resp.ContentLength, nil
-}
-
-func downloadFile(ctx context.Context,
-	url, dest string,
-	totalSize int64,
-	progressFn func(downloaded, total int64),
-) (string, error) {
-	client := &http.Client{Timeout: 10 * time.Minute}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return "", err
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("download failed: %s", resp.Status)
-	}
-	// Report the start, so a progress display times the transfer from
-	// the response rather than from the first 32 KB.
-	if progressFn != nil {
-		progressFn(0, totalSize)
-	}
-
-	out, err := os.Create(dest)
-	if err != nil {
-		return "", err
-	}
-	defer out.Close()
-
-	hasher := sha256.New()
-	writer := io.MultiWriter(out, hasher)
-
-	var downloaded int64
-	buf := make([]byte, 32*1024)
-	for {
-		n, readErr := resp.Body.Read(buf)
-		if n > 0 {
-			_, writeErr := writer.Write(buf[:n])
-			if writeErr != nil {
-				return "", writeErr
-			}
-			downloaded += int64(n)
-			if progressFn != nil {
-				progressFn(downloaded, totalSize)
-			}
-		}
-		if readErr == io.EOF {
-			break
-		}
-		if readErr != nil {
-			return "", readErr
-		}
-	}
-
-	return hex.EncodeToString(hasher.Sum(nil)), nil
 }
 
 func extractTarGz(archivePath, destDir string) error {
