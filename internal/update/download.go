@@ -436,7 +436,7 @@ func (b *stallBody) Read(p []byte) (int, error) {
 	if n > 0 {
 		b.timer.Reset(b.timeout)
 	}
-	if err != nil && err != io.EOF {
+	if err != nil && !errors.Is(err, io.EOF) {
 		if cause := context.Cause(b.ctx); errors.Is(cause, errStalled) {
 			err = cause
 		}
