@@ -1,11 +1,14 @@
 name: Rolling Release
 
-# Build directly-usable Linux and Windows binaries on every push to main.
-# Other branches build only on request: a manual run (workflow_dispatch)
-# builds the current tip of the chosen branch. Pull requests are merged with
-# a merge commit, so main builds every merged change anyway, and building
-# each branch push as well would compile the same source twice. Fork Checks
-# runs the frontend production build on pull requests instead.
+# Build directly-usable Linux and Windows binaries on every push to main
+# that changes more than Markdown files. A documentation-only push would
+# build the same binaries as the build before it, so it starts no build; see
+# the paths-ignore filter below. Other branches build only on request: a
+# manual run (workflow_dispatch) builds the current tip of the chosen branch.
+# Pull requests are merged with a merge commit, so main builds every merged
+# code change anyway, and building each branch push as well would compile
+# the same source twice. Fork Checks runs the frontend production build on
+# pull requests instead.
 #
 # Each build is published as a permanent snapshot prerelease tagged
 # "build-YYYYMMDD-<sha8>", where the date is the commit's committer date in
@@ -35,13 +38,20 @@ on:
     # not build.
     branches:
       - main
+    # GitHub compares the files the push changes, so merging a pull request
+    # that changes only Markdown starts no build. No Markdown file reaches
+    # the binaries or the installers: the skill templates are *.md.tmpl, and
+    # Markdown under testdata/ and plugins/ is not built. A manual run still
+    # builds any commit.
+    paths-ignore:
+      - "**.md"
   workflow_dispatch:
 
 permissions:
   contents: read
 
 # There is deliberately no workflow-level concurrency group. Every push to
-# main must build and get its own snapshot, even when newer pushes follow
+# main that builds must get its own snapshot, even when newer pushes follow
 # quickly, so superseded runs are not cancelled. This spends more CI minutes
 # than cancelling them did. Only the update of "latest" is serialized; see the
 # latest job.

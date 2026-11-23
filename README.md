@@ -18,9 +18,9 @@ The latest release is **v0.44.0**. Check the
 ## Install
 
 These commands install the newest rolling build of this fork. A new rolling
-build is published on every push to `main`. Replace `<owner>/<repo>` with this
-repository, or copy the filled-in commands from the
-[rolling release notes](../../releases/tag/latest).
+build is published on every push to `main` that changes more than Markdown
+files. Replace `<owner>/<repo>` with this repository, or copy the filled-in
+commands from the [rolling release notes](../../releases/tag/latest).
 
 **Linux (x86_64):**
 
