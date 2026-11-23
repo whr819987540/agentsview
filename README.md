@@ -48,12 +48,21 @@ it adds it to the front and asks you to open a new terminal. If another
 to fix that.
 
 Run `agentsview update` to move to the newest rolling build. It checks for a new
-build every time you run it and replaces the program you ran, even when the
-file has another name such as `agentsview-linux-amd64`. While it downloads, it
-shows the average speed and the elapsed time against the estimated total, such
-as `2.1 MB/s  0:19 elapsed / ~1:06 total`. Running
-`agentsview serve` from a newer rolling build replaces an older daemon that is
-still running.
+build every time you run it and replaces the program you ran, even when the file
+has another name such as `agentsview-linux-amd64`. Running `agentsview serve`
+from a newer rolling build replaces an older daemon that is still running.
+
+`agentsview update` downloads over 8 parallel connections:
+
+- When `aria2c` is on your `PATH`, it runs `aria2c`, which draws its own
+  progress line. It ignores your `aria2.conf`, so set a proxy in `https_proxy`.
+- Otherwise it says that `aria2c` was not found and splits the download into
+  HTTP Range requests itself. It also falls back to this downloader when
+  `aria2c` fails. Its progress line shows the average speed and the elapsed time
+  against the estimated total, such as `2.1 MB/s  0:19 elapsed / ~1:06 total`. A
+  part that drops, or receives nothing for 60 seconds, resumes where it stopped,
+  up to 5 tries. A server that ignores Range requests sends the file over one
+  connection.
 
 Every build stays available as a `build-YYYYMMDD-<commit>` entry on the
 [releases page](../../releases), dated by its commit. The installers and

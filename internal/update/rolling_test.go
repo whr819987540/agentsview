@@ -425,6 +425,7 @@ func TestCheckForUpdateUsesRollingRepo(t *testing.T) {
 func TestRollingUpdateSurvivesRepublish(t *testing.T) {
 	// A push republishes "latest" between the check and the download.
 	// The install still gets the checked build from its snapshot.
+	withoutAria2(t)
 	release := newRollingRelease("checked-binary")
 	root := release.serve(t)
 	exe := filepath.Join(t.TempDir(), rollingAssetName(runtime.GOOS, runtime.GOARCH))
