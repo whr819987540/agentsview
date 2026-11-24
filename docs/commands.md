@@ -1457,6 +1457,71 @@ document. Refresh saved digests when changing versions.
 
 ______________________________________________________________________
 
+### `agentsview curation`
+
+Move your stars, ended marks, and sidebar folders to another archive, such as
+when your sessions move to a new machine. Curation is the organizing you did in
+the sidebar; the sessions themselves move separately, for example by copying
+provider files, [artifact sync](/docs/artifact-sync/), or a configured remote
+host.
+
+1. On the old machine, export the curation to a file:
+
+   ```bash
+   agentsview curation export -o curation.json
+   ```
+
+1. Copy the file to the new machine after its sessions have synced.
+
+1. Preview the import, then apply it:
+
+   ```bash
+   agentsview curation import curation.json --dry-run
+   agentsview curation import curation.json
+   ```
+
+Both commands work through the running daemon, so you do not need to stop it.
+`export` starts the daemon when none is running, like other read commands.
+`import` writes the local archive directly when no daemon is running. Reload an
+open browser tab to see the imported curation.
+
+The export holds every starred session, every ended mark that still applies,
+every folder (empty ones included), and each session's folder. It names
+sessions by their IDs on the old machine, and lists their project names and
+folder names. `export` writes it to standard output unless you pass
+`-o`/`--output`; a file it creates is readable only by you.
+
+The import matches each exported session to one session on the new machine:
+
+| Session on the new machine                          | Matches when                                                           |
+| --------------------------------------------------- | ---------------------------------------------------------------------- |
+| Same ID, such as a session synced from copied files | Always, if it exists                                                   |
+| `<prefix>~<ID>`, from artifact sync or remote sync  | It is the only one, or its prefix is the old archive's artifact origin |
+
+The session's agent must also match. Sessions that match nothing, or more than
+one prefixed session, are listed in the report and skipped.
+
+For each matched session, the import adds only what the new machine lacks:
+
+- A star is added when the session has none.
+- An ended mark is added when the session has none, with the old machine's
+  activity time. If the new machine has seen newer activity for the session,
+  the mark clears itself, as it does when you resume a session.
+- A folder is recreated in the project the session has on the new machine, and
+  the session goes into it unless it is already in a folder there.
+- An empty folder is recreated when the new machine has sessions in its
+  project.
+
+The import never removes or replaces curation the new machine already has.
+Running it again changes nothing. It commits all changes together or none.
+Pinned messages and renamed session titles are not part of the export.
+
+Pass `--dry-run` to report the counts without writing, and `--json` for the full
+result, including every unmatched session ID. Pass `-` instead of a file name
+to read the export from standard input.
+
+______________________________________________________________________
+
 ### `agentsview session`
 
 Programmatic access to session data for scripts, automation agents, and CI jobs.
