@@ -1470,6 +1470,7 @@ organized into sections:
 | Session Providers  | Enable session providers, inspect their session directories, and add alternate agent homes               |
 | Archive content    | Choose whether future imports keep, drop, or offload tool-result images                                  |
 | Tool-result images | Preview and remove images from stored tool results                                                       |
+| Move stars and folders | Export stars, ended marks, and folders to a file, or import one from another machine ([details](/docs/commands/#agentsview-curation)) |
 | Terminal           | Default terminal emulator for session resume                                                             |
 | Embeddings         | Current semantic-index build phase, progress, throughput, ETA, last result, and local generations        |
 | GitHub             | Personal access token for Gist publishing                                                                |

@@ -12,9 +12,13 @@ The latest published release is
 **New features**
 
 - Keep your stars, ended marks, and sidebar folders when your sessions move to
-  a new machine. Run `agentsview curation export -o curation.json` on the old
-  machine, copy the file, and run `agentsview curation import curation.json`
-  on the new one; add `--dry-run` first to preview. The import finds each
+  a new machine. In the web UI, open **Settings > Move stars and folders**:
+  **Export to file** on the old machine, then **Choose file…** on the new one
+  to see what the import would change before you click **Import**. The sidebar
+  updates right away. From a terminal, run
+  `agentsview curation export -o curation.json` on the old machine and
+  `agentsview curation import curation.json` on the new one; add `--dry-run`
+  first to preview. The import finds each
   session by its ID, including the prefixed IDs that artifact sync and remote
   sync give copied sessions, and recreates folders in each session's project on
   the new machine. It only adds what is missing and keeps any curation the new
