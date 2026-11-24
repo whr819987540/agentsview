@@ -38,6 +38,7 @@ const {
   },
   mockSearchStore: {
     results: [] as Array<unknown>,
+    idMatches: [] as Array<unknown>,
     isSearching: false,
     error: null as {
       detail: string | null;
@@ -177,6 +178,7 @@ describe("CommandPalette", () => {
     // jsdom does not implement scrollIntoView
     Element.prototype.scrollIntoView = vi.fn();
     mockSearchStore.results = [];
+    mockSearchStore.idMatches = [];
     mockSearchStore.isSearching = false;
     mockSearchStore.error = null;
     mockSearchStore.mode = "fulltext";
@@ -889,5 +891,108 @@ describe("CommandPalette", () => {
     expect(mark?.textContent).toBe("needle");
 
     unmount(component);
+  });
+
+  describe("session ID matches", () => {
+    const UUID = "7f1c2a90-3b4d-4e5f-8a6b-1c2d3e4f5a6b";
+
+    function idMatch(id: string, displayName: string) {
+      return { ...makeSession(id, "claude"), project: "proj-b", display_name: displayName };
+    }
+
+    function pressKey(key: string) {
+      document
+        .querySelector<HTMLInputElement>(".palette-input")!
+        .dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true }));
+    }
+
+    it("lists ID matches above content results and drops a content duplicate", async () => {
+      mockSearchStore.idMatches = [idMatch(UUID, "Refactor login flow")];
+      mockSearchStore.results = [
+        makeSearchResult({ session_id: UUID, name: "Refactor login flow", snippet: "mentions the id" }),
+        makeSearchResult({ session_id: "codex:other12345", name: "Other session" }),
+      ];
+      const component = mount(CommandPalette, { target: document.body });
+      await enterSearchQuery("7f1c2a90");
+
+      const labels = Array.from(document.querySelectorAll(".palette-section-label")).map((label) =>
+        label.textContent?.trim(),
+      );
+      expect(labels).toEqual(["Session ID matches", "Content matches"]);
+      const rows = Array.from(document.querySelectorAll(".palette-item")).map((row) => [
+        row.querySelector(".item-name")?.textContent?.trim(),
+        row.querySelector(".item-id")?.textContent?.trim(),
+      ]);
+      expect(rows).toEqual([
+        ["Refactor login flow", "7f1c2a90"],
+        ["Other session", "other123"],
+      ]);
+      expect(document.querySelector(".palette-item .item-meta")?.textContent).toContain(
+        "proj-b",
+      );
+
+      unmount(component);
+    });
+
+    it("opens the first ID match on Enter without a message target", async () => {
+      mockSearchStore.idMatches = [idMatch(UUID, "Refactor login flow")];
+      mockSearchStore.results = [makeSearchResult()];
+      const component = mount(CommandPalette, { target: document.body });
+      await enterSearchQuery("7f1c2a90");
+
+      pressKey("Enter");
+      await tick();
+
+      expect(mockRouter.navigateToSession).toHaveBeenCalledExactlyOnceWith(UUID);
+      expect(mockUi.clearScrollState).toHaveBeenCalledOnce();
+      expect(mockUi.scrollToOrdinal).not.toHaveBeenCalled();
+      expect(mockUi.activeModal).toBeNull();
+
+      unmount(component);
+    });
+
+    it("moves from the ID matches into content results with the arrow keys", async () => {
+      mockSearchStore.idMatches = [idMatch(UUID, "Refactor login flow")];
+      mockSearchStore.results = [makeSearchResult({ session_id: "codex:search123", ordinal: 7 })];
+      const component = mount(CommandPalette, { target: document.body });
+      await enterSearchQuery("7f1c2a90");
+
+      pressKey("ArrowDown");
+      await tick();
+      const selected = document.querySelector(".palette-item.selected .item-id");
+      expect(selected?.textContent?.trim()).toBe("search12");
+      pressKey("Enter");
+      await tick();
+
+      expect(mockRouter.navigateToSession).toHaveBeenCalledExactlyOnceWith("codex:search123");
+      expect(mockUi.scrollToOrdinal).toHaveBeenCalledWith(7, "codex:search123");
+
+      unmount(component);
+    });
+
+    it("does not report no results when only an ID matches", async () => {
+      mockSearchStore.idMatches = [idMatch(UUID, "Refactor login flow")];
+      const component = mount(CommandPalette, { target: document.body });
+      await enterSearchQuery("7f1c2a90");
+
+      expect(document.querySelector(".palette-empty")).toBeNull();
+      expect(document.querySelectorAll(".palette-section-label")).toHaveLength(1);
+
+      unmount(component);
+    });
+
+    it("keeps ID matches visible while the content search is still running", async () => {
+      mockSearchStore.idMatches = [idMatch(UUID, "Refactor login flow")];
+      mockSearchStore.isSearching = true;
+      const component = mount(CommandPalette, { target: document.body });
+      await enterSearchQuery("7f1c2a90");
+
+      expect(document.querySelector(".palette-item .item-name")?.textContent?.trim()).toBe(
+        "Refactor login flow",
+      );
+      expect(document.querySelector(".palette-empty")?.textContent).toContain("Searching");
+
+      unmount(component);
+    });
   });
 });

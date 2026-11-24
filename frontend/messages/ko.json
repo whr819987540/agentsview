@@ -195,6 +195,8 @@
   "command_palette_no_results": "결과 없음",
   "command_palette_copy_session_id": "세션 ID 복사",
   "command_palette_recent_sessions": "최근 세션",
+  "command_palette_session_id_matches": "세션 ID 일치",
+  "command_palette_content_matches": "내용 일치",
   "session_breadcrumb_back_to_sessions": "세션으로 돌아가기",
   "session_breadcrumb_sessions": "세션",
   "session_breadcrumb_resume_session_in_terminal": "터미널에서 세션 재개",
