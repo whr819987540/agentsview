@@ -403,11 +403,15 @@ marked it. Hover the dot for a tooltip explaining the current state.
 | Quiet   | Hidden            | Cleanly-ended sessions older than 10 minutes; no dot is rendered                                                        |
 | Ended   | Hidden            | Sidebar only: you [marked the row or fork as ended](#mark-a-session-as-ended) and it has had no activity since          |
 
-The sidebar lists sessions by state: Working, Waiting, Idle, Stale, Quiet, then
-Unclean. Ended sessions sort with Quiet. Within a state, the session written to
-most recently comes first. Working sessions are the exception: they keep the
-order they started in, newest first, so new messages from running agents don't
-swap them. A session still moves up when its agent starts working again.
+The sidebar lists active sessions first, by state: Working, Waiting, Idle, then
+Stale. Quiet and Unclean sessions follow together, newest first, so a session
+that stopped mid tool call a few hours ago stays above sessions from earlier
+days; its red dot still marks it. Ended sessions sort with Quiet. Within a
+state, the session written to most recently comes first. Working sessions are
+the exception: they keep the order they started in, newest first, so new
+messages from running agents don't swap them. A session still moves up when its
+agent starts working again. Folders are listed at the top of their project, and
+the same order applies inside each folder and to the sessions outside folders.
 
 The "flagged" tier (Stale and Unclean) is meant to surface sessions that look
 like an agent crashed mid tool call or had its session file truncated, so

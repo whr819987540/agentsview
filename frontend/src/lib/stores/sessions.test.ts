@@ -3076,6 +3076,49 @@ describe("buildSessionGroups", () => {
     ]);
   });
 
+  it("sorts unclean sessions with quiet ones by their last activity", () => {
+    const isoAgo = (ms: number) => new Date(Date.now() - ms).toISOString();
+    const hours = (n: number) => n * 60 * 60 * 1000;
+    const rows = [
+      makeSkinnyRow({
+        id: "quiet-3h",
+        ended_at: isoAgo(hours(3)),
+        termination_status: "clean",
+      }),
+      // Stopped mid tool call two hours ago: newer than both quiet rows.
+      makeSkinnyRow({
+        id: "unclean-2h",
+        ended_at: isoAgo(hours(2)),
+        termination_status: "tool_call_pending",
+      }),
+      makeSkinnyRow({
+        id: "quiet-5h",
+        ended_at: isoAgo(hours(5)),
+        termination_status: "awaiting_user",
+      }),
+      makeSkinnyRow({
+        id: "truncated-1d",
+        ended_at: isoAgo(hours(24)),
+        termination_status: "truncated",
+      }),
+      makeSkinnyRow({
+        id: "stale-30m",
+        ended_at: isoAgo(30 * 60 * 1000),
+        termination_status: "tool_call_pending",
+      }),
+    ];
+
+    const groups = buildSessionGroups(rows as any);
+
+    expect(groups.map((g) => g.primarySessionId)).toEqual([
+      "stale-30m",
+      "unclean-2h",
+      "quiet-3h",
+      "quiet-5h",
+      "truncated-1d",
+    ]);
+  });
+
   it("sorts a row marked ended with the quiet rows until it has new activity", () => {
     const isoAgo = (ms: number) => new Date(Date.now() - ms).toISOString();
     const markedEnd = isoAgo(5 * 60 * 1000);
@@ -3595,13 +3638,10 @@ describe("buildSessionGroups", () => {
     ).toBe("waiting");
   });
 
-  it("status-tier sort puts unclean below quiet", () => {
-    // All four sessions are >1h idle so the time-based tier is
-    // either quiet (clean/null) or unclean (flagged). Within a
-    // tier, freshness wins. Order should be:
-    //   quiet-newer → quiet-older → unclean-newer → unclean-older
-    // i.e. unclean sinks to the very bottom regardless of
-    // recency relative to quiet rows.
+  it("inactive sort interleaves quiet and unclean sessions by recency", () => {
+    // All four sessions are >1h idle, so each is quiet (clean/null)
+    // or unclean (flagged). Both share the inactive tier, where the
+    // newest activity comes first whatever the status.
     const sessions = [
       makeSession({
         id: "unclean-newer",
@@ -3629,10 +3669,10 @@ describe("buildSessionGroups", () => {
 
     const groups = buildSessionGroups(sessions);
     expect(groups.map((g) => g.sessions[0]!.id)).toEqual([
-      "quiet-newer",
-      "quiet-older",
       "unclean-newer",
+      "quiet-newer",
       "unclean-older",
+      "quiet-older",
     ]);
   });
 });
