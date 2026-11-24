@@ -142,7 +142,7 @@ func newCurationImportCommand() *cobra.Command {
 // readCurationExport reads and checks a curation export before any daemon
 // or archive is opened, so a wrong file fails fast.
 func readCurationExport(stdin io.Reader, name string) (db.CurationExport, error) {
-	var r io.Reader = stdin
+	r := stdin
 	if name != "-" {
 		path, err := pathutil.ExpandHome(name)
 		if err != nil {

@@ -5,6 +5,7 @@ import (
 	"encoding/json/v2"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -54,10 +55,13 @@ func TestCurationMovesBetweenMachinesThroughDaemons(t *testing.T) {
 	out, err := executeCommand(newRootCommand(), "curation", "export", "-o", exportPath)
 	require.NoError(t, err)
 	assert.Equal(t, "Exported 2 curated sessions and 1 folder to "+exportPath+"\n", out)
-	info, err := os.Stat(exportPath)
-	require.NoError(t, err)
-	assert.Equal(t, os.FileMode(0o600), info.Mode().Perm(),
-		"the export names projects and folders, so only its owner reads it")
+	if runtime.GOOS != "windows" {
+		// Windows reports no Unix permission bits.
+		info, err := os.Stat(exportPath)
+		require.NoError(t, err)
+		assert.Equal(t, os.FileMode(0o600), info.Mode().Perm(),
+			"the export names projects and folders, so only its owner reads it")
+	}
 
 	// The new machine received s2 through artifact sync, which prefixes the
 	// sending machine's origin.

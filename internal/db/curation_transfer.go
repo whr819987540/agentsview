@@ -273,6 +273,7 @@ func (db *DB) ImportCuration(
 				continue
 			case curationPrefixed:
 				result.MatchedByPrefix++
+			case curationExact:
 			}
 			result.Matched++
 			if err := imp.apply(entry, target); err != nil {
@@ -344,7 +345,7 @@ func loadCurationMatcher(
 		}
 		m.byID[t.id] = t
 		m.projects[t.project] = true
-		for i := 0; i < len(t.id); i++ {
+		for i := range len(t.id) {
 			if t.id[i] == '~' && i+1 < len(t.id) {
 				suffix := t.id[i+1:]
 				m.bySuffix[suffix] = append(m.bySuffix[suffix], t)
