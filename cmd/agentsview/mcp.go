@@ -469,6 +469,26 @@ func (s *mcpDaemonService) ImportRecallEntries(
 	return svc.ImportRecallEntries(ctx, r, opts)
 }
 
+func (s *mcpDaemonService) ExportCuration(
+	ctx context.Context,
+) (*db.CurationExport, error) {
+	svc, err := s.daemonService(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return svc.ExportCuration(ctx)
+}
+
+func (s *mcpDaemonService) ImportCuration(
+	ctx context.Context, doc db.CurationExport, opts db.CurationImportOptions,
+) (*db.CurationImportResult, error) {
+	svc, err := s.daemonService(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return svc.ImportCuration(ctx, doc, opts)
+}
+
 func (s *mcpDaemonService) ListSecrets(
 	ctx context.Context, f service.SecretListFilter,
 ) (*service.SecretFindingList, error) {

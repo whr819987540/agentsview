@@ -11,6 +11,16 @@ The latest published release is
 
 **New features**
 
+- Keep your stars, ended marks, and sidebar folders when your sessions move to
+  a new machine. Run `agentsview curation export -o curation.json` on the old
+  machine, copy the file, and run `agentsview curation import curation.json`
+  on the new one; add `--dry-run` first to preview. The import finds each
+  session by its ID, including the prefixed IDs that artifact sync and remote
+  sync give copied sessions, and recreates folders in each session's project on
+  the new machine. It only adds what is missing and keeps any curation the new
+  machine already has. Both commands work while the daemon runs. Pinned
+  messages and renamed titles are not included. See
+  [`agentsview curation`](/docs/commands/#agentsview-curation).
 - Check a run of sessions in one go before deleting them. In the sidebar's
   multi-select mode, click a session, then hold `Shift` and click another:
   every session listed between them is checked too. If you had just unchecked

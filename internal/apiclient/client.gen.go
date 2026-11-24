@@ -205,6 +205,59 @@ func (o *PostAPIV1ArtifactsExchangeRequestOptions) GetHeader() (map[string]strin
 	return nil, nil
 }
 
+// PostAPIV1CurationImportRequestOptions is the options needed to make a request to PostAPIV1CurationImport.
+type PostAPIV1CurationImportRequestOptions struct {
+	Query *PostAPIV1CurationImportQuery
+	Body  *PostAPIV1CurationImportBody
+}
+
+// Validate validates all the fields in the options.
+// Use it if fields validation was not run.
+func (o *PostAPIV1CurationImportRequestOptions) Validate() error {
+	var errors runtime.ValidationErrors
+
+	if o.Query != nil {
+		if v, ok := any(o.Query).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Query", err)
+			}
+		}
+	}
+
+	if o.Body != nil {
+		if v, ok := any(o.Body).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("Body", err)
+			}
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+
+	return errors
+}
+
+// GetPathParams returns the path params as a map.
+func (o *PostAPIV1CurationImportRequestOptions) GetPathParams() (map[string]any, error) {
+	return nil, nil
+}
+
+// GetQuery returns the query params as a map.
+func (o *PostAPIV1CurationImportRequestOptions) GetQuery() (map[string]any, error) {
+	return runtime.AsMap[any](o.Query)
+}
+
+// GetBody returns the payload in any type that can be marshalled to JSON by the client.
+func (o *PostAPIV1CurationImportRequestOptions) GetBody() any {
+	return o.Body
+}
+
+// GetHeader returns the headers as a map.
+func (o *PostAPIV1CurationImportRequestOptions) GetHeader() (map[string]string, error) {
+	return nil, nil
+}
+
 // PostAPIV1DataCompactRequestOptions is the options needed to make a request to PostAPIV1DataCompact.
 type PostAPIV1DataCompactRequestOptions struct {
 	Body *PostAPIV1DataCompactBody
@@ -4625,6 +4678,8 @@ type ClientInterface interface {
 	GetAPIV1ActivityReportStreamWithResponse(ctx context.Context, options *GetAPIV1ActivityReportRequestOptions, reqEditors ...runtime.RequestEditorFn) (*GetAPIV1ActivityReportResp, error)
 	GetAPIV1ActivityReportReportIDSessionsWithResponse(ctx context.Context, options *GetAPIV1ActivityReportReportIDSessionsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*GetAPIV1ActivityReportReportIDSessionsResp, error)
 	PostAPIV1ArtifactsExchangeWithResponse(ctx context.Context, options *PostAPIV1ArtifactsExchangeRequestOptions, reqEditors ...runtime.RequestEditorFn) (*PostAPIV1ArtifactsExchangeResp, error)
+	GetAPIV1CurationExportWithResponse(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*GetAPIV1CurationExportResp, error)
+	PostAPIV1CurationImportWithResponse(ctx context.Context, options *PostAPIV1CurationImportRequestOptions, reqEditors ...runtime.RequestEditorFn) (*PostAPIV1CurationImportResp, error)
 	PostAPIV1DataCompactWithResponse(ctx context.Context, options *PostAPIV1DataCompactRequestOptions, reqEditors ...runtime.RequestEditorFn) (*PostAPIV1DataCompactResp, error)
 	PostAPIV1EmbeddingsBuildWithResponse(ctx context.Context, options *PostAPIV1EmbeddingsBuildRequestOptions, reqEditors ...runtime.RequestEditorFn) (*PostAPIV1EmbeddingsBuildResp, error)
 	GetAPIV1EmbeddingsGenerationsWithResponse(ctx context.Context, options *GetAPIV1EmbeddingsGenerationsRequestOptions, reqEditors ...runtime.RequestEditorFn) (*GetAPIV1EmbeddingsGenerationsResp, error)
@@ -5253,6 +5308,436 @@ func (c *Client) PostAPIV1ArtifactsExchangeWithResponse(ctx context.Context, opt
 	case 503:
 		v := PostAPIV1ArtifactsExchangeErrorResponseText503(resp.Content)
 		out.Text503 = &v
+		return out, runtime.NewClientAPIError(fmt.Errorf("API error (status %d)", resp.StatusCode), runtime.WithStatusCode(resp.StatusCode))
+	default:
+		return out, runtime.NewClientAPIError(fmt.Errorf("unexpected status code: %d", resp.StatusCode), runtime.WithStatusCode(resp.StatusCode))
+	}
+}
+
+// GetAPIV1CurationExport Export stars, end marks, and folders
+func (c *Client) GetAPIV1CurationExportWithResponse(ctx context.Context, reqEditors ...runtime.RequestEditorFn) (*GetAPIV1CurationExportResp, error) {
+	var err error
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL: c.apiClient.GetBaseURL() + "/api/v1/curation/export",
+		Method:     "GET",
+	}
+
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/v1/curation/export")
+	if err != nil {
+		return nil, fmt.Errorf("error executing request: %w", err)
+	}
+
+	out := &GetAPIV1CurationExportResp{
+		HTTPResponse: resp.Raw,
+		Body:         resp.Content,
+		StatusCode:   resp.StatusCode,
+	}
+
+	switch resp.StatusCode {
+	case 200:
+		out.JSON200 = new(GetAPIV1CurationExportResponse)
+		bodyBytes := resp.Content
+		if len(bodyBytes) > 0 {
+			if err := json.Unmarshal(bodyBytes, out.JSON200); err != nil {
+				return out, &runtime.ResponseDecodeError{
+					StatusCode:    resp.StatusCode,
+					ContentType:   resp.Headers.Get("Content-Type"),
+					ContentLength: len(bodyBytes),
+					TargetType:    "GetAPIV1CurationExportResponse",
+					Body:          bodyBytes,
+					Err:           err,
+				}
+			}
+		}
+		return out, nil
+	case 400:
+		out.JSON400 = new(GetAPIV1CurationExportErrorResponse)
+		bodyBytes := resp.Content
+		if len(bodyBytes) > 0 {
+			if err := json.Unmarshal(bodyBytes, out.JSON400); err != nil {
+				return out, &runtime.ResponseDecodeError{
+					StatusCode:    resp.StatusCode,
+					ContentType:   resp.Headers.Get("Content-Type"),
+					ContentLength: len(bodyBytes),
+					TargetType:    "GetAPIV1CurationExportErrorResponse",
+					Body:          bodyBytes,
+					Err:           err,
+				}
+			}
+		}
+		return out, runtime.NewClientAPIError(fmt.Errorf("API error (status %d)", resp.StatusCode), runtime.WithStatusCode(resp.StatusCode))
+	case 401:
+		out.JSON401 = new(GetAPIV1CurationExportErrorResponseJSON)
+		bodyBytes := resp.Content
+		if len(bodyBytes) > 0 {
+			if err := json.Unmarshal(bodyBytes, out.JSON401); err != nil {
+				return out, &runtime.ResponseDecodeError{
+					StatusCode:    resp.StatusCode,
+					ContentType:   resp.Headers.Get("Content-Type"),
+					ContentLength: len(bodyBytes),
+					TargetType:    "GetAPIV1CurationExportErrorResponseJSON",
+					Body:          bodyBytes,
+					Err:           err,
+				}
+			}
+		}
+		return out, runtime.NewClientAPIError(fmt.Errorf("API error (status %d)", resp.StatusCode), runtime.WithStatusCode(resp.StatusCode))
+	case 403:
+		out.JSON403 = new(GetAPIV1CurationExportErrorResponseJSON403)
+		bodyBytes := resp.Content
+		if len(bodyBytes) > 0 {
+			if err := json.Unmarshal(bodyBytes, out.JSON403); err != nil {
+				return out, &runtime.ResponseDecodeError{
+					StatusCode:    resp.StatusCode,
+					ContentType:   resp.Headers.Get("Content-Type"),
+					ContentLength: len(bodyBytes),
+					TargetType:    "GetAPIV1CurationExportErrorResponseJSON403",
+					Body:          bodyBytes,
+					Err:           err,
+				}
+			}
+		}
+		return out, runtime.NewClientAPIError(fmt.Errorf("API error (status %d)", resp.StatusCode), runtime.WithStatusCode(resp.StatusCode))
+	case 404:
+		out.JSON404 = new(GetAPIV1CurationExportErrorResponseJSON404)
+		bodyBytes := resp.Content
+		if len(bodyBytes) > 0 {
+			if err := json.Unmarshal(bodyBytes, out.JSON404); err != nil {
+				return out, &runtime.ResponseDecodeError{
+					StatusCode:    resp.StatusCode,
+					ContentType:   resp.Headers.Get("Content-Type"),
+					ContentLength: len(bodyBytes),
+					TargetType:    "GetAPIV1CurationExportErrorResponseJSON404",
+					Body:          bodyBytes,
+					Err:           err,
+				}
+			}
+		}
+		return out, runtime.NewClientAPIError(fmt.Errorf("API error (status %d)", resp.StatusCode), runtime.WithStatusCode(resp.StatusCode))
+	case 409:
+		out.JSON409 = new(GetAPIV1CurationExportErrorResponseJSON409)
+		bodyBytes := resp.Content
+		if len(bodyBytes) > 0 {
+			if err := json.Unmarshal(bodyBytes, out.JSON409); err != nil {
+				return out, &runtime.ResponseDecodeError{
+					StatusCode:    resp.StatusCode,
+					ContentType:   resp.Headers.Get("Content-Type"),
+					ContentLength: len(bodyBytes),
+					TargetType:    "GetAPIV1CurationExportErrorResponseJSON409",
+					Body:          bodyBytes,
+					Err:           err,
+				}
+			}
+		}
+		return out, runtime.NewClientAPIError(fmt.Errorf("API error (status %d)", resp.StatusCode), runtime.WithStatusCode(resp.StatusCode))
+	case 500:
+		out.JSON500 = new(GetAPIV1CurationExportErrorResponseJSON500)
+		bodyBytes := resp.Content
+		if len(bodyBytes) > 0 {
+			if err := json.Unmarshal(bodyBytes, out.JSON500); err != nil {
+				return out, &runtime.ResponseDecodeError{
+					StatusCode:    resp.StatusCode,
+					ContentType:   resp.Headers.Get("Content-Type"),
+					ContentLength: len(bodyBytes),
+					TargetType:    "GetAPIV1CurationExportErrorResponseJSON500",
+					Body:          bodyBytes,
+					Err:           err,
+				}
+			}
+		}
+		return out, runtime.NewClientAPIError(fmt.Errorf("API error (status %d)", resp.StatusCode), runtime.WithStatusCode(resp.StatusCode))
+	case 501:
+		out.JSON501 = new(GetAPIV1CurationExportErrorResponseJSON501)
+		bodyBytes := resp.Content
+		if len(bodyBytes) > 0 {
+			if err := json.Unmarshal(bodyBytes, out.JSON501); err != nil {
+				return out, &runtime.ResponseDecodeError{
+					StatusCode:    resp.StatusCode,
+					ContentType:   resp.Headers.Get("Content-Type"),
+					ContentLength: len(bodyBytes),
+					TargetType:    "GetAPIV1CurationExportErrorResponseJSON501",
+					Body:          bodyBytes,
+					Err:           err,
+				}
+			}
+		}
+		return out, runtime.NewClientAPIError(fmt.Errorf("API error (status %d)", resp.StatusCode), runtime.WithStatusCode(resp.StatusCode))
+	case 502:
+		out.JSON502 = new(GetAPIV1CurationExportErrorResponseJSON502)
+		bodyBytes := resp.Content
+		if len(bodyBytes) > 0 {
+			if err := json.Unmarshal(bodyBytes, out.JSON502); err != nil {
+				return out, &runtime.ResponseDecodeError{
+					StatusCode:    resp.StatusCode,
+					ContentType:   resp.Headers.Get("Content-Type"),
+					ContentLength: len(bodyBytes),
+					TargetType:    "GetAPIV1CurationExportErrorResponseJSON502",
+					Body:          bodyBytes,
+					Err:           err,
+				}
+			}
+		}
+		return out, runtime.NewClientAPIError(fmt.Errorf("API error (status %d)", resp.StatusCode), runtime.WithStatusCode(resp.StatusCode))
+	case 503:
+		out.JSON503 = new(GetAPIV1CurationExportErrorResponseJSON503)
+		bodyBytes := resp.Content
+		if len(bodyBytes) > 0 {
+			if err := json.Unmarshal(bodyBytes, out.JSON503); err != nil {
+				return out, &runtime.ResponseDecodeError{
+					StatusCode:    resp.StatusCode,
+					ContentType:   resp.Headers.Get("Content-Type"),
+					ContentLength: len(bodyBytes),
+					TargetType:    "GetAPIV1CurationExportErrorResponseJSON503",
+					Body:          bodyBytes,
+					Err:           err,
+				}
+			}
+		}
+		return out, runtime.NewClientAPIError(fmt.Errorf("API error (status %d)", resp.StatusCode), runtime.WithStatusCode(resp.StatusCode))
+	case 504:
+		out.JSON504 = new(GetAPIV1CurationExportErrorResponseJSON504)
+		bodyBytes := resp.Content
+		if len(bodyBytes) > 0 {
+			if err := json.Unmarshal(bodyBytes, out.JSON504); err != nil {
+				return out, &runtime.ResponseDecodeError{
+					StatusCode:    resp.StatusCode,
+					ContentType:   resp.Headers.Get("Content-Type"),
+					ContentLength: len(bodyBytes),
+					TargetType:    "GetAPIV1CurationExportErrorResponseJSON504",
+					Body:          bodyBytes,
+					Err:           err,
+				}
+			}
+		}
+		return out, runtime.NewClientAPIError(fmt.Errorf("API error (status %d)", resp.StatusCode), runtime.WithStatusCode(resp.StatusCode))
+	default:
+		return out, runtime.NewClientAPIError(fmt.Errorf("unexpected status code: %d", resp.StatusCode), runtime.WithStatusCode(resp.StatusCode))
+	}
+}
+
+// PostAPIV1CurationImport Import stars, end marks, and folders
+func (c *Client) PostAPIV1CurationImportWithResponse(ctx context.Context, options *PostAPIV1CurationImportRequestOptions, reqEditors ...runtime.RequestEditorFn) (*PostAPIV1CurationImportResp, error) {
+	var err error
+	reqParams := runtime.RequestOptionsParameters{
+		RequestURL:  c.apiClient.GetBaseURL() + "/api/v1/curation/import",
+		Method:      "POST",
+		Options:     options,
+		ContentType: "application/json",
+	}
+
+	req, err := c.apiClient.CreateRequest(ctx, reqParams, reqEditors...)
+	if err != nil {
+		return nil, fmt.Errorf("error creating request: %w", err)
+	}
+
+	resp, err := c.apiClient.ExecuteRequest(ctx, req, "/api/v1/curation/import")
+	if err != nil {
+		return nil, fmt.Errorf("error executing request: %w", err)
+	}
+
+	out := &PostAPIV1CurationImportResp{
+		HTTPResponse: resp.Raw,
+		Body:         resp.Content,
+		StatusCode:   resp.StatusCode,
+	}
+
+	switch resp.StatusCode {
+	case 200:
+		out.JSON200 = new(PostAPIV1CurationImportResponse)
+		bodyBytes := resp.Content
+		if len(bodyBytes) > 0 {
+			if err := json.Unmarshal(bodyBytes, out.JSON200); err != nil {
+				return out, &runtime.ResponseDecodeError{
+					StatusCode:    resp.StatusCode,
+					ContentType:   resp.Headers.Get("Content-Type"),
+					ContentLength: len(bodyBytes),
+					TargetType:    "PostAPIV1CurationImportResponse",
+					Body:          bodyBytes,
+					Err:           err,
+				}
+			}
+		}
+		return out, nil
+	case 400:
+		out.JSON400 = new(PostAPIV1CurationImportErrorResponse)
+		bodyBytes := resp.Content
+		if len(bodyBytes) > 0 {
+			if err := json.Unmarshal(bodyBytes, out.JSON400); err != nil {
+				return out, &runtime.ResponseDecodeError{
+					StatusCode:    resp.StatusCode,
+					ContentType:   resp.Headers.Get("Content-Type"),
+					ContentLength: len(bodyBytes),
+					TargetType:    "PostAPIV1CurationImportErrorResponse",
+					Body:          bodyBytes,
+					Err:           err,
+				}
+			}
+		}
+		return out, runtime.NewClientAPIError(fmt.Errorf("API error (status %d)", resp.StatusCode), runtime.WithStatusCode(resp.StatusCode))
+	case 401:
+		out.JSON401 = new(PostAPIV1CurationImportErrorResponseJSON)
+		bodyBytes := resp.Content
+		if len(bodyBytes) > 0 {
+			if err := json.Unmarshal(bodyBytes, out.JSON401); err != nil {
+				return out, &runtime.ResponseDecodeError{
+					StatusCode:    resp.StatusCode,
+					ContentType:   resp.Headers.Get("Content-Type"),
+					ContentLength: len(bodyBytes),
+					TargetType:    "PostAPIV1CurationImportErrorResponseJSON",
+					Body:          bodyBytes,
+					Err:           err,
+				}
+			}
+		}
+		return out, runtime.NewClientAPIError(fmt.Errorf("API error (status %d)", resp.StatusCode), runtime.WithStatusCode(resp.StatusCode))
+	case 403:
+		out.JSON403 = new(PostAPIV1CurationImportErrorResponseJSON403)
+		bodyBytes := resp.Content
+		if len(bodyBytes) > 0 {
+			if err := json.Unmarshal(bodyBytes, out.JSON403); err != nil {
+				return out, &runtime.ResponseDecodeError{
+					StatusCode:    resp.StatusCode,
+					ContentType:   resp.Headers.Get("Content-Type"),
+					ContentLength: len(bodyBytes),
+					TargetType:    "PostAPIV1CurationImportErrorResponseJSON403",
+					Body:          bodyBytes,
+					Err:           err,
+				}
+			}
+		}
+		return out, runtime.NewClientAPIError(fmt.Errorf("API error (status %d)", resp.StatusCode), runtime.WithStatusCode(resp.StatusCode))
+	case 404:
+		out.JSON404 = new(PostAPIV1CurationImportErrorResponseJSON404)
+		bodyBytes := resp.Content
+		if len(bodyBytes) > 0 {
+			if err := json.Unmarshal(bodyBytes, out.JSON404); err != nil {
+				return out, &runtime.ResponseDecodeError{
+					StatusCode:    resp.StatusCode,
+					ContentType:   resp.Headers.Get("Content-Type"),
+					ContentLength: len(bodyBytes),
+					TargetType:    "PostAPIV1CurationImportErrorResponseJSON404",
+					Body:          bodyBytes,
+					Err:           err,
+				}
+			}
+		}
+		return out, runtime.NewClientAPIError(fmt.Errorf("API error (status %d)", resp.StatusCode), runtime.WithStatusCode(resp.StatusCode))
+	case 409:
+		out.JSON409 = new(PostAPIV1CurationImportErrorResponseJSON409)
+		bodyBytes := resp.Content
+		if len(bodyBytes) > 0 {
+			if err := json.Unmarshal(bodyBytes, out.JSON409); err != nil {
+				return out, &runtime.ResponseDecodeError{
+					StatusCode:    resp.StatusCode,
+					ContentType:   resp.Headers.Get("Content-Type"),
+					ContentLength: len(bodyBytes),
+					TargetType:    "PostAPIV1CurationImportErrorResponseJSON409",
+					Body:          bodyBytes,
+					Err:           err,
+				}
+			}
+		}
+		return out, runtime.NewClientAPIError(fmt.Errorf("API error (status %d)", resp.StatusCode), runtime.WithStatusCode(resp.StatusCode))
+	case 422:
+		out.JSON422 = new(PostAPIV1CurationImportErrorResponseJSON422)
+		bodyBytes := resp.Content
+		if len(bodyBytes) > 0 {
+			if err := json.Unmarshal(bodyBytes, out.JSON422); err != nil {
+				return out, &runtime.ResponseDecodeError{
+					StatusCode:    resp.StatusCode,
+					ContentType:   resp.Headers.Get("Content-Type"),
+					ContentLength: len(bodyBytes),
+					TargetType:    "PostAPIV1CurationImportErrorResponseJSON422",
+					Body:          bodyBytes,
+					Err:           err,
+				}
+			}
+		}
+		return out, runtime.NewClientAPIError(fmt.Errorf("API error (status %d)", resp.StatusCode), runtime.WithStatusCode(resp.StatusCode))
+	case 500:
+		out.JSON500 = new(PostAPIV1CurationImportErrorResponseJSON500)
+		bodyBytes := resp.Content
+		if len(bodyBytes) > 0 {
+			if err := json.Unmarshal(bodyBytes, out.JSON500); err != nil {
+				return out, &runtime.ResponseDecodeError{
+					StatusCode:    resp.StatusCode,
+					ContentType:   resp.Headers.Get("Content-Type"),
+					ContentLength: len(bodyBytes),
+					TargetType:    "PostAPIV1CurationImportErrorResponseJSON500",
+					Body:          bodyBytes,
+					Err:           err,
+				}
+			}
+		}
+		return out, runtime.NewClientAPIError(fmt.Errorf("API error (status %d)", resp.StatusCode), runtime.WithStatusCode(resp.StatusCode))
+	case 501:
+		out.JSON501 = new(PostAPIV1CurationImportErrorResponseJSON501)
+		bodyBytes := resp.Content
+		if len(bodyBytes) > 0 {
+			if err := json.Unmarshal(bodyBytes, out.JSON501); err != nil {
+				return out, &runtime.ResponseDecodeError{
+					StatusCode:    resp.StatusCode,
+					ContentType:   resp.Headers.Get("Content-Type"),
+					ContentLength: len(bodyBytes),
+					TargetType:    "PostAPIV1CurationImportErrorResponseJSON501",
+					Body:          bodyBytes,
+					Err:           err,
+				}
+			}
+		}
+		return out, runtime.NewClientAPIError(fmt.Errorf("API error (status %d)", resp.StatusCode), runtime.WithStatusCode(resp.StatusCode))
+	case 502:
+		out.JSON502 = new(PostAPIV1CurationImportErrorResponseJSON502)
+		bodyBytes := resp.Content
+		if len(bodyBytes) > 0 {
+			if err := json.Unmarshal(bodyBytes, out.JSON502); err != nil {
+				return out, &runtime.ResponseDecodeError{
+					StatusCode:    resp.StatusCode,
+					ContentType:   resp.Headers.Get("Content-Type"),
+					ContentLength: len(bodyBytes),
+					TargetType:    "PostAPIV1CurationImportErrorResponseJSON502",
+					Body:          bodyBytes,
+					Err:           err,
+				}
+			}
+		}
+		return out, runtime.NewClientAPIError(fmt.Errorf("API error (status %d)", resp.StatusCode), runtime.WithStatusCode(resp.StatusCode))
+	case 503:
+		out.JSON503 = new(PostAPIV1CurationImportErrorResponseJSON503)
+		bodyBytes := resp.Content
+		if len(bodyBytes) > 0 {
+			if err := json.Unmarshal(bodyBytes, out.JSON503); err != nil {
+				return out, &runtime.ResponseDecodeError{
+					StatusCode:    resp.StatusCode,
+					ContentType:   resp.Headers.Get("Content-Type"),
+					ContentLength: len(bodyBytes),
+					TargetType:    "PostAPIV1CurationImportErrorResponseJSON503",
+					Body:          bodyBytes,
+					Err:           err,
+				}
+			}
+		}
+		return out, runtime.NewClientAPIError(fmt.Errorf("API error (status %d)", resp.StatusCode), runtime.WithStatusCode(resp.StatusCode))
+	case 504:
+		out.JSON504 = new(PostAPIV1CurationImportErrorResponseJSON504)
+		bodyBytes := resp.Content
+		if len(bodyBytes) > 0 {
+			if err := json.Unmarshal(bodyBytes, out.JSON504); err != nil {
+				return out, &runtime.ResponseDecodeError{
+					StatusCode:    resp.StatusCode,
+					ContentType:   resp.Headers.Get("Content-Type"),
+					ContentLength: len(bodyBytes),
+					TargetType:    "PostAPIV1CurationImportErrorResponseJSON504",
+					Body:          bodyBytes,
+					Err:           err,
+				}
+			}
+		}
 		return out, runtime.NewClientAPIError(fmt.Errorf("API error (status %d)", resp.StatusCode), runtime.WithStatusCode(resp.StatusCode))
 	default:
 		return out, runtime.NewClientAPIError(fmt.Errorf("unexpected status code: %d", resp.StatusCode), runtime.WithStatusCode(resp.StatusCode))
@@ -15642,6 +16127,24 @@ func (c *Client) GetAPIV1VersionWithResponse(ctx context.Context, reqEditors ...
 
 var _ ClientInterface = (*Client)(nil)
 
+// DBCurationEndMarkKind Which sessions the mark covers
+type DBCurationEndMarkKind string
+
+const (
+	Branch DBCurationEndMarkKind = "branch"
+	Row    DBCurationEndMarkKind = "row"
+)
+
+// Validate checks if the DBCurationEndMarkKind value is valid
+func (d DBCurationEndMarkKind) Validate() error {
+	switch d {
+	case Branch, Row:
+		return nil
+	default:
+		return runtime.NewValidationErrorsFromString("Enum", fmt.Sprintf("must be a valid DBCurationEndMarkKind value, got: %v", d))
+	}
+}
+
 type ServiceMemoryCapabilityStatusStatus string
 
 const (
@@ -16103,6 +16606,8 @@ func (g GetAPIV1SessionsIDWatchPath) Validate() error {
 
 type PostAPIV1ArtifactsExchangeBody = ArtifactExchangeRequest
 
+type PostAPIV1CurationImportBody = DBCurationExport
+
 type PostAPIV1DataCompactBody = DataCompactRequest
 
 type PostAPIV1EmbeddingsBuildBody = EmbeddingsBuildRequest
@@ -16261,6 +16766,11 @@ func (g GetAPIV1ActivityReportReportIDSessionsQuery) Validate() error {
 		return nil
 	}
 	return errors
+}
+
+type PostAPIV1CurationImportQuery struct {
+	// DryRun Report what the import would change without writing
+	DryRun *bool `json:"dry_run,omitempty"`
 }
 
 type GetAPIV1EmbeddingsGenerationsQuery struct {
@@ -17270,6 +17780,52 @@ type PostAPIV1ArtifactsExchangeErrorResponseText501 string
 type PostAPIV1ArtifactsExchangeErrorResponseText502 string
 
 type PostAPIV1ArtifactsExchangeErrorResponseText503 string
+
+type GetAPIV1CurationExportResponse = db.CurationExport
+
+type GetAPIV1CurationExportErrorResponse = APIErrorResponse
+
+type GetAPIV1CurationExportErrorResponseJSON = APIErrorResponse
+
+type GetAPIV1CurationExportErrorResponseJSON403 = APIErrorResponse
+
+type GetAPIV1CurationExportErrorResponseJSON404 = APIErrorResponse
+
+type GetAPIV1CurationExportErrorResponseJSON409 = APIErrorResponse
+
+type GetAPIV1CurationExportErrorResponseJSON500 = APIErrorResponse
+
+type GetAPIV1CurationExportErrorResponseJSON501 = APIErrorResponse
+
+type GetAPIV1CurationExportErrorResponseJSON502 = APIErrorResponse
+
+type GetAPIV1CurationExportErrorResponseJSON503 = APIErrorResponse
+
+type GetAPIV1CurationExportErrorResponseJSON504 = APIErrorResponse
+
+type PostAPIV1CurationImportResponse = db.CurationImportResult
+
+type PostAPIV1CurationImportErrorResponse = APIErrorResponse
+
+type PostAPIV1CurationImportErrorResponseJSON = APIErrorResponse
+
+type PostAPIV1CurationImportErrorResponseJSON403 = APIErrorResponse
+
+type PostAPIV1CurationImportErrorResponseJSON404 = APIErrorResponse
+
+type PostAPIV1CurationImportErrorResponseJSON409 = APIErrorResponse
+
+type PostAPIV1CurationImportErrorResponseJSON422 = APIErrorResponse
+
+type PostAPIV1CurationImportErrorResponseJSON500 = APIErrorResponse
+
+type PostAPIV1CurationImportErrorResponseJSON501 = APIErrorResponse
+
+type PostAPIV1CurationImportErrorResponseJSON502 = APIErrorResponse
+
+type PostAPIV1CurationImportErrorResponseJSON503 = APIErrorResponse
+
+type PostAPIV1CurationImportErrorResponseJSON504 = APIErrorResponse
 
 type PostAPIV1DataCompactResponse = db.CompactResult
 
@@ -18489,6 +19045,41 @@ type PostAPIV1ArtifactsExchangeResp struct {
 	Text501      *PostAPIV1ArtifactsExchangeErrorResponseText501
 	Text502      *PostAPIV1ArtifactsExchangeErrorResponseText502
 	Text503      *PostAPIV1ArtifactsExchangeErrorResponseText503
+}
+
+type GetAPIV1CurationExportResp struct {
+	HTTPResponse *http.Response
+	Body         []byte
+	StatusCode   int
+	JSON200      *GetAPIV1CurationExportResponse
+	JSON400      *GetAPIV1CurationExportErrorResponse
+	JSON401      *GetAPIV1CurationExportErrorResponseJSON
+	JSON403      *GetAPIV1CurationExportErrorResponseJSON403
+	JSON404      *GetAPIV1CurationExportErrorResponseJSON404
+	JSON409      *GetAPIV1CurationExportErrorResponseJSON409
+	JSON500      *GetAPIV1CurationExportErrorResponseJSON500
+	JSON501      *GetAPIV1CurationExportErrorResponseJSON501
+	JSON502      *GetAPIV1CurationExportErrorResponseJSON502
+	JSON503      *GetAPIV1CurationExportErrorResponseJSON503
+	JSON504      *GetAPIV1CurationExportErrorResponseJSON504
+}
+
+type PostAPIV1CurationImportResp struct {
+	HTTPResponse *http.Response
+	Body         []byte
+	StatusCode   int
+	JSON200      *PostAPIV1CurationImportResponse
+	JSON400      *PostAPIV1CurationImportErrorResponse
+	JSON401      *PostAPIV1CurationImportErrorResponseJSON
+	JSON403      *PostAPIV1CurationImportErrorResponseJSON403
+	JSON404      *PostAPIV1CurationImportErrorResponseJSON404
+	JSON409      *PostAPIV1CurationImportErrorResponseJSON409
+	JSON422      *PostAPIV1CurationImportErrorResponseJSON422
+	JSON500      *PostAPIV1CurationImportErrorResponseJSON500
+	JSON501      *PostAPIV1CurationImportErrorResponseJSON501
+	JSON502      *PostAPIV1CurationImportErrorResponseJSON502
+	JSON503      *PostAPIV1CurationImportErrorResponseJSON503
+	JSON504      *PostAPIV1CurationImportErrorResponseJSON504
 }
 
 type PostAPIV1DataCompactResp struct {
@@ -19942,6 +20533,96 @@ func (d DBContentMatch) Validate() error {
 	}
 	return errors
 }
+
+type DBCurationEndMark struct {
+	// ActivityAt Latest activity of the covered sessions when the mark was set
+	ActivityAt string `json:"activity_at" validate:"required"`
+
+	// Kind Which sessions the mark covers
+	Kind DBCurationEndMarkKind `json:"kind" validate:"required"`
+}
+
+func (d DBCurationEndMark) Validate() error {
+	var errors runtime.ValidationErrors
+	if err := typesValidator.Var(d.ActivityAt, "required"); err != nil {
+		errors = errors.Append("ActivityAt", err)
+	}
+	if v, ok := any(d.Kind).(runtime.Validator); ok {
+		if err := v.Validate(); err != nil {
+			errors = errors.Append("Kind", err)
+		}
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type DBCurationExport = db.CurationExport
+
+type DBCurationExportFolder struct {
+	// Name Folder name
+	Name string `json:"name" validate:"required"`
+
+	// Project Project the folder belongs to
+	Project string `json:"project" validate:"required"`
+}
+
+func (d DBCurationExportFolder) Validate() error {
+	return runtime.ConvertValidatorError(typesValidator.Struct(d))
+}
+
+type DBCurationExportSession struct {
+	// Agent Session agent; the import only matches sessions of the same agent
+	Agent   *string            `json:"agent,omitempty"`
+	EndMark *DBCurationEndMark `json:"end_mark,omitempty"`
+
+	// Folder Name of the session's folder within its project
+	Folder *string `json:"folder,omitempty"`
+
+	// ID Session ID in the exporting archive
+	ID string `json:"id" validate:"required"`
+
+	// Project Session project in the exporting archive
+	Project *string `json:"project,omitempty"`
+
+	// Starred Whether the session is starred
+	Starred *bool `json:"starred,omitempty"`
+
+	// StarredAt When the session was starred (RFC 3339)
+	StarredAt *string `json:"starred_at,omitempty"`
+}
+
+func (d DBCurationExportSession) Validate() error {
+	var errors runtime.ValidationErrors
+	if d.EndMark != nil {
+		if v, ok := any(d.EndMark).(runtime.Validator); ok {
+			if err := v.Validate(); err != nil {
+				errors = errors.Append("EndMark", err)
+			}
+		}
+	}
+	if err := typesValidator.Var(d.ID, "required"); err != nil {
+		errors = errors.Append("ID", err)
+	}
+	if len(errors) == 0 {
+		return nil
+	}
+	return errors
+}
+
+type DBCurationImportCounts struct {
+	// Added Applied to a session that had none
+	Added int64 `json:"added"`
+
+	// Kept This archive held a different value, which the import kept
+	Kept int64 `json:"kept"`
+
+	// Unchanged This archive already held the same value
+	Unchanged int64 `json:"unchanged"`
+}
+
+type DBCurationImportResult = db.CurationImportResult
 
 type DBCursorAttributionMetrics struct {
 	AiAuthoredPct        float64                     `json:"ai_authored_pct"`

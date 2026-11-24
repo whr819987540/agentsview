@@ -129,6 +129,7 @@ func newRootCommand() *cobra.Command {
 	root.AddCommand(newCaptureCommand())
 	root.AddCommand(newMCPCommand())
 	root.AddCommand(newRecallCommand())
+	root.AddCommand(newCurationCommand())
 	root.AddCommand(newInsightCommand())
 	root.AddCommand(newStatsCommand())
 	root.AddCommand(newParseDiffCommand())

@@ -1545,6 +1545,32 @@ func (b *directBackend) ImportRecallEntries(
 	return &result, nil
 }
 
+// ExportCuration reads the local archive. A replica-backed service has no
+// archive to export and returns db.ErrReadOnly.
+func (b *directBackend) ExportCuration(ctx context.Context) (*db.CurationExport, error) {
+	if b.local == nil {
+		return nil, db.ErrReadOnly
+	}
+	doc, err := b.local.ExportCuration(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &doc, nil
+}
+
+func (b *directBackend) ImportCuration(
+	ctx context.Context, doc db.CurationExport, opts db.CurationImportOptions,
+) (*db.CurationImportResult, error) {
+	if b.local == nil {
+		return nil, db.ErrReadOnly
+	}
+	result, err := b.local.ImportCuration(ctx, doc, opts)
+	if err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
 func recallFilterToDB(f RecallFilter) db.RecallQuery {
 	return db.RecallQuery{
 		Text:                f.Query,

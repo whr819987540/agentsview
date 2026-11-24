@@ -32,6 +32,8 @@ filter:
       - get-api-v1-recall-entries-id
       - post-api-v1-recall-query
       - post-api-v1-recall-import
+      - get-api-v1-curation-export
+      - post-api-v1-curation-import
       - get-api-v1-secrets
       - post-api-v1-secrets-scan
       - get-api-v1-projects

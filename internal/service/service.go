@@ -94,6 +94,14 @@ type SessionService interface {
 	ListSecrets(ctx context.Context, f SecretListFilter) (*SecretFindingList, error)
 	ScanSecrets(ctx context.Context, in SecretScanInput,
 		progress func(SecretScanProgress)) (*SecretScanSummary, error)
+	// ExportCuration returns the local archive's stars, end marks, and
+	// session folders for another archive to import.
+	ExportCuration(ctx context.Context) (*db.CurationExport, error)
+	// ImportCuration applies an exported curation to the local archive's
+	// matching sessions, keeping curation the archive already holds.
+	ImportCuration(
+		ctx context.Context, doc db.CurationExport, opts db.CurationImportOptions,
+	) (*db.CurationImportResult, error)
 }
 
 // SecretScanInput parameterises ScanSecrets (mirrors sync.SecretScanInput).

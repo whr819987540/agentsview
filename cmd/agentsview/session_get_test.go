@@ -159,6 +159,14 @@ func (s *stubGetService) ImportRecallEntries(context.Context, io.Reader, db.Reca
 	panic("ImportRecallEntries not expected")
 }
 
+func (s *stubGetService) ExportCuration(context.Context) (*db.CurationExport, error) {
+	panic("ExportCuration not expected")
+}
+
+func (s *stubGetService) ImportCuration(context.Context, db.CurationExport, db.CurationImportOptions) (*db.CurationImportResult, error) {
+	panic("ImportCuration not expected")
+}
+
 func (s *stubGetService) ListSecrets(context.Context, service.SecretListFilter) (*service.SecretFindingList, error) {
 	panic("ListSecrets not expected")
 }

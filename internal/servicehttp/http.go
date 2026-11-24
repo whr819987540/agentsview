@@ -1272,6 +1272,64 @@ func (b *httpBackend) ImportRecallEntries(
 	return out, nil
 }
 
+func (b *httpBackend) ExportCuration(ctx context.Context) (*db.CurationExport, error) {
+	api, err := b.apiClient(b.client)
+	if err != nil {
+		return nil, err
+	}
+	response, err := api.GetAPIV1CurationExportWithResponse(ctx)
+	if response == nil {
+		return nil, err
+	}
+	if err := b.curationResponseError(response.HTTPResponse, response.Body, err); err != nil {
+		return nil, err
+	}
+	return response.JSON200, nil
+}
+
+func (b *httpBackend) ImportCuration(
+	ctx context.Context, doc db.CurationExport, opts db.CurationImportOptions,
+) (*db.CurationImportResult, error) {
+	if b.readOnly {
+		return nil, fmt.Errorf("curation import: daemon at %s is read-only: %w",
+			b.baseURL, db.ErrReadOnly)
+	}
+	q := &apiclient.PostAPIV1CurationImportQuery{}
+	if opts.DryRun {
+		q.DryRun = new(true)
+	}
+	api, err := b.apiClient(b.client)
+	if err != nil {
+		return nil, err
+	}
+	response, err := api.PostAPIV1CurationImportWithResponse(ctx,
+		&apiclient.PostAPIV1CurationImportRequestOptions{Query: q, Body: &doc})
+	if response == nil {
+		return nil, err
+	}
+	if err := b.curationResponseError(response.HTTPResponse, response.Body, err); err != nil {
+		return nil, err
+	}
+	return response.JSON200, nil
+}
+
+// curationResponseError explains the two refusals a curation request can
+// meet: a daemon built before curation transfer, and a daemon that reads a
+// replica instead of the local archive.
+func (b *httpBackend) curationResponseError(
+	response *http.Response, body []byte, err error,
+) error {
+	switch response.StatusCode {
+	case http.StatusNotFound:
+		return fmt.Errorf("daemon at %s does not support curation transfer; "+
+			"restart it with this version of agentsview", b.baseURL)
+	case http.StatusNotImplemented:
+		return fmt.Errorf("daemon at %s does not serve the local archive: %w",
+			b.baseURL, db.ErrReadOnly)
+	}
+	return serviceResponseError(response, body, err)
+}
+
 func recallFilterToQuery(f service.RecallFilter) *apiclient.GetAPIV1RecallEntriesQuery {
 	q := &apiclient.GetAPIV1RecallEntriesQuery{}
 	if f.Query != "" {
