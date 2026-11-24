@@ -328,6 +328,11 @@ The latest published release is
 
 **Bug fixes**
 
+- Sessions that stopped mid tool call more than an hour ago no longer drop to
+  the bottom of the sidebar below sessions from earlier days. Once a session has
+  been idle for an hour, it sorts with the other inactive sessions by its last
+  activity, newest first, and keeps its red status dot. Sessions that are still
+  active keep their place at the top.
 - A third AgentsView tab no longer stays blank while two tabs with sessions are
   open at `localhost`, `127.0.0.1` or over HTTPS. Browsers allow six connections
   to one server, and every tab held one or two of them open for live updates,

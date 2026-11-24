@@ -2069,11 +2069,13 @@ export function buildSessionGroups(sessions: SessionGroupInput[]): SessionGroup[
 
   // Two-key sort:
   //   1. status priority — working → waiting → idle → stale →
-  //      quiet → unclean. Awaiting-user rows sit above idle even
-  //      when older, and unclean (terminated mid tool call) sinks
-  //      to the very bottom so noise from old crashed sessions
-  //      doesn't push live work off-screen. A group the user
-  //      marked ended sorts as quiet until it has new activity.
+  //      inactive. Awaiting-user rows sit above idle even when
+  //      older. Every row idle for an hour or more shares the
+  //      inactive tier, quiet or unclean (stopped mid tool call)
+  //      alike, so the rest of the list reads newest first and a
+  //      recently interrupted session does not sink below days-old
+  //      ones; its status dot still marks it. A group the user
+  //      marked ended sorts as inactive until it has new activity.
   //   2. group freshness — within a tier, the group whose
   //      newest member was written most recently wins. Mirrors
   //      the time-since-last-update order the sidebar had before
@@ -2105,10 +2107,11 @@ export function buildSessionGroups(sessions: SessionGroupInput[]): SessionGroup[
 
 const WORKING_SORT_KEY = 0;
 
-const QUIET_SORT_KEY = 4;
+/** Rows that stopped being active, ordered among themselves by recency. */
+const INACTIVE_SORT_KEY = 4;
 
 function statusSortKey(group: SessionGroup): number {
-  if (sessionEndMarks.sortsAsEnded(group.sessions)) return QUIET_SORT_KEY;
+  if (sessionEndMarks.sortsAsEnded(group.sessions)) return INACTIVE_SORT_KEY;
   const live = group.sessions.find((s) => s.id === group.liveSessionId) ?? group.sessions[0]!;
   const status = getSessionStatus(live, group.sessions);
   switch (status) {
@@ -2121,11 +2124,10 @@ function statusSortKey(group: SessionGroup): number {
     case "stale":
       return 3;
     case "quiet":
-      return QUIET_SORT_KEY;
     case "unclean":
-      return 5;
+      return INACTIVE_SORT_KEY;
   }
-  return 6;
+  return 5;
 }
 
 /** When the group's first session started; later starts sort first. */
