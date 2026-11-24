@@ -196,18 +196,26 @@ class StarredStore {
    * multiple refreshes are in-flight.
    */
   private reconcileIfIdle() {
+    void this.refresh();
+  }
+
+  /**
+   * Re-read stars from the server, such as after an import changed
+   * them outside this store. While toggles are in flight it does
+   * nothing: their own reconcile runs once they settle.
+   */
+  async refresh(): Promise<void> {
     if (this.queues.size > 0) return;
     const mutVer = this.mutationVersion;
     const rid = ++this.refreshId;
-    StarredService.getApiV1Starred()
-      .then((res) => {
-        if (this.mutationVersion === mutVer && this.refreshId === rid) {
-          this.ids = new Set(res.session_ids);
-        }
-      })
-      .catch(() => {
-        // Server unavailable; keep optimistic state.
-      });
+    try {
+      const res = await StarredService.getApiV1Starred();
+      if (this.mutationVersion === mutVer && this.refreshId === rid) {
+        this.ids = new Set(res.session_ids);
+      }
+    } catch {
+      // Server unavailable; keep optimistic state.
+    }
   }
 
   /**

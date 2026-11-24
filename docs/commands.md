@@ -1483,7 +1483,14 @@ host.
 Both commands work through the running daemon, so you do not need to stop it.
 `export` starts the daemon when none is running, like other read commands.
 `import` writes the local archive directly when no daemon is running. Reload an
-open browser tab to see the imported curation.
+open browser tab to see curation imported from the terminal.
+
+The web UI offers the same steps in **Settings > Move stars and folders**.
+**Export to file** downloads the export. **Choose file…** checks an export,
+shows what the import would add, keep, and skip, and lists sessions not found
+on this machine. **Import** applies it and updates the sidebar right away.
+Import is off when the server is read-only, including when it serves a
+PostgreSQL or ClickHouse replica; export there says it needs the local archive.
 
 The export holds every starred session, every ended mark that still applies,
 every folder (empty ones included), and each session's folder. It names

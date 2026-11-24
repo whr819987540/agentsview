@@ -284,3 +284,44 @@ describe("StarredStore load retry", () => {
     expect(store.isStarred("s1")).toBe(true);
   });
 });
+
+describe("StarredStore refresh", () => {
+  beforeEach(() => {
+    localStorage.removeItem(STORAGE_KEY);
+    starredService.getApiV1Starred.mockReset();
+    starredService.putApiV1SessionsByIdStar.mockReset().mockResolvedValue(undefined);
+  });
+
+  it("replaces the stars after the server changed them outside the store", async () => {
+    starredService.getApiV1Starred.mockResolvedValueOnce({ session_ids: ["a"] });
+    const store = createStarredStore();
+    await store.load();
+    expect(store.isStarred("a")).toBe(true);
+
+    // An import starred b and c; a was unstarred elsewhere.
+    starredService.getApiV1Starred.mockResolvedValueOnce({ session_ids: ["b", "c"] });
+    await store.refresh();
+
+    expect([...store.ids].sort()).toEqual(["b", "c"]);
+  });
+
+  it("leaves a star still being saved alone", async () => {
+    starredService.getApiV1Starred.mockResolvedValue({ session_ids: [] });
+    const store = createStarredStore();
+    await store.load();
+    starredService.getApiV1Starred.mockClear();
+    let finishPut!: () => void;
+    starredService.putApiV1SessionsByIdStar.mockReturnValue(
+      new Promise<void>((resolve) => {
+        finishPut = resolve;
+      }),
+    );
+
+    store.star("x");
+    await store.refresh();
+
+    expect(starredService.getApiV1Starred).not.toHaveBeenCalled();
+    expect(store.isStarred("x")).toBe(true);
+    finishPut();
+  });
+});
