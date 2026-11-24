@@ -21,6 +21,9 @@ name: Rolling Release
 #
 # Assets on both releases:
 #   agentsview-linux-amd64, agentsview-windows-amd64.exe, SHA256SUMS
+#   agentsview-simple-linux-amd64.tar.gz
+#              the CJK full-text search sidecar for the Linux binary; see
+#              scripts/rolling-sidecar.sh
 #   VERSION    the exact string both binaries embed as main.version
 #   BUILD_TAG  the snapshot tag name
 # "latest" also carries install.sh and install.ps1.
@@ -213,10 +216,41 @@ jobs:
             exit 1
           fi
 
+      # The CJK full-text search sidecar ships beside the Linux binary. The
+      # script reuses the current rolling build's archive while its inputs
+      # are unchanged, so updates do not rebuild the CJK index; it builds a
+      # new one in this manylinux container otherwise.
+      - name: Package the CJK search sidecar
+        id: sidecar
+        shell: bash
+        run: bash scripts/rolling-sidecar.sh "$GITHUB_REPOSITORY" dist/agentsview-simple-linux-amd64.tar.gz
+
+      # A freshly built sidecar must load before it is published. The CJK
+      # tests skip when no sidecar loads, so a skip fails this step.
+      - name: Test a freshly built CJK search sidecar
+        if: steps.sidecar.outputs.built == 'true'
+        shell: bash
+        env:
+          CGO_ENABLED: "1"
+        run: |
+          export CGO_CFLAGS="-O2 -g -I${GITHUB_WORKSPACE}/.sqlite-include"
+          SIMPLE_DIR="$RUNNER_TEMP/agentsview-simple"
+          mkdir -p "$SIMPLE_DIR"
+          tar -xzf dist/agentsview-simple-linux-amd64.tar.gz -C "$SIMPLE_DIR"
+          AGENTSVIEW_SIMPLE_DIR="$SIMPLE_DIR" go test -tags fts5 ./internal/db \
+            -run 'CJKFTS' -count=1 -v | tee "$RUNNER_TEMP/cjk-fts.log"
+          if grep -q -- '--- SKIP' "$RUNNER_TEMP/cjk-fts.log"; then
+            echo "ERROR: CJK FTS tests skipped; the sidecar did not load." >&2
+            exit 1
+          fi
+          grep -q -- '--- PASS: TestCJKFTSChineseSearch' "$RUNNER_TEMP/cjk-fts.log"
+
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: rolling-linux-amd64
-          path: dist/agentsview-linux-amd64
+          path: |
+            dist/agentsview-linux-amd64
+            dist/agentsview-simple-linux-amd64.tar.gz
 
   build-windows:
     needs: [metadata, frontend]
@@ -338,7 +372,8 @@ jobs:
           printf '%s\n' "$VERSION" > VERSION
           # Newer clients read this from "latest" to find the snapshot.
           printf '%s\n' "$BUILD_TAG" > BUILD_TAG
-          sha256sum agentsview-linux-amd64 agentsview-windows-amd64.exe > SHA256SUMS
+          sha256sum agentsview-linux-amd64 agentsview-windows-amd64.exe \
+            agentsview-simple-linux-amd64.tar.gz > SHA256SUMS
           cat SHA256SUMS
 
       - name: Publish snapshot release
@@ -347,7 +382,7 @@ jobs:
           # inject shell syntax into the run script.
           COMMIT_SUBJECT: ${{ needs.metadata.outputs.subject }}
         run: |
-          ASSETS=(agentsview-linux-amd64 agentsview-windows-amd64.exe SHA256SUMS VERSION BUILD_TAG)
+          ASSETS=(agentsview-linux-amd64 agentsview-windows-amd64.exe agentsview-simple-linux-amd64.tar.gz SHA256SUMS VERSION BUILD_TAG)
           FILES=("${ASSETS[@]/#/artifacts/}")
 
           # Prints absent, incomplete (an asset is missing or not fully
@@ -505,6 +540,7 @@ jobs:
           gh release download "$BUILD_TAG" --dir assets \
             --pattern agentsview-linux-amd64 \
             --pattern agentsview-windows-amd64.exe \
+            --pattern agentsview-simple-linux-amd64.tar.gz \
             --pattern SHA256SUMS \
             --pattern VERSION \
             --pattern BUILD_TAG
@@ -604,6 +640,7 @@ jobs:
               --notes "$NOTES" \
               assets/agentsview-linux-amd64 \
               assets/agentsview-windows-amd64.exe \
+              assets/agentsview-simple-linux-amd64.tar.gz \
               installers/install.sh \
               installers/install.ps1 \
               assets/SHA256SUMS \
@@ -615,8 +652,9 @@ jobs:
           # Update the release in place so its download URLs keep working.
           # --clobber deletes each asset and then uploads its replacement,
           # so each asset is briefly missing. The order keeps clients safe:
-          #   1. Binaries and installers. An older client that fetches a
-          #      new binary with the old SHA256SUMS fails verification.
+          #   1. Binaries, the sidecar, and installers. An older client
+          #      that fetches a new binary with the old SHA256SUMS fails
+          #      verification.
           #   2. SHA256SUMS, now matching the new binaries.
           #   3. VERSION. Older clients only start an update once it
           #      changes, and by then the binaries and checksums match.
@@ -625,6 +663,7 @@ jobs:
           gh release upload latest --clobber \
             assets/agentsview-linux-amd64 \
             assets/agentsview-windows-amd64.exe \
+            assets/agentsview-simple-linux-amd64.tar.gz \
             installers/install.sh \
             installers/install.ps1
           gh release upload latest --clobber assets/SHA256SUMS
