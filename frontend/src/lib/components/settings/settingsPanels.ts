@@ -10,6 +10,7 @@ export type SettingsPanelId =
   | "worktree-mappings"
   | "embeddings"
   | "archive-content"
+  | "curation-transfer"
   | "github"
   | "remote-access";
 
@@ -99,6 +100,14 @@ export function settingsPanels(): SettingsPanelMeta[] {
       description: m.settings_archive_content_description(),
       group: data,
       keywords: m.settings_search_keywords_archive_content(),
+    },
+    {
+      id: "curation-transfer",
+      label: m.settings_curation_title(),
+      title: m.settings_curation_title(),
+      description: m.settings_curation_description(),
+      group: data,
+      keywords: m.settings_search_keywords_curation(),
     },
     {
       id: "github",

@@ -197,6 +197,46 @@ describe("SettingsPage", () => {
     unmount(component);
   });
 
+  it("finds the stars and folders transfer panel under Data", async () => {
+    settingsService.getApiV1Settings.mockResolvedValue({
+      agent_dirs: {},
+      chart_palette: "agentsview",
+      github_configured: false,
+      host: "127.0.0.1",
+      port: 8080,
+      read_only: false,
+      require_auth: false,
+      terminal: { mode: "auto" },
+    });
+    const component = mount(SettingsPage, {
+      target: document.body,
+    });
+    await tick();
+    await tick();
+
+    const nav = document.body.querySelector('nav[aria-label="Settings"]')!;
+    const search = document.body.querySelector<HTMLInputElement>(
+      'input[type="search"][aria-label="Search settings"]',
+    )!;
+    search.value = "migrate";
+    search.dispatchEvent(new Event("input", { bubbles: true }));
+    await tick();
+
+    const buttons = Array.from(nav.querySelectorAll("button"));
+    expect(buttons).toHaveLength(1);
+    expect(buttons[0]!.textContent).toContain("Move stars and folders");
+    buttons[0]!.click();
+    await tick();
+
+    const visiblePanel = document.body.querySelector<HTMLElement>(
+      ".settings-panel:not([hidden])",
+    );
+    expect(visiblePanel?.textContent).toContain("Export to file");
+    expect(visiblePanel?.textContent).toContain("Choose file…");
+
+    unmount(component);
+  });
+
   it("filters settings by keywords and restores the selected panel", async () => {
     settingsService.getApiV1Settings.mockResolvedValue({
       agent_dirs: {},
@@ -261,7 +301,7 @@ describe("SettingsPage", () => {
     restoredSearch.dispatchEvent(new Event("input", { bubbles: true }));
     await tick();
 
-    expect(restoredNav.querySelectorAll("button")).toHaveLength(11);
+    expect(restoredNav.querySelectorAll("button")).toHaveLength(12);
     expect(
       document.body.querySelector(".settings-page")?.classList.contains("settings-no-results"),
     ).toBe(false);

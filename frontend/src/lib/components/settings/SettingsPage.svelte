@@ -19,6 +19,7 @@
   import DateRangeSettings from "./DateRangeSettings.svelte";
   import TerminalSettings from "./TerminalSettings.svelte";
   import ArchiveContentSettings from "./ArchiveContentSettings.svelte";
+  import CurationTransferSettings from "./CurationTransferSettings.svelte";
   import EmbeddingsSettings from "./EmbeddingsSettings.svelte";
   import ToolImageCleanup from "./ToolImageCleanup.svelte";
   import GithubSettings from "./GithubSettings.svelte";
@@ -218,6 +219,8 @@
                 <EmbeddingsSettings />
               {:else if meta.id === "archive-content"}
                 <ArchiveContentSettings />
+              {:else if meta.id === "curation-transfer"}
+                <CurationTransferSettings />
               {:else if meta.id === "github"}
                 <GithubSettings />
               {:else if meta.id === "remote-access"}
