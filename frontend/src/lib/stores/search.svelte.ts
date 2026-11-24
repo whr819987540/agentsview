@@ -1,9 +1,10 @@
 import { debounce } from "@kenn-io/kit-ui";
-import { SearchService } from "../api/generated/index.js";
+import { SearchService, SessionsService } from "../api/generated/index.js";
 import { ApiError, isAbortError } from "../api/runtime.js";
-import type { DbSearchResult as SearchResult } from "../api/generated/index.js";
+import type { DbSearchResult as SearchResult, DbSession } from "../api/generated/index.js";
 import { resolveRange, type RangeSelection } from "../components/shared/rangeSelection.js";
 import { reportTelemetry } from "../utils/telemetry.js";
+import { isSessionIdQuery, sessionIdsParam, sessionLookupPartial } from "../utils/go-to-session.js";
 
 export type SearchMode = "fulltext" | "semantic" | "hybrid";
 export type SearchSort = "relevance" | "recency";
@@ -42,6 +43,7 @@ export const SEARCH_MODE_STORAGE_KEY = "agentsview-search-mode";
 const SEARCH_DEBOUNCE_MS = 300;
 const PALETTE_RESULT_LIMIT = 30;
 const CONTENT_SEARCH_LIMIT = 120;
+const SESSION_ID_MATCH_LIMIT = 5;
 const SEARCH_MODES: readonly SearchMode[] = ["fulltext", "semantic", "hybrid"];
 
 function availableStorage(): SearchModeStorage | null {
@@ -132,6 +134,9 @@ export class SearchStore {
   mode: SearchMode = $state("fulltext");
   range: RangeSelection = $state({ mode: "relative", days: 0 });
   results: PaletteSearchResult[] = $state([]);
+  // Sessions whose ID contains the query. They ignore the project, date range,
+  // and search mode, because an ID names one session wherever it lives.
+  idMatches: DbSession[] = $state([]);
   isSearching: boolean = $state(false);
   error: SearchFailure | null = $state(null);
   // search_run counts each mode once per palette open; the palette clears this when it closes.
@@ -139,6 +144,7 @@ export class SearchStore {
 
   private storage: SearchModeStorage | null;
   private abortController: AbortController | null = null;
+  private idLookupController: AbortController | null = null;
   private requestVersion = 0;
 
   private debouncedSearch = debounce((query: string, project: string) => {
@@ -158,6 +164,7 @@ export class SearchStore {
     if (!query.trim()) {
       this.debouncedSearch.cancel();
       this.results = [];
+      this.idMatches = [];
       this.error = null;
       this.isSearching = false;
       return;
@@ -214,6 +221,7 @@ export class SearchStore {
   clear() {
     this.query = "";
     this.results = [];
+    this.idMatches = [];
     this.error = null;
     this.isSearching = false;
     this.debouncedSearch.cancel();
@@ -228,6 +236,48 @@ export class SearchStore {
     this.requestVersion += 1;
     this.abortController?.abort();
     this.abortController = null;
+    this.idLookupController?.abort();
+    this.idLookupController = null;
+  }
+
+  // lookupSessionIds runs beside the text search. The resolve endpoint finds
+  // IDs containing the query, newest first; the list endpoint then hydrates
+  // exactly those rows, including children and one-shot or automated
+  // sessions that the sidebar would hide.
+  private async lookupSessionIds(query: string, requestVersion: number) {
+    const controller = new AbortController();
+    this.idLookupController = controller;
+    const { signal } = controller;
+    const isCurrent = () => requestVersion === this.requestVersion && !signal.aborted;
+    try {
+      const resolved = await SessionsService.getApiV1SessionIdsResolve(
+        { partial: sessionLookupPartial(query), limit: SESSION_ID_MATCH_LIMIT },
+        { signal },
+      );
+      if (!isCurrent()) return;
+      const ids = resolved.ids ?? [];
+      let matches: DbSession[] = [];
+      if (ids.length > 0) {
+        const list = await SessionsService.getApiV1Sessions(
+          { ids: sessionIdsParam(ids) },
+          { signal },
+        );
+        const byId = new Map(list.sessions.map((session) => [session.id, session]));
+        matches = ids.flatMap((id) => {
+          const session = byId.get(id);
+          return session ? [session] : [];
+        });
+      }
+      if (!isCurrent()) return;
+      this.idMatches = matches;
+    } catch (error: unknown) {
+      if (!isCurrent() || isAbortError(error)) return;
+      // The ID lookup is a shortcut. When it fails, the text search still
+      // reports its own results or error.
+      this.idMatches = [];
+    } finally {
+      if (isCurrent()) this.idLookupController = null;
+    }
   }
 
   private async executeSearch(query: string, project: string) {
@@ -242,6 +292,11 @@ export class SearchStore {
     if (!this.reportedModes.has(mode)) {
       this.reportedModes.add(mode);
       reportTelemetry("search_run", { query_type: mode === "fulltext" ? "text" : mode });
+    }
+    if (isSessionIdQuery(query)) {
+      void this.lookupSessionIds(query, requestVersion);
+    } else {
+      this.idMatches = [];
     }
     // All time must omit both bounds, rather than use the picker's fallback
     // start date when the earliest archived session is unknown.

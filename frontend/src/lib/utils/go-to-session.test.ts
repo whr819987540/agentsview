@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vite-plus/test";
-import { resolveSessionId, sessionLookupPartial } from "./go-to-session.js";
+import {
+  isSessionIdQuery,
+  resolveSessionId,
+  sessionIdsParam,
+  sessionLookupPartial,
+} from "./go-to-session.js";
 
 const UUID = "123e4567-e89b-12d3-a456-426614174000";
 
@@ -65,5 +70,39 @@ describe("resolveSessionId", () => {
     const candidates = Array.from({ length: 999 }, (_, index) => `other-${index}`);
     candidates.push(`codex:${UUID}`);
     expect(resolveSessionId(UUID, candidates, true)).toEqual({ kind: "capped" });
+  });
+});
+
+describe("isSessionIdQuery", () => {
+  it.each([
+    [UUID, true],
+    [`  ${UUID}  `, true],
+    ["123e4567", true],
+    ["7f1c2a", true],
+    [`codex:${UUID}`, true],
+    [`build-host~codex:${UUID}`, true],
+    ["agent-a1b2c3.d4_e5", true],
+    ["7f1c2", false],
+    ["refactor", false],
+    ["deadbeef", false],
+    ["fix bug 42", false],
+    ["error/401", false],
+    ["会话123456", false],
+    ["", false],
+  ])("classifies %j as %s", (input, expected) => {
+    expect(isSessionIdQuery(input)).toBe(expected);
+  });
+});
+
+describe("sessionIdsParam", () => {
+  it.each([
+    [["a1", "codex:b2"], "a1,codex:b2"],
+    [["plain", 'has"quote'], 'plain,has"quote'],
+    [["plain", "with,comma"], '"plain","with,comma"'],
+    [["with,comma", 'and"quote'], '"with,comma","and""quote"'],
+    [["line\nbreak", "plain"], '"line\nbreak","plain"'],
+    [["ok", "bad\r\nid"], "ok"],
+  ])("encodes %j as %j", (ids, expected) => {
+    expect(sessionIdsParam(ids)).toBe(expected);
   });
 });

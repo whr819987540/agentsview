@@ -198,6 +198,8 @@
   "command_palette_no_results": "Aucun résultat",
   "command_palette_copy_session_id": "Copier l'ID de la session",
   "command_palette_recent_sessions": "Sessions récentes",
+  "command_palette_session_id_matches": "Correspondances d'ID de session",
+  "command_palette_content_matches": "Correspondances dans le contenu",
   "session_breadcrumb_back_to_sessions": "Retour aux sessions",
   "session_breadcrumb_sessions": "Sessions",
   "session_breadcrumb_resume_session_in_terminal": "Reprendre la session dans le terminal",

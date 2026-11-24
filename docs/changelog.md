@@ -22,6 +22,13 @@ The latest published release is
   to with `AGENTSVIEW_SIMPLE_DIR` is left alone. Windows rolling builds do not
   include it yet. See
   [CJK full-text search](/docs/configuration/#cjk-full-text-search).
+- Find a session from its ID in the search palette. Type or paste a full
+  session ID, or any part of 6 or more characters such as the short ID shown on
+  results, and the matching sessions appear first under **Session ID matches**.
+  They show up whatever project, date range, or search mode the palette is set
+  to, including child and one-shot sessions the sidebar hides. Before, an ID
+  only matched when it happened to appear in a message. See
+  [Find a session by ID](/docs/usage/#find-a-session-by-id).
 - Keep your stars, ended marks, and sidebar folders when your sessions move to
   a new machine. In the web UI, open **Settings > Move stars and folders**:
   **Export to file** on the old machine, then **Choose file…** on the new one
@@ -339,6 +346,11 @@ The latest published release is
 
 **Bug fixes**
 
+- Sessions that stopped mid tool call more than an hour ago no longer drop to
+  the bottom of the sidebar below sessions from earlier days. Once a session has
+  been idle for an hour, it sorts with the other inactive sessions by its last
+  activity, newest first, and keeps its red status dot. Sessions that are still
+  active keep their place at the top.
 - A third AgentsView tab no longer stays blank while two tabs with sessions are
   open at `localhost`, `127.0.0.1` or over HTTPS. Browsers allow six connections
   to one server, and every tab held one or two of them open for live updates,

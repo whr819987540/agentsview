@@ -173,6 +173,8 @@
   "command_palette_no_results": "無結果",
   "command_palette_copy_session_id": "複製對話 ID",
   "command_palette_recent_sessions": "最近對話",
+  "command_palette_session_id_matches": "對話 ID 相符",
+  "command_palette_content_matches": "內容相符",
   "session_breadcrumb_back_to_sessions": "返回對話列表",
   "session_breadcrumb_sessions": "對話",
   "session_breadcrumb_resume_session_in_terminal": "在終端繼續對話",
