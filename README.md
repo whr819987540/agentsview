@@ -47,9 +47,17 @@ it adds it to the front and asks you to open a new terminal. If another
 `agentsview.exe` would still run first, the installer names it and explains how
 to fix that.
 
+The Linux installer also installs the CJK search extension, which adds
+Chinese, Japanese, and Korean full-text search, in
+`~/.local/lib/agentsview/simple`. Restart agentsview afterwards; its first start
+indexes your existing messages. Set `AGENTSVIEW_SKIP_CJK_FTS=1` to skip the
+extension. See
+[CJK full-text search](docs/configuration.md#cjk-full-text-search).
+
 Run `agentsview update` to move to the newest rolling build. It checks for a new
 build every time you run it and replaces the program you ran, even when the file
-has another name such as `agentsview-linux-amd64`. Running `agentsview serve`
+has another name such as `agentsview-linux-amd64`. On Linux it also keeps the
+CJK search extension in step with the new build. Running `agentsview serve`
 from a newer rolling build replaces an older daemon that is still running.
 
 `agentsview update` downloads over 8 parallel connections:
