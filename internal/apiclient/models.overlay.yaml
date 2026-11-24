@@ -21,6 +21,18 @@ actions:
       x-go-type-import:
         path: go.kenn.io/agentsview/internal/db
         name: db
+  - target: $.components.schemas.DbCurationExport
+    update:
+      x-go-type: db.CurationExport
+      x-go-type-import:
+        path: go.kenn.io/agentsview/internal/db
+        name: db
+  - target: $.components.schemas.DbCurationImportResult
+    update:
+      x-go-type: db.CurationImportResult
+      x-go-type-import:
+        path: go.kenn.io/agentsview/internal/db
+        name: db
   - target: $.components.schemas.DbProjectInfo
     update:
       x-go-type: db.ProjectInfo

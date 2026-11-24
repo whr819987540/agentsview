@@ -3,6 +3,7 @@ export * as AnalyticsService from "./analytics/analytics.ts";
 export * as ArtifactsService from "./artifacts/artifacts.ts";
 export * as AssetsService from "./assets/assets.ts";
 export * as ConfigService from "./config/config.ts";
+export * as CurationService from "./curation/curation.ts";
 export * as DataService from "./data/data.ts";
 export * as EmbeddingsService from "./embeddings/embeddings.ts";
 export * as ExportService from "./export/export.ts";
