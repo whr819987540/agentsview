@@ -13,6 +13,8 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	"go.kenn.io/kit/atomicfile"
 )
 
 // The rolling release publishes the CJK full-text search sidecar beside the
@@ -184,14 +186,13 @@ func installSidecar(ctx context.Context, asset *sidecarAsset, exePath string) (s
 // downloadSidecar fetches url to dest and checks its SHA-256 against
 // expected while it streams.
 func downloadSidecar(ctx context.Context, url, dest, expected string) error {
-	ctx, cancel := context.WithTimeout(ctx, sidecarDownloadTimeout)
-	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return err
 	}
 	req.Header.Set("User-Agent", updateUserAgent)
-	resp, err := http.DefaultClient.Do(req)
+	client := &http.Client{Timeout: sidecarDownloadTimeout}
+	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("download CJK search extension: %w", err)
 	}
@@ -232,18 +233,19 @@ func checkSidecarLayout(dir string) error {
 }
 
 // replaceDir renames staged to target. An existing target is moved aside
-// first and restored if the second rename fails.
+// first and restored if the second rename fails. Each rename goes to a path
+// that does not exist, which RenameNoReplace guarantees for directories too.
 func replaceDir(staged, target string) error {
 	aside := ""
 	if _, err := os.Lstat(target); err == nil {
 		aside = fmt.Sprintf("%s.old-%d", staged, time.Now().UnixNano())
-		if err := os.Rename(target, aside); err != nil {
+		if err := atomicfile.RenameNoReplace(target, aside); err != nil {
 			return fmt.Errorf("replace %s: %w", target, err)
 		}
 	}
-	if err := os.Rename(staged, target); err != nil {
+	if err := atomicfile.RenameNoReplace(staged, target); err != nil {
 		if aside != "" {
-			if restoreErr := os.Rename(aside, target); restoreErr != nil {
+			if restoreErr := atomicfile.RenameNoReplace(aside, target); restoreErr != nil {
 				return fmt.Errorf(
 					"replace %s: %w (restoring the previous copy also failed: %w)",
 					target, err, restoreErr,

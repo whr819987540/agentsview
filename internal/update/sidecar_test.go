@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"compress/gzip"
 	"io/fs"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -129,9 +130,7 @@ func entryNames(t *testing.T, dir string) []string {
 // installedFiles is what a managed install of an archive leaves on disk.
 func installedFiles(files map[string]string, archive string) map[string]string {
 	want := map[string]string{sidecarMarkerName: sha256Hex(archive) + "\n"}
-	for name, body := range files {
-		want[name] = body
-	}
+	maps.Copy(want, files)
 	return want
 }
 
