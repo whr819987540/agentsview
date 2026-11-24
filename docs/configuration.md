@@ -1426,12 +1426,23 @@ full-text search indexes on message content.
 
 ### CJK full-text search
 
-To add character and phrase matching for Chinese, Japanese, and Korean text,
-including Chinese word segmentation, build and install the pinned
-`simple`/cppjieba sidecar with `make install-cjk-fts`. Building it requires Git,
-CMake 3.19 or newer, and a C++14 compiler. AgentsView discovers it next to the
-binary or under the sibling `lib/agentsview/simple` directory. A custom path can
-be selected with `AGENTSVIEW_SIMPLE_DIR`.
+Character and phrase matching for Chinese, Japanese, and Korean text, including
+Chinese word segmentation, needs the pinned `simple`/cppjieba sidecar:
+
+- **Linux rolling builds** ship it. The rolling installer and
+  `agentsview update` install it in `lib/agentsview/simple` beside the install
+  directory, which is `~/.local/lib/agentsview/simple` for the default
+  `~/.local/bin`, and keep it in step with the binary. They never replace a
+  sidecar they did not install or one named by `AGENTSVIEW_SIMPLE_DIR`. Set
+  `AGENTSVIEW_SKIP_CJK_FTS=1` when running either to leave the sidecar alone.
+- **Other installs** build and install it with `make install-cjk-fts`. Building
+  it requires Git, CMake 3.19 or newer, and a C++14 compiler.
+
+AgentsView looks for the sidecar in an `agentsview-simple` directory next to
+the binary, then in the sibling `lib/agentsview/simple` directory. A custom path
+can be selected with `AGENTSVIEW_SIMPLE_DIR`. The daemon loads the sidecar when
+it starts, so restart it after installing one. The first start then indexes
+every existing message for CJK search, which makes `sessions.db` larger.
 
 The sidecar indexes individual CJK characters and routes queries containing Han,
 Hiragana, Katakana, or Hangul through that index. Query preparation depends on

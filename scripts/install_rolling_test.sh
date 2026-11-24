@@ -108,6 +108,7 @@ run_install() {
         export PATH="/usr/bin:/bin"
         export AGENTSVIEW_REPO="example/agentsview"
         unset ZDOTDIR XDG_CONFIG_HOME AGENTSVIEW_INSTALL_DIR AGENTSVIEW_NO_MODIFY_PATH AGENTSVIEW_SKIP_CHECKSUM
+        unset AGENTSVIEW_SKIP_CJK_FTS AGENTSVIEW_SIMPLE_DIR
         for kv in "$@"; do export "${kv?}"; done
         set -e
         main 2>&1
@@ -116,6 +117,38 @@ run_install() {
 }
 
 requested_urls() { cat "$WORK/urls" 2>/dev/null; }
+
+# Publishes a snapshot whose binary holds the given text and whose CJK
+# search sidecar archive holds files tagged with it. Extra arguments
+# name more files to put in the archive.
+publish_sidecar_build() {
+    local tag="$1" content="$2"
+    shift 2
+    local src="$WORK/sidecar-$tag"
+    rm -rf "$src"
+    mkdir -p "$src/dict" "$RELEASES/$tag"
+    printf 'lib %s\n' "$content" > "$src/libsimple.so"
+    printf 'dict %s\n' "$content" > "$src/dict/jieba.dict.utf8"
+    printf 'simple %s\n' "$content" > "$src/VERSIONS"
+    local extra
+    for extra in "$@"; do
+        printf 'extra %s\n' "$content" > "$src/$extra"
+    done
+    printf '%s\n' "$content" > "$RELEASES/$tag/agentsview-linux-amd64"
+    (cd "$src" && tar -czf "$RELEASES/$tag/$SIDECAR_ASSET" libsimple.so dict VERSIONS)
+    (cd "$RELEASES/$tag" && sha256sum agentsview-linux-amd64 "$SIDECAR_ASSET" > SHA256SUMS)
+    printf '%s\n' "$tag" > "$RELEASES/$tag/BUILD_TAG"
+    cp "$RELEASES/$tag"/* "$RELEASES/latest/"
+}
+
+sidecar_sum() { sha256sum "$RELEASES/$1/$SIDECAR_ASSET" | cut -d' ' -f1; }
+
+# Prints every file under a directory as path=content, sorted.
+tree_of() {
+    (cd "$1" && find . -type f | LC_ALL=C sort | while IFS= read -r f; do
+        printf '%s=%s\n' "$f" "$(cat "$f")"
+    done)
+}
 
 new_home() {
     local home="$WORK/home-$1"
@@ -399,6 +432,120 @@ assert_contains "reports download failure" "Download failed" "$OUTPUT"
 assert_contains "points at the snapshot release" "releases/tag/$BUILD2" "$OUTPUT"
 assert_missing "no binary after missing asset" "$home/.local/bin/agentsview"
 mv "$WORK/held" "$RELEASES/$BUILD2/agentsview-linux-amd64"
+
+# --- CJK search sidecar ---
+BUILD3="build-20260103-3333cccc"
+BUILD4="build-20260104-4444dddd"
+BUILD5="build-20260105-5555eeee"
+publish_sidecar_build "$BUILD3" "build-3" "dict/retired.utf8"
+SUM3=$(sidecar_sum "$BUILD3")
+
+# A build that lists the sidecar installs it where the daemon looks.
+home=$(new_home sidecar)
+sidecar="$home/.local/lib/agentsview/simple"
+run_install "$home" SHELL=/bin/zsh
+assert_eq "sidecar install succeeds" 0 "$STATUS"
+assert_eq "sidecar unpacked beside the install directory" \
+    "./$SIDECAR_MARKER=$SUM3
+./VERSIONS=simple build-3
+./dict/jieba.dict.utf8=dict build-3
+./dict/retired.utf8=extra build-3
+./libsimple.so=lib build-3" "$(tree_of "$sidecar")"
+assert_contains "names the sidecar directory" "Installed the CJK search extension in $sidecar" "$OUTPUT"
+assert_contains "says to restart" "Restart agentsview to search Chinese, Japanese, and Korean text" "$OUTPUT"
+assert_eq "sidecar comes from the same snapshot" \
+    "$BASE_URL/latest/BUILD_TAG
+$BASE_URL/$BUILD3/agentsview-linux-amd64
+$BASE_URL/$BUILD3/SHA256SUMS
+$BASE_URL/$BUILD3/$SIDECAR_ASSET" "$(requested_urls)"
+
+# Reinstalling the same build keeps the sidecar without downloading it.
+run_install "$home" SHELL=/bin/zsh
+assert_contains "matching sidecar is kept" "CJK search extension is up to date" "$OUTPUT"
+assert_not_contains "matching sidecar is not downloaded" "$SIDECAR_ASSET" "$(requested_urls)"
+
+# A new sidecar replaces the whole directory and leaves nothing beside it.
+publish_sidecar_build "$BUILD4" "build-4"
+SUM4=$(sidecar_sum "$BUILD4")
+run_install "$home" SHELL=/bin/zsh
+assert_eq "sidecar update succeeds" 0 "$STATUS"
+assert_eq "new sidecar replaces the old one" \
+    "./$SIDECAR_MARKER=$SUM4
+./VERSIONS=simple build-4
+./dict/jieba.dict.utf8=dict build-4
+./libsimple.so=lib build-4" "$(tree_of "$sidecar")"
+assert_eq "no staging directories remain" "simple" "$(ls -A "$home/.local/lib/agentsview")"
+
+# A sidecar the installer did not put there is left alone.
+home=$(new_home sidecar-manual)
+mkdir -p "$home/.local/lib/agentsview/simple"
+printf 'built by hand\n' > "$home/.local/lib/agentsview/simple/libsimple.so"
+run_install "$home" SHELL=/bin/zsh
+assert_eq "install beside a manual sidecar succeeds" 0 "$STATUS"
+assert_eq "manual sidecar is untouched" "./libsimple.so=built by hand" \
+    "$(tree_of "$home/.local/lib/agentsview/simple")"
+assert_contains "says why it left the sidecar" "this installer did not install it" "$OUTPUT"
+assert_not_contains "manual sidecar is not downloaded over" "$SIDECAR_ASSET" "$(requested_urls)"
+
+# The daemon prefers agentsview-simple beside the binary, so that copy
+# is the one kept current.
+home=$(new_home sidecar-beside)
+mkdir -p "$home/.local/bin/agentsview-simple"
+printf 'old\n' > "$home/.local/bin/agentsview-simple/$SIDECAR_MARKER"
+run_install "$home" SHELL=/bin/zsh
+assert_eq "sidecar beside the binary is updated" \
+    "./$SIDECAR_MARKER=$SUM4
+./VERSIONS=simple build-4
+./dict/jieba.dict.utf8=dict build-4
+./libsimple.so=lib build-4" "$(tree_of "$home/.local/bin/agentsview-simple")"
+assert_missing "no second sidecar under lib" "$home/.local/lib"
+
+# Each opt-out installs the binary and leaves the sidecar alone.
+for kv in AGENTSVIEW_SKIP_CJK_FTS=1 AGENTSVIEW_SIMPLE_DIR=/opt/simple AGENTSVIEW_SKIP_CHECKSUM=1; do
+    home=$(new_home "sidecar-${kv%%=*}")
+    run_install "$home" SHELL=/bin/zsh "$kv"
+    assert_eq "$kv install succeeds" 0 "$STATUS"
+    assert_eq "$kv installs the binary" "build-4" "$(cat "$home/.local/bin/agentsview")"
+    assert_missing "$kv leaves the sidecar alone" "$home/.local/lib"
+    assert_not_contains "$kv downloads no sidecar" "$SIDECAR_ASSET" "$(requested_urls)"
+done
+
+# A bad or missing sidecar still installs the binary.
+home=$(new_home sidecar-bad)
+cp "$RELEASES/$BUILD4/$SIDECAR_ASSET" "$WORK/held-sidecar"
+printf 'tampered\n' > "$RELEASES/$BUILD4/$SIDECAR_ASSET"
+run_install "$home" SHELL=/bin/zsh
+assert_eq "tampered sidecar does not fail the install" 0 "$STATUS"
+assert_eq "binary installed despite a tampered sidecar" "build-4" "$(cat "$home/.local/bin/agentsview")"
+assert_contains "reports the sidecar checksum failure" "failed checksum verification" "$OUTPUT"
+assert_missing "tampered sidecar is not unpacked" "$home/.local/lib/agentsview/simple"
+rm "$RELEASES/$BUILD4/$SIDECAR_ASSET"
+run_install "$home" SHELL=/bin/zsh
+assert_eq "missing sidecar does not fail the install" 0 "$STATUS"
+assert_contains "reports the sidecar download failure" "Could not download the CJK search extension" "$OUTPUT"
+assert_missing "missing sidecar leaves no directory" "$home/.local/lib/agentsview/simple"
+mv "$WORK/held-sidecar" "$RELEASES/$BUILD4/$SIDECAR_ASSET"
+
+# An archive without the library never replaces a working sidecar.
+home=$(new_home sidecar-incomplete)
+run_install "$home" SHELL=/bin/zsh
+publish_sidecar_build "$BUILD5" "build-5"
+(cd "$WORK/sidecar-$BUILD5" && tar -czf "$RELEASES/$BUILD5/$SIDECAR_ASSET" dict VERSIONS)
+(cd "$RELEASES/$BUILD5" && sha256sum agentsview-linux-amd64 "$SIDECAR_ASSET" > SHA256SUMS)
+cp "$RELEASES/$BUILD5"/* "$RELEASES/latest/"
+run_install "$home" SHELL=/bin/zsh
+assert_eq "incomplete sidecar does not fail the install" 0 "$STATUS"
+assert_contains "reports the incomplete archive" "archive is incomplete" "$OUTPUT"
+assert_eq "working sidecar stays after an incomplete archive" \
+    "./$SIDECAR_MARKER=$SUM4
+./VERSIONS=simple build-4
+./dict/jieba.dict.utf8=dict build-4
+./libsimple.so=lib build-4" "$(tree_of "$home/.local/lib/agentsview/simple")"
+assert_eq "incomplete archive leaves nothing beside the sidecar" "simple" \
+    "$(ls -A "$home/.local/lib/agentsview")"
+
+# Later cases expect build 2 on "latest".
+publish_build "$BUILD2" "build-2"
 
 # The unpublished script has no repository until the workflow fills it in.
 home=$(new_home no-repo)

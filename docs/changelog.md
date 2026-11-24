@@ -11,6 +11,17 @@ The latest published release is
 
 **New features**
 
+- Search Chinese, Japanese, and Korean text on Linux rolling builds without
+  compiling anything. The rolling installer and `agentsview update` now install
+  the CJK search extension in `~/.local/lib/agentsview/simple`, or beside
+  whichever directory holds the binary, and keep it in step with each build.
+  After the next start, which indexes your existing messages and makes
+  `sessions.db` larger, a search such as `搜索` also finds messages where the
+  word sits inside a longer run of Chinese text. Set `AGENTSVIEW_SKIP_CJK_FTS=1`
+  to skip the extension. A copy you built with `make install-cjk-fts` or point
+  to with `AGENTSVIEW_SIMPLE_DIR` is left alone. Windows rolling builds do not
+  include it yet. See
+  [CJK full-text search](/docs/configuration/#cjk-full-text-search).
 - Find a session from its ID in the search palette. Type or paste a full
   session ID, or any part of 6 or more characters such as the short ID shown on
   results, and the matching sessions appear first under **Session ID matches**.

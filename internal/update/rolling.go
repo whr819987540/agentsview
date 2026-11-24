@@ -120,17 +120,20 @@ func rollingDisplayInfo(currentVersion, latestVersion string) *UpdateInfo {
 }
 
 // withRollingDownload completes display-only info with the checksum and
-// size of this platform's binary in the snapshot at snapshotBase.
+// size of this platform's binary in the snapshot at snapshotBase. When the
+// snapshot's SHA256SUMS also lists a CJK search sidecar for this platform,
+// the info carries it too; older snapshots publish none.
 func withRollingDownload(ctx context.Context,
 	info *UpdateInfo, snapshotBase string,
 ) (*UpdateInfo, error) {
 	assetName := rollingAssetName(runtime.GOOS, runtime.GOARCH)
-	checksum, err := fetchChecksumFromFile(ctx,
-		snapshotBase+"/"+rollingChecksumsAsset, assetName,
+	checksums, err := fetchChecksums(ctx,
+		snapshotBase+"/"+rollingChecksumsAsset,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("check for updates: %w", err)
 	}
+	checksum := extractChecksum(checksums, assetName)
 	if checksum == "" {
 		return nil, fmt.Errorf(
 			"no rolling build for %s/%s", runtime.GOOS, runtime.GOARCH,
@@ -152,6 +155,14 @@ func withRollingDownload(ctx context.Context,
 	full.Size = size
 	full.Checksum = checksum
 	full.cacheOnly = false
+	sidecarName := rollingSidecarAssetName(runtime.GOOS, runtime.GOARCH)
+	if sum := extractChecksum(checksums, sidecarName); sum != "" {
+		full.sidecar = &sidecarAsset{
+			URL:      snapshotBase + "/" + sidecarName,
+			Name:     sidecarName,
+			Checksum: sum,
+		}
+	}
 	return &full, nil
 }
 

@@ -51,6 +51,9 @@ type UpdateInfo struct {
 	// it came from cache or a display-only rolling check. The caller
 	// must re-fetch for installs.
 	cacheOnly bool
+	// sidecar is the CJK search sidecar a rolling snapshot publishes
+	// for this platform, or nil when it publishes none.
+	sidecar *sidecarAsset
 }
 
 // NeedsRefetch returns true when the info is display-only and
@@ -182,6 +185,16 @@ func PerformUpdate(ctx context.Context,
 		archivePath, info.Checksum, dstPath, downloadChecksum,
 	); err != nil {
 		return err
+	}
+	// The sidecar is optional, so a failure leaves the new binary in
+	// place with CJK search as it was and does not fail the update.
+	if info.sidecar != nil {
+		status, err := installSidecar(ctx, info.sidecar, dstPath)
+		if err != nil {
+			fmt.Printf("Warning: the CJK search extension was not updated: %v\n", err)
+		} else if status != "" {
+			fmt.Println(status)
+		}
 	}
 	fmt.Println("Update complete.")
 	return nil
@@ -645,11 +658,20 @@ const maxChecksumsSize = 1 << 20
 func fetchChecksumFromFile(ctx context.Context,
 	url, assetName string,
 ) (string, error) {
+	body, err := fetchChecksums(ctx, url)
+	if err != nil {
+		return "", err
+	}
+	return extractChecksum(body, assetName), nil
+}
+
+// fetchChecksums reads a SHA256SUMS release asset.
+func fetchChecksums(ctx context.Context, url string) (string, error) {
 	body, err := fetchSmallAsset(ctx, url, maxChecksumsSize)
 	if err != nil {
 		return "", fmt.Errorf("failed to fetch checksums: %w", err)
 	}
-	return extractChecksum(body, assetName), nil
+	return body, nil
 }
 
 // fetchSmallAsset GETs a small text release asset, such as VERSION,

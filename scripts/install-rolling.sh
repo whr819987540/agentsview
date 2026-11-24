@@ -13,11 +13,20 @@
 # immutable build-YYYYMMDD-<sha> release that BUILD_TAG names, so a push
 # during the install cannot mix files from two builds.
 #
+# Builds that list agentsview-simple-linux-amd64.tar.gz in SHA256SUMS
+# also carry the CJK full-text search sidecar. The installer unpacks it
+# into ../lib/agentsview/simple beside the install directory, where the
+# daemon finds it, unless a copy it did not install is already there.
+#
 # Environment overrides:
 #   AGENTSVIEW_REPO            owner/repo that publishes the rolling release
 #   AGENTSVIEW_INSTALL_DIR     install directory (default: ~/.local/bin)
 #   AGENTSVIEW_NO_MODIFY_PATH  set to 1 to leave shell startup files alone
 #   AGENTSVIEW_SKIP_CHECKSUM   set to 1 to skip SHA256SUMS verification
+#                              (this also skips the CJK search sidecar)
+#   AGENTSVIEW_SKIP_CJK_FTS    set to 1 to leave the CJK search sidecar alone
+#   AGENTSVIEW_SIMPLE_DIR      a sidecar you manage; the installer leaves it
+#                              alone
 
 set -euo pipefail
 
@@ -30,6 +39,11 @@ LATEST_TAG="latest"
 BUILD_TAG_PATTERN='^build-[0123456789]{8}-[0123456789abcdef]{7,40}$'
 BINARY_NAME="agentsview"
 ASSET_NAME="agentsview-linux-amd64"
+SIDECAR_ASSET="agentsview-simple-linux-amd64.tar.gz"
+# Records the checksum of the sidecar archive this installer or
+# `agentsview update` unpacked. A sidecar directory without it was
+# installed another way, such as `make install-cjk-fts`.
+SIDECAR_MARKER=".agentsview-archive-sha256"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -95,23 +109,37 @@ resolve_build_tag() {
     echo "$tag"
 }
 
+# Prints the checksum SHA256SUMS lists for a file, or nothing.
+checksum_for() {
+    local checksums_file="$1"
+    local filename="$2"
+    awk -v f="$filename" '{gsub(/^\*/, "", $2); if ($2==f) {print $1; exit}}' "$checksums_file"
+}
+
+# Prints the SHA-256 of a file. Fails when no sha256 tool exists.
+sha256_of() {
+    if command -v sha256sum &>/dev/null; then
+        sha256sum "$1" | cut -d' ' -f1
+    elif command -v shasum &>/dev/null; then
+        shasum -a 256 "$1" | cut -d' ' -f1
+    else
+        return 1
+    fi
+}
+
 verify_checksum() {
     local file="$1"
     local checksums_file="$2"
     local filename="$3"
 
     local expected
-    expected=$(awk -v f="$filename" '{gsub(/^\*/, "", $2); if ($2==f) {print $1; exit}}' "$checksums_file")
+    expected=$(checksum_for "$checksums_file" "$filename")
     if [ -z "$expected" ]; then
         error "No checksum found for $filename in SHA256SUMS"
     fi
 
     local actual
-    if command -v sha256sum &>/dev/null; then
-        actual=$(sha256sum "$file" | cut -d' ' -f1)
-    elif command -v shasum &>/dev/null; then
-        actual=$(shasum -a 256 "$file" | cut -d' ' -f1)
-    else
+    if ! actual=$(sha256_of "$file"); then
         error "No sha256 tool available. Install coreutils or set AGENTSVIEW_SKIP_CHECKSUM=1 to bypass."
     fi
 
@@ -307,6 +335,114 @@ install_binary() {
     fi
 }
 
+# Prints the directory the daemon loads the CJK search sidecar from, in
+# the order internal/db searches: an agentsview-simple entry beside the
+# binary, else ../lib/agentsview/simple. The daemon resolves its own
+# path through symlinks, so this does too.
+sidecar_target() {
+    local real_dir
+    real_dir=$(cd -P "$1" && pwd -P) || return 1
+    if [ -e "$real_dir/agentsview-simple" ] || [ -L "$real_dir/agentsview-simple" ]; then
+        echo "$real_dir/agentsview-simple"
+    else
+        echo "$(cd -P "$real_dir/.." && pwd -P)/lib/agentsview/simple"
+    fi
+}
+
+# Installs or updates the CJK search sidecar for the binary in
+# install_dir. The sidecar is optional, so every problem is a warning
+# and the install itself still succeeds.
+#
+# The archive is unpacked into a sibling directory and renamed into
+# place. The daemon refuses to start with an incomplete sidecar
+# directory, but a missing one only turns CJK search off.
+install_sidecar() {
+    local base_url="$1"
+    local tmpdir="$2"
+    local install_dir="$3"
+    local unavailable="Chinese, Japanese, and Korean search stays as it was."
+
+    if [ "${AGENTSVIEW_SKIP_CJK_FTS:-0}" = "1" ]; then
+        warn "CJK search extension skipped (AGENTSVIEW_SKIP_CJK_FTS=1)"
+        return 0
+    fi
+    if [ -n "${AGENTSVIEW_SIMPLE_DIR:-}" ]; then
+        info "Leaving the CJK search extension in $AGENTSVIEW_SIMPLE_DIR alone (AGENTSVIEW_SIMPLE_DIR is set)"
+        return 0
+    fi
+    if [ "${AGENTSVIEW_SKIP_CHECKSUM:-0}" = "1" ]; then
+        warn "CJK search extension skipped because checksum verification is off"
+        return 0
+    fi
+
+    local expected
+    expected=$(checksum_for "$tmpdir/SHA256SUMS" "$SIDECAR_ASSET")
+    # Builds from before the sidecar was published list none.
+    [ -n "$expected" ] || return 0
+
+    local target
+    if ! target=$(sidecar_target "$install_dir"); then
+        warn "Could not resolve where the CJK search extension goes. $unavailable"
+        return 0
+    fi
+    if [ -e "$target" ] || [ -L "$target" ]; then
+        if [ ! -f "$target/$SIDECAR_MARKER" ]; then
+            info "Leaving the CJK search extension in $target alone (this installer did not install it)"
+            return 0
+        fi
+        if [ "$(tr -d '[:space:]' < "$target/$SIDECAR_MARKER")" = "$expected" ]; then
+            info "CJK search extension is up to date"
+            return 0
+        fi
+    fi
+
+    info "Downloading ${SIDECAR_ASSET}..."
+    local archive="$tmpdir/$SIDECAR_ASSET"
+    if ! download "${base_url}/${SIDECAR_ASSET}" "$archive"; then
+        warn "Could not download the CJK search extension. $unavailable"
+        return 0
+    fi
+    local actual
+    if ! actual=$(sha256_of "$archive") || [ "$actual" != "$expected" ]; then
+        warn "The CJK search extension failed checksum verification and was not installed. $unavailable"
+        return 0
+    fi
+
+    local parent staged
+    parent=$(dirname "$target")
+    if ! mkdir -p "$parent" ||
+        ! staged=$(mktemp -d "$parent/.$(basename "$target").new-XXXXXX"); then
+        warn "Could not write to $parent. $unavailable"
+        return 0
+    fi
+    if ! tar -xzf "$archive" -C "$staged" --no-same-owner ||
+        [ ! -f "$staged/libsimple.so" ] || [ ! -d "$staged/dict" ] ||
+        ! printf '%s\n' "$expected" > "$staged/$SIDECAR_MARKER"; then
+        rm -rf "$staged"
+        warn "The CJK search extension archive is incomplete and was not installed. $unavailable"
+        return 0
+    fi
+
+    local aside=""
+    if [ -e "$target" ] || [ -L "$target" ]; then
+        aside="$staged.old"
+        if ! mv "$target" "$aside"; then
+            rm -rf "$staged"
+            warn "Could not replace $target. $unavailable"
+            return 0
+        fi
+    fi
+    if ! mv "$staged" "$target"; then
+        [ -z "$aside" ] || mv "$aside" "$target"
+        rm -rf "$staged"
+        warn "Could not replace $target. $unavailable"
+        return 0
+    fi
+    [ -z "$aside" ] || rm -rf "$aside"
+    info "Installed the CJK search extension in $target"
+    info "Restart agentsview to search Chinese, Japanese, and Korean text; the first start indexes existing messages."
+}
+
 main() {
     info "Installing the agentsview rolling build..."
     echo
@@ -345,6 +481,7 @@ main() {
 
     install_binary "$tmpdir/$ASSET_NAME" "$install_dir"
     info "Installed ${install_dir}/${BINARY_NAME} (${build_tag})"
+    install_sidecar "$base_url" "$tmpdir" "$install_dir"
     echo
 
     RC_TO_RELOAD=""
