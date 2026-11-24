@@ -1,7 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
-import { SearchService } from "../api/generated/index.js";
+import { SearchService, SessionsService } from "../api/generated/index.js";
 import { ApiError } from "../api/runtime.js";
-import type { SearchResponse } from "../api/generated/index.js";
+import type {
+  DbSession,
+  ResolveSessionIDsResponse,
+  SearchResponse,
+} from "../api/generated/index.js";
 import type { DbContentMatch, ServiceContentSearchResult } from "../api/generated/index.js";
 import { SEARCH_MODE_STORAGE_KEY, createSearchStore, type SearchMode } from "./search.svelte.js";
 import { reportTelemetry } from "../utils/telemetry.js";
@@ -16,10 +20,15 @@ vi.mock("../api/generated/index.js", async (importOriginal) => {
       getApiV1Search: vi.fn(),
       getApiV1SearchContent: vi.fn(),
     },
+    SessionsService: {
+      getApiV1SessionIdsResolve: vi.fn(),
+      getApiV1Sessions: vi.fn(),
+    },
   };
 });
 
 const searchService = vi.mocked(SearchService);
+const sessionsService = vi.mocked(SessionsService);
 const DEBOUNCE_MS = 300;
 
 function contentResult(matches: DbContentMatch[]): ServiceContentSearchResult {
@@ -573,5 +582,191 @@ describe("SearchStore telemetry", () => {
       ["search_run", { query_type: "text" }],
       ["search_run", { query_type: "semantic" }],
     ]);
+  });
+});
+
+function idSession(id: string, project: string): DbSession {
+  return {
+    id,
+    project,
+    agent: "claude",
+    display_name: `Session ${id}`,
+    first_message: null,
+    started_at: "2026-07-01T10:00:00Z",
+    ended_at: "2026-07-01T11:00:00Z",
+  } as DbSession;
+}
+
+describe("SearchStore session ID lookup", () => {
+  const UUID = "7f1c2a90-3b4d-4e5f-8a6b-1c2d3e4f5a6b";
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.resetAllMocks();
+    searchService.getApiV1Search.mockResolvedValue(fullTextResponse("id", 0));
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("finds sessions by ID fragment outside the project and range, newest first", async () => {
+    const store = createSearchStore(memoryStorage());
+    store.setRange({ mode: "custom", from: "2026-07-01", to: "2026-07-14" });
+    sessionsService.getApiV1SessionIdsResolve.mockResolvedValueOnce({
+      ids: [UUID, "codex:7f1c2a90-0000-4000-8000-000000000000"],
+    });
+    sessionsService.getApiV1Sessions.mockResolvedValueOnce({
+      total: 2,
+      // The list endpoint orders rows its own way; the store keeps the
+      // resolve order, which is newest first.
+      sessions: [
+        idSession("codex:7f1c2a90-0000-4000-8000-000000000000", "other"),
+        idSession(UUID, "proj-b"),
+      ],
+    });
+
+    store.search("7f1c2a90", "alpha");
+    await runDebounce();
+    await flushMicrotasks();
+
+    expect(sessionsService.getApiV1SessionIdsResolve).toHaveBeenCalledWith(
+      { partial: "7f1c2a90", limit: 5 },
+      expect.objectContaining({ signal: expect.anything() }),
+    );
+    expect(sessionsService.getApiV1Sessions).toHaveBeenCalledWith(
+      { ids: `${UUID},codex:7f1c2a90-0000-4000-8000-000000000000` },
+      expect.objectContaining({ signal: expect.anything() }),
+    );
+    expect(store.idMatches.map((session) => [session.id, session.project])).toEqual([
+      [UUID, "proj-b"],
+      ["codex:7f1c2a90-0000-4000-8000-000000000000", "other"],
+    ]);
+    expect(searchService.getApiV1Search).toHaveBeenCalledWith(
+      expect.objectContaining({ q: "7f1c2a90", project: "alpha", date_from: "2026-07-01" }),
+      expect.anything(),
+    );
+  });
+
+  it("normalizes an upper-case UUID before the lookup", async () => {
+    const store = createSearchStore(memoryStorage());
+    sessionsService.getApiV1SessionIdsResolve.mockResolvedValueOnce({ ids: [] });
+
+    store.search(UUID.toUpperCase());
+    await runDebounce();
+
+    expect(sessionsService.getApiV1SessionIdsResolve).toHaveBeenCalledWith(
+      { partial: UUID, limit: 5 },
+      expect.anything(),
+    );
+  });
+
+  it("looks up IDs in semantic mode too", async () => {
+    const store = createSearchStore(memoryStorage());
+    store.setMode("semantic");
+    searchService.getApiV1SearchContent.mockResolvedValueOnce(contentResult([]));
+    sessionsService.getApiV1SessionIdsResolve.mockResolvedValueOnce({ ids: [UUID] });
+    sessionsService.getApiV1Sessions.mockResolvedValueOnce({
+      total: 1,
+      sessions: [idSession(UUID, "proj-b")],
+    });
+
+    store.search(UUID);
+    await runDebounce();
+    await flushMicrotasks();
+
+    expect(store.idMatches.map((session) => session.id)).toEqual([UUID]);
+  });
+
+  it.each(["refactor auth", "deadbeef", "ab12"])(
+    "does not look up IDs for the text query %j",
+    async (query) => {
+      const store = createSearchStore(memoryStorage());
+
+      store.search(query);
+      await runDebounce();
+
+      expect(sessionsService.getApiV1SessionIdsResolve).not.toHaveBeenCalled();
+      expect(store.idMatches).toEqual([]);
+    },
+  );
+
+  it("skips hydration when no ID contains the query", async () => {
+    const store = createSearchStore(memoryStorage());
+    sessionsService.getApiV1SessionIdsResolve.mockResolvedValueOnce({ ids: [] });
+
+    store.search("123456789");
+    await runDebounce();
+    await flushMicrotasks();
+
+    expect(sessionsService.getApiV1Sessions).not.toHaveBeenCalled();
+    expect(store.idMatches).toEqual([]);
+  });
+
+  it("keeps the text results and reports no error when the ID lookup fails", async () => {
+    const store = createSearchStore(memoryStorage());
+    searchService.getApiV1Search.mockResolvedValueOnce(fullTextResponse("7f1c2a90", 1));
+    sessionsService.getApiV1SessionIdsResolve.mockRejectedValueOnce(
+      generatedApiError(500, "resolve failed"),
+    );
+
+    store.search("7f1c2a90");
+    await runDebounce();
+    await flushMicrotasks();
+
+    expect(store.results.map((result) => result.session_id)).toEqual(["full-0"]);
+    expect(store.error).toBeNull();
+    expect(store.idMatches).toEqual([]);
+  });
+
+  it("drops ID matches when the query stops looking like an ID", async () => {
+    const store = createSearchStore(memoryStorage());
+    sessionsService.getApiV1SessionIdsResolve.mockResolvedValueOnce({ ids: [UUID] });
+    sessionsService.getApiV1Sessions.mockResolvedValueOnce({
+      total: 1,
+      sessions: [idSession(UUID, "proj-b")],
+    });
+    store.search("7f1c2a90");
+    await runDebounce();
+    await flushMicrotasks();
+    expect(store.idMatches).toHaveLength(1);
+
+    store.search("7f1c2a90 notes");
+    await runDebounce();
+
+    expect(store.idMatches).toEqual([]);
+  });
+
+  it("a stale ID lookup cannot overwrite a newer query", async () => {
+    const store = createSearchStore(memoryStorage());
+    const stale = deferred<ResolveSessionIDsResponse>();
+    sessionsService.getApiV1SessionIdsResolve.mockReturnValueOnce(stale.promise as never);
+    store.search("7f1c2a90");
+    await runDebounce();
+
+    store.search("plain words");
+    await runDebounce();
+    stale.resolve({ ids: [UUID] });
+    await flushMicrotasks();
+
+    expect(sessionsService.getApiV1Sessions).not.toHaveBeenCalled();
+    expect(store.idMatches).toEqual([]);
+  });
+
+  it("clear empties ID matches", async () => {
+    const store = createSearchStore(memoryStorage());
+    sessionsService.getApiV1SessionIdsResolve.mockResolvedValueOnce({ ids: [UUID] });
+    sessionsService.getApiV1Sessions.mockResolvedValueOnce({
+      total: 1,
+      sessions: [idSession(UUID, "proj-b")],
+    });
+    store.search(UUID);
+    await runDebounce();
+    await flushMicrotasks();
+    expect(store.idMatches).toHaveLength(1);
+
+    store.clear();
+
+    expect(store.idMatches).toEqual([]);
   });
 });

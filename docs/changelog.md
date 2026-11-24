@@ -11,6 +11,13 @@ The latest published release is
 
 **New features**
 
+- Find a session from its ID in the search palette. Type or paste a full
+  session ID, or any part of 6 or more characters such as the short ID shown on
+  results, and the matching sessions appear first under **Session ID matches**.
+  They show up whatever project, date range, or search mode the palette is set
+  to, including child and one-shot sessions the sidebar hides. Before, an ID
+  only matched when it happened to appear in a message. See
+  [Find a session by ID](/docs/usage/#find-a-session-by-id).
 - Keep your stars, ended marks, and sidebar folders when your sessions move to
   a new machine. In the web UI, open **Settings > Move stars and folders**:
   **Export to file** on the old machine, then **Choose file…** on the new one

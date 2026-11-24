@@ -25,6 +25,7 @@
   import ProjectTypeahead from "../layout/ProjectTypeahead.svelte";
   import RangePicker from "../shared/RangePicker.svelte";
   import type { Session } from "../../api/types.js";
+  import type { DbSession } from "../../api/generated/index.js";
   import type {
     PaletteSearchResult,
     SearchMode,
@@ -84,9 +85,17 @@
   // else recent sessions
   let showSearchResults = $derived(isServerSearchQuery(inputValue));
 
+  // Sessions whose ID contains the query come first. A text result for the
+  // same session is dropped so it does not appear twice.
+  let idMatches = $derived(showSearchResults ? searchStore.idMatches : []);
+  let textResults = $derived.by(() => {
+    const ids = new Set(idMatches.map((session) => session.id));
+    return searchStore.results.filter((result) => !ids.has(result.session_id));
+  });
+
   let totalItems = $derived(
     showSearchResults
-      ? searchStore.results.length
+      ? idMatches.length + textResults.length
       : recentSessions.length,
   );
 
@@ -170,7 +179,12 @@
 
   function selectCurrent() {
     if (showSearchResults) {
-      const result = searchStore.results[selectedIndex];
+      const idMatch = idMatches[selectedIndex];
+      if (idMatch) {
+        selectIdMatch(idMatch);
+        return;
+      }
+      const result = textResults[selectedIndex - idMatches.length];
       if (result) {
         selectSearchResult(result);
       }
@@ -189,6 +203,14 @@
   // or lost (#1190).
   function selectSession(s: Session) {
     router.navigateToSession(s.id);
+    close();
+  }
+
+  function selectIdMatch(s: DbSession) {
+    router.navigateToSession(s.id);
+    // Like a name-only match, an ID match opens the session without a
+    // message target, so clear any stale highlighted ordinal.
+    ui.clearScrollState();
     close();
   }
 
@@ -327,6 +349,39 @@
 
     <div class="palette-results">
       {#if showSearchResults}
+        {#if idMatches.length > 0}
+          <div class="palette-section-label">{m.command_palette_session_id_matches()}</div>
+          {#each idMatches as session, i (session.id)}
+            {@const preview = session.display_name ?? normalizeMessagePreview(session.first_message)}
+            {@const timestamp = session.ended_at ?? session.started_at}
+            <button
+              class="palette-item"
+              class:selected={i === selectedIndex}
+              onclick={() => selectIdMatch(session)}
+              onmouseenter={() => (selectedIndex = i)}
+            >
+              <span class="item-dot" style:background={agentColor(session.agent)}></span>
+              <span class="item-body">
+                <span class="item-name">{preview
+                  ? truncate(preview, 60)
+                  : session.project}</span>
+              </span>
+              <span class="item-meta">
+                {truncate(session.project, 20)}{timestamp ? ' · ' + formatRelativeTime(timestamp) : ''}
+              </span>
+              <!-- svelte-ignore a11y_click_events_have_key_events -->
+              <!-- svelte-ignore a11y_no_static_element_interactions -->
+              <span
+                class="item-id"
+                title={m.command_palette_copy_session_id()}
+                onclick={(e) => {
+                  e.stopPropagation();
+                  copyToClipboard(session.id);
+                }}
+              >{stripIdPrefix(session.id, session.agent).slice(0, 8)}</span>
+            </button>
+          {/each}
+        {/if}
         {#if searchStore.isSearching}
           <div class="palette-empty">{m.command_palette_searching()}</div>
         {:else if searchStore.error?.kind === "semantic-unavailable"}
@@ -353,15 +408,21 @@
               <span>{searchStore.error.detail ?? m.command_palette_search_failed()}</span>
             {/if}
           </div>
-        {:else if searchStore.results.length === 0}
-          <div class="palette-empty">{m.command_palette_no_results()}</div>
+        {:else if textResults.length === 0}
+          {#if idMatches.length === 0}
+            <div class="palette-empty">{m.command_palette_no_results()}</div>
+          {/if}
         {:else}
-          {#each searchStore.results as result, i}
+          {#if idMatches.length > 0}
+            <div class="palette-section-label">{m.command_palette_content_matches()}</div>
+          {/if}
+          {#each textResults as result, i}
+            {@const index = idMatches.length + i}
             <button
               class="palette-item"
-              class:selected={i === selectedIndex}
+              class:selected={index === selectedIndex}
               onclick={() => selectSearchResult(result)}
-              onmouseenter={() => (selectedIndex = i)}
+              onmouseenter={() => (selectedIndex = index)}
             >
               <span
                 class="item-dot"

@@ -173,6 +173,8 @@
   "command_palette_no_results": "无结果",
   "command_palette_copy_session_id": "复制会话 ID",
   "command_palette_recent_sessions": "最近会话",
+  "command_palette_session_id_matches": "会话 ID 匹配",
+  "command_palette_content_matches": "内容匹配",
   "session_breadcrumb_back_to_sessions": "返回会话列表",
   "session_breadcrumb_sessions": "会话",
   "session_breadcrumb_resume_session_in_terminal": "在终端继续会话",

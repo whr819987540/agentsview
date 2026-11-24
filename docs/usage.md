@@ -669,6 +669,9 @@ UUID, then press Enter. This opens the session without changing the sidebar
 filters. If the UUID matches more than one session, use its full ID with the
 provider prefix, such as `codex:550e8400-e29b-41d4-a716-446655440000`.
 
+To find a session from part of its ID, type the fragment in the command palette
+instead. See [Find a session by ID](#find-a-session-by-id).
+
 ![Open a session by ID or UUID](/docs/assets/generated/screenshots/open-session.png)
 
 ### URL Filters
@@ -1206,6 +1209,23 @@ Results use a compact row:
 
 Select a result to jump to that session and scroll directly to the matching
 message.
+
+### Find a session by ID
+
+Type or paste a session ID, or part of one, such as the 8-character ID shown on
+each result. The palette lists up to 5 sessions whose ID contains your query,
+newest first, under **Session ID matches**. Message results follow under
+**Content matches**. A session already listed as an ID match is not repeated.
+
+A query counts as an ID when it is a single word of at least 6 characters that
+contains a digit and uses only letters, digits, `.`, `_`, `:`, `~`, or `-`.
+ID matching is case-sensitive, except that a complete UUID is matched in lower
+case.
+
+ID matches ignore the project and date filters and the search mode, because an
+ID names one session wherever it is. They also include child, one-shot, and
+automated sessions that the sidebar hides. Selecting an ID match opens the
+session at its start.
 
 ### Project and date filters
 

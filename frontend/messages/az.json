@@ -198,6 +198,8 @@
   "command_palette_no_results": "Nəticə yoxdur",
   "command_palette_copy_session_id": "Sessiya ID-sini kopyala",
   "command_palette_recent_sessions": "Son sessiyalar",
+  "command_palette_session_id_matches": "Sessiya ID uyğunluqları",
+  "command_palette_content_matches": "Məzmun uyğunluqları",
   "session_breadcrumb_back_to_sessions": "Sessiyalara qayıt",
   "session_breadcrumb_sessions": "Sessiyalar",
   "session_breadcrumb_resume_session_in_terminal": "Sessiyaya terminalda davam et",
