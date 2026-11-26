@@ -41,7 +41,6 @@
     computeTotalSize,
     filterGroupSessions,
     findStart,
-    isEmptyFork,
     isSubagentDescendant,
   } from "./session-list-utils.js";
   import { handedOffIds, handoffSourceIds } from "../../utils/session-primary.js";
@@ -127,12 +126,12 @@
           (sources.get(s.id) ?? []).some((id) => starred.isStarred(id)),
       );
     }
-    // An empty fork carries nothing to read. Keep the open session listed
-    // so the sidebar still shows where the reader is.
+    // Keep an open transcript listed so the sidebar still shows where the
+    // reader is.
     const active = sessions.activeSessionId;
     return filterGroupSessions(
       out,
-      (s) => (!isEmptyFork(s) && !handedOff.has(s.id)) || s.id === active,
+      (s) => !handedOff.has(s.id) || s.id === active,
     );
   });
 

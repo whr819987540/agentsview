@@ -17,8 +17,8 @@ The latest published release is
   abandoned. A fork opens with the messages it inherited from its parent
   folded away, and says which parent turn it forked after; a continuation says
   which parent turn it picks up from and how many later parent turns it
-  skipped. The sidebar marks forks with an icon and hides forks that never got
-  a prompt, and the session tree shows the turn each branch left after. See
+  skipped. The sidebar marks forks with an icon, and the session tree shows
+  the turn each branch left after. See
   [Forks and Subagent Sessions](/docs/usage/#forks-and-subagent-sessions).
 - A Claude Code session you moved to the background now appears once in the
   sidebar and the session tree, as it does in Claude Code's session list.

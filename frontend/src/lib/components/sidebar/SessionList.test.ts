@@ -761,8 +761,8 @@ describe("SessionList visible hydration", () => {
     expect(document.body.textContent).not.toContain("Fork B");
   });
 
-  it("hides forks with no prompts of their own unless one is open", async () => {
-    const rows = () => [
+  it("lists forks with no prompts of their own, as Claude Code does", async () => {
+    sessions.sessions = [
       makeSession({
         id: "root",
         display_name: "Fork root",
@@ -788,7 +788,6 @@ describe("SessionList visible hydration", () => {
         ended_at: "2024-01-01T04:00:01Z",
       }),
     ];
-    sessions.sessions = rows();
     vi.spyOn(sessions, "hydrateVisibleSessions").mockResolvedValue(undefined);
 
     component = mount(SessionList, { target: document.body });
@@ -800,16 +799,8 @@ describe("SessionList visible hydration", () => {
       .click();
     await tick();
 
+    expect(document.querySelector('[data-session-id="unused"] .fork-mark')).not.toBeNull();
     expect(document.querySelector('[data-session-id="moved"]')).not.toBeNull();
-    expect(document.querySelector('[data-session-id="unused"]')).toBeNull();
-
-    sessions.activeSessionId = "unused";
-    await tick();
-    await tick();
-    expect(document.querySelector('[data-session-id="unused"]')).not.toBeNull();
-    expect(
-      document.querySelector('[data-session-id="unused"] .fork-mark'),
-    ).not.toBeNull();
     expect(document.querySelector('[data-session-id="moved"] .fork-mark')).toBeNull();
   });
 
