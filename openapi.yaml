@@ -6162,6 +6162,8 @@ components:
         after_turn:
           format: int64
           type: integer
+        handoff:
+          type: boolean
         parent:
           $ref: "#/components/schemas/DbSession"
         relationship_type:
@@ -7397,6 +7399,8 @@ components:
     SessionTreeNode:
       additionalProperties: false
       properties:
+        before_handoff:
+          type: boolean
         children:
           items:
             $ref: "#/components/schemas/SessionTreeNode"
@@ -7404,6 +7408,10 @@ components:
         depth:
           format: int64
           type: integer
+        handoff_sources:
+          items:
+            $ref: "#/components/schemas/DbSession"
+          type: array
         is_active:
           type: boolean
         is_branch_start:
