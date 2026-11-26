@@ -11,6 +11,15 @@ The latest published release is
 
 **New features**
 
+- See where a conversation branched without leaving it. A session that was
+  forked, continued, or rewound now shows a marker after the message where it
+  happened, with a link to the fork or continuation or the prompts the rewind
+  abandoned. A fork opens with the messages it inherited from its parent
+  folded away, and says which parent turn it forked after; a continuation says
+  which parent turn it picks up from and how many later parent turns it
+  skipped. The sidebar marks forks with an icon and hides forks that never got
+  a prompt, and the session tree shows the turn each branch left after. See
+  [Forks and Subagent Sessions](/docs/usage/#forks-and-subagent-sessions).
 - Search Chinese, Japanese, and Korean text on Linux rolling builds without
   compiling anything. The rolling installer and `agentsview update` now install
   the CJK search extension in `~/.local/lib/agentsview/simple`, or beside

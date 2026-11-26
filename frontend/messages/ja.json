@@ -480,6 +480,109 @@
   "fork_boundary_title": "Fork starts at this point",
   "fork_boundary_label": "Fork starts",
   "fork_boundary_note": "Messages above are inherited context from the parent session.",
+  "fork_boundary_show_inherited": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=other": "継承した {countLabel} 件のメッセージを表示"
+      }
+    }
+  ],
+  "fork_boundary_hide_inherited": "継承したメッセージを隠す",
+  "fork_boundary_note_collapsed": "親セッションから継承した履歴は非表示です。",
+  "branch_leave_fork": "{title} のターン {turn} の後から分岐",
+  "branch_leave_continuation": "{title} のターン {turn} の後から継続",
+  "branch_leave_skipped": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=other": "そのセッションの後続 {countLabel} ターンはこのセッションに含まれません。"
+      }
+    }
+  ],
+  "branch_leave_open_parent": "その位置を開く",
+  "branch_marker_fork": "ここで分岐: {title}",
+  "branch_marker_continuation": "{title} で継続",
+  "branch_marker_continuation_rewound": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "input title",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=other": "ここから {title} で継続。下の後続 {countLabel} ターンは含まれません。"
+      }
+    }
+  ],
+  "branch_marker_rewind": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=other": "ここで巻き戻し: {countLabel} 件の入力を破棄"
+      }
+    }
+  ],
+  "branch_marker_turns": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=other": "{countLabel} ターン"
+      }
+    }
+  ],
+  "branch_marker_no_turns": "まだターンなし",
+  "sidebar_fork_marker": "分岐",
+  "system_boundary_fork_source": "分岐の通知",
+  "session_tree_after_turn": "ターン {turn} の後",
+  "session_tree_turns_not_carried": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=other": "後続 {countLabel} ターンは引き継がれていません"
+      }
+    }
+  ],
+  "session_tree_no_turns": "ターンなし",
   "sidebar_session_count": [
     {
       "declarations": [

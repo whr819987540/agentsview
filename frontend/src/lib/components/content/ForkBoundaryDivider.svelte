@@ -1,14 +1,42 @@
 <script lang="ts">
-  import type { DbMessage as Message } from "../../api/generated/index.js";
-  import { formatTimestamp } from "../../utils/format.js";
+  import { Button } from "@kenn-io/kit-ui";
+  import type {
+    DbMessage as Message,
+    ServiceBranchLeave as BranchLeave,
+  } from "../../api/generated/index.js";
+  import { formatNumber, formatTimestamp } from "../../utils/format.js";
+  import { leaveLabel } from "../../utils/branch-points.js";
   import { LinkIcon } from "../../icons.js";
   import { m } from "../../i18n/index.js";
 
   interface Props {
     message: Message;
+    /** Where the fork leaves its parent, when the archive can place it. */
+    leave?: BranchLeave | null;
+    /** Inherited messages above the boundary. */
+    inheritedCount?: number;
+    /** Whether the inherited messages are hidden. */
+    collapsed?: boolean;
+    onToggle?: () => void;
   }
 
-  let { message }: Props = $props();
+  let {
+    message,
+    leave = null,
+    inheritedCount = 0,
+    collapsed = false,
+    onToggle,
+  }: Props = $props();
+
+  let note = $derived(
+    collapsed ? m.fork_boundary_note_collapsed() : m.fork_boundary_note(),
+  );
+
+  function toggle(event: MouseEvent) {
+    // The row under the boundary selects its message on click.
+    event.stopPropagation();
+    onToggle?.();
+  }
 </script>
 
 <div class="fork-boundary" title={m.fork_boundary_title()}>
@@ -26,7 +54,22 @@
   </span>
   <span class="fork-line"></span>
 </div>
-<div class="fork-note">{m.fork_boundary_note()}</div>
+<div class="fork-note">
+  {#if leave}
+    <span class="fork-leave">{leaveLabel(leave)}</span>
+  {/if}
+  <span>{note}</span>
+  {#if onToggle && inheritedCount > 0}
+    <Button size="sm" surface="soft" onclick={toggle}>
+      {collapsed
+        ? m.fork_boundary_show_inherited({
+            count: inheritedCount,
+            countLabel: formatNumber(inheritedCount),
+          })
+        : m.fork_boundary_hide_inherited()}
+    </Button>
+  {/if}
+</div>
 
 <style>
   .fork-boundary {
@@ -69,6 +112,10 @@
   }
 
   .fork-note {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--space-3) var(--space-5);
     margin: 4px 12px 6px;
     padding: 6px 10px;
     background: color-mix(
@@ -81,5 +128,11 @@
     line-height: 1.5;
     border-radius: 0 var(--radius-sm, 4px)
       var(--radius-sm, 4px) 0;
+  }
+
+  .fork-leave {
+    flex-basis: 100%;
+    color: var(--text-primary);
+    font-weight: 500;
   }
 </style>

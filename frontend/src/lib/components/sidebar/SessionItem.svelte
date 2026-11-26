@@ -26,6 +26,7 @@
     ChevronDownIcon,
     ChevronRightIcon,
     CircleCheckIcon,
+    GitForkIcon,
     StarIcon,
     UserRoundIcon,
     UsersRoundIcon,
@@ -626,11 +627,16 @@
           title={displayLabel.text}
           ondblclick={handleDblClick}
         >
-          {#if displayLabel.isShell}
-            <code>{displayLabel.text}</code>
-          {:else}
-            {displayLabel.text}
-          {/if}
+          <!-- Keep these blocks adjacent: whitespace between them would
+               become part of the name's text. -->
+          {#if session.relationship_type === "fork"}<span
+              class="fork-mark"
+              title={m.sidebar_fork_marker()}
+              aria-label={m.sidebar_fork_marker()}
+              role="img"
+            ><GitForkIcon size="11" strokeWidth="2.2" aria-hidden="true" /></span>{/if}{#if displayLabel.isShell}<code
+              >{displayLabel.text}</code
+            >{:else}{displayLabel.text}{/if}
         </div>
         <div class="session-meta">
           {#if !hideProject}
@@ -881,6 +887,13 @@
 
   .session-item.active .session-meta {
     color: var(--text-secondary);
+  }
+
+  .fork-mark {
+    display: inline-flex;
+    vertical-align: -1px;
+    margin-right: 4px;
+    color: var(--accent-blue);
   }
 
   /* Orphaned teammate at root level — dim it slightly */

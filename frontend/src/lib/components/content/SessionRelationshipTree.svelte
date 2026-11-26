@@ -10,6 +10,7 @@
   import { fetchSessionTree } from "../../api/sessionTree.js";
   import type { Session } from "../../api/types/core.js";
   import type {
+    ServiceBranchLeave as BranchLeave,
     SessionTreeNode,
     SessionTreeResponse,
   } from "../../api/generated/index.js";
@@ -196,6 +197,18 @@
     }
   }
 
+  function isEmptyFork(session: Session): boolean {
+    return (
+      session.relationship_type === "fork" && session.user_message_count === 0
+    );
+  }
+
+  // A continuation that resumed from an earlier parent turn skips the
+  // parent's later turns.
+  function skippedTurns(leave: BranchLeave): number {
+    return leave.relationship_type === "continuation" ? leave.turns_after : 0;
+  }
+
   function messageCountLabel(count: number): string {
     return m.session_tree_message_count({
       count,
@@ -266,6 +279,7 @@
             class:active={node.is_active}
             class:leaf={node.is_leaf}
             class:branch-start={node.is_branch_start}
+            class:empty-fork={isEmptyFork(session)}
             href={router.buildSessionHref(session.id)}
             aria-current={node.is_active ? "page" : undefined}
             title={sessionTitle(session)}
@@ -285,6 +299,25 @@
               <span class="tree-meta">
                 <span>{session.agent}</span>
                 <span>{messageCountLabel(session.message_count)}</span>
+                {#if node.leaves}
+                  {@const skipped = skippedTurns(node.leaves)}
+                  <span class="tree-branch">
+                    {m.session_tree_after_turn({
+                      turn: formatNumber(node.leaves.after_turn),
+                    })}
+                  </span>
+                  {#if skipped > 0}
+                    <span class="tree-branch">
+                      {m.session_tree_turns_not_carried({
+                        count: skipped,
+                        countLabel: formatNumber(skipped),
+                      })}
+                    </span>
+                  {/if}
+                {/if}
+                {#if isEmptyFork(session)}
+                  <span>{m.session_tree_no_turns()}</span>
+                {/if}
               </span>
             </span>
           </a>
@@ -468,6 +501,14 @@
     font-size: 8px;
     line-height: 1.35;
     text-transform: uppercase;
+  }
+
+  .tree-node.empty-fork {
+    opacity: 0.55;
+  }
+
+  .tree-branch {
+    color: var(--accent-blue);
   }
 
   .tree-node.active .tree-rel {

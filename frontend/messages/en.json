@@ -404,6 +404,115 @@
   "fork_boundary_title": "Fork starts at this point",
   "fork_boundary_label": "Fork starts",
   "fork_boundary_note": "Messages above are inherited context from the parent session.",
+  "fork_boundary_show_inherited": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "Show {countLabel} inherited message",
+        "countPlural=other": "Show {countLabel} inherited messages"
+      }
+    }
+  ],
+  "fork_boundary_hide_inherited": "Hide inherited messages",
+  "fork_boundary_note_collapsed": "History inherited from the parent session is hidden.",
+  "branch_leave_fork": "Forked from {title} after turn {turn}",
+  "branch_leave_continuation": "Continues {title} after turn {turn}",
+  "branch_leave_skipped": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "That session's {countLabel} later turn is not part of this one.",
+        "countPlural=other": "That session's {countLabel} later turns are not part of this one."
+      }
+    }
+  ],
+  "branch_leave_open_parent": "Open there",
+  "branch_marker_fork": "Forked here: {title}",
+  "branch_marker_continuation": "Continued in {title}",
+  "branch_marker_continuation_rewound": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "input title",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "Continued in {title} from here. The {countLabel} later turn below is not part of it.",
+        "countPlural=other": "Continued in {title} from here. The {countLabel} later turns below are not part of it."
+      }
+    }
+  ],
+  "branch_marker_rewind": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "Rewound here: {countLabel} input abandoned",
+        "countPlural=other": "Rewound here: {countLabel} inputs abandoned"
+      }
+    }
+  ],
+  "branch_marker_turns": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "{countLabel} turn",
+        "countPlural=other": "{countLabel} turns"
+      }
+    }
+  ],
+  "branch_marker_no_turns": "no turns yet",
+  "sidebar_fork_marker": "Fork",
+  "system_boundary_fork_source": "Fork notice",
+  "session_tree_after_turn": "after turn {turn}",
+  "session_tree_turns_not_carried": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "{countLabel} later turn not carried over",
+        "countPlural=other": "{countLabel} later turns not carried over"
+      }
+    }
+  ],
+  "session_tree_no_turns": "no turns",
   "sidebar_session_count": [
     {
       "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],

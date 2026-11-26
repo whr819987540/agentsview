@@ -468,6 +468,109 @@
   "fork_boundary_title": "Fork starts at this point",
   "fork_boundary_label": "Fork starts",
   "fork_boundary_note": "Messages above are inherited context from the parent session.",
+  "fork_boundary_show_inherited": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=other": "상속된 메시지 {countLabel}개 표시"
+      }
+    }
+  ],
+  "fork_boundary_hide_inherited": "상속된 메시지 숨기기",
+  "fork_boundary_note_collapsed": "상위 세션에서 상속한 기록이 숨겨져 있습니다.",
+  "branch_leave_fork": "{title}의 {turn}번째 턴 이후에서 분기됨",
+  "branch_leave_continuation": "{title}의 {turn}번째 턴 이후를 이어감",
+  "branch_leave_skipped": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=other": "해당 세션의 이후 턴 {countLabel}개는 이 세션에 포함되지 않습니다."
+      }
+    }
+  ],
+  "branch_leave_open_parent": "해당 위치 열기",
+  "branch_marker_fork": "여기서 분기됨: {title}",
+  "branch_marker_continuation": "{title}에서 계속됨",
+  "branch_marker_continuation_rewound": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "input title",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=other": "여기서부터 {title}에서 계속됨. 아래 이후 턴 {countLabel}개는 포함되지 않습니다."
+      }
+    }
+  ],
+  "branch_marker_rewind": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=other": "여기서 되돌림: 입력 {countLabel}개 버려짐"
+      }
+    }
+  ],
+  "branch_marker_turns": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=other": "{countLabel}턴"
+      }
+    }
+  ],
+  "branch_marker_no_turns": "아직 턴 없음",
+  "sidebar_fork_marker": "분기",
+  "system_boundary_fork_source": "분기 알림",
+  "session_tree_after_turn": "{turn}번째 턴 이후",
+  "session_tree_turns_not_carried": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=other": "이후 턴 {countLabel}개는 이어지지 않음"
+      }
+    }
+  ],
+  "session_tree_no_turns": "턴 없음",
   "sidebar_session_count": [
     {
       "declarations": [

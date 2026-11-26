@@ -394,9 +394,14 @@ session reads do not load it.
   because it holds no prompt text.
 - A full resync copies it with orphaned and trashed sessions.
 
+`GET /api/v1/sessions/{id}/branch-points` and the session tree place forks,
+continuations, and rewinds with `DB.LocateBranch` and `DB.LocateRewind`, which
+read this column and `rewound_inputs`.
+
 Only the SQLite archive stores the column, which is an active exception like
-rewound inputs: replicas and mirrors serve fork context cut by timestamp.
-Remove it by adding the column to each replica's session schema and push.
+rewound inputs: replicas and mirrors serve fork context cut by timestamp and
+report no branch points. Remove it by adding the column to each replica's
+session schema and push.
 
 ### Usage cache divergence
 

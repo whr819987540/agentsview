@@ -480,6 +480,115 @@
   "fork_boundary_title": "Fork starts at this point",
   "fork_boundary_label": "Fork starts",
   "fork_boundary_note": "Messages above are inherited context from the parent session.",
+  "fork_boundary_show_inherited": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "{countLabel} miras mesajı göstər",
+        "countPlural=other": "{countLabel} miras mesajı göstər"
+      }
+    }
+  ],
+  "fork_boundary_hide_inherited": "Miras mesajları gizlət",
+  "fork_boundary_note_collapsed": "Ana sessiyadan miras qalan tarixçə gizlədilib.",
+  "branch_leave_fork": "{title} sessiyasından {turn} nömrəli növbədən sonra ayrılıb",
+  "branch_leave_continuation": "{title} sessiyasını {turn} nömrəli növbədən sonra davam etdirir",
+  "branch_leave_skipped": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "Həmin sessiyanın sonrakı {countLabel} növbəsi bu sessiyaya daxil deyil.",
+        "countPlural=other": "Həmin sessiyanın sonrakı {countLabel} növbəsi bu sessiyaya daxil deyil."
+      }
+    }
+  ],
+  "branch_leave_open_parent": "Həmin yerdə aç",
+  "branch_marker_fork": "Burada ayrıldı: {title}",
+  "branch_marker_continuation": "{title} sessiyasında davam etdi",
+  "branch_marker_continuation_rewound": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "input title",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "Buradan {title} sessiyasında davam etdi. Aşağıdakı sonrakı {countLabel} növbə ona daxil deyil.",
+        "countPlural=other": "Buradan {title} sessiyasında davam etdi. Aşağıdakı sonrakı {countLabel} növbə ona daxil deyil."
+      }
+    }
+  ],
+  "branch_marker_rewind": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "Burada geri qaytarıldı: {countLabel} giriş atıldı",
+        "countPlural=other": "Burada geri qaytarıldı: {countLabel} giriş atıldı"
+      }
+    }
+  ],
+  "branch_marker_turns": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "{countLabel} növbə",
+        "countPlural=other": "{countLabel} növbə"
+      }
+    }
+  ],
+  "branch_marker_no_turns": "hələ növbə yoxdur",
+  "sidebar_fork_marker": "Ayrılma",
+  "system_boundary_fork_source": "Ayrılma bildirişi",
+  "session_tree_after_turn": "{turn} nömrəli növbədən sonra",
+  "session_tree_turns_not_carried": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "sonrakı {countLabel} növbə köçürülməyib",
+        "countPlural=other": "sonrakı {countLabel} növbə köçürülməyib"
+      }
+    }
+  ],
+  "session_tree_no_turns": "növbə yoxdur",
   "sidebar_session_count": [
     {
       "declarations": [

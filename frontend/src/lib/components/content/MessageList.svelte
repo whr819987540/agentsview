@@ -13,6 +13,16 @@
   import MessageContent from "./MessageContent.svelte";
   import CompactBoundaryDivider from "./CompactBoundaryDivider.svelte";
   import ForkBoundaryDivider from "./ForkBoundaryDivider.svelte";
+  import BranchLeaveCard from "./BranchLeaveCard.svelte";
+  import BranchPointMarker from "./BranchPointMarker.svelte";
+  import { fetchBranchPoints } from "../../api/branchPoints.js";
+  import type { ServiceBranchPoints as BranchPoints } from "../../api/generated/index.js";
+  import { attachBranchPoints } from "../../utils/branch-points.js";
+  import {
+    countInheritedMessages,
+    hideInheritedRows,
+    isInheritedOrdinal,
+  } from "../../utils/inherited-context.js";
   import SystemBoundaryCard from "../system/SystemBoundaryCard.svelte";
   import ToolCallGroup from "./ToolCallGroup.svelte";
   import type { DbMessage as Message } from "../../api/generated/index.js";
@@ -90,9 +100,91 @@
     }),
   );
 
-  let displayItemsAsc = $derived(sessionScope.items);
+  // A fork's inherited parent messages start collapsed behind its fork
+  // boundary row, per session.
+  let inheritedCollapsed = $state(true);
+  let inheritedSessionId: string | null = null;
+  $effect(() => {
+    const sid = sessions.activeSessionId;
+    if (sid !== inheritedSessionId) {
+      inheritedSessionId = sid;
+      inheritedCollapsed = true;
+    }
+  });
 
-  let normalDisplayItemsAsc = $derived(sessionScope.normalItems);
+  let inheritedCount = $derived(countInheritedMessages(sessionScope.items));
+
+  let displayItemsAsc = $derived(
+    hideInheritedRows(sessionScope.items, inheritedCollapsed),
+  );
+
+  let normalDisplayItemsAsc = $derived(
+    hideInheritedRows(sessionScope.normalItems, inheritedCollapsed),
+  );
+
+  /**
+   * Shows the inherited context when `ordinal` is one of its hidden
+   * messages. Returns whether the rows changed.
+   */
+  function revealInherited(ordinal: number): boolean {
+    if (!inheritedCollapsed || !isInheritedOrdinal(ordinal)) return false;
+    inheritedCollapsed = false;
+    return true;
+  }
+
+  async function toggleInherited() {
+    inheritedCollapsed = !inheritedCollapsed;
+    await tick();
+    // Keep the boundary where the reader clicked it.
+    scrollToOrdinal(-1);
+  }
+
+  // Where conversations branch off this transcript, and where it leaves
+  // its own parent. Refetched when the transcript changes.
+  let branchPoints = $state<BranchPoints | null>(null);
+  $effect(() => {
+    const sid = messages.sessionId;
+    void messages.loadedRevision;
+    if (!sid) {
+      branchPoints = null;
+      return;
+    }
+    const controller = new AbortController();
+    fetchBranchPoints(sid, controller.signal)
+      .then((next) => {
+        if (!controller.signal.aborted && messages.sessionId === sid) {
+          branchPoints = next;
+        }
+      })
+      .catch((err) => {
+        if (controller.signal.aborted) return;
+        if (messages.sessionId === sid) branchPoints = null;
+        console.warn("failed to load branch points", err);
+      });
+    return () => controller.abort();
+  });
+
+  let hasForkBoundary = $derived(
+    messages.messages.some((msg) => msg.source_subtype === "fork_boundary"),
+  );
+
+  // Branch markers by ascending display index. A fork or continuation
+  // whose inherited context is not shown says where it came from above its
+  // first own row.
+  let rowMarkers = $derived.by(() => {
+    const points = branchPoints && branchPoints.session_id === messages.sessionId
+      ? branchPoints.points
+      : [];
+    return attachBranchPoints(displayItemsAsc, points);
+  });
+
+  let leaveRowIndex = $derived.by(() => {
+    const leave = branchPoints?.leaves;
+    if (!leave || hasForkBoundary || branchPoints?.session_id !== messages.sessionId) {
+      return -1;
+    }
+    return displayItemsAsc.findIndex((item) => item.ordinals.some((o) => o >= 0));
+  });
 
   let displayedOrdinals = $derived.by(() =>
     displayItemsAsc.flatMap((item) => item.ordinals),
@@ -671,6 +763,12 @@
       };
       if (!targetHolds()) return abandon();
 
+      if (revealInherited(ordinal)) {
+        await tick();
+        await raf();
+        if (reqId !== lastScrollRequest) return;
+      }
+
       if (displayIndexOf(ordinal) < 0) {
         await messages.ensureOrdinalLoaded(ordinal);
         if (reqId !== lastScrollRequest) return;
@@ -899,7 +997,10 @@
       isCurrent: () => !destroyed && reqId === lastScrollRequest &&
         messages.sessionId === sessionId && sessions.activeSessionId === sessionId &&
         inSessionSearch.isActive,
-      ensureLoaded: (ordinal) => messages.ensureOrdinalLoaded(ordinal),
+      ensureLoaded: (ordinal) => {
+        revealInherited(ordinal);
+        return messages.ensureOrdinalLoaded(ordinal);
+      },
       mountMessage: () => {
         const ascIndex = displayItemsAsc.findIndex((item) => item.ordinals.includes(match.ordinal));
         if (ascIndex < 0) return Promise.resolve(false);
@@ -1237,6 +1338,8 @@
     >
       {#each virtualizer.instance?.getVirtualItems() ?? [] as row (row.key)}
         {@const item = itemAt(row.index)}
+        {@const ascIndex = ui.sortNewestFirst ? displayItemsAsc.length - 1 - row.index : row.index}
+        {@const markers = rowMarkers.get(ascIndex)}
         {#if item}
           <!-- svelte-ignore a11y_click_events_have_key_events -->
           <!-- svelte-ignore a11y_no_static_element_interactions -->
@@ -1254,6 +1357,18 @@
               ui.selectOrdinal(item.ordinals[0]!);
             }}
           >
+            {#if !ui.sortNewestFirst}
+              {#if ascIndex === leaveRowIndex && branchPoints?.leaves}
+                <BranchLeaveCard leave={branchPoints.leaves} />
+              {/if}
+              {#each markers?.before ?? [] as point, i (i)}
+                <BranchPointMarker {point} />
+              {/each}
+            {:else}
+              {#each markers?.after ?? [] as point, i (i)}
+                <BranchPointMarker {point} />
+              {/each}
+            {/if}
             {#if item.kind !== "tool-group" && readProgressDivider !== null && item.ordinals.includes(readProgressDivider.ordinal)}
               <div class="read-progress-divider" role="separator" aria-label={m.read_progress_boundary()}>
                 {readProgressDivider.label}
@@ -1273,7 +1388,13 @@
               <CompactBoundaryDivider message={item.message} />
             {:else if item.message.is_system
               && item.message.source_subtype === "fork_boundary"}
-              <ForkBoundaryDivider message={item.message} />
+              <ForkBoundaryDivider
+                message={item.message}
+                leave={branchPoints?.session_id === messages.sessionId ? branchPoints?.leaves : null}
+                {inheritedCount}
+                collapsed={inheritedCollapsed}
+                onToggle={() => void toggleInherited()}
+              />
             {:else if isSystemBoundaryMessage(item.message)}
               <SystemBoundaryCard
                 subtype={item.message.source_subtype}
@@ -1285,6 +1406,18 @@
                 message={item.message}
                 searchOrdinal={item.message.ordinal}
               />
+            {/if}
+            {#if !ui.sortNewestFirst}
+              {#each markers?.after ?? [] as point, i (i)}
+                <BranchPointMarker {point} />
+              {/each}
+            {:else}
+              {#each markers?.before ?? [] as point, i (i)}
+                <BranchPointMarker {point} />
+              {/each}
+              {#if ascIndex === leaveRowIndex && branchPoints?.leaves}
+                <BranchLeaveCard leave={branchPoints.leaves} />
+              {/if}
             {/if}
           </div>
         {/if}
