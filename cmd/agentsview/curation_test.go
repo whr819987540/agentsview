@@ -21,7 +21,7 @@ func curateArchive(t *testing.T, dataDir string) {
 	defer d.Close()
 	_, err = d.StarSession(t.Context(), "s1")
 	require.NoError(t, err)
-	folder, err := d.CreateSessionFolder(t.Context(), "alpha", "Docs")
+	folder, err := d.CreateSessionFolder(t.Context(), "alpha", "Docs", nil)
 	require.NoError(t, err)
 	require.NoError(t, d.MoveSessionsToFolder(t.Context(), folder.ID, []string{"s2"}))
 }

@@ -1493,10 +1493,10 @@ Import is off when the server is read-only, including when it serves a
 PostgreSQL or ClickHouse replica; export there says it needs the local archive.
 
 The export holds every starred session, every ended mark that still applies,
-every folder (empty ones included), and each session's folder. It names
-sessions by their IDs on the old machine, and lists their project names and
-folder names. `export` writes it to standard output unless you pass
-`-o`/`--output`; a file it creates is readable only by you.
+every folder (empty ones included) with the folder that holds it, and each
+session's folder. It names sessions by their IDs on the old machine, and lists
+their project names and folder names. `export` writes it to standard output
+unless you pass `-o`/`--output`; a file it creates is readable only by you.
 
 The import matches each exported session to one session on the new machine:
 
@@ -1515,7 +1515,10 @@ For each matched session, the import adds only what the new machine lacks:
   activity time. If the new machine has seen newer activity for the session,
   the mark clears itself, as it does when you resume a session.
 - A folder is recreated in the project the session has on the new machine, and
-  the session goes into it unless it is already in a folder there.
+  the session goes into it unless it is already in a folder there. A recreated
+  folder goes inside the folder that held it on the old machine, which is
+  recreated too when missing. A folder the new machine already has keeps its
+  place.
 - An empty folder is recreated when the new machine has sessions in its
   project.
 

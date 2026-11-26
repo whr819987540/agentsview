@@ -45,7 +45,7 @@
     isSubagentDescendant,
   } from "./session-list-utils.js";
   import { handedOffIds, handoffSourceIds } from "../../utils/session-primary.js";
-  import { endSessionDrag, sessionDragFor } from "./session-drag.js";
+  import { endSidebarDrag, isFolderDrag, sidebarDragFor } from "./session-drag.js";
 
   const EXPANDED_FOLDERS_KEY = "agentsview-sidebar-expanded-folders";
 
@@ -82,7 +82,8 @@
   // Folders start collapsed; the expanded ones are remembered per browser.
   let expandedFolders: Set<number> = $state(readExpandedFolders());
   let renamingFolderId: number | null = $state(null);
-  // Folder a dragged session would land in; null is the project top level.
+  // Folder a dragged session or folder would land in; null is the project
+  // top level.
   let dropTarget: number | null | undefined = $state(undefined);
   let projectMenu: { x: number; y: number; project: string } | null = $state(null);
   let detachSidebar: (() => void) | null = null;
@@ -278,14 +279,20 @@
     ];
   }
 
-  async function createFolder(project: string) {
+  /** Create a folder at the project's top level, or inside parentId, and
+   *  open its name editor. */
+  async function createFolder(project: string, parentId: number | null = null) {
     projectMenu = null;
     try {
       const folder = await sessionFolders.create(
         project,
         sessionFolders.availableName(project, m.sidebar_folder_default_name()),
+        parentId,
       );
       if (groupMode !== "none" && collapsed.has(project)) toggleGroup(project);
+      if (parentId !== null) {
+        setFoldersExpanded([parentId, ...sessionFolders.ancestorIds(parentId)], true);
+      }
       renamingFolderId = folder.id;
       await tick();
       const row = renderDisplayItems.find((it) => it.id === `folder:${folder.id}`);
@@ -303,8 +310,16 @@
 
   function acceptedDrag(e: DragEvent, item: DisplayItem) {
     if (item.dropFolderId === undefined || !sessionFolders.editable) return null;
-    const drag = sessionDragFor(e);
+    const drag = sidebarDragFor(e);
     if (!drag || drag.project !== item.dropProject) return null;
+    // A folder cannot go into itself or one of its subfolders.
+    if (
+      isFolderDrag(drag) &&
+      item.dropFolderId !== null &&
+      sessionFolders.subtreeIds(drag.folderId).has(item.dropFolderId)
+    ) {
+      return null;
+    }
     return drag;
   }
 
@@ -324,10 +339,19 @@
   async function handleDrop(e: DragEvent, item: DisplayItem) {
     const drag = acceptedDrag(e, item);
     dropTarget = undefined;
-    endSessionDrag();
+    endSidebarDrag();
     if (!drag || item.dropFolderId === undefined) return;
     e.preventDefault();
     const target = item.dropFolderId;
+    if (isFolderDrag(drag)) {
+      if (target === sessionFolders.parentId(drag.folderId)) return;
+      try {
+        await sessionFolders.moveFolder(drag.folderId, target);
+      } catch {
+        showFlash(m.sidebar_folder_move_folder_failed(), { tone: "danger" });
+      }
+      return;
+    }
     if (target === sessionFolders.folderIdForSessions(drag.project, drag.sessionIds)) {
       return;
     }
@@ -698,15 +722,19 @@
           }
         }
       }
-      // Session may be filed in a collapsed folder.
+      // Session may be filed in a collapsed folder, or in a folder inside
+      // a collapsed one.
       if (folderView) {
         const owner = groups.find((g) =>
           g.sessions.some((s) => s.id === activeId),
         );
         const folderId = owner && folderView.groupFolder.get(owner.key);
-        if (folderId !== undefined && !expandedFolders.has(folderId)) {
-          setFoldersExpanded([folderId], true);
-          return;
+        if (folderId !== undefined) {
+          const path = [folderId, ...sessionFolders.ancestorIds(folderId)];
+          if (path.some((id) => !expandedFolders.has(id))) {
+            setFoldersExpanded(path, true);
+            return;
+          }
         }
       }
       // Session may be inside a collapsed continuation chain.
@@ -936,6 +964,7 @@
           <SessionFolderRow
             folder={item.folder}
             count={item.count}
+            inset={item.inset ?? 0}
             expanded={expandedFolders.has(folderId)}
             editable={sessionFolders.editable}
             renaming={renamingFolderId === folderId}
@@ -945,6 +974,7 @@
             onRenameEnd={() => {
               if (renamingFolderId === folderId) renamingFolderId = null;
             }}
+            onCreateSubfolder={() => void createFolder(item.folder!.project, folderId)}
           />
         {:else if item.type === "gap"}
           <div class="folder-gap" aria-hidden="true"></div>

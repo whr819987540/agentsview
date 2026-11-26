@@ -12,6 +12,7 @@ interface FolderRow {
   id: number;
   project: string;
   name: string;
+  parent_id?: number;
   session_ids: string[];
   created_at: string;
   updated_at: string;
@@ -36,7 +37,7 @@ async function mockFolderApi(page: Page): Promise<FolderRow[]> {
     const path = new URL(request.url()).pathname.replace(/^\/api\/v1\/session-folders/, "");
     const method = request.method();
     const body = request.postData() ? request.postDataJSON() : {};
-    const byId = path.match(/^\/(\d+)(\/sessions)?$/);
+    const byId = path.match(/^\/(\d+)(\/sessions|\/parent)?$/);
     const folder = byId ? folders.find((f) => f.id === Number(byId[1])) : undefined;
 
     if (path === "" && method === "GET") {
@@ -47,10 +48,11 @@ async function mockFolderApi(page: Page): Promise<FolderRow[]> {
         return;
       }
       const now = new Date().toISOString();
-      const created = {
+      const created: FolderRow = {
         id: nextId++,
         project: body.project,
         name: body.name,
+        ...(body.parent_id === undefined ? {} : { parent_id: body.parent_id }),
         session_ids: [],
         created_at: now,
         updated_at: now,
@@ -67,11 +69,23 @@ async function mockFolderApi(page: Page): Promise<FolderRow[]> {
     } else if (path === "/remove-sessions" && method === "POST") {
       unfile(body.session_ids);
       await route.fulfill({ json: list() });
-    } else if (folder && byId?.[2] && method === "PUT") {
+    } else if (folder && byId?.[2] === "/parent" && method === "PUT") {
+      if (body.parent_id === undefined) delete folder.parent_id;
+      else folder.parent_id = body.parent_id;
+      await route.fulfill({ json: folder });
+    } else if (folder && byId?.[2] === "/sessions" && method === "PUT") {
       unfile(body.session_ids);
       folder.session_ids.push(...body.session_ids);
       await route.fulfill({ json: list() });
     } else if (folder && method === "DELETE") {
+      // Its sessions and subfolders move up into the folder that held it.
+      const parent = folders.find((f) => f.id === folder.parent_id);
+      if (parent) parent.session_ids.push(...folder.session_ids);
+      for (const f of folders) {
+        if (f.parent_id !== folder.id) continue;
+        if (parent) f.parent_id = parent.id;
+        else delete f.parent_id;
+      }
       folders.splice(folders.indexOf(folder), 1);
       await route.fulfill({ status: 204, body: "" });
     } else {
@@ -148,4 +162,83 @@ test("moves a session into a folder created from its menu", async ({ page }) => 
   expect(folders.map((f) => [f.project, f.name, f.session_ids])).toEqual([
     [PROJECT, "Later", ["fold-1"]],
   ]);
+});
+
+async function createFolder(page: Page, name: string) {
+  await page.getByRole("button", { name: "New folder" }).click();
+  const nameInput = page.getByRole("textbox", { name: "Folder name" });
+  await nameInput.fill(name);
+  await nameInput.press("Enter");
+}
+
+test("nests a folder and moves a deleted folder's contents up", async ({ page }) => {
+  const folders = await mockFolderApi(page);
+  const sp = await openProject(page);
+
+  await createFolder(page, "Work");
+  const work = page.locator(".folder-row", { hasText: "Work" });
+  await work.click({ button: "right" });
+  await page.getByRole("button", { name: "New subfolder" }).click();
+  const nameInput = page.getByRole("textbox", { name: "Folder name" });
+  await nameInput.fill("Bugs");
+  await nameInput.press("Enter");
+  // The parent opened to show its new subfolder.
+  const bugs = page.locator(".folder-row", { hasText: "Bugs" });
+  await expect(bugs).toBeVisible();
+
+  await sessionRow(page, "fold-1").click({ button: "right" });
+  await page.getByRole("button", { name: "Move to folder…" }).click();
+  await page
+    .getByRole("dialog", { name: "Move to folder" })
+    .getByRole("button", { name: "Bugs" })
+    .click();
+
+  // A folder counts the sessions of the folders inside it.
+  await expect(work.locator(".folder-count")).toHaveText("1");
+  await expect(bugs.locator(".folder-count")).toHaveText("1");
+  const workId = folders.find((f) => f.name === "Work")!.id;
+  expect(folders.map((f) => [f.name, f.parent_id, f.session_ids])).toEqual([
+    ["Work", undefined, []],
+    ["Bugs", workId, ["fold-1"]],
+  ]);
+
+  await work.click({ button: "right" });
+  await page.getByRole("button", { name: "Delete folder" }).click();
+
+  await expect(page.locator(".folder-row")).toHaveCount(1);
+  await expect(bugs.locator(".folder-count")).toHaveText("1");
+  await expect(sp.sessionItems).toHaveCount(2);
+  expect(folders.map((f) => [f.name, f.parent_id, f.session_ids])).toEqual([
+    ["Bugs", undefined, ["fold-1"]],
+  ]);
+});
+
+test("moves a folder into another by dragging it and back out from its menu", async ({
+  browserName,
+  page,
+}) => {
+  test.skip(browserName !== "chromium", "HTML5 drag and drop is verified on Chromium");
+  const folders = await mockFolderApi(page);
+  await openProject(page);
+  await createFolder(page, "Work");
+  await createFolder(page, "Specs");
+  const work = page.locator(".folder-row", { hasText: "Work" });
+  const specs = page.locator(".folder-row", { hasText: "Specs" });
+
+  await specs.dragTo(work);
+
+  await expect(specs).toHaveCount(0);
+  const workId = folders.find((f) => f.name === "Work")!.id;
+  expect(folders.find((f) => f.name === "Specs")!.parent_id).toBe(workId);
+
+  await work.click();
+  await specs.click({ button: "right" });
+  await page.getByRole("button", { name: "Move to folder…" }).click();
+  const picker = page.getByRole("dialog", { name: "Move folder to" });
+  await picker.getByRole("button", { name: "Top level" }).click();
+
+  await expect(picker).toHaveCount(0);
+  await expect.poll(() => folders.find((f) => f.name === "Specs")!.parent_id).toBeUndefined();
+  await work.click();
+  await expect(page.locator(".folder-row")).toHaveCount(2);
 });

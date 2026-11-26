@@ -5,6 +5,8 @@
 export interface SessionFolderCreateInputBody {
   /** Folder name, unique within the project */
   name: string;
+  /** Folder of the same project to create the new one in; omit for the project's top level */
+  parent_id?: number;
   /** Project the folder belongs to */
   project: string;
 }

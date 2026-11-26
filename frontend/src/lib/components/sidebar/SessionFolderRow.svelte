@@ -12,25 +12,32 @@
     SessionFolderNameTakenError,
   } from "../../stores/sessionFolders.svelte.js";
   import type { SidebarFolder } from "./session-list-utils.js";
+  import SessionFolderPicker from "./SessionFolderPicker.svelte";
+  import { endSidebarDrag, startFolderDrag } from "./session-drag.js";
 
   interface Props {
     folder: SidebarFolder;
-    /** Session rows filed in the folder under the current filters. */
+    /** Session rows in the folder and its subfolders under the current
+     *  filters. */
     count: number;
+    /** Folders around this one; each indents the row one level. */
+    inset?: number;
     expanded: boolean;
     editable: boolean;
     /** Show the name editor; the list opens it for a new folder. */
     renaming: boolean;
-    /** A dragged session would land in this folder. */
+    /** A dragged session or folder would land in this folder. */
     dropActive: boolean;
     onToggle: () => void;
     onRenameStart: () => void;
     onRenameEnd: () => void;
+    onCreateSubfolder: () => void;
   }
 
   let {
     folder,
     count,
+    inset = 0,
     expanded,
     editable,
     renaming,
@@ -38,12 +45,15 @@
     onToggle,
     onRenameStart,
     onRenameEnd,
+    onCreateSubfolder,
   }: Props = $props();
 
   let renameValue = $state("");
   let renameInput: HTMLInputElement | undefined = $state(undefined);
   let renameSubmitting = false;
   let contextMenu: { x: number; y: number } | null = $state(null);
+  let folderPicker: { x: number; y: number } | null = $state(null);
+  let indent = $derived(`${8 + inset * 14}px`);
 
   let toggleLabel = $derived(
     expanded
@@ -120,6 +130,14 @@
     }
   }
 
+  function openFolderPicker(e: MouseEvent) {
+    // Keep the click from reaching the picker's outside-click check.
+    e.stopPropagation();
+    const origin = contextMenu;
+    contextMenu = null;
+    if (origin) folderPicker = origin;
+  }
+
   async function deleteFolder() {
     contextMenu = null;
     try {
@@ -132,7 +150,7 @@
 </script>
 
 {#if renaming}
-  <div class="folder-row editing">
+  <div class="folder-row editing" style:padding-left={indent}>
     <span class="folder-chevron"></span>
     <FolderIcon class="folder-icon" size="12" strokeWidth="1.8" aria-hidden="true" />
     <TextInput
@@ -159,6 +177,10 @@
     type="button"
     class="folder-row"
     class:drop-active={dropActive}
+    style:padding-left={indent}
+    draggable={editable ? "true" : undefined}
+    ondragstart={(e) => startFolderDrag(e, { project: folder.project, folderId: folder.id })}
+    ondragend={endSidebarDrag}
     aria-expanded={expanded}
     title={toggleLabel}
     aria-label={toggleLabel}
@@ -197,6 +219,18 @@
       class="context-menu-item"
       onclick={() => {
         contextMenu = null;
+        onCreateSubfolder();
+      }}
+    >
+      {m.sidebar_folder_create_subfolder()}
+    </button>
+    <button class="context-menu-item" onclick={openFolderPicker}>
+      {m.sidebar_row_move_to_folder()}
+    </button>
+    <button
+      class="context-menu-item"
+      onclick={() => {
+        contextMenu = null;
         onRenameStart();
       }}
     >
@@ -206,6 +240,16 @@
       {m.sidebar_folder_delete()}
     </button>
   </div>
+{/if}
+
+{#if folderPicker}
+  <SessionFolderPicker
+    x={folderPicker.x}
+    y={folderPicker.y}
+    project={folder.project}
+    folderId={folder.id}
+    onclose={() => (folderPicker = null)}
+  />
 {/if}
 
 <style>

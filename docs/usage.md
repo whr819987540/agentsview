@@ -479,28 +479,40 @@ section. Groups start collapsed when first enabled.
 
 ### Session Folders
 
-Sort a project's sessions into folders in the sidebar. Folders change only how
-the sidebar lists sessions: a session keeps its project and its data, and
-deleting a folder never deletes a session. Session folders are unreleased.
+Sort a project's sessions into folders in the sidebar, and folders into other
+folders. Folders change only how the sidebar lists sessions: a session keeps its
+project and its data, and deleting a folder never deletes a session. Session
+folders are unreleased.
 
 Folders appear when the sidebar shows sessions by project: filter the list to
 one project, or turn on **Group by project**. Each project lists its folders
-first, then the sessions that are in no folder. Folders start collapsed; click a
-folder to open it. The sidebar remembers the folders you opened in this
-browser.
+first, then the sessions that are in no folder. An open folder lists its
+subfolders first, then its own sessions, each level indented one step further.
+A folder's count includes the sessions in its subfolders. Folders start
+collapsed; click a folder to open it. The sidebar remembers the folders you
+opened in this browser, and opens every folder around the session you are
+reading.
 
 1. Create a folder with the **New folder** button in the sidebar header while
    the list is filtered to a project. When grouping by project, right-click the
    project's header instead. Type a name and press Enter.
+1. Create a folder inside another one from the outer folder's right-click menu:
+   choose **New subfolder**.
 1. Move a session by dragging its row onto a folder, or right-click the session
-   and choose **Move to folder…**. The picker can also create a folder, and
-   **No folder** takes the session out of its folder. Dropping a session on a
-   row outside any folder also takes it out. A session's continuations and
+   and choose **Move to folder…**. The picker lists folders as a tree, can
+   create a top-level folder, and **No folder** takes the session out of its
+   folder. Dropping a session on a row outside any folder takes it out; dropping
+   it on a session inside a folder files it there. A session's continuations and
    subagents move with it.
+1. Move a folder, with everything in it, by dragging it onto another folder, or
+   right-click it and choose **Move to folder…**. **Top level** in that picker
+   moves it out of every folder. A folder cannot go inside itself or one of its
+   own subfolders.
 1. Rename a folder by double-clicking it or from its right-click menu. Folder
-   names are unique within a project.
-1. Delete a folder from its right-click menu. Its sessions return to the
-   project's list.
+   names are unique within a project, at every level: two folders of one
+   project cannot share a name even when different folders hold them.
+1. Delete a folder from its right-click menu. Its sessions and subfolders move
+   up one level, into the folder that held it or to the project's list.
 
 A session sits in at most one folder, and only in a folder of its own project.
 If you change a session's project, it no longer shows in its old project's

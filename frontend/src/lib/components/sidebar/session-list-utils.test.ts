@@ -1376,6 +1376,69 @@ describe("buildDisplayItems (folders)", () => {
     expect(computeTotalSize(items)).toBe(items.reduce((sum, item) => sum + item.height, 0));
   });
 
+  describe("nested folders", () => {
+    // Work > Bugs > Triage. a1 is in Triage, a2 in Work, a3 in no folder.
+    const work: SidebarFolder = { id: 1, project: "alpha", name: "Work" };
+    const bugs: SidebarFolder = { id: 2, project: "alpha", name: "Bugs", parent_id: 1 };
+    const triage: SidebarFolder = { id: 3, project: "alpha", name: "Triage", parent_id: 2 };
+    const groups = [
+      projectGroup("a1", "alpha"),
+      projectGroup("a2", "alpha"),
+      projectGroup("a3", "alpha"),
+    ];
+    const filed = { a1: 3, a2: 1 };
+
+    it("counts a closed folder's sessions at every level inside it", () => {
+      const view = folderView([bugs, triage, work], filed, { project: "alpha" });
+
+      const items = buildDisplayItems(groups, [], "none", new Set(), new Set(), view);
+
+      expect(rowSummary(items)).toEqual(["folder:Work(2)", "session:a3+0"]);
+      expect(adjacentVisibleSessionId(items, "a1", 1)).toBe("a3");
+    });
+
+    it("indents each level and separates it from the sessions that follow", () => {
+      const view = folderView([bugs, triage, work], filed, {
+        project: "alpha",
+        expanded: [1, 2, 3],
+      });
+
+      const items = buildDisplayItems(groups, [], "none", new Set(), new Set(), view);
+
+      expect(items.map((i) => [i.id, i.inset ?? 0, i.dropFolderId])).toEqual([
+        ["folder:1", 0, 1],
+        ["folder:2", 1, 2],
+        ["folder:3", 2, 3],
+        ["session:a1", 3, 3],
+        ["folder-gap:alpha:1", 1, 1],
+        ["session:a2", 1, 1],
+        ["folder-gap:alpha", 0, null],
+        ["session:a3", 0, null],
+      ]);
+      expect(rowSummary(items).slice(0, 3)).toEqual([
+        "folder:Work(2)",
+        "folder:Bugs(1)",
+        "folder:Triage(1)",
+      ]);
+      expect(computeTotalSize(items)).toBe(items.reduce((sum, item) => sum + item.height, 0));
+    });
+
+    it("lists subfolders before the folder's own sessions and hides a closed subfolder", () => {
+      const view = folderView([bugs, triage, work], filed, { project: "alpha", expanded: [1] });
+
+      const items = buildDisplayItems(groups, [], "none", new Set(), new Set(), view);
+
+      expect(rowSummary(items)).toEqual([
+        "folder:Work(2)",
+        "folder:Bugs(1)",
+        "session:a2+1",
+        "gap",
+        "session:a3+0",
+      ]);
+      expect(adjacentVisibleSessionId(items, "a1", 1)).toBe("a2");
+    });
+  });
+
   it("steps from a session hidden in a collapsed folder to the next row", () => {
     const groups = [
       projectGroup("a1", "alpha"),

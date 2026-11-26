@@ -20,6 +20,7 @@ func (s *Server) registerSessionFolderRoutes() {
 	s.get(group, "", "List session folders", s.humaListSessionFolders)
 	s.post(group, "", "Create session folder", s.humaCreateSessionFolder)
 	s.patch(group, "/{id}", "Rename session folder", s.humaRenameSessionFolder)
+	s.put(group, "/{id}/parent", "Move session folder", s.humaMoveSessionFolder)
 	s.deleteRoute(group, "/{id}", "Delete session folder", s.humaDeleteSessionFolder)
 	s.put(group, "/{id}/sessions", "Move sessions into a folder", s.humaMoveSessionsToFolder)
 	s.post(group, "/remove-sessions",
@@ -35,8 +36,16 @@ type sessionFoldersResponse struct {
 
 type sessionFolderCreateInput struct {
 	Body struct {
-		Project string `json:"project" required:"true" doc:"Project the folder belongs to"`
-		Name    string `json:"name" required:"true" doc:"Folder name, unique within the project"`
+		Project  string `json:"project" required:"true" doc:"Project the folder belongs to"`
+		Name     string `json:"name" required:"true" doc:"Folder name, unique within the project"`
+		ParentID *int64 `json:"parent_id,omitempty" doc:"Folder of the same project to create the new one in; omit for the project's top level"`
+	}
+}
+
+type sessionFolderParentInput struct {
+	ID   int64 `path:"id" required:"true" doc:"Folder ID"`
+	Body struct {
+		ParentID *int64 `json:"parent_id,omitempty" doc:"Folder of the same project to move the folder into; omit for the project's top level"`
 	}
 }
 
@@ -126,7 +135,7 @@ func (s *Server) humaCreateSessionFolder(
 	if err != nil {
 		return nil, err
 	}
-	folder, err := localDB.CreateSessionFolder(ctx, in.Body.Project, in.Body.Name)
+	folder, err := localDB.CreateSessionFolder(ctx, in.Body.Project, in.Body.Name, in.Body.ParentID)
 	if err != nil {
 		return nil, sessionFolderError("create session folder", err)
 	}
@@ -144,6 +153,21 @@ func (s *Server) humaRenameSessionFolder(
 	folder, err := localDB.RenameSessionFolder(ctx, in.ID, in.Body.Name)
 	if err != nil {
 		return nil, sessionFolderError("rename session folder", err)
+	}
+	return &jsonOutput[db.SessionFolder]{Body: folder}, nil
+}
+
+func (s *Server) humaMoveSessionFolder(
+	ctx context.Context,
+	in *sessionFolderParentInput,
+) (*jsonOutput[db.SessionFolder], error) {
+	localDB, err := s.writableLocalDB()
+	if err != nil {
+		return nil, err
+	}
+	folder, err := localDB.MoveSessionFolder(ctx, in.ID, in.Body.ParentID)
+	if err != nil {
+		return nil, sessionFolderError("move session folder", err)
 	}
 	return &jsonOutput[db.SessionFolder]{Body: folder}, nil
 }

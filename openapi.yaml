@@ -1255,6 +1255,9 @@ components:
         name:
           description: Folder name
           type: string
+        parent:
+          description: Name of the folder of the same project that holds this one; absent at the project's top level
+          type: string
         project:
           description: Project the folder belongs to
           type: string
@@ -2826,6 +2829,10 @@ components:
           type: integer
         name:
           type: string
+        parent_id:
+          description: Folder that holds this one; absent at the project's top level
+          format: int64
+          type: integer
         project:
           type: string
         session_ids:
@@ -7172,6 +7179,10 @@ components:
         name:
           description: Folder name, unique within the project
           type: string
+        parent_id:
+          description: Folder of the same project to create the new one in; omit for the project's top level
+          format: int64
+          type: integer
         project:
           description: Project the folder belongs to
           type: string
@@ -7190,6 +7201,14 @@ components:
           type: array
       required:
         - session_ids
+      type: object
+    SessionFolderParentInputBody:
+      additionalProperties: false
+      properties:
+        parent_id:
+          description: Folder of the same project to move the folder into; omit for the project's top level
+          format: int64
+          type: integer
       type: object
     SessionFolderRemoveInputBody:
       additionalProperties: false
@@ -18227,6 +18246,100 @@ paths:
                 $ref: "#/components/schemas/ApiErrorResponse"
           description: Gateway Timeout
       summary: Rename session folder
+      tags:
+        - SessionFolders
+  /api/v1/session-folders/{id}/parent:
+    put:
+      operationId: put-api-v1-session-folders-id-parent
+      parameters:
+        - description: Folder ID
+          in: path
+          name: id
+          required: true
+          schema:
+            description: Folder ID
+            format: int64
+            type: integer
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SessionFolderParentInputBody"
+        required: true
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DbSessionFolder"
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Bad Request
+        "401":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Unauthorized
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Forbidden
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Not Found
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Conflict
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Unprocessable Entity
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Internal Server Error
+        "501":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Not Implemented
+        "502":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Bad Gateway
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Service Unavailable
+        "504":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Gateway Timeout
+      summary: Move session folder
       tags:
         - SessionFolders
   /api/v1/session-folders/{id}/sessions:

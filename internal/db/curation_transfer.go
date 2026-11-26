@@ -60,10 +60,12 @@ type CurationEndMark struct {
 	ActivityAt string `json:"activity_at" doc:"Latest activity of the covered sessions when the mark was set"`
 }
 
-// CurationExportFolder names one folder.
+// CurationExportFolder names one folder and the folder that holds it.
+// Folder names are unique within a project, so a name identifies a folder.
 type CurationExportFolder struct {
 	Project string `json:"project" doc:"Project the folder belongs to"`
 	Name    string `json:"name" doc:"Folder name"`
+	Parent  string `json:"parent,omitempty" doc:"Name of the folder of the same project that holds this one; absent at the project's top level"`
 }
 
 // CurationImportOptions controls ImportCuration.
@@ -169,10 +171,18 @@ func (db *DB) ExportCuration(ctx context.Context) (CurationExport, error) {
 	if err != nil {
 		return CurationExport{}, err
 	}
+	byID := make(map[int64]SessionFolder, len(folders))
 	for _, f := range folders {
-		doc.Folders = append(doc.Folders, CurationExportFolder{
-			Project: f.Project, Name: f.Name,
-		})
+		byID[f.ID] = f
+	}
+	for _, f := range folders {
+		entry := CurationExportFolder{Project: f.Project, Name: f.Name}
+		if f.ParentID != nil {
+			if parent, ok := byID[*f.ParentID]; ok && parent.Project == f.Project {
+				entry.Parent = parent.Name
+			}
+		}
+		doc.Folders = append(doc.Folders, entry)
 	}
 	return doc, nil
 }
@@ -221,8 +231,60 @@ func ValidateCurationExport(doc *CurationExport) error {
 			return fmt.Errorf("%w: folder %d: %w", ErrCurationImportInvalid, i, err)
 		}
 		folder.Name = name
+		if folder.Parent != "" {
+			parent, err := NormalizeSessionFolderName(folder.Parent)
+			if err != nil {
+				return fmt.Errorf("%w: folder %d parent: %w", ErrCurationImportInvalid, i, err)
+			}
+			folder.Parent = parent
+		}
+	}
+	return validateCurationFolderTree(doc.Folders)
+}
+
+// validateCurationFolderTree checks that each folder has one parent, that
+// every parent is a listed folder of the same project, and that no folder
+// sits inside itself.
+func validateCurationFolderTree(folders []CurationExportFolder) error {
+	parents := curationFolderParents(folders)
+	for _, folder := range folders {
+		key := curationFolderKey{folder.Project, folder.Name}
+		if parents[key] != folder.Parent {
+			return fmt.Errorf("%w: folder %q in %s is listed with two parents",
+				ErrCurationImportInvalid, folder.Name, folder.Project)
+		}
+	}
+	for key, parent := range parents {
+		seen := map[string]bool{key.name: true}
+		for parent != "" {
+			if seen[parent] {
+				return fmt.Errorf("%w: folder %q in %s sits inside itself",
+					ErrCurationImportInvalid, key.name, key.project)
+			}
+			seen[parent] = true
+			next, ok := parents[curationFolderKey{key.project, parent}]
+			if !ok {
+				return fmt.Errorf("%w: folder %q in %s has parent %q, which is not listed",
+					ErrCurationImportInvalid, key.name, key.project, parent)
+			}
+			parent = next
+		}
 	}
 	return nil
+}
+
+// curationFolderParents maps each exported folder to its parent's name,
+// with "" for the project's top level. A folder listed twice keeps its
+// first parent.
+func curationFolderParents(folders []CurationExportFolder) map[curationFolderKey]string {
+	parents := make(map[curationFolderKey]string, len(folders))
+	for _, folder := range folders {
+		key := curationFolderKey{folder.Project, folder.Name}
+		if _, ok := parents[key]; !ok {
+			parents[key] = folder.Parent
+		}
+	}
+	return parents
 }
 
 // ImportCuration applies an exported curation to the sessions of this
@@ -233,7 +295,10 @@ func ValidateCurationExport(doc *CurationExport) error {
 // keeps every star, end mark, and folder this archive already holds. A
 // folder is recreated in the project the matched session has here. An empty
 // exported folder is recreated only when this archive has sessions in its
-// project. The import commits as one transaction; a dry run rolls it back.
+// project. A recreated folder goes inside the folder that held it in the
+// export, which is recreated too when missing; a folder this archive already
+// holds stays where it is. The import commits as one transaction; a dry run
+// rolls it back.
 func (db *DB) ImportCuration(
 	ctx context.Context, doc CurationExport, opts CurationImportOptions,
 ) (CurationImportResult, error) {
@@ -253,6 +318,7 @@ func (db *DB) ImportCuration(
 		imp := curationImporter{
 			ctx: ctx, tx: tx, result: &result,
 			folders: map[curationFolderKey]int64{},
+			parents: curationFolderParents(doc.Folders),
 		}
 		matcher, err := loadCurationMatcher(ctx, tx, doc.ArtifactOrigin)
 		if err != nil {
@@ -285,7 +351,7 @@ func (db *DB) ImportCuration(
 			if withMembers[key] || !matcher.projects[folder.Project] {
 				continue
 			}
-			if _, err := imp.folderID(key); err != nil {
+			if _, err := imp.folderID(folder.Project, key); err != nil {
 				return err
 			}
 		}
@@ -396,6 +462,8 @@ type curationImporter struct {
 	tx      *sql.Tx
 	result  *CurationImportResult
 	folders map[curationFolderKey]int64
+	// parents maps each exported folder to its parent's name.
+	parents map[curationFolderKey]string
 }
 
 func (imp *curationImporter) apply(
@@ -412,7 +480,8 @@ func (imp *curationImporter) apply(
 		}
 	}
 	if entry.Folder != "" && target.project != "" {
-		if err := imp.folderMember(target, entry.Folder); err != nil {
+		exported := curationFolderKey{entry.Project, entry.Folder}
+		if err := imp.folderMember(target, exported); err != nil {
 			return err
 		}
 	}
@@ -470,11 +539,14 @@ func (imp *curationImporter) endMark(sessionID string, mark CurationEndMark) err
 	return nil
 }
 
-// folderMember puts a session into the named folder of its project here.
-// A session already in a folder of its project stays there. A membership in
-// another project's folder does not show in the sidebar, so the import
-// replaces it.
-func (imp *curationImporter) folderMember(target curationTarget, name string) error {
+// folderMember puts a session into the folder of its project here that has
+// the exported folder's name. A session already in a folder of its project
+// stays there. A membership in another project's folder does not show in
+// the sidebar, so the import replaces it.
+func (imp *curationImporter) folderMember(
+	target curationTarget, exported curationFolderKey,
+) error {
+	name := exported.name
 	var project, current string
 	err := imp.tx.QueryRowContext(imp.ctx, `
 		SELECT f.project, f.name
@@ -493,7 +565,7 @@ func (imp *curationImporter) folderMember(target curationTarget, name string) er
 	case err != nil && !errors.Is(err, sql.ErrNoRows):
 		return fmt.Errorf("reading folder of session %s: %w", target.id, err)
 	}
-	folderID, err := imp.folderID(curationFolderKey{target.project, name})
+	folderID, err := imp.folderID(target.project, exported)
 	if err != nil {
 		return err
 	}
@@ -511,9 +583,15 @@ func (imp *curationImporter) folderMember(target curationTarget, name string) er
 	return nil
 }
 
-// folderID returns the folder with the given project and name, creating it
-// when this archive has none.
-func (imp *curationImporter) folderID(key curationFolderKey) (int64, error) {
+// folderID returns the folder of project here that has the exported
+// folder's name, creating it when this archive has none. A created folder
+// goes inside the folder with its exported parent's name, created the same
+// way. ValidateCurationExport rules out parent cycles, so the recursion
+// ends.
+func (imp *curationImporter) folderID(
+	project string, exported curationFolderKey,
+) (int64, error) {
+	key := curationFolderKey{project, exported.name}
 	if id, ok := imp.folders[key]; ok {
 		return id, nil
 	}
@@ -523,9 +601,19 @@ func (imp *curationImporter) folderID(key curationFolderKey) (int64, error) {
 		key.project, key.name,
 	).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
+		var parentID *int64
+		if parent := imp.parents[exported]; parent != "" {
+			pid, parentErr := imp.folderID(
+				project, curationFolderKey{exported.project, parent},
+			)
+			if parentErr != nil {
+				return 0, parentErr
+			}
+			parentID = &pid
+		}
 		res, insertErr := imp.tx.ExecContext(imp.ctx,
-			`INSERT INTO session_folders (project, name) VALUES (?, ?)`,
-			key.project, key.name,
+			`INSERT INTO session_folders (project, name, parent_id) VALUES (?, ?, ?)`,
+			key.project, key.name, parentID,
 		)
 		if insertErr != nil {
 			return 0, fmt.Errorf("creating folder %q in %s: %w", key.name, key.project, insertErr)

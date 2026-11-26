@@ -5,9 +5,11 @@ import type {
   DbSessionFolder,
   DeleteApiV1SessionFoldersByIdPathParameters,
   PatchApiV1SessionFoldersByIdPathParameters,
+  PutApiV1SessionFoldersByIdParentPathParameters,
   PutApiV1SessionFoldersByIdSessionsPathParameters,
   SessionFolderCreateInputBody,
   SessionFolderMoveInputBody,
+  SessionFolderParentInputBody,
   SessionFolderRemoveInputBody,
   SessionFolderRenameInputBody,
   SessionFoldersResponse,
@@ -164,6 +166,47 @@ export const patchApiV1SessionFoldersById = async (
     method: "PATCH",
     headers: { "Content-Type": "application/json", ...getHeaders(options?.headers) },
     body: JSON.stringify(sessionFolderRenameInputBody),
+  });
+};
+
+export const getPutApiV1SessionFoldersByIdParentUrl = ({
+  id,
+}: PutApiV1SessionFoldersByIdParentPathParameters) => {
+  return `/api/v1/session-folders/${encodeURIComponent(String(id))}/parent`;
+};
+
+/**
+ * @summary Move session folder
+ */
+export const putApiV1SessionFoldersByIdParent = async (
+  { id }: PutApiV1SessionFoldersByIdParentPathParameters,
+  sessionFolderParentInputBody: SessionFolderParentInputBody,
+  options?: Parameters<typeof orvalFetch>[1],
+): Promise<DbSessionFolder> => {
+  const getHeaders = (
+    h?: NonNullable<RequestInit["headers"]>,
+  ): Record<string, string | readonly string[]> => {
+    if (!h) return {};
+    if (h instanceof Headers) return Object.fromEntries(h.entries());
+    if (Symbol.iterator in h) {
+      return Object.fromEntries(
+        Array.from(
+          h as Iterable<Iterable<string>>,
+          (entry) => Array.from(entry) as [string, string],
+        ),
+      );
+    }
+    const headers: Record<string, string | readonly string[]> = {};
+    for (const [name, value] of Object.entries<string | readonly string[] | undefined>(h)) {
+      if (value !== undefined) headers[name] = value;
+    }
+    return headers;
+  };
+  return orvalFetch<DbSessionFolder>(getPutApiV1SessionFoldersByIdParentUrl({ id }), {
+    ...options,
+    method: "PUT",
+    headers: { "Content-Type": "application/json", ...getHeaders(options?.headers) },
+    body: JSON.stringify(sessionFolderParentInputBody),
   });
 };
 

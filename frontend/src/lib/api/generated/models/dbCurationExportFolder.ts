@@ -5,6 +5,8 @@
 export interface DbCurationExportFolder {
   /** Folder name */
   name: string;
+  /** Name of the folder of the same project that holds this one; absent at the project's top level */
+  parent?: string;
   /** Project the folder belongs to */
   project: string;
 }
