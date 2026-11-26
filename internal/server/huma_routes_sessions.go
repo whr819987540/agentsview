@@ -1,6 +1,7 @@
 package server
 
 import (
+	"cmp"
 	"context"
 	"encoding/csv"
 	"errors"
@@ -13,6 +14,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"strings"
 	"time"
 
@@ -209,6 +211,14 @@ type sessionTreeNode struct {
 	// Leaves places where a fork or continuation leaves its parent, when
 	// the archive can place it.
 	Leaves *service.BranchLeave `json:"leaves,omitempty"`
+	// HandoffSources lists, oldest first, the transcripts this session
+	// continued from each time Claude Code moved it to the background.
+	// Claude Code lists the session once, so the tree shows them as part
+	// of this node, which holds their children too.
+	HandoffSources []db.Session `json:"handoff_sources,omitempty"`
+	// BeforeHandoff marks a node that branches off one of its parent
+	// node's handoff sources, so Leaves counts that transcript's turns.
+	BeforeHandoff bool `json:"before_handoff,omitempty"`
 }
 
 func (in *sessionFilterInput) listFilter() (service.ListFilter, error) {
@@ -497,6 +507,12 @@ func (s *Server) sessionTreeRoot(
 	return root, truncated, nil
 }
 
+// buildSessionTreeNode builds the node for session and its descendants.
+// When Claude Code moves a session to the background, the session carries
+// on in a new transcript and Claude Code lists only the newest one. The
+// node then stands for session and every transcript that took it over:
+// it shows the newest, lists the others as handoff sources, and holds the
+// children of all of them.
 func (s *Server) buildSessionTreeNode(
 	ctx context.Context,
 	session *db.Session,
@@ -508,29 +524,39 @@ func (s *Server) buildSessionTreeNode(
 	(*count)++
 	visited[session.ID] = true
 
-	node := sessionTreeNode{
-		Session:  *session,
-		Depth:    depth,
-		IsActive: session.ID == activeID,
-		Children: []sessionTreeNode{},
-	}
+	var leaves *service.BranchLeave
 	if depth > 0 {
 		if reader, ok := s.sessions.(service.BranchPointReader); ok {
-			leaves, err := reader.SessionLeave(ctx, session)
+			var err error
+			leaves, err = reader.SessionLeave(ctx, session)
 			if err != nil {
 				return sessionTreeNode{}, false, err
 			}
-			node.Leaves = leaves
+		}
+	}
+
+	chain, children, err := s.sessionTreeHandoffChain(ctx, session, visited)
+	if err != nil {
+		return sessionTreeNode{}, false, err
+	}
+	head := chain[len(chain)-1]
+	node := sessionTreeNode{
+		Session:  head,
+		Depth:    depth,
+		Children: []sessionTreeNode{},
+		Leaves:   leaves,
+	}
+	if len(chain) > 1 {
+		node.HandoffSources = chain[:len(chain)-1]
+	}
+	for _, member := range chain {
+		if member.ID == activeID {
+			node.IsActive = true
 		}
 	}
 	if *count >= sessionTreeMaxNodes {
 		node.IsLeaf = true
 		return node, true, nil
-	}
-
-	children, err := s.db.GetChildSessions(ctx, session.ID)
-	if err != nil {
-		return sessionTreeNode{}, false, err
 	}
 
 	truncated := false
@@ -553,12 +579,66 @@ func (s *Server) buildSessionTreeNode(
 		if childTruncated {
 			truncated = true
 		}
+		childNode.BeforeHandoff = child.ParentSessionID != nil &&
+			*child.ParentSessionID != head.ID
 		node.Children = append(node.Children, childNode)
 	}
 
 	node.IsLeaf = len(node.Children) == 0
 	node.IsBranchStart = len(node.Children) > 1
 	return node, truncated, nil
+}
+
+// sessionTreeHandoffChain follows the Claude Code background handoffs that
+// took over session. It returns session followed by each transcript that
+// took over the one before, and the other children of all of them in start
+// order. When a transcript was handed off more than once, the latest
+// handoff carries the chain and the earlier ones stay its children.
+func (s *Server) sessionTreeHandoffChain(
+	ctx context.Context,
+	session *db.Session,
+	visited map[string]bool,
+) ([]db.Session, []db.Session, error) {
+	chain := []db.Session{*session}
+	var children []db.Session
+	for {
+		current := chain[len(chain)-1]
+		kids, err := s.db.GetChildSessions(ctx, current.ID)
+		if err != nil {
+			return nil, nil, err
+		}
+		next := -1
+		for i := range kids {
+			if !db.IsClaudeHandoff(kids[i]) || visited[kids[i].ID] {
+				continue
+			}
+			if next < 0 || compareSessionStart(kids[i], kids[next]) > 0 {
+				next = i
+			}
+		}
+		for i := range kids {
+			if i != next {
+				children = append(children, kids[i])
+			}
+		}
+		if next < 0 {
+			break
+		}
+		visited[kids[next].ID] = true
+		chain = append(chain, kids[next])
+	}
+	if len(chain) > 1 {
+		slices.SortStableFunc(children, compareSessionStart)
+	}
+	return chain, children, nil
+}
+
+// compareSessionStart orders sessions by start time, then by ID.
+func compareSessionStart(a, b db.Session) int {
+	return cmp.Or(
+		cmp.Compare(derefString(a.StartedAt), derefString(b.StartedAt)),
+		cmp.Compare(a.ID, b.ID),
+	)
 }
 
 func (s *Server) humaGetMessages(

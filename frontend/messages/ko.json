@@ -503,6 +503,23 @@
     }
   ],
   "branch_leave_open_parent": "해당 위치 열기",
+  "branch_leave_handoff": "백그라운드로 옮겨져 {turn}번째 턴 이후부터 이어감",
+  "branch_leave_handoff_rewound": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=other": "백그라운드로 옮기기 전의 이후 턴 {countLabel}개는 되돌려졌습니다."
+      }
+    }
+  ],
+  "branch_leave_open_handoff": "옮기기 전 기록 열기",
   "branch_marker_fork": "여기서 분기됨: {title}",
   "branch_marker_continuation": "{title}에서 계속됨",
   "branch_marker_continuation_rewound": [
@@ -518,6 +535,23 @@
       ],
       "match": {
         "countPlural=other": "여기서부터 {title}에서 계속됨. 아래 이후 턴 {countLabel}개는 포함되지 않습니다."
+      }
+    }
+  ],
+  "branch_marker_handoff": "여기서 백그라운드로 옮겨져 {title}에서 계속됨",
+  "branch_marker_handoff_rewound": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "input title",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=other": "여기서 백그라운드로 옮겨져 {title}에서 계속됨. 아래 이후 턴 {countLabel}개는 되돌려졌습니다."
       }
     }
   ],
@@ -555,6 +589,7 @@
   "sidebar_fork_marker": "분기",
   "system_boundary_fork_source": "분기 알림",
   "session_tree_after_turn": "{turn}번째 턴 이후",
+  "session_tree_after_turn_before_background": "백그라운드로 옮기기 전 {turn}번째 턴 이후",
   "session_tree_turns_not_carried": [
     {
       "declarations": [
@@ -571,6 +606,7 @@
     }
   ],
   "session_tree_no_turns": "턴 없음",
+  "session_tree_moved_to_background": "백그라운드로 옮겨짐",
   "sidebar_session_count": [
     {
       "declarations": [

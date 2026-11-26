@@ -554,12 +554,23 @@ with their parent. Smaller ones fold into the main session, which shows the
 conversation as it continued after the rewind. Their prompts are kept as
 rewound prompts for the **Inputs** tree below.
 
-In the sidebar, a group of related sessions always starts with the original
+In the sidebar, a group of related sessions starts with the original
 session, as in the session tree. Expand the group to see its continuations,
 forks, and subagents below it. Forks carry a fork icon. A fork with no prompt
 of its own, such as one Claude Code's `/fork` created that you never used,
 stays out of the sidebar unless it is open; the session tree still lists it,
 dimmed.
+
+A Claude Code session you moved to the background appears once, as in Claude
+Code's own session list. Claude Code keeps the session going in a new
+transcript, and AgentsView lists that transcript in the original's place:
+it heads the sidebar group and the session tree, and the forks you made
+before and after the move sit below it. The transcript from before the move
+stays out of the sidebar unless it is open. The session tree shows it as part
+of the session, which it marks **moved to the background**, and forks made
+before the move say which turn they left after, counted in that earlier
+transcript. Other continuations, from Claude Code or another agent, still
+list below the original session.
 
 The conversation shows where it branched:
 
@@ -571,10 +582,12 @@ The conversation shows where it branched:
     **Show N inherited messages** to read them. Jumping or searching to one
     of them shows them too.
 - A continuation opens with a card that says which parent turn it continues
-    from and links there. When it picks up from an earlier turn, for example
-    because you rewound right after moving a Claude Code session to the
-    background, the card says how many of the parent's later turns it does
-    not carry.
+    from and links there. When it picks up from an earlier turn, the card
+    says how many of the parent's later turns it does not carry. For a
+    Claude Code session you moved to the background, the card says which
+    turn the session continues after and how many later turns from before
+    the move were rewound, and **Open the earlier transcript** opens the
+    transcript from before the move.
 
 The session tree also shows which parent turn each fork or continuation left
 after. These markers come from the local archive, so a server reading a

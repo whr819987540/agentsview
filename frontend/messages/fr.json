@@ -517,6 +517,24 @@
     }
   ],
   "branch_leave_open_parent": "Ouvrir à cet endroit",
+  "branch_leave_handoff": "Passée en arrière-plan, reprend après le tour {turn}",
+  "branch_leave_handoff_rewound": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "{countLabel} tour ultérieur d'avant le passage en arrière-plan a été abandonné par un retour en arrière.",
+        "countPlural=other": "{countLabel} tours ultérieurs d'avant le passage en arrière-plan ont été abandonnés par un retour en arrière."
+      }
+    }
+  ],
+  "branch_leave_open_handoff": "Ouvrir la transcription précédente",
   "branch_marker_fork": "Bifurcation ici : {title}",
   "branch_marker_continuation": "Poursuivie dans {title}",
   "branch_marker_continuation_rewound": [
@@ -533,6 +551,24 @@
       "match": {
         "countPlural=one": "Poursuivie dans {title} à partir d'ici. {countLabel} tour ultérieur ci-dessous n'en fait pas partie.",
         "countPlural=other": "Poursuivie dans {title} à partir d'ici. {countLabel} tours ultérieurs ci-dessous n'en font pas partie."
+      }
+    }
+  ],
+  "branch_marker_handoff": "Passée en arrière-plan ici, poursuivie dans {title}",
+  "branch_marker_handoff_rewound": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "input title",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "Passée en arrière-plan ici, poursuivie dans {title}. {countLabel} tour ultérieur ci-dessous a été abandonné par un retour en arrière.",
+        "countPlural=other": "Passée en arrière-plan ici, poursuivie dans {title}. {countLabel} tours ultérieurs ci-dessous ont été abandonnés par un retour en arrière."
       }
     }
   ],
@@ -572,6 +608,7 @@
   "sidebar_fork_marker": "Bifurcation",
   "system_boundary_fork_source": "Avis de bifurcation",
   "session_tree_after_turn": "après le tour {turn}",
+  "session_tree_after_turn_before_background": "après le tour {turn}, avant le passage en arrière-plan",
   "session_tree_turns_not_carried": [
     {
       "declarations": [
@@ -589,6 +626,7 @@
     }
   ],
   "session_tree_no_turns": "aucun tour",
+  "session_tree_moved_to_background": "passée en arrière-plan",
   "sidebar_session_count": [
     {
       "declarations": [

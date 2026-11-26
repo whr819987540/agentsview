@@ -52,6 +52,10 @@ type BranchLeave struct {
 	// TurnsAfter counts the parent's user prompts after the branch. For a
 	// continuation they are turns it does not carry on.
 	TurnsAfter int `json:"turns_after"`
+	// Handoff marks a continuation Claude Code started when it moved the
+	// session to the background. The parent is then the same session's
+	// earlier transcript, and turns after the branch were rewound.
+	Handoff bool `json:"handoff,omitempty"`
 }
 
 // BranchPoint is a place where the conversation left a session's transcript:
@@ -177,6 +181,7 @@ func (b *directBackend) SessionLeave(
 		AfterOrdinal:     placement.AfterOrdinal,
 		AfterTurn:        placement.AfterTurn,
 		TurnsAfter:       placement.TurnsAfter,
+		Handoff:          db.IsClaudeHandoff(*session),
 	}, nil
 }
 

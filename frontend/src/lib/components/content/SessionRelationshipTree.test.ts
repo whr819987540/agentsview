@@ -339,6 +339,118 @@ describe("SessionRelationshipTree", () => {
     expect(rootRow?.textContent).not.toContain("after turn");
   });
 
+  it("shows a session Claude Code moved to the background as one node", async () => {
+    const left = makeSession("left", { agent: "claude", relationship_type: "" });
+    const moved = makeSession("moved", {
+      agent: "claude",
+      relationship_type: "continuation",
+      session_kind: "bg",
+    });
+    mocks.fetchSessionTree.mockResolvedValue({
+      active_session_id: "left",
+      truncated: false,
+      root: {
+        session: moved,
+        handoff_sources: [left],
+        depth: 0,
+        is_active: true,
+        is_leaf: false,
+        is_branch_start: true,
+        children: [
+          {
+            session: makeSession("early-fork", {
+              agent: "claude",
+              relationship_type: "fork",
+            }),
+            leaves: {
+              parent: left,
+              relationship_type: "fork",
+              after_ordinal: 7,
+              after_turn: 4,
+              turns_after: 1,
+            },
+            before_handoff: true,
+            depth: 1,
+            is_active: false,
+            is_leaf: true,
+            is_branch_start: false,
+            children: [],
+          },
+          {
+            session: makeSession("late-fork", {
+              agent: "claude",
+              relationship_type: "fork",
+            }),
+            leaves: {
+              parent: moved,
+              relationship_type: "fork",
+              after_ordinal: 5,
+              after_turn: 3,
+              turns_after: 0,
+            },
+            depth: 1,
+            is_active: false,
+            is_leaf: true,
+            is_branch_start: false,
+            children: [],
+          },
+        ],
+      },
+    } satisfies SessionTreeResponse);
+
+    component = mount(SessionRelationshipTree, {
+      target: document.body,
+      props: { sessionId: "left" },
+    });
+    await flush();
+
+    expect(document.querySelector('a[href="/sessions/left"]')).toBeNull();
+    const rootRow = document.querySelector<HTMLAnchorElement>('a[href="/sessions/moved"]');
+    expect(rootRow?.classList.contains("active")).toBe(true);
+    expect(rootRow?.querySelector(".tree-rel")?.textContent?.trim()).toBe(
+      m.session_tree_relationship_root(),
+    );
+    expect(rootRow?.textContent).toContain("moved to the background");
+
+    const early = document.querySelector<HTMLAnchorElement>('a[href="/sessions/early-fork"]');
+    expect(early?.textContent).toContain(
+      "after turn 4, before the move to the background",
+    );
+    const late = document.querySelector<HTMLAnchorElement>('a[href="/sessions/late-fork"]');
+    expect(late?.textContent).toContain("after turn 3");
+    expect(late?.textContent).not.toContain("before the move");
+  });
+
+  it("offers the input view for a session moved to the background without forks", async () => {
+    const left = makeSession("left", { agent: "claude", relationship_type: "" });
+    mocks.fetchSessionTree.mockResolvedValue({
+      active_session_id: "moved",
+      truncated: false,
+      root: {
+        session: makeSession("moved", {
+          agent: "claude",
+          relationship_type: "continuation",
+          session_kind: "bg",
+        }),
+        handoff_sources: [left],
+        depth: 0,
+        is_active: true,
+        is_leaf: true,
+        is_branch_start: false,
+        children: [],
+      },
+    } satisfies SessionTreeResponse);
+
+    component = mount(SessionRelationshipTree, {
+      target: document.body,
+      props: { sessionId: "moved" },
+    });
+    await flush();
+
+    expect(document.querySelector(".session-tree")).not.toBeNull();
+    expect(document.querySelector(".tree-view-switch")).not.toBeNull();
+  });
+
   it("renders active, leaf, branch, and localized labels", async () => {
     mocks.fetchSessionTree.mockResolvedValue(makeTree());
 

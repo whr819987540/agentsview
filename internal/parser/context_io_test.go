@@ -102,7 +102,7 @@ func TestClaudeDAGPostProcessingStopsAfterContextCancellation(t *testing.T) {
 	}
 
 	_, err := parseDAG(
-		ctx, entries, resolved, "session", "project", "machine", "",
+		ctx, entries, resolved, "session", "project", "machine", "", "",
 		FileInfo{}, nil, time.Time{}, time.Time{}, claudeSessionMeta{},
 	)
 

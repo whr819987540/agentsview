@@ -441,6 +441,24 @@
     }
   ],
   "branch_leave_open_parent": "Open there",
+  "branch_leave_handoff": "Moved to the background, continuing after turn {turn}",
+  "branch_leave_handoff_rewound": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "{countLabel} later turn from before the move was rewound.",
+        "countPlural=other": "{countLabel} later turns from before the move were rewound."
+      }
+    }
+  ],
+  "branch_leave_open_handoff": "Open the earlier transcript",
   "branch_marker_fork": "Forked here: {title}",
   "branch_marker_continuation": "Continued in {title}",
   "branch_marker_continuation_rewound": [
@@ -457,6 +475,24 @@
       "match": {
         "countPlural=one": "Continued in {title} from here. The {countLabel} later turn below is not part of it.",
         "countPlural=other": "Continued in {title} from here. The {countLabel} later turns below are not part of it."
+      }
+    }
+  ],
+  "branch_marker_handoff": "Moved to the background here, continuing in {title}",
+  "branch_marker_handoff_rewound": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "input title",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "Moved to the background, continuing in {title} from here. The {countLabel} later turn below was rewound.",
+        "countPlural=other": "Moved to the background, continuing in {title} from here. The {countLabel} later turns below were rewound."
       }
     }
   ],
@@ -496,6 +532,7 @@
   "sidebar_fork_marker": "Fork",
   "system_boundary_fork_source": "Fork notice",
   "session_tree_after_turn": "after turn {turn}",
+  "session_tree_after_turn_before_background": "after turn {turn}, before the move to the background",
   "session_tree_turns_not_carried": [
     {
       "declarations": [
@@ -513,6 +550,7 @@
     }
   ],
   "session_tree_no_turns": "no turns",
+  "session_tree_moved_to_background": "moved to the background",
   "sidebar_session_count": [
     {
       "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],

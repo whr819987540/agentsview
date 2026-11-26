@@ -370,12 +370,12 @@ func TestClaudeBackgroundForkEqualBgCopiesElectKeeperByStem(t *testing.T) {
 	}
 }
 
-func TestClaudeBackgroundForkBoundaryRetryFailsOpen(t *testing.T) {
+func TestClaudeBackgroundForkBoundaryRetryKeepsLatestReply(t *testing.T) {
 	t.Parallel()
-	// Two retained entries parented at the replay leaf (a retry right
-	// after the handoff) cannot be re-rooted without collapsing the
-	// retry branches into a linear merge. The trim fails open so the
-	// intact DAG keeps retry semantics: only the latest branch shows.
+	// Two of the fork's own entries hang off the replay leaf: a retry
+	// right after the handoff. The replayed head stays in the DAG, so
+	// branch selection keeps only the latest reply, and the fork is
+	// still linked to the parent it replays.
 	forkContent := strings.Join([]string{
 		lineageUserLine("u1", "", "2026-01-01T10:00:00Z", "fork-2222", "bg", "first question"),
 		lineageAssistantLine("a1", "u1", "2026-01-01T10:00:05Z", "fork-2222", "bg", "msg_01", "first answer", 20),
@@ -394,14 +394,16 @@ func TestClaudeBackgroundForkBoundaryRetryFailsOpen(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, results, 1)
 	assert.Empty(t, excluded)
-	assert.Empty(t, results[0].Session.ParentSessionID)
+	sess := results[0].Session
+	assert.Equal(t, "orig-1111", sess.ParentSessionID)
+	assert.Equal(t, RelContinuation, sess.RelationshipType)
+	require.NotNil(t, sess.ForkPointUUID)
+	assert.Equal(t, "a1", *sess.ForkPointUUID)
 	var contents []string
 	for _, m := range results[0].Messages {
 		contents = append(contents, m.Content)
 	}
-	assert.Contains(t, contents, "first question")
-	assert.Contains(t, contents, "final answer")
-	assert.NotContains(t, contents, "abandoned retry")
+	assert.Equal(t, []string{"final answer"}, contents)
 }
 
 func TestClaudeBackgroundForkKeepsQueuedCommandWithoutNewChainEntry(t *testing.T) {
