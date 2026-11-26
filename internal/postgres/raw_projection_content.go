@@ -185,10 +185,11 @@ func rawCanonicalValue(v reflect.Value, field string) (any, error) {
 		for i := range v.NumField() {
 			f := v.Type().Field(i)
 			// This transient projection marker adds no content to the existing
-			// normalized-content-v1 representation. Rewound inputs are
-			// SQLite-only and no PostgreSQL store keeps them.
+			// normalized-content-v1 representation. Rewound inputs and
+			// fork points are SQLite-only and no PostgreSQL store keeps
+			// them.
 			if !f.IsExported() || f.Name == "UsageAutomationProjected" ||
-				f.Name == "RewoundInputs" {
+				f.Name == "RewoundInputs" || f.Name == "ForkPointUUID" {
 				continue
 			}
 			value, err := rawCanonicalValue(v.Field(i), f.Name)

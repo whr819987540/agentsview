@@ -578,7 +578,12 @@ CREATE INDEX IF NOT EXISTS idx_provider_freshness_updated_at
 // used to drop with the branch, are stored in sessions.rewound_inputs for the
 // input tree. Re-parse unchanged Claude sources so sessions rewound before
 // the upgrade show them.)
-const dataVersion = 127
+// (128: Claude /fork children link to their parent as forks, a background
+// handoff that a later fork extends is no longer mistaken for that fork's
+// replay and deleted, and sessions.fork_point_uuid records where a fork or
+// continuation leaves its parent. Re-parse unchanged Claude sources so
+// existing families gain the corrected links and fork points.)
+const dataVersion = 128
 
 const tokenCoverageRepairStatsKey = "token_coverage_repair_v1"
 
@@ -2673,6 +2678,12 @@ func schemaColumnMigrations() []schemaColumnMigration {
 			// JSON array (NULL = not reported by the parser).
 			"sessions", "rewound_inputs",
 			"ALTER TABLE sessions ADD COLUMN rewound_inputs TEXT",
+		},
+		{
+			// Source UUID of the last parent message the session
+			// inherits ('' = none, NULL = not reported by the parser).
+			"sessions", "fork_point_uuid",
+			"ALTER TABLE sessions ADD COLUMN fork_point_uuid TEXT",
 		},
 		{
 			// Marks made before branch marks existed all cover a row.

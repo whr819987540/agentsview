@@ -655,15 +655,14 @@ func (b *directBackend) forkContext(
 		return current, currentMsgs, nil, nil
 	}
 
-	boundary, hasBoundary := forkBoundaryTime(currentMsgs, current.StartedAt)
 	contextMsgs, err := ancestorMessages(
 		ctx,
 		src,
 		*current.ParentSessionID,
-		boundary,
-		hasBoundary,
+		b.leaveBoundary(ctx, current, currentMsgs),
 		map[string]bool{id: true},
 		isForkWithParent,
+		b.forkPoint,
 	)
 	if err != nil {
 		return nil, nil, nil, err
@@ -722,17 +721,81 @@ func truncateForkContextToReplay(
 	return contextMsgs[:len(replay)]
 }
 
-// ancestorMessages returns a session's messages before a boundary, after
-// those of its ancestors for as long as follow accepts the link to the next
-// one up.
+// forkBoundary marks where a session leaves its parent. The parent
+// messages it inherits run through the one whose source UUID is the
+// session's fork point. When the point is unknown or is not among the
+// parent's messages, they are the ones before the session's first
+// timestamp.
+type forkBoundary struct {
+	pointUUID string
+	before    time.Time
+	hasBefore bool
+}
+
+// inherited returns the part of a parent's messages, in ordinal order, that
+// the boundary keeps.
+func (fb forkBoundary) inherited(msgs []db.Message) []db.Message {
+	if fb.pointUUID != "" {
+		for i, m := range msgs {
+			if m.SourceUUID == fb.pointUUID {
+				return msgs[:i+1]
+			}
+		}
+	}
+	return messagesBefore(msgs, fb.before, fb.hasBefore)
+}
+
+// forkPointLookup returns a session's recorded fork point, or "" when the
+// store does not record one.
+type forkPointLookup func(ctx context.Context, id string) (string, error)
+
+// forkPoint reads a fork point from the local archive. Replicas and
+// mirrors do not carry fork points, so their reads fall back to
+// timestamps.
+func (b *directBackend) forkPoint(ctx context.Context, id string) (string, error) {
+	if b.local == nil {
+		return "", nil
+	}
+	return b.local.GetSessionForkPoint(ctx, id)
+}
+
+// leaveBoundary returns where session leaves its parent, given the
+// session's own messages on the path being built.
+func (b *directBackend) leaveBoundary(
+	ctx context.Context, session *db.Session, msgs []db.Message,
+) forkBoundary {
+	return sessionLeaveBoundary(ctx, session, msgs, b.forkPoint)
+}
+
+func sessionLeaveBoundary(
+	ctx context.Context,
+	session *db.Session,
+	msgs []db.Message,
+	forkPoint forkPointLookup,
+) forkBoundary {
+	before, hasBefore := forkBoundaryTime(msgs, session.StartedAt)
+	fb := forkBoundary{before: before, hasBefore: hasBefore}
+	if forkPoint != nil {
+		// A failed lookup only costs precision: the timestamp
+		// boundary still applies.
+		if point, err := forkPoint(ctx, session.ID); err == nil {
+			fb.pointUUID = point
+		}
+	}
+	return fb
+}
+
+// ancestorMessages returns the messages of sessionID that a boundary
+// keeps, after those of its ancestors for as long as follow accepts the
+// link to the next one up.
 func ancestorMessages(
 	ctx context.Context,
 	src forkMessageSource,
 	sessionID string,
-	before time.Time,
-	hasBefore bool,
+	boundary forkBoundary,
 	visited map[string]bool,
 	follow func(*db.Session) bool,
+	forkPoint forkPointLookup,
 ) ([]db.Message, error) {
 	if visited[sessionID] {
 		return nil, nil
@@ -747,20 +810,19 @@ func ancestorMessages(
 	if err != nil {
 		return nil, err
 	}
-	msgs = messagesBefore(msgs, before, hasBefore)
+	msgs = boundary.inherited(msgs)
 
 	if !follow(session) {
 		return msgs, nil
 	}
-	parentBoundary, parentHasBoundary := forkBoundaryTime(msgs, session.StartedAt)
 	parentMsgs, err := ancestorMessages(
 		ctx,
 		src,
 		*session.ParentSessionID,
-		parentBoundary,
-		parentHasBoundary,
+		sessionLeaveBoundary(ctx, session, msgs, forkPoint),
 		visited,
 		follow,
+		forkPoint,
 	)
 	if err != nil {
 		return nil, err

@@ -549,10 +549,12 @@ func claudeParseFile(
 	// from. The replayed prefix was dropped above; the relationship
 	// makes the session tree show the branch and lets the fork
 	// context view prepend the shared history from the parent.
+	mainForkPoint := ""
 	if forkedFromSID != "" && forkedFromSID != sessionID &&
 		len(results) > 0 {
 		results[0].Session.ParentSessionID = forkedFromSID
 		results[0].Session.RelationshipType = RelFork
+		mainForkPoint = claudeBranchForkPoint(entries, parentOf, chunkAlias)
 	}
 
 	// Splice queued_command attachments into the main session
@@ -568,11 +570,25 @@ func claudeParseFile(
 		}
 	}
 
-	// An established background-fork lineage is a continuation of the
-	// parent transcript. In-file DAG forks (results[1:]) keep their
-	// fork relationship to the main branch.
+	// An established background-fork lineage links the transcript to the
+	// one it replays: a /fork child as a fork, a handoff as a
+	// continuation. In-file DAG forks (results[1:]) keep their fork
+	// relationship to the main branch.
 	if lineage != nil && len(results) > 0 {
-		results[0].Session.RelationshipType = RelContinuation
+		results[0].Session.RelationshipType = lineage.relationship
+		mainForkPoint = lineage.forkPointUUID
+	}
+	// A full parse always reports the fork point, empty when the
+	// session inherits nothing from a parent transcript.
+	for i := range results {
+		if results[i].Session.ForkPointUUID != nil {
+			continue
+		}
+		forkPoint := ""
+		if i == 0 {
+			forkPoint = mainForkPoint
+		}
+		results[i].Session.ForkPointUUID = &forkPoint
 	}
 
 	// Classify termination status for each result. All forks
@@ -1638,6 +1654,46 @@ func resolveClaudeDAGParents(
 	return resolved, true
 }
 
+// claudeBranchForkPoint returns the replayed entry that a /branch
+// transcript's own records hang off: the last parent message the branch
+// inherits. Replayed entries are the ones stamped with forkedFrom. The walk
+// goes up through non-message records and maps an absorbed streaming chunk
+// onto the merged message that carries it. It returns "" when no own entry
+// hangs off the replay.
+func claudeBranchForkPoint(
+	entries []dagEntry,
+	parentOf map[string]string,
+	chunkAlias map[string]string,
+) string {
+	replayed := make(map[string]struct{})
+	for _, e := range entries {
+		if e.replayed {
+			replayed[e.uuid] = struct{}{}
+		}
+	}
+	if len(replayed) == 0 {
+		return ""
+	}
+	maxSteps := len(parentOf) + len(chunkAlias) + 1
+	for _, e := range entries {
+		if e.replayed {
+			continue
+		}
+		p := e.parentUuid
+		for steps := 0; p != "" && steps <= maxSteps; steps++ {
+			if a, ok := chunkAlias[p]; ok {
+				p = a
+			}
+			if _, ok := replayed[p]; ok {
+				return p
+			}
+			p = parentOf[p]
+		}
+		return ""
+	}
+	return ""
+}
+
 // parseDAG builds a parent->children adjacency map from resolved
 // parent references and walks the tree. The main session follows
 // the live branch -- at every fork point, the child whose subtree
@@ -1884,6 +1940,9 @@ func parseDAG(
 		sid := sessionID
 		pSID := b.parentID
 		relType := RelationshipType("")
+		// Only an in-file fork's point is known here; the caller fills
+		// in the main session's.
+		var forkPoint string
 
 		if i > 0 {
 			// Fork session: ID derived from first entry's uuid,
@@ -1891,6 +1950,7 @@ func parseDAG(
 			firstEntry := entries[b.indices[0]]
 			sid = sessionID + "-" + firstEntry.uuid
 			relType = RelFork
+			forkPoint = resolvedParents[b.indices[0]]
 		}
 
 		linear := false
@@ -1910,6 +1970,9 @@ func parseDAG(
 			File:              fileInfo,
 			ClaudeLinearParse: &linear,
 			RewoundInputs:     claudeRewoundInputsInFileOrder(rewound[sid]),
+		}
+		if i > 0 {
+			sess.ForkPointUUID = &forkPoint
 		}
 		meta.applyTo(&sess)
 		if err := accumulateMessageTokenUsageContext(

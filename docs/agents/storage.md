@@ -376,6 +376,28 @@ push no copy, so the input tree they serve has no rewound branches. This is an
 active exception that keeps the first version to the local archive. Remove it
 by adding the column to each replica's session schema and push.
 
+### Fork points
+
+`sessions.fork_point_uuid` holds the source UUID of the last parent message a
+session inherits: where a fork branched off its parent, or where a
+continuation took over. A background handoff that the user rewound can take
+over at an earlier turn than its parent's last one, so timestamps alone cannot
+place it. Fork context and the input tree cut the parent's messages at this
+message, and fall back to the session's first timestamp when the column is
+empty or names no parent message. Read it through `DB.GetSessionForkPoint`;
+session reads do not load it.
+
+- A full Claude parse always writes the column, with `''` when the session
+  inherits nothing. Incremental and non-parse writers pass NULL, and the upsert
+  keeps the stored value.
+- Writes sanitize it like other parser text. Usage-only archives keep it,
+  because it holds no prompt text.
+- A full resync copies it with orphaned and trashed sessions.
+
+Only the SQLite archive stores the column, which is an active exception like
+rewound inputs: replicas and mirrors serve fork context cut by timestamp.
+Remove it by adding the column to each replica's session schema and push.
+
 ### Usage cache divergence
 
 SQLite's aggregate usage APIs read timezone-specific daily rollups from a

@@ -1479,6 +1479,12 @@ type ParsedSession struct {
 	// them, so a stored list is kept; a full Claude parse always sets it,
 	// empty when the transcript has none.
 	RewoundInputs []ParsedRewoundInput
+	// ForkPointUUID is the source UUID of the last parent message this
+	// session inherits: where a fork branched off its parent, or where a
+	// continuation took over. Nil means the parse does not report it, so a
+	// stored value is kept; a full Claude parse always sets it, empty when
+	// the session has no parent transcript or the point is unknown.
+	ForkPointUUID *string
 	// ClaudeSubagentSources records the files that contributed to this full
 	// parse. Sync keeps this local provenance with the archived messages.
 	ClaudeSubagentSources []string

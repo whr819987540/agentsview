@@ -1809,6 +1809,9 @@ func orphanSessionCols(ctx context.Context, tx *sql.Tx) string {
 		// A session copied because its source is gone keeps the
 		// rewound inputs no parse can recover.
 		"rewound_inputs",
+		// Likewise the fork point, which only the source transcripts
+		// can re-derive.
+		"fork_point_uuid",
 	} {
 		if oldDBHasColumn(ctx, tx, "sessions", c) {
 			cols = append(cols, c)

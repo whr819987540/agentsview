@@ -342,6 +342,7 @@ func SanitizeSession(s *Session) ValidationStats {
 	sanitizeStringPtrField(s.FirstMessage, &stats)
 	sanitizeStringPtrField(s.SessionName, &stats)
 	sanitizeStringPtrField(s.TerminationStatus, &stats)
+	sanitizeStringPtrField(s.ForkPointUUID, &stats)
 	for i := range s.RewoundInputs {
 		input := &s.RewoundInputs[i]
 		sanitizeStringField(&input.SourceUUID, &stats)

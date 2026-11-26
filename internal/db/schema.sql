@@ -33,6 +33,11 @@ CREATE TABLE IF NOT EXISTS sessions (
     -- parser does not report them. SQLite-only, like the columns above:
     -- replicas and mirrors do not carry it.
     rewound_inputs TEXT,
+    -- Source UUID of the last parent message this session inherits: where
+    -- a fork branched off, or where a continuation took over. '' when a
+    -- parse found none, NULL when the parser does not report it.
+    -- SQLite-only, like the columns above.
+    fork_point_uuid TEXT,
     file_inode  INTEGER,
     file_device INTEGER,
     file_hash   TEXT,

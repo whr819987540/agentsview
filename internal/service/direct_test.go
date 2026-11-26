@@ -1330,6 +1330,52 @@ func TestDirectBackend_Messages_IncludesForkContext(t *testing.T) {
 	assert.Equal(t, 0, noContext.Messages[0].Ordinal)
 }
 
+// A fork's recorded fork point ends its inherited context, even when later
+// parent messages predate the fork's first message.
+func TestDirectBackend_Messages_ForkContextEndsAtForkPoint(t *testing.T) {
+	t.Parallel()
+	svc, env := newDirectTestSvc(t)
+	ctx := t.Context()
+	parentID := "parent-session"
+	childID := "child-session"
+	dbtest.SeedSession(t, env.db, parentID, "p1", dbtest.WithMessageCount(4))
+	dbtest.SeedSession(t, env.db, childID, "p1",
+		dbtest.WithMessageCount(1),
+		func(s *db.Session) {
+			s.ParentSessionID = &parentID
+			s.RelationshipType = "fork"
+			s.StartedAt = new("2026-07-01T11:00:00Z")
+			s.ForkPointUUID = new("p-a1")
+		})
+	msg := func(sid string, ordinal int, role, content, ts, uuid string) db.Message {
+		return db.Message{
+			SessionID: sid, Ordinal: ordinal, Role: role,
+			Content: content, ContentLength: len(content),
+			Timestamp: ts, SourceUUID: uuid,
+		}
+	}
+	dbtest.SeedMessages(t, env.db,
+		msg(parentID, 0, "user", "shared question", "2026-07-01T10:00:00Z", "p-u0"),
+		msg(parentID, 1, "assistant", "shared answer", "2026-07-01T10:01:00Z", "p-a1"),
+		msg(parentID, 2, "user", "parent only", "2026-07-01T10:10:00Z", "p-u2"),
+		msg(parentID, 3, "assistant", "parent only answer", "2026-07-01T10:11:00Z", "p-a3"),
+		msg(childID, 0, "user", "child question", "2026-07-01T11:00:00Z", "c-u0"),
+	)
+
+	list, err := svc.Messages(ctx, childID, service.MessageFilter{
+		IncludeForkContext: true,
+		Limit:              10,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, list)
+	assert.Equal(t, []string{
+		"shared question",
+		"shared answer",
+		parentID,
+		"child question",
+	}, messageContents(list.Messages))
+}
+
 func TestDirectBackend_Messages_CodexForkContextUsesReplayRollback(
 	t *testing.T,
 ) {
