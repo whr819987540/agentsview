@@ -333,6 +333,30 @@ describe("inForkFamily", () => {
     expect(inForkFamily(continued, "helper")).toBe(false);
   });
 
+  // A session Claude Code moved to the background is one node that also
+  // stands for the transcript it left.
+  function handoff(
+    id: string,
+    sources: string[],
+    children: SessionTreeNode[] = [],
+  ): SessionTreeNode {
+    return {
+      ...treeNode(id, "continuation", children),
+      handoff_sources: sources.map((source) => session(source)),
+    };
+  }
+
+  it("finds the family of a session moved to the background, from either transcript", () => {
+    const moved = handoff("moved", ["left"]);
+    expect(inForkFamily(moved, "moved")).toBe(true);
+    expect(inForkFamily(moved, "left")).toBe(true);
+  });
+
+  it("finds the family of a transcript a handoff below the root left", () => {
+    const root = treeNode("root", undefined, [handoff("moved", ["left"])]);
+    expect(inForkFamily(root, "left")).toBe(true);
+  });
+
   it("finds the family of every session in a chain of continuations", () => {
     // first ─ second (continuation) ─ third (continuation)
     const chain = treeNode("first", undefined, [

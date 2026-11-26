@@ -50,14 +50,14 @@
     href={router.buildSessionHref(leave.parent.id, params)}
     onclick={open}
   >
-    {m.branch_leave_open_parent()}
+    {leave.handoff ? m.branch_leave_open_handoff() : m.branch_leave_open_parent()}
   </a>
   {#if skipped > 0}
+    {@const counts = { count: skipped, countLabel: formatNumber(skipped) }}
     <span class="leave-skipped">
-      {m.branch_leave_skipped({
-        count: skipped,
-        countLabel: formatNumber(skipped),
-      })}
+      {leave.handoff
+        ? m.branch_leave_handoff_rewound(counts)
+        : m.branch_leave_skipped(counts)}
     </span>
   {/if}
 </div>

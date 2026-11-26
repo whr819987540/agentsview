@@ -9,6 +9,7 @@
   import { router } from "../../stores/router.svelte.js";
   import { branchSessionTitle } from "../../utils/branch-points.js";
   import { formatNumber } from "../../utils/format.js";
+  import { isClaudeHandoff } from "../../utils/session-primary.js";
 
   interface Props {
     point: BranchPoint;
@@ -27,14 +28,23 @@
     switch (point.kind) {
       case "fork":
         return m.branch_marker_fork({ title });
-      case "continuation":
+      case "continuation": {
+        const counts = {
+          title,
+          count: point.turns_after,
+          countLabel: formatNumber(point.turns_after),
+        };
+        // Claude Code moved this session to the background here and kept
+        // it going in the new transcript.
+        if (point.session && isClaudeHandoff(point.session)) {
+          return point.turns_after > 0
+            ? m.branch_marker_handoff_rewound(counts)
+            : m.branch_marker_handoff({ title });
+        }
         return point.turns_after > 0
-          ? m.branch_marker_continuation_rewound({
-              title,
-              count: point.turns_after,
-              countLabel: formatNumber(point.turns_after),
-            })
+          ? m.branch_marker_continuation_rewound(counts)
           : m.branch_marker_continuation({ title });
+      }
       default:
         return m.branch_marker_rewind({
           count: inputs.length,

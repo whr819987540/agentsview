@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -88,6 +89,24 @@ func ptrContinuedIn(ts, sid, childID string) string {
 	return fmt.Sprintf(
 		`{"type":"continued-in","timestamp":%q,"sessionId":%q,"continuedInSessionId":%q}`,
 		ts, sid, childID,
+	)
+}
+
+// ptrTurnEnd is the turn_duration record written after each reply. The next
+// prompt parents to it, and so does a prompt sent after a rewind to that turn.
+func ptrTurnEnd(uuid, parent, ts, sid, kind string) string {
+	return fmt.Sprintf(
+		`{"parentUuid":%q,"type":"system","subtype":"turn_duration","durationMs":1000,"timestamp":%q,"uuid":%q,"isMeta":false,%s"sessionId":%q}`,
+		parent, ts, uuid, ptrKind(kind), sid,
+	)
+}
+
+// ptrAttachment is an attachment record that carries a uuid, such as the
+// session_cron_carry record a handoff writes before its first prompt.
+func ptrAttachment(uuid, parent, ts, sid, kind, attachmentType string) string {
+	return fmt.Sprintf(
+		`{"parentUuid":%q,"type":"attachment","attachment":{"type":%q},"timestamp":%q,"uuid":%q,%s"sessionId":%q}`,
+		parent, attachmentType, ts, uuid, ptrKind(kind), sid,
 	)
 }
 
@@ -215,12 +234,18 @@ func ptrFamilyWith(t *testing.T, opts ptrFamilyOpts) map[string]string {
 	return paths
 }
 
+// userContents returns the prompts among msgs, skipping system rows and
+// the records that only carry tool results.
 func userContents(msgs []ParsedMessage) []string {
 	var out []string
 	for _, m := range msgs {
-		if m.Role == RoleUser && !m.IsSystem {
-			out = append(out, m.Content)
+		if m.Role != RoleUser || m.IsSystem {
+			continue
 		}
+		if m.Content == "" && len(m.ToolResults) > 0 {
+			continue
+		}
+		out = append(out, m.Content)
 	}
 	return out
 }
@@ -358,4 +383,316 @@ func TestClaudeHandoffResolvesFromEachSignalAlone(t *testing.T) {
 			assert.Equal(t, RelFork, forkResults[0].Session.RelationshipType)
 		})
 	}
+}
+
+const (
+	rwOrigID     = "c1c1c1c1-0000-4000-8000-000000000011"
+	rwForkID     = "c2c2c2c2-0000-4000-8000-000000000012"
+	rwForkForkID = "c3c3c3c3-0000-4000-8000-000000000013"
+)
+
+// rwHistory is the three turns orig wrote, as orig wrote them or as a fork
+// copied them.
+func rwHistory(sid, kind string) []string {
+	return []string{
+		ptrUser("u1", "", "2026-11-25T01:50:00Z", sid, kind, "first question"),
+		ptrAssistant("a1", "u1", "2026-11-25T01:51:00Z", sid, kind, "msg_1", "first answer"),
+		ptrTurnEnd("s1", "a1", "2026-11-25T01:51:01Z", sid, kind),
+		ptrUser("u2", "s1", "2026-11-25T02:00:00Z", sid, kind, "second question"),
+		ptrAssistant("a2", "u2", "2026-11-25T02:10:00Z", sid, kind, "msg_2", "second answer"),
+		ptrTurnEnd("s2", "a2", "2026-11-25T02:10:01Z", sid, kind),
+		ptrUser("u3", "s2", "2026-11-25T02:20:00Z", sid, kind, "third question"),
+		ptrAssistant("a3", "u3", "2026-11-25T02:30:00Z", sid, kind, "msg_3", "third answer"),
+		ptrTurnEnd("s3", "a3", "2026-11-25T02:30:01Z", sid, kind),
+	}
+}
+
+// rwForkTurn is the turn fork wrote before it was forked again, as fork wrote
+// it or as forkfork copied it.
+func rwForkTurn(sid string) []string {
+	return []string{
+		ptrUser("u4", "fs1", "2026-11-26T02:24:00Z", sid, "bg", "abandoned question"),
+		ptrAssistant("a4", "u4", "2026-11-26T02:27:00Z", sid, "bg", "msg_4", "abandoned answer"),
+		ptrTurnEnd("s4", "a4", "2026-11-26T02:27:01Z", sid, "bg"),
+	}
+}
+
+// ptrRewoundForkFamily writes the family from a real report:
+//
+//	orig      interactive, three turns, then /fork
+//	fork      /fork of orig after its third turn: one turn of its own, then
+//	          /fork again, then a rewind to the end of orig's second turn and
+//	          two new turns
+//	forkfork  /fork of fork before the rewind, never used
+//
+// The rewind lands in the history fork copied from orig, so two branches of
+// fork's own hang off that copy: the one its fork notice starts and the one
+// the rewind starts.
+func ptrRewoundForkFamily(t *testing.T) map[string]string {
+	t.Helper()
+	const (
+		o  = rwOrigID
+		f  = rwForkID
+		ff = rwForkForkID
+	)
+	orig := joinLines(
+		rwHistory(o, ""),
+		ptrForkCommand("oc1", "oc2", "oc3", "s3", "2026-11-25T02:31:00Z", o, "", f),
+	)
+	// A fork's queued notice lands before the copied history, and the
+	// notice itself right after it.
+	notice := ptrForkSource("fs1", "s3", "2026-11-25T02:31:01Z", f)
+	fork := joinLines(
+		notice[:1],
+		rwHistory(f, "bg"),
+		notice[1:],
+		[]string{ptrUUIDLess("last-prompt", "", f)},
+		rwForkTurn(f),
+		ptrForkCommand("fc1", "fc2", "fc3", "s4", "2026-11-26T02:28:28Z", f, "bg", ff),
+		[]string{
+			ptrUUIDLess("file-history-snapshot", "", f),
+			ptrUser("u5", "s2", "2026-11-26T02:28:40Z", f, "bg", "rewound question"),
+			ptrAssistant("a5", "u5", "2026-11-26T02:32:00Z", f, "bg", "msg_5", "rewound answer"),
+			ptrTurnEnd("s5", "a5", "2026-11-26T02:32:01Z", f, "bg"),
+			ptrUser("u6", "s5", "2026-11-26T02:40:00Z", f, "bg", "follow-up question"),
+			ptrAssistant("a6", "u6", "2026-11-26T02:41:00Z", f, "bg", "msg_6", "follow-up answer"),
+		},
+	)
+	ffNotice := ptrForkSource("fs2", "s4", "2026-11-26T02:28:29Z", ff)
+	forkFork := joinLines(
+		ffNotice[:1],
+		rwHistory(ff, "bg"),
+		ptrForkSource("fs1", "s3", "2026-11-25T02:31:01Z", ff)[1:],
+		rwForkTurn(ff),
+		ffNotice[1:],
+		[]string{ptrUUIDLess("last-prompt", "", ff)},
+	)
+
+	dir := t.TempDir()
+	paths := map[string]string{}
+	for id, content := range map[string]string{o: orig, f: fork, ff: forkFork} {
+		path := filepath.Join(dir, id+".jsonl")
+		require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+		paths[id] = path
+	}
+	return paths
+}
+
+func TestClaudeForkRewoundIntoCopiedHistory(t *testing.T) {
+	t.Parallel()
+	paths := ptrRewoundForkFamily(t)
+
+	tests := []struct {
+		name         string
+		id           string
+		wantParent   string
+		wantForkAt   string
+		wantPrompts  []string
+		wantMessages int
+		wantRewound  []ParsedRewoundInput
+	}{
+		{
+			// The rewind kept orig's first two turns, so fork inherits up
+			// to the end of the second. The turn it abandoned is its own
+			// rewound input; orig's third turn stays orig's.
+			name:         "fork rewound into the copied history",
+			id:           rwForkID,
+			wantParent:   rwOrigID,
+			wantForkAt:   "a2",
+			wantPrompts:  []string{"rewound question", "follow-up question"},
+			wantMessages: 4,
+			wantRewound: []ParsedRewoundInput{{
+				SourceUUID: "u4",
+				Timestamp:  time.Date(2026, 11, 26, 2, 24, 0, 0, time.UTC),
+				Content:    "abandoned question",
+			}},
+		},
+		{
+			name:         "fork of the fork made before the rewind",
+			id:           rwForkForkID,
+			wantParent:   rwForkID,
+			wantForkAt:   "a4",
+			wantPrompts:  nil,
+			wantMessages: 1,
+			wantRewound:  []ParsedRewoundInput{},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			results, excluded, err := claudeParseFile(
+				paths[tt.id], "my_app", "local",
+				claudeParseOptions{siblingLineage: true},
+			)
+			require.NoError(t, err)
+			assert.Empty(t, excluded)
+			require.Len(t, results, 1)
+			sess := results[0].Session
+			assert.Equal(t, tt.wantParent, sess.ParentSessionID)
+			assert.Equal(t, RelFork, sess.RelationshipType)
+			require.NotNil(t, sess.ForkPointUUID)
+			assert.Equal(t, tt.wantForkAt, *sess.ForkPointUUID)
+			assert.Equal(t, tt.wantPrompts, userContents(results[0].Messages))
+			assert.Len(t, results[0].Messages, tt.wantMessages)
+			assert.Equal(t, tt.wantRewound, sess.RewoundInputs)
+		})
+	}
+}
+
+func TestClaudeForkRewoundIntoCopiedHistoryLeavesOriginalAlone(t *testing.T) {
+	t.Parallel()
+	paths := ptrRewoundForkFamily(t)
+	results, _, err := claudeParseFile(
+		paths[rwOrigID], "my_app", "local",
+		claudeParseOptions{siblingLineage: true},
+	)
+	require.NoError(t, err)
+	require.Len(t, results, 1)
+	assert.Empty(t, results[0].Session.ParentSessionID)
+	assert.Equal(t,
+		[]string{"first question", "second question", "third question"},
+		userContents(results[0].Messages),
+	)
+}
+
+// A handoff writes a session_cron_carry attachment before its first prompt,
+// so its own records reach the copied history only through that attachment.
+// The session must still be read as a branching conversation: here a rewind
+// replaced a prompt, and one reply ran two tool calls in parallel.
+func TestClaudeHandoffOpeningWithAttachmentKeepsBranches(t *testing.T) {
+	t.Parallel()
+	const (
+		o = ptrOrigID
+		c = ptrContID
+	)
+	orig := joinLines([]string{
+		ptrUser("u1", "", "2026-11-25T01:50:00Z", o, "", "first question"),
+		ptrAssistant("a1", "u1", "2026-11-25T01:51:00Z", o, "", "msg_1", "first answer"),
+		ptrTurnEnd("s1", "a1", "2026-11-25T01:51:01Z", o, ""),
+		ptrUUIDLess("last-prompt", "", o),
+		ptrContinuedIn("2026-11-25T02:53:20Z", o, c),
+	})
+	cont := joinLines([]string{
+		ptrUser("u1", "", "2026-11-25T01:50:00Z", c, "bg", "first question"),
+		ptrAssistant("a1", "u1", "2026-11-25T01:51:00Z", c, "bg", "msg_1", "first answer"),
+		ptrTurnEnd("s1", "a1", "2026-11-25T01:51:01Z", c, "bg"),
+		ptrUUIDLess("last-prompt", "", c),
+		ptrAttachment("cc1", "s1", "2026-11-25T03:02:48Z", c, "bg", "session_cron_carry"),
+		ptrUser("u2", "cc1", "2026-11-25T03:04:00Z", c, "bg", "second question"),
+		claudeToolUseChunkLine("2026-11-25T03:04:10Z", "t1", "u2", "msg_2", "tu1"),
+		claudeToolUseChunkLine("2026-11-25T03:04:11Z", "t2", "t1", "msg_2", "tu2"),
+		claudeToolResultUserLine("2026-11-25T03:04:12Z", "r2", "t2", "tu2"),
+		claudeToolResultUserLine("2026-11-25T03:04:13Z", "r1", "t1", "tu1"),
+		ptrAssistant("a2", "r1", "2026-11-25T03:05:00Z", c, "bg", "msg_3", "second answer"),
+		ptrTurnEnd("s2", "a2", "2026-11-25T03:05:01Z", c, "bg"),
+		ptrUser("u3", "s2", "2026-11-25T03:10:00Z", c, "bg", "abandoned question"),
+		ptrAssistant("a3", "u3", "2026-11-25T03:11:00Z", c, "bg", "msg_4", "abandoned answer"),
+		ptrUser("u4", "s2", "2026-11-25T03:20:00Z", c, "bg", "replacement question"),
+		ptrAssistant("a4", "u4", "2026-11-25T03:21:00Z", c, "bg", "msg_5", "replacement answer"),
+	})
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, o+".jsonl"), []byte(orig), 0o644))
+	contPath := filepath.Join(dir, c+".jsonl")
+	require.NoError(t, os.WriteFile(contPath, []byte(cont), 0o644))
+
+	results, excluded, err := claudeParseFile(
+		contPath, "my_app", "local",
+		claudeParseOptions{siblingLineage: true},
+	)
+	require.NoError(t, err)
+	assert.Empty(t, excluded)
+	require.Len(t, results, 1)
+	sess := results[0].Session
+	assert.Equal(t, o, sess.ParentSessionID)
+	assert.Equal(t, RelContinuation, sess.RelationshipType)
+	require.NotNil(t, sess.ForkPointUUID)
+	assert.Equal(t, "a1", *sess.ForkPointUUID)
+	assert.Equal(t,
+		[]string{"second question", "replacement question"},
+		userContents(results[0].Messages),
+	)
+	assert.Equal(t, []ParsedRewoundInput{{
+		SourceUUID: "u3",
+		AfterUUID:  "u2",
+		Timestamp:  time.Date(2026, 11, 25, 3, 10, 0, 0, time.UTC),
+		Content:    "abandoned question",
+	}}, sess.RewoundInputs)
+	var resultIDs []string
+	for _, m := range results[0].Messages {
+		for _, r := range m.ToolResults {
+			resultIDs = append(resultIDs, r.ToolUseID)
+		}
+	}
+	assert.ElementsMatch(t, []string{"tu1", "tu2"}, resultIDs)
+}
+
+// A fork that abandons a long branch when it rewinds into its copied history
+// keeps that branch as a session of its own. The branch left the copy at
+// the end of orig's third turn, so it hangs off orig there, not off the
+// fork's main branch, which shares only orig's first two turns with it.
+func TestClaudeForkRewoundIntoCopiedHistoryKeepsLongBranch(t *testing.T) {
+	t.Parallel()
+	const (
+		o = rwOrigID
+		f = rwForkID
+	)
+	orig := joinLines(
+		rwHistory(o, ""),
+		ptrForkCommand("oc1", "oc2", "oc3", "s3", "2026-11-25T02:31:00Z", o, "", f),
+	)
+	notice := ptrForkSource("fs1", "s3", "2026-11-25T02:31:01Z", f)
+	var ownTurns []string
+	parent := "fs1"
+	for i := range 4 {
+		n := i + 4
+		minute := fmt.Sprintf("2026-11-26T02:%02d:00Z", 10*i)
+		ownTurns = append(ownTurns,
+			ptrUser(fmt.Sprintf("u%d", n), parent, minute, f, "bg", fmt.Sprintf("branch question %d", n)),
+			ptrAssistant(fmt.Sprintf("a%d", n), fmt.Sprintf("u%d", n), minute, f, "bg", fmt.Sprintf("msg_%d", n), "branch answer"),
+		)
+		parent = fmt.Sprintf("a%d", n)
+	}
+	fork := joinLines(
+		notice[:1],
+		rwHistory(f, "bg"),
+		notice[1:],
+		[]string{ptrUUIDLess("last-prompt", "", f)},
+		ownTurns,
+		[]string{
+			ptrUser("u9", "s2", "2026-11-26T03:00:00Z", f, "bg", "rewound question"),
+			ptrAssistant("a9", "u9", "2026-11-26T03:01:00Z", f, "bg", "msg_9", "rewound answer"),
+		},
+	)
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, o+".jsonl"), []byte(orig), 0o644))
+	forkPath := filepath.Join(dir, f+".jsonl")
+	require.NoError(t, os.WriteFile(forkPath, []byte(fork), 0o644))
+
+	results, excluded, err := claudeParseFile(
+		forkPath, "my_app", "local",
+		claudeParseOptions{siblingLineage: true},
+	)
+	require.NoError(t, err)
+	assert.Empty(t, excluded)
+	require.Len(t, results, 2)
+
+	main := results[0].Session
+	assert.Equal(t, f, main.ID)
+	assert.Equal(t, o, main.ParentSessionID)
+	assert.Equal(t, RelFork, main.RelationshipType)
+	require.NotNil(t, main.ForkPointUUID)
+	assert.Equal(t, "a2", *main.ForkPointUUID)
+	assert.Equal(t, []string{"rewound question"}, userContents(results[0].Messages))
+	assert.Empty(t, main.RewoundInputs)
+
+	branch := results[1].Session
+	assert.Equal(t, f+"-u3", branch.ID)
+	assert.Equal(t, o, branch.ParentSessionID)
+	assert.Equal(t, RelFork, branch.RelationshipType)
+	require.NotNil(t, branch.ForkPointUUID)
+	assert.Equal(t, "a3", *branch.ForkPointUUID)
+	assert.Equal(t,
+		[]string{"branch question 4", "branch question 5", "branch question 6", "branch question 7"},
+		userContents(results[1].Messages),
+	)
 }

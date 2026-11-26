@@ -64,12 +64,14 @@
   }
 
   let rows = $derived(tree ? flattenTree(tree.root) : []);
-  let visible = $derived(rows.length > 1);
   // The input view needs a fork or continuation that links the session's
   // inputs to another session's; other sessions show only the session view.
   let hasFamily = $derived(
     tree ? inForkFamily(tree.root, tree.active_session_id) : false,
   );
+  // A session Claude Code moved to the background is one node, but its
+  // inputs still span the transcripts it left.
+  let visible = $derived(rows.length > 1 || hasFamily);
   let view = $derived<SessionTreeView>(
     hasFamily ? ui.sessionTreeView : "sessions",
   );
@@ -184,6 +186,17 @@
     return first;
   }
 
+  // The top node heads the tree even when it stands for a session Claude
+  // Code moved to the background. Another node that does takes the place of
+  // the transcript the session started in, so it shows that relationship.
+  function nodeRelationship(node: SessionTreeNode): string | undefined {
+    if (node.depth === 0) return undefined;
+    return (
+      node.handoff_sources?.[0]?.relationship_type ??
+      node.session.relationship_type
+    );
+  }
+
   function relationshipLabel(value: string | undefined): string {
     switch (value) {
       case "fork":
@@ -292,19 +305,23 @@
               <span class="tree-row-main">
                 <span class="tree-title">{sessionTitle(session)}</span>
                 <span class="tree-rel">
-                  {relationshipLabel(session.relationship_type)}
+                  {relationshipLabel(nodeRelationship(node))}
                 </span>
               </span>
               <span class="tree-preview">{sessionPreview(session)}</span>
               <span class="tree-meta">
                 <span>{session.agent}</span>
                 <span>{messageCountLabel(session.message_count)}</span>
+                {#if node.handoff_sources?.length}
+                  <span>{m.session_tree_moved_to_background()}</span>
+                {/if}
                 {#if node.leaves}
                   {@const skipped = skippedTurns(node.leaves)}
+                  {@const turn = formatNumber(node.leaves.after_turn)}
                   <span class="tree-branch">
-                    {m.session_tree_after_turn({
-                      turn: formatNumber(node.leaves.after_turn),
-                    })}
+                    {node.before_handoff
+                      ? m.session_tree_after_turn_before_background({ turn })
+                      : m.session_tree_after_turn({ turn })}
                   </span>
                   {#if skipped > 0}
                     <span class="tree-branch">

@@ -572,6 +572,30 @@ describe("SessionList visible hydration", () => {
     expect(document.body.textContent).not.toContain("Unstarred");
   });
 
+  it("keeps a background handoff family under starred-only when the transcript it left is starred", async () => {
+    sessions.sessions = [
+      makeSession({ id: "left", display_name: "Before the move", is_index_only: true }),
+      makeSession({
+        id: "moved",
+        parent_session_id: "left",
+        relationship_type: "continuation",
+        session_kind: "bg",
+        display_name: "Problem review",
+        started_at: "2024-01-01T01:00:00Z",
+        is_index_only: true,
+      }),
+    ];
+    starred.filterOnly = true;
+    starred.ids = new Set(["left"]);
+    vi.spyOn(sessions, "hydrateVisibleSessions").mockResolvedValue(undefined);
+
+    component = mount(SessionList, { target: document.body });
+    await tick();
+
+    expect(document.querySelector('[data-session-id="moved"]')).not.toBeNull();
+    expect(document.querySelector('[data-session-id="left"]')).toBeNull();
+  });
+
   describe("end marks under starred-only", () => {
     const root = () =>
       makeSession({
@@ -787,6 +811,69 @@ describe("SessionList visible hydration", () => {
       document.querySelector('[data-session-id="unused"] .fork-mark'),
     ).not.toBeNull();
     expect(document.querySelector('[data-session-id="moved"] .fork-mark')).toBeNull();
+  });
+
+  it("lists a session Claude Code moved to the background once, under the transcript it continued in", async () => {
+    sessions.sessions = [
+      makeSession({
+        id: "left",
+        display_name: "Before the move",
+        started_at: "2024-01-01T00:00:00Z",
+        ended_at: "2024-01-01T01:00:00Z",
+      }),
+      makeSession({
+        id: "early-fork",
+        parent_session_id: "left",
+        relationship_type: "fork",
+        session_kind: "bg",
+        display_name: "Early fork",
+        started_at: "2024-01-01T00:30:00Z",
+        ended_at: "2024-01-01T00:40:00Z",
+      }),
+      makeSession({
+        id: "moved",
+        parent_session_id: "left",
+        relationship_type: "continuation",
+        session_kind: "bg",
+        display_name: "Problem review",
+        started_at: "2024-01-01T01:00:00Z",
+        ended_at: "2024-01-01T03:00:00Z",
+      }),
+      makeSession({
+        id: "late-fork",
+        parent_session_id: "moved",
+        relationship_type: "fork",
+        session_kind: "bg",
+        display_name: "Late fork",
+        started_at: "2024-01-01T02:00:00Z",
+        ended_at: "2024-01-01T02:30:00Z",
+      }),
+    ];
+    vi.spyOn(sessions, "hydrateVisibleSessions").mockResolvedValue(undefined);
+
+    component = mount(SessionList, { target: document.body });
+    await tick();
+    document
+      .querySelector<HTMLButtonElement>(
+        `[data-session-id="moved"] button[aria-label="${m.sidebar_row_expand()}"]`,
+      )!
+      .click();
+    await tick();
+
+    expect(document.querySelector('[data-session-id="early-fork"]')).not.toBeNull();
+    expect(document.querySelector('[data-session-id="late-fork"]')).not.toBeNull();
+    expect(document.querySelector('[data-session-id="left"]')).toBeNull();
+
+    // Opening the earlier transcript lists it under the same row.
+    sessions.activeSessionId = "left";
+    await tick();
+    await tick();
+    expect(document.querySelector('[data-session-id="left"]')).not.toBeNull();
+    expect(
+      document.querySelector(
+        `[data-session-id="moved"] button[aria-label="${m.sidebar_row_collapse()}"]`,
+      ),
+    ).not.toBeNull();
   });
 
   it("reveals a directly opened fork once the first hydration resolves", async () => {

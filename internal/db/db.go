@@ -583,7 +583,13 @@ CREATE INDEX IF NOT EXISTS idx_provider_freshness_updated_at
 // replay and deleted, and sessions.fork_point_uuid records where a fork or
 // continuation leaves its parent. Re-parse unchanged Claude sources so
 // existing families gain the corrected links and fork points.)
-const dataVersion = 128
+// (129: A Claude /fork child or background handoff that rewound into the
+// history it copied from its parent stays linked to that parent instead of
+// being stored as a separate root with the copied turns, and keeps only its
+// own rewound inputs. Every result of a parallel tool call is stored, where
+// the parser used to keep only the last one written. Re-parse unchanged
+// Claude sources so existing sessions gain the links and tool results.)
+const dataVersion = 129
 
 const tokenCoverageRepairStatsKey = "token_coverage_repair_v1"
 

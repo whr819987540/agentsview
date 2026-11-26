@@ -6,6 +6,7 @@ import type { DbSession } from "./dbSession.ts";
 export interface ServiceBranchLeave {
   after_ordinal: number;
   after_turn: number;
+  handoff?: boolean;
   parent: DbSession;
   relationship_type: string;
   turns_after: number;

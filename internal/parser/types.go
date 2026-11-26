@@ -1395,6 +1395,10 @@ const SessionKindNonInteractive = "non-interactive"
 // is the roborev feature tag (`codex exec --thread-source roborev`).
 const SessionKindRoborev = "roborev"
 
+// SessionKindBackground marks a Claude Code transcript written by a
+// background process: a session moved to the background or a /fork child.
+const SessionKindBackground = "bg"
+
 // FileInfo holds file system metadata for a session source file.
 type FileInfo struct {
 	Path   string

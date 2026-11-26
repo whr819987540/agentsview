@@ -188,63 +188,60 @@ func claudeParseFile(
 		}
 		lastLineFailed = false
 
-		// Drop the contiguous leading replay region of a background
-		// fork before any metadata, timestamp, or attachment
-		// collection: replayed records belong to the parent session.
-		if lineage != nil &&
-			gjson.GetBytes(lineBytes, "uuid").Str != "" {
-			ordinal := uuidLineOrdinal
-			uuidLineOrdinal++
-			if ordinal < lineage.dropCount {
-				continue
-			}
-		}
-
 		entryType := gjson.GetBytes(lineBytes, "type").Str
+		recordUUID := gjson.GetBytes(lineBytes, "uuid").Str
 
 		// Record the uuid/parentUuid link of every record type.
 		// Claude Code threads the DAG through non-message records
 		// too (attachments, system entries), so fork detection
 		// must be able to resolve parent references across them,
 		// not just across user/assistant entries.
-		if u := gjson.GetBytes(lineBytes, "uuid").Str; u != "" {
-			if _, seen := parentOf[u]; !seen {
-				parentOf[strings.Clone(u)] = strings.Clone(
+		if recordUUID != "" {
+			if _, seen := parentOf[recordUUID]; !seen {
+				parentOf[strings.Clone(recordUUID)] = strings.Clone(
 					gjson.GetBytes(lineBytes, "parentUuid").Str,
 				)
 			}
 		}
 
-		// /branch (and forked resumes) replay the parent session's
-		// history at the top of the new file, stamping each copied
-		// record with forkedFrom. Those records are the parent's
-		// content -- already archived under the parent session -- so
-		// they never surface as this session's messages; the
-		// sessions are linked via ParentSessionID instead. Replayed
-		// user/assistant records still join the DAG (marked
-		// replayed) so the genuine tail stays connected to a single
-		// root and rewinds inside the branched session resolve.
-		// Replayed timestamps are excluded from session bounds:
-		// they predate the fork.
-		if ff := gjson.GetBytes(lineBytes, "forkedFrom"); ff.Exists() {
-			if forkedFromSID == "" {
-				forkedFromSID = strings.Clone(ff.Get("sessionId").Str)
+		// Two kinds of file open with a copy of the parent session's
+		// history: a background fork replays the parent's chain as its
+		// leading uuid-bearing lines, and /branch (or a forked resume)
+		// stamps each copied record with forkedFrom. The copy is the
+		// parent's content, already archived under the parent, so it
+		// skips metadata, timestamp, and attachment collection and never
+		// surfaces as this session's messages; the sessions are linked
+		// via ParentSessionID instead. Copied user/assistant records
+		// still join the DAG, marked replayed: the session's own records
+		// hang off them, and a rewind into the copy leaves several own
+		// branches hanging there, which branch selection must see.
+		replayed := false
+		if lineage != nil && recordUUID != "" {
+			replayed = uuidLineOrdinal < lineage.replayCount
+			uuidLineOrdinal++
+		}
+		if !replayed {
+			if ff := gjson.GetBytes(lineBytes, "forkedFrom"); ff.Exists() {
+				replayed = true
+				if forkedFromSID == "" {
+					forkedFromSID = strings.Clone(ff.Get("sessionId").Str)
+				}
 			}
+		}
+		if replayed {
 			if entryType == "user" || entryType == "assistant" {
-				line := string(lineBytes)
-				uuid := gjson.Get(line, "uuid").Str
-				if uuid != "" {
+				if recordUUID != "" {
 					hasAnyUUID = true
 				} else {
 					allHaveUUID = false
 				}
 				entries = append(entries, dagEntry{
-					uuid:       uuid,
-					parentUuid: gjson.Get(line, "parentUuid").Str,
+					uuid:       strings.Clone(recordUUID),
+					parentUuid: strings.Clone(gjson.GetBytes(lineBytes, "parentUuid").Str),
 					entryType:  strings.Clone(entryType),
 					lineIndex:  lineIndex,
-					line:       line,
-					timestamp:  extractTimestamp(line),
+					line:       claudeReplayedLine(lineBytes),
+					timestamp:  extractTimestampBytes(lineBytes),
 					replayed:   true,
 				})
 				lineIndex++
@@ -428,14 +425,6 @@ func claudeParseFile(
 
 		uuid := gjson.Get(line, "uuid").Str
 		parentUuid := gjson.Get(line, "parentUuid").Str
-		if lineage != nil && parentUuid != "" {
-			if _, dropped := lineage.dropUUIDs[parentUuid]; dropped {
-				// The replay boundary entry references a dropped
-				// record; re-root it so DAG processing still sees a
-				// single-root chain.
-				parentUuid = ""
-			}
-		}
 
 		if uuid != "" {
 			hasAnyUUID = true
@@ -514,6 +503,17 @@ func claudeParseFile(
 		isTruncated:     isTruncated,
 	}
 
+	// replayParentID names the session the file's replayed head was
+	// copied from: the parent a background fork replays, or the session
+	// a /branch file was forked from.
+	replayParentID := ""
+	switch {
+	case lineage != nil:
+		replayParentID = lineage.parentSessionID
+	case forkedFromSID != "" && forkedFromSID != sessionID:
+		replayParentID = forkedFromSID
+	}
+
 	var (
 		results  []ParseResult
 		parseErr error
@@ -530,7 +530,7 @@ func claudeParseFile(
 	if dagOK {
 		results, parseErr = parseDAG(
 			ctx, entries, resolvedParents, sessionID, project, machine,
-			parentSessionID, fileInfo, subagentMap,
+			parentSessionID, replayParentID, fileInfo, subagentMap,
 			globalStart, globalEnd, meta,
 		)
 	} else {
@@ -545,16 +545,26 @@ func claudeParseFile(
 		return nil, nil, parseErr
 	}
 
-	// Link a forked session (/branch) to the session it was forked
-	// from. The replayed prefix was dropped above; the relationship
-	// makes the session tree show the branch and lets the fork
-	// context view prepend the shared history from the parent.
-	mainForkPoint := ""
-	if forkedFromSID != "" && forkedFromSID != sessionID &&
-		len(results) > 0 {
-		results[0].Session.ParentSessionID = forkedFromSID
-		results[0].Session.RelationshipType = RelFork
-		mainForkPoint = claudeBranchForkPoint(entries, parentOf, chunkAlias)
+	// Link the session to the one its replayed head was copied from: a
+	// /branch file or /fork child as a fork, a background handoff as a
+	// continuation. The relationship makes the session tree show the
+	// branch and lets the fork context view prepend the shared history
+	// from the parent. In-file DAG forks (results[1:]) keep the parent
+	// parseDAG gave them.
+	if replayParentID != "" && len(results) > 0 {
+		main := &results[0].Session
+		main.ParentSessionID = replayParentID
+		main.RelationshipType = RelFork
+		if lineage != nil {
+			main.RelationshipType = lineage.relationship
+		}
+		// parseDAG places the fork point on the path the session keeps.
+		// A linear parse keeps every record, so the first own record's
+		// link into the copy places it.
+		if main.ForkPointUUID == nil {
+			forkPoint := claudeBranchForkPoint(entries, parentOf, chunkAlias)
+			main.ForkPointUUID = &forkPoint
+		}
 	}
 
 	// Splice queued_command attachments into the main session
@@ -570,25 +580,12 @@ func claudeParseFile(
 		}
 	}
 
-	// An established background-fork lineage links the transcript to the
-	// one it replays: a /fork child as a fork, a handoff as a
-	// continuation. In-file DAG forks (results[1:]) keep their fork
-	// relationship to the main branch.
-	if lineage != nil && len(results) > 0 {
-		results[0].Session.RelationshipType = lineage.relationship
-		mainForkPoint = lineage.forkPointUUID
-	}
 	// A full parse always reports the fork point, empty when the
 	// session inherits nothing from a parent transcript.
 	for i := range results {
-		if results[i].Session.ForkPointUUID != nil {
-			continue
+		if results[i].Session.ForkPointUUID == nil {
+			results[i].Session.ForkPointUUID = new(string)
 		}
-		forkPoint := ""
-		if i == 0 {
-			forkPoint = mainForkPoint
-		}
-		results[i].Session.ForkPointUUID = &forkPoint
 	}
 
 	// Classify termination status for each result. All forks
@@ -729,6 +726,59 @@ func compactClaudeEntry(line []byte) string {
 	writeClaudeCompactObject(&b, &first, "toolUseResult", toolResultFields)
 	b.WriteByte('}')
 	return b.String()
+}
+
+// claudeReplayedBlock, claudeReplayedMessage, and claudeReplayedRecord
+// are the parts of a replayed record that DAG processing reads.
+type claudeReplayedBlock struct {
+	Type      string `json:"type"`
+	ID        string `json:"id,omitempty"`
+	ToolUseID string `json:"tool_use_id,omitempty"`
+}
+
+type claudeReplayedMessage struct {
+	ID         string                `json:"id,omitempty"`
+	StopReason string                `json:"stop_reason,omitempty"`
+	Content    []claudeReplayedBlock `json:"content"`
+}
+
+type claudeReplayedRecord struct {
+	UUID       string                `json:"uuid"`
+	ParentUUID string                `json:"parentUuid,omitempty"`
+	Message    claudeReplayedMessage `json:"message"`
+}
+
+// claudeReplayedLine keeps what DAG processing reads from a record copied
+// from the parent session: its links, the message id and stop reason that
+// merge streamed chunks, and the ids that pair tool calls with their
+// results. The parent session stores the content, so a fork of a long
+// session holds none of it in memory.
+func claudeReplayedLine(line []byte) string {
+	record := claudeReplayedRecord{
+		UUID:       gjson.GetBytes(line, "uuid").Str,
+		ParentUUID: gjson.GetBytes(line, "parentUuid").Str,
+		Message: claudeReplayedMessage{
+			Content: []claudeReplayedBlock{},
+		},
+	}
+	message := gjson.GetBytes(line, "message")
+	record.Message.ID = message.Get("id").Str
+	record.Message.StopReason = message.Get("stop_reason").Str
+	if content := message.Get("content"); content.IsArray() {
+		content.ForEach(func(_, block gjson.Result) bool {
+			record.Message.Content = append(record.Message.Content, claudeReplayedBlock{
+				Type:      block.Get("type").Str,
+				ID:        block.Get("id").Str,
+				ToolUseID: block.Get("tool_use_id").Str,
+			})
+			return true
+		})
+	}
+	out, err := json.Marshal(record)
+	if err != nil {
+		return `{}`
+	}
+	return string(out)
 }
 
 // setClaudeCompactFields fills fields from the keys of an object
@@ -1704,10 +1754,16 @@ func claudeBranchForkPoint(
 // as separate fork ParseResults. Short ones are dropped from the
 // transcript, and their user inputs become the rewound inputs of
 // the session they branch from.
+//
+// replayParentID names the session the file's replayed head was copied
+// from, or is empty when the session is not linked to one. Each branch
+// then reports the last copied entry on its path as its fork point,
+// and a fork branch that leaves inside the copy belongs to that
+// session rather than to this file's main branch.
 func parseDAG(
 	ctx context.Context, entries []dagEntry,
 	resolvedParents []string,
-	sessionID, project, machine, parentSessionID string,
+	sessionID, project, machine, parentSessionID, replayParentID string,
 	fileInfo FileInfo,
 	subagentMap map[string]string,
 	globalStart, globalEnd time.Time,
@@ -1818,6 +1874,8 @@ func parseDAG(
 	// fork branch when it carries more than forkThreshold user
 	// turns. A shorter one is dropped from the transcript, and its
 	// user turns are kept as rewound inputs of the owning session.
+	// A sibling without user turns is dropped too, unless it is a
+	// result of a parallel tool call, which stays on the path.
 	// ownerID is the session ID of the branch that owns this walk.
 	var walkBranch func(startIdx int, ownerID string) ([]int, error)
 	var forkBranches []branch
@@ -1854,6 +1912,13 @@ func parseDAG(
 					return nil, err
 				}
 				if turns == 0 {
+					// Each result of a parallel tool call parents to its
+					// own call, so the results hang side by side off the
+					// response and only one leads on. The others belong
+					// to this path, not to a branch a rewind abandoned.
+					if claudeAnswersToolCall(entries[current], entries[kid]) {
+						path = append(path, kid)
+					}
 					continue
 				}
 				if turns <= forkThreshold {
@@ -1940,9 +2005,26 @@ func parseDAG(
 		sid := sessionID
 		pSID := b.parentID
 		relType := RelationshipType("")
-		// Only an in-file fork's point is known here; the caller fills
-		// in the main session's.
-		var forkPoint string
+		// copied is the branch's last entry from the replayed head,
+		// where its own records leave the session the head was copied
+		// from. The copy precedes a file's own records, so it opens
+		// every path that holds any of it.
+		copied := -1
+		if replayParentID != "" {
+			for _, idx := range b.indices {
+				if !entries[idx].replayed {
+					break
+				}
+				copied = idx
+			}
+		}
+		// The main session's fork point is left to the caller when its
+		// path holds no copied entry. The value is copied so the parsed
+		// session does not keep the entries alive.
+		var forkPoint *string
+		if i == 0 && copied >= 0 {
+			forkPoint = new(strings.Clone(entries[copied].uuid))
+		}
 
 		if i > 0 {
 			// Fork session: ID derived from first entry's uuid,
@@ -1950,7 +2032,14 @@ func parseDAG(
 			firstEntry := entries[b.indices[0]]
 			sid = sessionID + "-" + firstEntry.uuid
 			relType = RelFork
-			forkPoint = resolvedParents[b.indices[0]]
+			forkPoint = new(strings.Clone(resolvedParents[b.indices[0]]))
+			// A branch that leaves inside the copy hangs off the
+			// session the copy came from: its own records continue
+			// that session's history, not this file's main branch.
+			if copied >= 0 {
+				pSID = replayParentID
+				forkPoint = new(strings.Clone(entries[copied].uuid))
+			}
 		}
 
 		linear := false
@@ -1970,9 +2059,7 @@ func parseDAG(
 			File:              fileInfo,
 			ClaudeLinearParse: &linear,
 			RewoundInputs:     claudeRewoundInputsInFileOrder(rewound[sid]),
-		}
-		if i > 0 {
-			sess.ForkPointUUID = &forkPoint
+			ForkPointUUID:     forkPoint,
 		}
 		meta.applyTo(&sess)
 		if err := accumulateMessageTokenUsageContext(
@@ -1988,6 +2075,39 @@ func parseDAG(
 	}
 
 	return results, nil
+}
+
+// claudeAnswersToolCall reports whether result is a tool result record for
+// one of the tool calls in call.
+func claudeAnswersToolCall(call, result dagEntry) bool {
+	if call.entryType != "assistant" || result.entryType != "user" {
+		return false
+	}
+	calls := make(map[string]struct{})
+	gjson.Get(call.line, "message.content").ForEach(
+		func(_, block gjson.Result) bool {
+			if block.Get("type").Str == "tool_use" {
+				if id := block.Get("id").Str; id != "" {
+					calls[id] = struct{}{}
+				}
+			}
+			return true
+		},
+	)
+	if len(calls) == 0 {
+		return false
+	}
+	answers := false
+	gjson.Get(result.line, "message.content").ForEach(
+		func(_, block gjson.Result) bool {
+			if block.Get("type").Str != "tool_result" {
+				return true
+			}
+			_, answers = calls[block.Get("tool_use_id").Str]
+			return !answers
+		},
+	)
+	return answers
 }
 
 // claudeRewoundEntry is a rewound input with the index of its entry.
@@ -2367,9 +2487,13 @@ func mergeClaudeAssistantMessageChunksContext(
 			continue
 		}
 
+		// A run never spans the end of a replayed head: a copied chunk
+		// keeps no content, and the session's own records must not
+		// absorb it or be absorbed by it.
 		j := i + 1
 		for j < len(entries) &&
 			entries[j].entryType == "assistant" &&
+			entries[j].replayed == entries[i].replayed &&
 			gjson.Get(entries[j].line, "message.id").Str == mid {
 			if err := contextErrEvery(ctx, j-i); err != nil {
 				return nil, nil, err

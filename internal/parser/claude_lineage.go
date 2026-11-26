@@ -58,9 +58,15 @@ import (
 // uuid content (a fork that is a pure copy of a bg sibling) elects
 // direction deterministically by stem. Anything else ambiguous
 // (unmarked manual --fork-session copies, missing or divergent
-// siblings, several branches at the replay boundary) fails open: no
-// trim and no relationship is emitted, leaving the status-quo
-// duplicate rather than risking a wrongly-oriented trim.
+// siblings) fails open: no trim and no relationship is emitted,
+// leaving the status-quo duplicate rather than risking a
+// wrongly-oriented trim.
+//
+// The replayed lines stay in the parse, marked replayed like a /branch
+// head: they produce no messages, but the fork's own records hang off
+// them. A fork can rewind into the copied history, which leaves several
+// of its own branches hanging off the copy, and DAG branch selection
+// decides which one the session keeps, as it does for any rewind.
 
 const (
 	// claudeLineageSniffMaxLines bounds how many leading lines are
@@ -124,20 +130,15 @@ type claudeParseOptions struct {
 }
 
 // claudeLineagePlan describes an established fork lineage: the leading
-// dropCount uuid-bearing lines of the fork transcript are a replay of
-// the parent transcript and are dropped from the parse.
+// replayCount uuid-bearing lines of the fork transcript are a replay of
+// the parent transcript. The parse keeps them in the DAG, marked
+// replayed, and stores none of them as the fork's messages.
 type claudeLineagePlan struct {
 	parentSessionID string
 	// relationship is RelFork for a /fork child and RelContinuation for
 	// a handoff or an unmarked replay.
 	relationship RelationshipType
-	// forkPointUUID is the last replayed user or assistant entry the
-	// fork's own records hang off: the parent message it inherits up to.
-	forkPointUUID string
-	dropCount     int
-	// dropUUIDs holds the replayed uuids so retained entries whose
-	// parentUuid points into the dropped region can be re-rooted.
-	dropUUIDs map[string]struct{}
+	replayCount  int
 }
 
 func claudeSniffHead(
@@ -271,7 +272,7 @@ func claudeSniffHeadLines(
 		}
 		return claudeHeadSniff{
 			rootUUID: uuid,
-			rootIsBG: gjson.GetBytes(lineBytes, "sessionKind").Str == "bg",
+			rootIsBG: gjson.GetBytes(lineBytes, "sessionKind").Str == SessionKindBackground,
 			ok:       true,
 		}, lr.bytesRead, nil
 	}
@@ -279,16 +280,6 @@ func claudeSniffHeadLines(
 		return claudeHeadSniff{}, lr.bytesRead, err
 	}
 	return claudeHeadSniff{}, lr.bytesRead, nil
-}
-
-// claudeForkLine is one uuid-bearing line of a fork transcript.
-type claudeForkLine struct {
-	uuid       string
-	parentUUID string
-	// chainEntry marks user/assistant records — the ones the parser
-	// collects into DAG entries and whose parent links matter for
-	// boundary re-rooting.
-	chainEntry bool
 }
 
 // claudeLineageMarks summarizes the lineage evidence of one transcript
@@ -363,11 +354,11 @@ func claudeForkChildPrefix(lineBytes []byte) string {
 	return prefix
 }
 
-// claudeScanUUIDs streams every uuid-bearing line of a transcript in
-// order and returns the transcript's lineage marks. Errors and malformed
+// claudeScanUUIDs streams the uuid of every uuid-bearing line of a
+// transcript in order and returns the transcript's lineage marks. Errors and malformed
 // lines are skipped; lineage resolution fails open on incomplete data.
 func claudeScanUUIDs(
-	ctx context.Context, path string, visit func(line claudeForkLine),
+	ctx context.Context, path string, visit func(uuid string),
 ) (claudeLineageMarks, bool, error) {
 	var marks claudeLineageMarks
 	f, err := os.Open(path)
@@ -416,11 +407,7 @@ func claudeScanUUIDs(
 			}
 		}
 		uuidLines++
-		visit(claudeForkLine{
-			uuid:       uuid,
-			parentUUID: gjson.GetBytes(lineBytes, "parentUuid").Str,
-			chainEntry: entryType == "user" || entryType == "assistant",
-		})
+		visit(uuid)
 	}
 	if !interrupted {
 		marks.contiguous = uuidLines
@@ -538,9 +525,9 @@ func claudeResolveSiblingLineage(
 		return candidates[i].stem < candidates[j].stem
 	})
 
-	var forkSeq []claudeForkLine
-	selfMarks, complete, err := claudeScanUUIDs(ctx, path, func(line claudeForkLine) {
-		forkSeq = append(forkSeq, line)
+	var forkSeq []string
+	selfMarks, complete, err := claudeScanUUIDs(ctx, path, func(uuid string) {
+		forkSeq = append(forkSeq, uuid)
 	})
 	if err != nil {
 		return nil, err
@@ -566,8 +553,8 @@ func claudeResolveSiblingLineage(
 	// this transcript is its parent regardless of run length.
 	forkStem := strings.TrimSuffix(base, ".jsonl")
 	forkUUIDs := make(map[string]struct{}, len(forkSeq))
-	for _, line := range forkSeq {
-		forkUUIDs[line.uuid] = struct{}{}
+	for _, uuid := range forkSeq {
+		forkUUIDs[uuid] = struct{}{}
 	}
 	type scored struct {
 		stem  string
@@ -586,8 +573,8 @@ func claudeResolveSiblingLineage(
 			continue
 		}
 		set := make(map[string]struct{})
-		marks, complete, err := claudeScanUUIDs(ctx, c.path, func(line claudeForkLine) {
-			set[line.uuid] = struct{}{}
+		marks, complete, err := claudeScanUUIDs(ctx, c.path, func(uuid string) {
+			set[uuid] = struct{}{}
 		})
 		if err != nil {
 			return nil, err
@@ -596,8 +583,8 @@ func claudeResolveSiblingLineage(
 			continue
 		}
 		run := 0
-		for _, line := range forkSeq {
-			if _, ok := set[line.uuid]; !ok {
+		for _, uuid := range forkSeq {
+			if _, ok := set[uuid]; !ok {
 				break
 			}
 			run++
@@ -631,76 +618,14 @@ func claudeResolveSiblingLineage(
 	} else if best == nil || bestTied {
 		return nil, nil
 	}
-	bestRun := best.run
-	dropUUIDs := make(map[string]struct{}, bestRun)
-	for _, line := range forkSeq[:bestRun] {
-		if _, ok := best.set[line.uuid]; ok {
-			dropUUIDs[line.uuid] = struct{}{}
-		}
-	}
-	// More than one retained chain entry hanging off the dropped
-	// region means the replay boundary carries retry or fork
-	// branches. Re-rooting them all would collapse the DAG into a
-	// linear merge, so the trim fails open and the intact DAG keeps
-	// its branch semantics.
-	danglingChildren := 0
-	for _, line := range forkSeq[bestRun:] {
-		if !line.chainEntry {
-			continue
-		}
-		if _, dropped := dropUUIDs[line.parentUUID]; dropped {
-			danglingChildren++
-		}
-	}
-	if danglingChildren > 1 {
-		return nil, nil
-	}
 	relationship := RelContinuation
-	if selfMarks.forkSourceAfter(bestRun) ||
+	if selfMarks.forkSourceAfter(best.run) ||
 		(!best.marks.continues(forkStem) && best.marks.namesChild(forkStem)) {
 		relationship = RelFork
 	}
 	return &claudeLineagePlan{
 		parentSessionID: best.stem,
 		relationship:    relationship,
-		forkPointUUID:   claudeReplayForkPoint(forkSeq, bestRun, dropUUIDs),
-		dropCount:       bestRun,
-		dropUUIDs:       dropUUIDs,
+		replayCount:     best.run,
 	}, nil
-}
-
-// claudeReplayForkPoint returns the last replayed user or assistant entry
-// that the fork's own records hang off. It follows the first retained
-// line whose parent is replayed up through replayed system and attachment
-// records, and falls back to the last replayed chain entry.
-func claudeReplayForkPoint(
-	forkSeq []claudeForkLine, run int, dropped map[string]struct{},
-) string {
-	replayed := make(map[string]claudeForkLine, run)
-	for _, line := range forkSeq[:run] {
-		replayed[line.uuid] = line
-	}
-	for _, line := range forkSeq[run:] {
-		if _, ok := dropped[line.parentUUID]; !ok {
-			continue
-		}
-		current := line.parentUUID
-		for steps := 0; steps <= run; steps++ {
-			entry, ok := replayed[current]
-			if !ok {
-				break
-			}
-			if entry.chainEntry {
-				return entry.uuid
-			}
-			current = entry.parentUUID
-		}
-		break
-	}
-	for i := run - 1; i >= 0; i-- {
-		if forkSeq[i].chainEntry {
-			return forkSeq[i].uuid
-		}
-	}
-	return ""
 }

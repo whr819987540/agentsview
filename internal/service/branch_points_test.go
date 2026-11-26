@@ -121,3 +121,38 @@ func TestDirectBackend_BranchPointsPlaceChildInParent(t *testing.T) {
 	require.NoError(t, err)
 	assert.Nil(t, missing)
 }
+
+func TestDirectBackend_BranchPointsMarkClaudeHandoff(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name        string
+		agent       string
+		sessionKind string
+		want        bool
+	}{
+		{name: "Claude background handoff", agent: "claude", sessionKind: "bg", want: true},
+		{name: "Claude continuation of another kind", agent: "claude", want: false},
+		{name: "another agent", agent: "codex", sessionKind: "bg", want: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			reader, env := newBranchPointReader(t)
+			seedBranchFamily(t, env.db)
+			dbtest.SeedSession(t, env.db, "moved", "p1", func(s *db.Session) {
+				s.Agent = tt.agent
+				s.SessionKind = tt.sessionKind
+				s.ParentSessionID = new("base")
+				s.RelationshipType = "continuation"
+				s.StartedAt = new("2026-07-01T12:00:00Z")
+				s.ForkPointUUID = new("a1")
+			})
+
+			points, err := reader.BranchPoints(t.Context(), "moved")
+			require.NoError(t, err)
+			require.NotNil(t, points)
+			require.NotNil(t, points.Leaves)
+			assert.Equal(t, tt.want, points.Leaves.Handoff)
+		})
+	}
+}

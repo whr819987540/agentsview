@@ -517,6 +517,24 @@
     }
   ],
   "branch_leave_open_parent": "Abrir en ese punto",
+  "branch_leave_handoff": "Pasada a segundo plano, continúa después del turno {turn}",
+  "branch_leave_handoff_rewound": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "{countLabel} turno posterior de antes del paso a segundo plano se descartó con un retroceso.",
+        "countPlural=other": "{countLabel} turnos posteriores de antes del paso a segundo plano se descartaron con un retroceso."
+      }
+    }
+  ],
+  "branch_leave_open_handoff": "Abrir la transcripción anterior",
   "branch_marker_fork": "Bifurcada aquí: {title}",
   "branch_marker_continuation": "Continuada en {title}",
   "branch_marker_continuation_rewound": [
@@ -533,6 +551,24 @@
       "match": {
         "countPlural=one": "Continuada en {title} desde aquí. {countLabel} turno posterior de abajo no forma parte de ella.",
         "countPlural=other": "Continuada en {title} desde aquí. {countLabel} turnos posteriores de abajo no forman parte de ella."
+      }
+    }
+  ],
+  "branch_marker_handoff": "Pasada a segundo plano aquí, continuada en {title}",
+  "branch_marker_handoff_rewound": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "input title",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "Pasada a segundo plano aquí, continuada en {title}. {countLabel} turno posterior de abajo se descartó con un retroceso.",
+        "countPlural=other": "Pasada a segundo plano aquí, continuada en {title}. {countLabel} turnos posteriores de abajo se descartaron con un retroceso."
       }
     }
   ],
@@ -572,6 +608,7 @@
   "sidebar_fork_marker": "Bifurcación",
   "system_boundary_fork_source": "Aviso de bifurcación",
   "session_tree_after_turn": "después del turno {turn}",
+  "session_tree_after_turn_before_background": "después del turno {turn}, antes de pasar a segundo plano",
   "session_tree_turns_not_carried": [
     {
       "declarations": [
@@ -589,6 +626,7 @@
     }
   ],
   "session_tree_no_turns": "sin turnos",
+  "session_tree_moved_to_background": "pasada a segundo plano",
   "sidebar_session_count": [
     {
       "declarations": [

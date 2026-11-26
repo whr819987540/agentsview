@@ -69,8 +69,15 @@ export function branchSessionTitle(
   return title || untitled;
 }
 
-/** Says which parent turn a fork or continuation leaves from. */
+/**
+ * Says which parent turn a fork or continuation leaves from. A session
+ * Claude Code moved to the background continues from its own earlier
+ * transcript, so the label says so instead of naming another session.
+ */
 export function leaveLabel(leave: BranchLeave): string {
+  if (leave.handoff) {
+    return m.branch_leave_handoff({ turn: formatNumber(leave.after_turn) });
+  }
   const params = {
     title: branchSessionTitle(leave.parent, m.session_tree_untitled()),
     turn: formatNumber(leave.after_turn),

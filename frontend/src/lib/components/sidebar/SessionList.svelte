@@ -44,6 +44,7 @@
     isEmptyFork,
     isSubagentDescendant,
   } from "./session-list-utils.js";
+  import { handedOffIds, handoffSourceIds } from "../../utils/session-primary.js";
   import { endSessionDrag, sessionDragFor } from "./session-drag.js";
 
   const EXPANDED_FOLDERS_KEY = "agentsview-sidebar-expanded-folders";
@@ -111,15 +112,26 @@
 
   let groups = $derived.by(() => {
     let out = sessions.groupedSessions;
+    // Claude Code lists a session it moved to the background once, under the
+    // transcript it continued in, so the transcript it left is not listed.
+    const all = out.flatMap((g) => g.allSessions ?? g.sessions);
+    const handedOff = handedOffIds(all);
     if (starred.filterOnly) {
-      out = filterGroupSessions(out, (s) => starred.isStarred(s.id));
+      // A star on the transcript the session left still marks the session.
+      const sources = handoffSourceIds(all);
+      out = filterGroupSessions(
+        out,
+        (s) =>
+          starred.isStarred(s.id) ||
+          (sources.get(s.id) ?? []).some((id) => starred.isStarred(id)),
+      );
     }
-    // An empty fork carries nothing to read. Keep the open one listed so
-    // the sidebar still shows where the reader is.
+    // An empty fork carries nothing to read. Keep the open session listed
+    // so the sidebar still shows where the reader is.
     const active = sessions.activeSessionId;
     return filterGroupSessions(
       out,
-      (s) => !isEmptyFork(s) || s.id === active,
+      (s) => (!isEmptyFork(s) && !handedOff.has(s.id)) || s.id === active,
     );
   });
 

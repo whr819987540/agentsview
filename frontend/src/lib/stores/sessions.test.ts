@@ -130,6 +130,7 @@ type SkinnySessionRow = {
   agent: string;
   agent_label?: string | null;
   entrypoint?: string | null;
+  session_kind?: string | null;
   display_name?: string | null;
   started_at: string | null;
   ended_at: string | null;
@@ -594,6 +595,36 @@ describe("SessionsStore", () => {
       expect(sessions.sessions).toHaveLength(500);
       expect(sessions.total).toBe(86312);
       expect(sessions.nextCursor).toBe("next");
+    });
+
+    it("heads a background handoff family with the transcript Claude Code lists from index rows alone", async () => {
+      vi.mocked(api.getSidebarSessionIndex).mockResolvedValue({
+        sessions: [
+          makeSkinnyRow({ id: "left", started_at: "2024-01-01T00:00:00Z" }),
+          makeSkinnyRow({
+            id: "moved",
+            parent_session_id: "left",
+            relationship_type: "continuation",
+            session_kind: "bg",
+            started_at: "2024-01-01T01:00:00Z",
+          }),
+          makeSkinnyRow({
+            id: "forked",
+            parent_session_id: "moved",
+            relationship_type: "fork",
+            session_kind: "bg",
+            started_at: "2024-01-01T02:00:00Z",
+          }),
+        ],
+        total: 1,
+      });
+
+      const detach = sessions.attachSidebar();
+      await sessions.load();
+      detach();
+
+      expect(sessions.sessions.find((s) => s.id === "moved")?.session_kind).toBe("bg");
+      expect(sessions.groupedSessions.map((g) => g.primarySessionId)).toEqual(["moved"]);
     });
 
     it("builds the sidebar rows once per change", () => {
@@ -3564,6 +3595,87 @@ describe("buildSessionGroups", () => {
     expect(groups).toHaveLength(1);
     expect(groups[0]!.primarySessionId).toBe(primary);
     expect(groups[0]!.liveSessionId).toBe(live);
+  });
+
+  it("heads a session Claude Code moved to the background with the transcript it continued in", () => {
+    const sessions = [
+      makeSession({
+        id: "left",
+        started_at: "2024-01-01T00:00:00Z",
+        ended_at: "2024-01-01T01:00:00Z",
+      }),
+      makeSession({
+        id: "early-fork",
+        parent_session_id: "left",
+        relationship_type: "fork",
+        session_kind: "bg",
+        started_at: "2024-01-01T00:30:00Z",
+        ended_at: "2024-01-01T05:00:00Z",
+      }),
+      makeSession({
+        id: "moved",
+        parent_session_id: "left",
+        relationship_type: "continuation",
+        session_kind: "bg",
+        started_at: "2024-01-01T01:00:00Z",
+        ended_at: "2024-01-01T03:00:00Z",
+      }),
+      makeSession({
+        id: "late-fork",
+        parent_session_id: "moved",
+        relationship_type: "fork",
+        session_kind: "bg",
+        started_at: "2024-01-01T02:00:00Z",
+        ended_at: "2024-01-01T04:00:00Z",
+      }),
+    ];
+
+    const groups = buildSessionGroups(sessions);
+    expect(groups).toHaveLength(1);
+    expect(groups[0]!.key).toBe("left");
+    expect(groups[0]!.primarySessionId).toBe("moved");
+    expect(groups[0]!.liveSessionId).toBe("moved");
+  });
+
+  it("follows every handoff to the transcript Claude Code lists last", () => {
+    const sessions = [
+      makeSession({ id: "first", started_at: "2024-01-01T00:00:00Z" }),
+      makeSession({
+        id: "second",
+        parent_session_id: "first",
+        relationship_type: "continuation",
+        session_kind: "bg",
+        started_at: "2024-01-01T01:00:00Z",
+      }),
+      makeSession({
+        id: "third",
+        parent_session_id: "second",
+        relationship_type: "continuation",
+        session_kind: "bg",
+        started_at: "2024-01-01T02:00:00Z",
+      }),
+    ];
+
+    expect(buildSessionGroups(sessions)[0]!.primarySessionId).toBe("third");
+  });
+
+  it.each([
+    { name: "a Claude continuation that is not a handoff", agent: "claude", kind: undefined },
+    { name: "another agent's background continuation", agent: "codex", kind: "bg" },
+  ])("keeps the root on top of $name", ({ agent, kind }) => {
+    const sessions = [
+      makeSession({ id: "root", agent, started_at: "2024-01-01T00:00:00Z" }),
+      makeSession({
+        id: "cont",
+        agent,
+        parent_session_id: "root",
+        relationship_type: "continuation",
+        session_kind: kind,
+        started_at: "2024-01-01T01:00:00Z",
+      }),
+    ];
+
+    expect(buildSessionGroups(sessions)[0]!.primarySessionId).toBe("root");
   });
 
   it("sorts sessions within group by startedAt asc", () => {

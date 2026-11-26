@@ -2277,6 +2277,144 @@ func TestGetSessionBranchPoints_PlacesForkAndTreeAnnotatesIt(t *testing.T) {
 	assert.Equal(t, 1, tree.Root.Children[0].Leaves.TurnsAfter)
 }
 
+// handoffTreeNode decodes the session tree fields the handoff tests read.
+type handoffTreeNode struct {
+	Session        db.Session        `json:"session"`
+	Children       []handoffTreeNode `json:"children"`
+	IsActive       bool              `json:"is_active"`
+	HandoffSources []db.Session      `json:"handoff_sources"`
+	BeforeHandoff  bool              `json:"before_handoff"`
+	Leaves         *struct {
+		AfterTurn int `json:"after_turn"`
+		Parent    struct {
+			ID string `json:"id"`
+		} `json:"parent"`
+	} `json:"leaves"`
+}
+
+func treeNodeIDs(nodes []handoffTreeNode) []string {
+	ids := make([]string, 0, len(nodes))
+	for _, node := range nodes {
+		ids = append(ids, node.Session.ID)
+	}
+	return ids
+}
+
+func TestGetSessionTree_ClaudeHandoffShowsTheSessionClaudeCodeLists(t *testing.T) {
+	te := setup(t)
+	// orig is the transcript Claude Code left when it moved the session to
+	// the background, and cont the one it continued in. A /fork made before
+	// the handoff hangs off orig, one made after it off cont.
+	te.seedSession(t, "ho-orig", "my-app", 6, func(s *db.Session) {
+		s.StartedAt = new("2025-01-15T10:00:00Z")
+	})
+	te.seedSession(t, "ho-cont", "my-app", 4, func(s *db.Session) {
+		s.ParentSessionID = new("ho-orig")
+		s.RelationshipType = "continuation"
+		s.SessionKind = "bg"
+		s.StartedAt = new("2025-01-15T11:00:00Z")
+		s.ForkPointUUID = new("a1")
+	})
+	te.seedSession(t, "ho-fork-orig", "my-app", 2, func(s *db.Session) {
+		s.ParentSessionID = new("ho-orig")
+		s.RelationshipType = "fork"
+		s.SessionKind = "bg"
+		s.StartedAt = new("2025-01-15T10:30:00Z")
+		s.ForkPointUUID = new("a2")
+	})
+	te.seedSession(t, "ho-fork-fork", "my-app", 1, func(s *db.Session) {
+		s.ParentSessionID = new("ho-fork-orig")
+		s.RelationshipType = "fork"
+		s.SessionKind = "bg"
+		s.StartedAt = new("2025-01-15T10:45:00Z")
+	})
+	te.seedSession(t, "ho-fork-cont", "my-app", 2, func(s *db.Session) {
+		s.ParentSessionID = new("ho-cont")
+		s.RelationshipType = "fork"
+		s.SessionKind = "bg"
+		s.StartedAt = new("2025-01-15T12:00:00Z")
+	})
+	msg := func(ordinal int, role, uuid string) db.Message {
+		return db.Message{
+			SessionID: "ho-orig", Ordinal: ordinal, Role: role,
+			Content: uuid, ContentLength: len(uuid), SourceUUID: uuid,
+			Timestamp: fmt.Sprintf("2025-01-15T10:%02d:00Z", ordinal),
+		}
+	}
+	dbtest.SeedMessages(t, te.db,
+		msg(0, "user", "u1"), msg(1, "assistant", "a1"),
+		msg(2, "user", "u2"), msg(3, "assistant", "a2"),
+		msg(4, "user", "u3"), msg(5, "assistant", "a3"),
+	)
+
+	for _, active := range []string{"ho-orig", "ho-cont", "ho-fork-fork"} {
+		t.Run(active, func(t *testing.T) {
+			w := te.get(t, "/api/v1/sessions/"+active+"/tree")
+			assertStatus(t, w, http.StatusOK)
+			var resp struct {
+				Root handoffTreeNode `json:"root"`
+			}
+			require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+
+			root := resp.Root
+			assert.Equal(t, "ho-cont", root.Session.ID)
+			require.Len(t, root.HandoffSources, 1)
+			assert.Equal(t, "ho-orig", root.HandoffSources[0].ID)
+			assert.Equal(t, active != "ho-fork-fork", root.IsActive)
+			require.Equal(t,
+				[]string{"ho-fork-orig", "ho-fork-cont"},
+				treeNodeIDs(root.Children),
+			)
+
+			forkOrig := root.Children[0]
+			assert.True(t, forkOrig.BeforeHandoff)
+			require.NotNil(t, forkOrig.Leaves)
+			assert.Equal(t, "ho-orig", forkOrig.Leaves.Parent.ID)
+			assert.Equal(t, 2, forkOrig.Leaves.AfterTurn)
+			assert.Equal(t, []string{"ho-fork-fork"}, treeNodeIDs(forkOrig.Children))
+			assert.Equal(t, active == "ho-fork-fork", forkOrig.Children[0].IsActive)
+
+			forkCont := root.Children[1]
+			assert.False(t, forkCont.BeforeHandoff)
+			assert.Empty(t, forkCont.HandoffSources)
+		})
+	}
+}
+
+func TestGetSessionTree_OtherContinuationsKeepTheirRoot(t *testing.T) {
+	te := setup(t)
+	te.seedSession(t, "plain-root", "my-app", 4, func(s *db.Session) {
+		s.StartedAt = new("2025-01-15T10:00:00Z")
+	})
+	// A Claude continuation that did not come from a background handoff,
+	// and a background handoff of another agent, stay children.
+	te.seedSession(t, "plain-cont", "my-app", 2, func(s *db.Session) {
+		s.ParentSessionID = new("plain-root")
+		s.RelationshipType = "continuation"
+		s.StartedAt = new("2025-01-15T11:00:00Z")
+	})
+	te.seedSession(t, "plain-other-agent", "my-app", 2, func(s *db.Session) {
+		s.ParentSessionID = new("plain-root")
+		s.RelationshipType = "continuation"
+		s.Agent = "codex"
+		s.SessionKind = "bg"
+		s.StartedAt = new("2025-01-15T12:00:00Z")
+	})
+
+	w := te.get(t, "/api/v1/sessions/plain-cont/tree")
+	assertStatus(t, w, http.StatusOK)
+	var resp struct {
+		Root handoffTreeNode `json:"root"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Equal(t, "plain-root", resp.Root.Session.ID)
+	assert.Empty(t, resp.Root.HandoffSources)
+	assert.Equal(t,
+		[]string{"plain-cont", "plain-other-agent"},
+		treeNodeIDs(resp.Root.Children),
+	)
+}
+
 func TestGetSessionInputTree_MergesForkPrefix(t *testing.T) {
 	te := setup(t)
 	te.seedSession(t, "input-root", "my-app", 4, func(s *db.Session) {

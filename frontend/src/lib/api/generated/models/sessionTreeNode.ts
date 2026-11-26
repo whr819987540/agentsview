@@ -5,8 +5,10 @@ import type { DbSession } from "./dbSession.ts";
 import type { ServiceBranchLeave } from "./serviceBranchLeave.ts";
 
 export interface SessionTreeNode {
+  before_handoff?: boolean;
   children: SessionTreeNode[];
   depth: number;
+  handoff_sources?: DbSession[];
   is_active: boolean;
   is_branch_start: boolean;
   is_leaf: boolean;
