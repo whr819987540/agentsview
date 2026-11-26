@@ -392,6 +392,12 @@ type Session struct {
 	// including an empty one, replaces it. Session reads do not load it;
 	// use GetSessionRewoundInputs.
 	RewoundInputs []RewoundInput `json:"-"`
+	// ForkPointUUID is SQLite-only: the source UUID of the last parent
+	// message this session inherits, where a fork branched off or a
+	// continuation took over. Nil leaves the stored value unchanged on
+	// upsert; a non-nil value, including "", replaces it. Session reads do
+	// not load it; use GetSessionForkPoint.
+	ForkPointUUID *string `json:"-"`
 	// LastWriteIncremental is SQLite-only sync bookkeeping (like
 	// NextOrdinal): true when the last write to this row went through
 	// the incremental-append path (updateSessionIncrementalTx) instead
@@ -1418,9 +1424,9 @@ const insertSessionSQL = `
 			last_write_incremental,
 			file_path, file_size, file_mtime,
 			next_ordinal, last_entry_uuid, claude_linear_parse,
-			rewound_inputs,
+			rewound_inputs, fork_point_uuid,
 			file_inode, file_device, file_hash
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 // insertSessionIfAbsentSQL inserts a session only when its id does not already
 // exist, leaving an existing row untouched.
@@ -1483,6 +1489,9 @@ const upsertSessionBaseSQL = insertSessionSQL + `
 			-- incremental and non-parse writers pass NULL.
 			rewound_inputs = COALESCE(
 				excluded.rewound_inputs, sessions.rewound_inputs),
+			-- Likewise only a parse that reports a fork point replaces it.
+			fork_point_uuid = COALESCE(
+				excluded.fork_point_uuid, sessions.fork_point_uuid),
 			file_inode = excluded.file_inode,
 			file_device = excluded.file_device,
 			file_hash = excluded.file_hash`
@@ -1527,7 +1536,7 @@ func upsertSessionArgs(s Session) []any {
 		false,
 		s.FilePath, s.FileSize, s.FileMtime,
 		s.NextOrdinal, s.LastEntryUUID, s.ClaudeLinearParse,
-		rewoundInputsColumn(s.RewoundInputs),
+		rewoundInputsColumn(s.RewoundInputs), s.ForkPointUUID,
 		s.FileInode, s.FileDevice, s.FileHash,
 	}
 }

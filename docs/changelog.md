@@ -346,6 +346,16 @@ The latest published release is
 
 **Bug fixes**
 
+- A Claude Code session you moved to the background no longer disappears from
+  AgentsView after you run `/fork` in it. The new fork copies the session's
+  history, and AgentsView used to mistake the session for a copy of its own
+  fork, trim away everything it held, and delete it. After the next start
+  re-reads your Claude Code sessions, the session is back as long as Claude
+  Code still has its file. Sessions created with `/fork` now show as forks of
+  the session they came from instead of as its continuation, and a session
+  that picks up from an earlier turn, for example after you rewound right
+  after moving it to the background, now attaches to the turn it really
+  continues from.
 - Sessions that stopped mid tool call more than an hour ago no longer drop to
   the bottom of the sidebar below sessions from earlier days. Once a session has
   been idle for an hour, it sorts with the other inactive sessions by its last

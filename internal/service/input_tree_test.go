@@ -600,3 +600,39 @@ func TestDirectBackend_InputTreeAttachesForkRewindsToInheritedInputs(
 		{parent: 1, session: "fork-a", ordinal: -1, preview: "start fresh", ends: []string{}, rewound: true},
 	}, inputTreeRows(tree))
 }
+
+// A handoff can resume from an earlier turn than the one its parent last
+// wrote: the user rewound right after the handoff. Its recorded fork point
+// places it after that turn, although every parent message predates it.
+func TestDirectBackend_InputTreeContinuationBranchesAtItsForkPoint(
+	t *testing.T,
+) {
+	t.Parallel()
+	reader, env := newInputTreeReader(t)
+	dbtest.SeedSession(t, env.db, "base", "p1", func(s *db.Session) {
+		s.StartedAt = new("2026-07-01T09:00:00Z")
+	})
+	dbtest.SeedSession(t, env.db, "moved", "p1", func(s *db.Session) {
+		s.ParentSessionID = new("base")
+		s.RelationshipType = "continuation"
+		s.StartedAt = new("2026-07-01T10:00:00Z")
+		s.ForkPointUUID = new("b1")
+	})
+	dbtest.SeedMessages(t, env.db,
+		uuidMsg("base", 0, "user", "first", "2026-07-01T09:00:00Z", "u0"),
+		uuidMsg("base", 1, "assistant", "ok", "2026-07-01T09:01:00Z", "b1"),
+		uuidMsg("base", 2, "user", "second", "2026-07-01T09:10:00Z", "u2"),
+		uuidMsg("base", 3, "assistant", "ok", "2026-07-01T09:11:00Z", "b3"),
+		uuidMsg("moved", 0, "user", "instead", "2026-07-01T10:00:00Z", "m0"),
+	)
+
+	tree, err := reader.InputTree(t.Context(), "moved")
+	require.NoError(t, err)
+	require.NotNil(t, tree)
+	assert.Equal(t, []inputTreeRow{
+		{parent: -1, session: "base", ordinal: 0, preview: "first", ends: []string{}},
+		{parent: 0, session: "base", ordinal: 2, preview: "second", ends: []string{"base"}},
+		{parent: 0, session: "moved", ordinal: 0, preview: "instead", ends: []string{"moved"}},
+	}, inputTreeRows(tree))
+	assert.Equal(t, []string{"first", "instead"}, activePath(tree))
+}

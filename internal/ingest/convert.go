@@ -40,6 +40,7 @@ func ConvertSessionContext(
 		LastEntryUUID:     stringPtr(LastParsedSourceUUID("", messages)),
 		ClaudeLinearParse: parsed.ClaudeLinearParse,
 		RewoundInputs:     convertRewoundInputs(parsed.RewoundInputs),
+		ForkPointUUID:     parsed.ForkPointUUID,
 		FileInode:         int64Ptr(parsed.File.Inode),
 		FileDevice:        int64Ptr(parsed.File.Device),
 		FileHash:          stringPtr(parsed.File.Hash),

@@ -421,7 +421,27 @@ fixtures retain this field; missing identities remain source-local.
   ctime can also remain unchanged. Cached head metadata therefore requires a
   bounded leading-byte digest check before reusing the root UUID or background
   stamp. Full parsing retains the verified parent and trims only the replayed
-  prefix; no provider format changed. Reverified 2026-08-16 with Claude Code
+  prefix; no provider format changed. Reverified 2026-11-25 against local
+  Claude Code 2.1.332 transcripts of a handoff, a rewind, and two `/fork`
+  runs in one family. Claude Code now writes pointers: the transcript a
+  handoff leaves gains a uuid-less
+  `{"type":"continued-in","continuedInSessionId":...}` record, and `/fork`
+  spawns a bg replay that opens with a queue-operation and a `user` record
+  carrying `origin.kind: "task-notification"` and a `<fork-source>` notice,
+  while the forking transcript records a `system`/`local_command` pair whose
+  stdout line carries `commandRun.command: "fork"` and ends with the child's
+  8-character id prefix. That stdout line is a chain entry, so later replays
+  copy it. A replay copy is one contiguous block of uuid-bearing lines; the
+  original writer interleaves uuid-less `api-request`, `last-prompt`, title,
+  and `file-history-*` records with its chain. A handoff that is rewound
+  before it writes anything persists only the chain up to the rewind target,
+  although its `file-history-snapshot` records still name the parent's later
+  turns. Lineage therefore prefers a `continued-in` parent, rules out sessions
+  a transcript names as its own children, and rejects a candidate whose shared
+  run extends past the transcript's contiguous replay block; before this, a
+  forked handoff was trimmed against its own `/fork` child and deleted. A
+  session with its own `<fork-source>` notice links as a fork. Reverified
+  2026-08-16 with Claude Code
   2.1.233 using a controlled `claude -p --session-id <uuid>` probe under an
   isolated `CLAUDE_CONFIG_DIR`. Before the deliberately bounded probe was
   terminated during its API retry, Claude had created the exact UUID

@@ -83,6 +83,12 @@ func TestForkDetection_LargeGapFork(t *testing.T) {
 	assert.Equal(t, "fork", fork.Session.ParentSessionID, "fork ParentSessionID")
 	assert.Equal(t, RelFork, fork.Session.RelationshipType, "fork RelationshipType")
 	assert.Equal(t, "q1", fork.Session.FirstMessage, "fork FirstMessage")
+
+	// The fork branched after b; the main session inherits nothing.
+	require.NotNil(t, fork.Session.ForkPointUUID)
+	assert.Equal(t, "b", *fork.Session.ForkPointUUID, "fork ForkPointUUID")
+	require.NotNil(t, main.Session.ForkPointUUID)
+	assert.Empty(t, *main.Session.ForkPointUUID, "main ForkPointUUID")
 }
 
 func TestForkDetection_SmallGapRetry(t *testing.T) {
@@ -638,6 +644,10 @@ func TestForkDetection_BranchedSessionLinksToParent(t *testing.T) {
 	assert.Equal(t, "parent-sess", sess.ParentSessionID, "ParentSessionID")
 	assert.Equal(t, RelFork, sess.RelationshipType, "RelationshipType")
 	assert.Equal(t, "branch q1 fixed", sess.FirstMessage, "FirstMessage")
+	// The genuine region hangs off the last replayed entry, through the
+	// /branch command record.
+	require.NotNil(t, sess.ForkPointUUID)
+	assert.Equal(t, "p4", *sess.ForkPointUUID, "ForkPointUUID")
 	// Bounds come from the genuine region, not replayed timestamps.
 	assert.Equal(t, "2024-01-01T11:00:00Z", formatTime(sess.StartedAt), "StartedAt")
 

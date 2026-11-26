@@ -101,7 +101,9 @@ func (b *directBackend) InputTree(
 		if err != nil {
 			return nil, err
 		}
-		continued, err := continuedContext(ctx, src, session, own, inherited)
+		continued, err := continuedContext(
+			ctx, src, session, own, inherited, b.forkPoint,
+		)
 		if err != nil {
 			return nil, err
 		}
@@ -232,6 +234,7 @@ func continuedContext(
 	src forkMessageSource,
 	session *db.Session,
 	own, inherited []db.Message,
+	forkPoint forkPointLookup,
 ) ([]db.Message, error) {
 	top := session
 	visited := map[string]bool{session.ID: true}
@@ -258,10 +261,10 @@ func continuedContext(
 			}
 		}
 	}
-	boundary, hasBoundary := forkBoundaryTime(topMsgs, top.StartedAt)
 	return ancestorMessages(
-		ctx, src, *top.ParentSessionID, boundary, hasBoundary, visited,
-		isInputTreeLink,
+		ctx, src, *top.ParentSessionID,
+		sessionLeaveBoundary(ctx, top, topMsgs, forkPoint), visited,
+		isInputTreeLink, forkPoint,
 	)
 }
 
