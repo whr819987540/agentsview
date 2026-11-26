@@ -544,7 +544,29 @@ rewound prompts for the **Inputs** tree below.
 
 In the sidebar, a group of related sessions always starts with the original
 session, as in the session tree. Expand the group to see its continuations,
-forks, and subagents below it.
+forks, and subagents below it. Forks carry a fork icon. A fork with no prompt
+of its own, such as one Claude Code's `/fork` created that you never used,
+stays out of the sidebar unless it is open; the session tree still lists it,
+dimmed.
+
+The conversation shows where it branched:
+
+- After the message where a session was forked, continued, or rewound, a
+    marker names the fork or continuation and links to it, or lists the
+    prompts the rewind abandoned.
+- A fork opens with the messages it inherited from its parent folded behind
+    its fork boundary, which says which parent turn it forked after. Click
+    **Show N inherited messages** to read them. Jumping or searching to one
+    of them shows them too.
+- A continuation opens with a card that says which parent turn it continues
+    from and links there. When it picks up from an earlier turn, for example
+    because you rewound right after moving a Claude Code session to the
+    background, the card says how many of the parent's later turns it does
+    not carry.
+
+The session tree also shows which parent turn each fork or continuation left
+after. These markers come from the local archive, so a server reading a
+PostgreSQL or ClickHouse replica does not show them.
 
 Open **Analysis** on a session with forks, continuations, or subagents to see
 its session tree. When the session has forks or continuations, switch the tree
