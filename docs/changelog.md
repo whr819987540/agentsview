@@ -355,6 +355,18 @@ The latest published release is
 
 **Bug fixes**
 
+- A Claude Code fork that you rewound past the point where you forked it now
+  shows as a fork of the session it came from. AgentsView used to store it as
+  an unrelated session that repeated the parent's earlier turns, and it listed
+  one of the parent's prompts among the fork's rewound prompts. A session you
+  moved to the background and then rewound now shows only the conversation
+  you kept, with the abandoned prompts listed as rewound, instead of every
+  branch in a row. Existing sessions are corrected after the next start
+  re-reads your Claude Code sessions.
+- Every Claude Code tool call that ran in parallel with others now shows its
+  result. AgentsView kept only the result Claude Code wrote last and showed
+  the other calls without output. Existing sessions are corrected after the
+  next start re-reads your Claude Code sessions.
 - A Claude Code session you moved to the background no longer disappears from
   AgentsView after you run `/fork` in it. The new fork copies the session's
   history, and AgentsView used to mistake the session for a copy of its own

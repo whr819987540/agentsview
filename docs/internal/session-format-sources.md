@@ -441,7 +441,23 @@ fixtures retain this field; missing identities remain source-local.
   run extends past the transcript's contiguous replay block; before this, a
   forked handoff was trimmed against its own `/fork` child and deleted. A
   session with its own `<fork-source>` notice links as a fork. Reverified
-  2026-08-16 with Claude Code
+  2026-11-26 against the same family after a `/fork` child rewound into the
+  history it copied: the new prompt parents to the copied `turn_duration`
+  record of an earlier turn, so the child's own notice branch and the rewound
+  branch both hang off the copy. A handoff's first own record can be a
+  uuid-bearing `session_cron_carry` attachment parented to the copy, ahead of
+  its first prompt. A `/fork` child copies the forking chain through the last
+  `turn_duration` record before the command, without the `/fork` records. A
+  background fork of a compacted session copies the chain from the
+  `compact_boundary` record, not the history before it. Full parsing
+  therefore keeps the copied chain in the DAG, marked replayed, lets branch
+  selection pick the live branch, and takes the last copied entry on that
+  branch as the fork point; before this, the child was stored as a separate
+  root with the copied turns. The same transcripts show parallel tool calls
+  as one `assistant` record per `tool_use` block, sharing `message.id`, with
+  each `tool_result` record parented to its own call and written in
+  completion order; only the last one written leads on, and the parser now
+  keeps the others too. Reverified 2026-08-16 with Claude Code
   2.1.233 using a controlled `claude -p --session-id <uuid>` probe under an
   isolated `CLAUDE_CONFIG_DIR`. Before the deliberately bounded probe was
   terminated during its API retry, Claude had created the exact UUID

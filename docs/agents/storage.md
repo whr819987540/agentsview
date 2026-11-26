@@ -380,9 +380,13 @@ by adding the column to each replica's session schema and push.
 
 `sessions.fork_point_uuid` holds the source UUID of the last parent message a
 session inherits: where a fork branched off its parent, or where a
-continuation took over. A background handoff that the user rewound can take
-over at an earlier turn than its parent's last one, so timestamps alone cannot
-place it. Fork context and the input tree cut the parent's messages at this
+continuation took over. A background handoff or `/fork` child that the user
+rewound can take over at an earlier turn than its parent's last one, so
+timestamps alone cannot place it. The Claude parser takes the last copied
+parent message on the branch the session keeps, not the one its first own
+record follows, because a rewind into the copied history leaves the first own
+records on an abandoned branch. Fork context and the input tree cut the
+parent's messages at this
 message, and fall back to the session's first timestamp when the column is
 empty or names no parent message. Read it through `DB.GetSessionForkPoint`;
 session reads do not load it.
