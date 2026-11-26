@@ -350,7 +350,7 @@ var claudeForkSourceMarker = []byte("<fork-source>")
 
 // claudeForkChildPrefix returns the child session id prefix at the end of
 // a /fork stdout line, such as "session waiting for a prompt · <name> ·
-// 70d053ce". It returns "" for any other shape.
+// 1a2b3c4d". It returns "" for any other shape.
 func claudeForkChildPrefix(lineBytes []byte) string {
 	if gjson.GetBytes(lineBytes, "subtype").Str != "local_command" ||
 		gjson.GetBytes(lineBytes, "commandRun.command").Str != "fork" {
