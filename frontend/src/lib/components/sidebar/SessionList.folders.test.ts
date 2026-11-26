@@ -20,6 +20,7 @@ vi.mock("../../api/generated/index", async (importOriginal) => ({
     patchApiV1SessionFoldersById: vi.fn(),
     deleteApiV1SessionFoldersById: vi.fn(),
     putApiV1SessionFoldersByIdSessions: vi.fn(),
+    putApiV1SessionFoldersByIdParent: vi.fn(),
     postApiV1SessionFoldersRemoveSessions: vi.fn(),
   },
 }));
@@ -29,6 +30,7 @@ const folderService = SessionFoldersService as unknown as Record<
   | "postApiV1SessionFolders"
   | "patchApiV1SessionFoldersById"
   | "putApiV1SessionFoldersByIdSessions"
+  | "putApiV1SessionFoldersByIdParent"
   | "postApiV1SessionFoldersRemoveSessions",
   ReturnType<typeof vi.fn>
 >;
@@ -70,11 +72,18 @@ function makeSession(id: string, project: string, endedAt: string): Session {
   };
 }
 
-function folder(id: number, name: string, sessionIds: string[], project = "alpha"): SessionFolder {
+function folder(
+  id: number,
+  name: string,
+  sessionIds: string[],
+  project = "alpha",
+  parentId?: number,
+): SessionFolder {
   return {
     id,
     project,
     name,
+    ...(parentId === undefined ? {} : { parent_id: parentId }),
     session_ids: sessionIds,
     created_at: "2026-10-01T00:00:00Z",
     updated_at: "2026-10-01T00:00:00Z",
@@ -99,6 +108,21 @@ function folderRows(): string[] {
     (row) =>
       `${row.querySelector(".folder-name")?.textContent}(${row.querySelector(".folder-count")?.textContent})`,
   );
+}
+
+function folderRow(name: string): HTMLElement {
+  return Array.from(document.querySelectorAll<HTMLElement>(".folder-row")).find(
+    (row) => row.querySelector(".folder-name")?.textContent === name,
+  )!;
+}
+
+async function openMenuItem(row: HTMLElement, label: string) {
+  row.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, clientX: 12, clientY: 12 }));
+  await tick();
+  Array.from(document.querySelectorAll<HTMLButtonElement>(".context-menu-item"))
+    .find((button) => button.textContent?.includes(label))!
+    .click();
+  await settle();
 }
 
 function sessionRow(id: string): HTMLElement {
@@ -407,5 +431,132 @@ describe("SessionList folders", () => {
       { name: "Specs" },
     );
     expect(folderRows()).toEqual(["Docs(1)", "Specs(0)"]);
+  });
+  describe("nested folders", () => {
+    // Docs > Inner, with a2 filed in Inner and Specs at the top level.
+    beforeEach(() => {
+      const initial = {
+        folders: [
+          folder(1, "Docs", []),
+          folder(3, "Inner", ["a2"], "alpha", 1),
+          folder(2, "Specs", []),
+        ],
+        editable: true,
+      };
+      folderService.getApiV1SessionFolders.mockResolvedValue(initial);
+      sessionFolders.folders = initial.folders;
+    });
+
+    it("shows a subfolder inside its open parent and counts its sessions in the parent", async () => {
+      component = mount(SessionList, { target: document.body });
+      await settle();
+      expect(folderRows()).toEqual(["Docs(1)", "Specs(0)"]);
+
+      folderRow("Docs").click();
+      await settle();
+      folderRow("Inner").click();
+      await settle();
+
+      expect(folderRows()).toEqual(["Docs(1)", "Inner(1)", "Specs(0)"]);
+      expect(folderRow("Inner").style.paddingLeft).toBe("22px");
+      expect(sessionRow("a2").style.paddingLeft).toBe("36px");
+    });
+
+    it("creates a subfolder from a folder's menu and opens its parent", async () => {
+      folderService.postApiV1SessionFolders.mockResolvedValue(
+        folder(5, "New folder", [], "alpha", 2),
+      );
+      component = mount(SessionList, { target: document.body });
+      await settle();
+
+      await openMenuItem(folderRow("Specs"), m.sidebar_folder_create_subfolder());
+
+      expect(folderService.postApiV1SessionFolders).toHaveBeenCalledWith({
+        project: "alpha",
+        name: "New folder",
+        parent_id: 2,
+      });
+      const editor = document.querySelector<HTMLElement>(".folder-row.editing")!;
+      expect(editor.style.paddingLeft).toBe("22px");
+      expect(editor.querySelector("input")!.value).toBe("New folder");
+    });
+
+    it("moves a folder into the folder it is dropped on", async () => {
+      folderService.putApiV1SessionFoldersByIdParent.mockResolvedValue(
+        folder(2, "Specs", [], "alpha", 1),
+      );
+      component = mount(SessionList, { target: document.body });
+      await settle();
+
+      folderRow("Specs").dispatchEvent(dragEvent("dragstart"));
+      const over = dragEvent("dragover");
+      folderRow("Docs").dispatchEvent(over);
+      expect(over.defaultPrevented).toBe(true);
+      folderRow("Docs").dispatchEvent(dragEvent("drop"));
+      await settle();
+
+      expect(folderService.putApiV1SessionFoldersByIdParent).toHaveBeenCalledWith(
+        { id: 2 },
+        { parent_id: 1 },
+      );
+      expect(folderRows()).toEqual(["Docs(1)"]);
+    });
+
+    it("refuses to drop a folder into itself or a folder inside it", async () => {
+      component = mount(SessionList, { target: document.body });
+      await settle();
+      folderRow("Docs").click();
+      await settle();
+
+      folderRow("Docs").dispatchEvent(dragEvent("dragstart"));
+      const onItself = dragEvent("dragover");
+      folderRow("Docs").dispatchEvent(onItself);
+      const onChild = dragEvent("dragover");
+      folderRow("Inner").dispatchEvent(onChild);
+      const onSibling = dragEvent("dragover");
+      folderRow("Specs").dispatchEvent(onSibling);
+
+      expect(onItself.defaultPrevented).toBe(false);
+      expect(onChild.defaultPrevented).toBe(false);
+      expect(onSibling.defaultPrevented).toBe(true);
+    });
+
+    it("moves a folder to the top level from its picker, which leaves out the folder itself", async () => {
+      folderService.putApiV1SessionFoldersByIdParent.mockResolvedValue(folder(3, "Inner", ["a2"]));
+      component = mount(SessionList, { target: document.body });
+      await settle();
+      folderRow("Docs").click();
+      await settle();
+
+      await openMenuItem(folderRow("Inner"), m.sidebar_row_move_to_folder());
+
+      const picker = document.querySelector<HTMLElement>(".folder-picker")!;
+      expect(picker.getAttribute("aria-label")).toBe(m.sidebar_folder_move_heading());
+      const options = Array.from(
+        picker.querySelectorAll<HTMLButtonElement>(".folder-picker-option"),
+      );
+      expect(options.map((o) => o.textContent?.trim())).toEqual([
+        m.sidebar_folder_top_level(),
+        "Docs",
+        "Specs",
+      ]);
+      expect(options[1]!.getAttribute("aria-current")).toBe("true");
+      expect(picker.querySelector("input")).toBeNull();
+
+      options[0]!.click();
+      await settle();
+
+      expect(folderService.putApiV1SessionFoldersByIdParent).toHaveBeenCalledWith({ id: 3 }, {});
+      expect(folderRows()).toEqual(["Docs(0)", "Inner(1)", "Specs(0)"]);
+    });
+
+    it("opens every folder around the active session", async () => {
+      sessions.activeSessionId = "a2";
+      component = mount(SessionList, { target: document.body });
+      await settle();
+
+      expect(folderRows()).toEqual(["Docs(1)", "Inner(1)", "Specs(0)"]);
+      expect(visibleSessionIds()).toContain("a2");
+    });
   });
 });

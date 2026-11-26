@@ -16,7 +16,7 @@ func TestCurationExportHandler(t *testing.T) {
 	ctx := t.Context()
 	_, err := te.db.StarSession(ctx, "a1")
 	require.NoError(t, err)
-	folder, err := te.db.CreateSessionFolder(ctx, "alpha", "Docs")
+	folder, err := te.db.CreateSessionFolder(ctx, "alpha", "Docs", nil)
 	require.NoError(t, err)
 	require.NoError(t, te.db.MoveSessionsToFolder(ctx, folder.ID, []string{"a2"}))
 

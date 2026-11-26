@@ -1,4 +1,5 @@
 import type { SessionGroup, SessionGroupInput } from "../../stores/sessions.svelte.js";
+import { folderChildren } from "../../utils/folder-tree.js";
 import { sessionAncestryMatches } from "../../utils/session-ancestry.js";
 import { selectLiveId, selectPrimaryId } from "../../utils/session-primary.js";
 
@@ -68,6 +69,8 @@ export interface SidebarFolder {
   id: number;
   project: string;
   name: string;
+  /** The folder that holds this one; absent at the project's top level. */
+  parent_id?: number;
 }
 
 /**
@@ -77,7 +80,7 @@ export interface SidebarFolder {
 export interface FolderView {
   /** The filtered project when the list shows a single project. */
   project: string | null;
-  /** Folders of each project in display order. */
+  /** Folders of each project, sorted the way siblings list. */
   foldersByProject: ReadonlyMap<string, readonly SidebarFolder[]>;
   /** Folder of each filed session group, keyed by group key. */
   groupFolder: ReadonlyMap<string, number>;
@@ -93,7 +96,8 @@ export interface DisplayItem {
   group?: SessionGroup;
   /** The folder a "folder" row stands for. */
   folder?: SidebarFolder;
-  /** Extra indent levels: 1 for rows inside a folder. */
+  /** Extra indent levels: one for each folder around the row. A folder
+   *  row is indented by the folders around it, not by itself. */
   inset?: number;
   /** Drop target for dragged sessions: a folder ID, or null for the
    *  project's top level. Undefined where folders do not apply. */
@@ -449,9 +453,10 @@ function emitGroupItems(
  * Otherwise, interleaves header rows and session rows,
  * respecting collapsed groups. Continuation chains expand
  * inline when their group key is in expandedGroups. Where folders
- * apply, a project's folders come first, each followed by its
- * sessions when expanded, then the project's unfiled sessions. A gap
- * row separates an open last folder's sessions from the unfiled ones.
+ * apply, a project's folders come first, each followed when expanded by
+ * its subfolders and then its own sessions, then the project's unfiled
+ * sessions. At every level, a gap row separates an open last folder's
+ * rows from the sessions that follow it.
  */
 export function buildDisplayItems(
   groups: SessionGroup[],
@@ -539,6 +544,7 @@ function emitFolderedGroups(
   y: { value: number },
 ): void {
   const projectFolders = view.foldersByProject.get(project) ?? [];
+  const children = folderChildren(projectFolders);
   const byFolder = new Map<number, SessionGroup[]>(projectFolders.map((f) => [f.id, []]));
   const unfiled: SessionGroup[] = [];
   for (const g of groups) {
@@ -548,56 +554,69 @@ function emitFolderedGroups(
     else unfiled.push(g);
   }
 
-  let lastFolderShown = false;
-  for (const folder of projectFolders) {
-    const folderGroups = byFolder.get(folder.id)!;
-    lastFolderShown = view.expanded.has(folder.id) && folderGroups.length > 0;
-    items.push({
-      id: `folder:${folder.id}`,
-      type: "folder",
-      label: folder.name,
-      count: folderGroups.length,
-      folder,
-      sectionGroups: folderGroups,
-      dropFolderId: folder.id,
-      dropProject: project,
-      height: FOLDER_HEADER_HEIGHT,
-      top: y.value,
-    });
-    y.value += FOLDER_HEADER_HEIGHT;
-    if (!view.expanded.has(folder.id)) continue;
-    for (const g of folderGroups) {
-      emitPlacedGroupItems(g, label, expandedGroups, items, y, {
-        inset: 1,
+  // The session groups of each folder and of every folder inside it, which
+  // its row counts and a collapsed row stands for.
+  const contents = new Map<number, SessionGroup[]>();
+  const collect = (folder: SidebarFolder): SessionGroup[] => {
+    const out = [...byFolder.get(folder.id)!];
+    for (const child of children.get(folder.id) ?? []) out.push(...collect(child));
+    contents.set(folder.id, out);
+    return out;
+  };
+  for (const folder of children.get(null) ?? []) collect(folder);
+
+  const emitLevel = (parentId: number | null, depth: number) => {
+    const inset = depth > 0 ? depth : undefined;
+    let lastFolderShown = false;
+    for (const folder of children.get(parentId) ?? []) {
+      const folderGroups = contents.get(folder.id)!;
+      const start = items.length;
+      items.push({
+        id: `folder:${folder.id}`,
+        type: "folder",
+        label: folder.name,
+        count: folderGroups.length,
+        folder,
+        sectionGroups: folderGroups,
+        inset,
         dropFolderId: folder.id,
+        dropProject: project,
+        height: FOLDER_HEADER_HEIGHT,
+        top: y.value,
+      });
+      y.value += FOLDER_HEADER_HEIGHT;
+      if (view.expanded.has(folder.id)) emitLevel(folder.id, depth + 1);
+      lastFolderShown = items.length > start + 1;
+    }
+
+    const direct = parentId === null ? unfiled : byFolder.get(parentId)!;
+    // Without the gap, the open last folder's indented rows run straight
+    // into the sessions of this level. It belongs to this level, so a drop
+    // on it files a session here.
+    if (lastFolderShown && direct.length > 0) {
+      items.push({
+        id: parentId === null ? `folder-gap:${project}` : `folder-gap:${project}:${parentId}`,
+        type: "gap",
+        label,
+        count: 0,
+        inset,
+        dropFolderId: parentId,
+        dropProject: project,
+        height: FOLDER_GAP_HEIGHT,
+        top: y.value,
+      });
+      y.value += FOLDER_GAP_HEIGHT;
+    }
+
+    for (const g of direct) {
+      emitPlacedGroupItems(g, label, expandedGroups, items, y, {
+        inset,
+        dropFolderId: parentId,
         dropProject: project,
       });
     }
-  }
-
-  // Without the gap, the open last folder's indented rows run straight
-  // into the unfiled rows. It belongs to the top level, so a drop on it
-  // takes a session out of its folder.
-  if (lastFolderShown && unfiled.length > 0) {
-    items.push({
-      id: `folder-gap:${project}`,
-      type: "gap",
-      label,
-      count: 0,
-      dropFolderId: null,
-      dropProject: project,
-      height: FOLDER_GAP_HEIGHT,
-      top: y.value,
-    });
-    y.value += FOLDER_GAP_HEIGHT;
-  }
-
-  for (const g of unfiled) {
-    emitPlacedGroupItems(g, label, expandedGroups, items, y, {
-      dropFolderId: null,
-      dropProject: project,
-    });
-  }
+  };
+  emitLevel(null, 0);
 }
 
 function displaySessionId(item: DisplayItem): string | null {

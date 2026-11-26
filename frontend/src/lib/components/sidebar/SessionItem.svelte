@@ -38,7 +38,7 @@
   import { sync } from "../../stores/sync.svelte.js";
   import ProjectTypeahead from "../layout/ProjectTypeahead.svelte";
   import SessionFolderPicker from "./SessionFolderPicker.svelte";
-  import { endSessionDrag, startSessionDrag } from "./session-drag.js";
+  import { endSidebarDrag, startSessionDrag } from "./session-drag.js";
 
   interface Props {
     session: SessionGroupInput;
@@ -531,7 +531,7 @@
   style:padding-left="{8 + depth * 16 + inset * 14}px"
   draggable={canFile && !renaming ? "true" : undefined}
   ondragstart={handleDragStart}
-  ondragend={endSessionDrag}
+  ondragend={endSidebarDrag}
   onclick={handleRowClick}
   onkeydown={(e) => {
     if (e.target !== e.currentTarget) {

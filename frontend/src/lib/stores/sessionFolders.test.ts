@@ -14,6 +14,7 @@ vi.mock("../api/generated/index", () => ({
     patchApiV1SessionFoldersById: vi.fn(),
     deleteApiV1SessionFoldersById: vi.fn(),
     putApiV1SessionFoldersByIdSessions: vi.fn(),
+    putApiV1SessionFoldersByIdParent: vi.fn(),
     postApiV1SessionFoldersRemoveSessions: vi.fn(),
   },
 }));
@@ -24,15 +25,23 @@ const service = SessionFoldersService as unknown as Record<
   | "patchApiV1SessionFoldersById"
   | "deleteApiV1SessionFoldersById"
   | "putApiV1SessionFoldersByIdSessions"
+  | "putApiV1SessionFoldersByIdParent"
   | "postApiV1SessionFoldersRemoveSessions",
   ReturnType<typeof vi.fn>
 >;
 
-function folder(id: number, name: string, sessionIds: string[], project = "alpha"): SessionFolder {
+function folder(
+  id: number,
+  name: string,
+  sessionIds: string[],
+  project = "alpha",
+  parentId?: number,
+): SessionFolder {
   return {
     id,
     project,
     name,
+    ...(parentId === undefined ? {} : { parent_id: parentId }),
     session_ids: sessionIds,
     created_at: "2026-10-01T00:00:00Z",
     updated_at: "2026-10-01T00:00:00Z",
@@ -144,6 +153,76 @@ describe("SessionFoldersStore", () => {
 
     expect(store.foldersFor("alpha").map((f) => f.name)).toEqual(["Bugs"]);
     expect(store.folderIdBySession.size).toBe(0);
+  });
+
+  describe("nested folders", () => {
+    // Work > Bugs > Triage, with Notes also in Work and Ops in beta.
+    beforeEach(async () => {
+      service.getApiV1SessionFolders.mockResolvedValue({
+        folders: [
+          folder(1, "Work", ["w1"]),
+          folder(2, "Bugs", ["b1"], "alpha", 1),
+          folder(3, "Triage", ["t1"], "alpha", 2),
+          folder(4, "Notes", [], "alpha", 1),
+          folder(5, "Ops", [], "beta"),
+        ],
+        editable: true,
+      });
+      store = createSessionFoldersStore();
+      await store.load();
+    });
+
+    it("walks a folder's ancestors and subtree", () => {
+      expect(store.ancestorIds(3)).toEqual([2, 1]);
+      expect(store.parentId(3)).toBe(2);
+      expect(store.parentId(1)).toBeNull();
+      expect([...store.subtreeIds(1)].sort((a, b) => a - b)).toEqual([1, 2, 3, 4]);
+      expect([...store.subtreeIds(3)]).toEqual([3]);
+    });
+
+    it("creates a subfolder with its parent and a top-level folder without one", async () => {
+      service.postApiV1SessionFolders.mockResolvedValue(folder(6, "Later", [], "alpha", 1));
+
+      await store.create("alpha", "Later", 1);
+      await store.create("alpha", "Top");
+
+      expect(service.postApiV1SessionFolders.mock.calls).toEqual([
+        [{ project: "alpha", name: "Later", parent_id: 1 }],
+        [{ project: "alpha", name: "Top" }],
+      ]);
+    });
+
+    it("moves a folder to the top level by sending no parent", async () => {
+      service.putApiV1SessionFoldersByIdParent.mockResolvedValue(folder(3, "Triage", ["t1"]));
+
+      await store.moveFolder(3, null);
+
+      expect(service.putApiV1SessionFoldersByIdParent).toHaveBeenCalledWith({ id: 3 }, {});
+      expect(store.parentId(3)).toBeNull();
+      expect(store.ancestorIds(2)).toEqual([1]);
+    });
+
+    it("moves a deleted folder's sessions and subfolders into its parent", async () => {
+      service.deleteApiV1SessionFoldersById.mockResolvedValue(undefined);
+
+      await store.remove(2);
+
+      expect(store.parentId(3)).toBe(1);
+      expect(store.folders.find((f) => f.id === 1)!.session_ids).toEqual(["w1", "b1"]);
+      expect(store.folderIdBySession.get("b1")).toBe(1);
+      expect(store.folderIdBySession.get("t1")).toBe(3);
+    });
+
+    it("moves a deleted top-level folder's contents to the top level", async () => {
+      service.deleteApiV1SessionFoldersById.mockResolvedValue(undefined);
+
+      await store.remove(1);
+
+      expect(store.parentId(2)).toBeNull();
+      expect(store.parentId(4)).toBeNull();
+      expect(store.folderIdBySession.has("w1")).toBe(false);
+      expect(store.ancestorIds(3)).toEqual([2]);
+    });
   });
 
   it("numbers a default name already used in the project", () => {

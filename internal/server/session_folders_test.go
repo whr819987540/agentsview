@@ -13,6 +13,7 @@ type sessionFolderBody struct {
 	ID         int64    `json:"id"`
 	Project    string   `json:"project"`
 	Name       string   `json:"name"`
+	ParentID   *int64   `json:"parent_id"`
 	SessionIDs []string `json:"session_ids"`
 }
 
@@ -75,6 +76,56 @@ func TestSessionFolderHandlers(t *testing.T) {
 
 	w = te.get(t, "/api/v1/sessions/a1")
 	require.Equal(t, http.StatusOK, w.Code, "deleting a folder keeps its sessions: %s", w.Body.String())
+}
+
+func TestSessionFolderNestingHandlers(t *testing.T) {
+	te := setup(t)
+	te.seedSession(t, "a1", "alpha", 2)
+
+	w := te.post(t, "/api/v1/session-folders", `{"project":"alpha","name":"Work"}`)
+	require.Equal(t, http.StatusCreated, w.Code, "body: %s", w.Body.String())
+	work := decode[sessionFolderBody](t, w)
+	assert.Nil(t, work.ParentID)
+	w = te.post(t, "/api/v1/session-folders", `{"project":"beta","name":"Ops"}`)
+	require.Equal(t, http.StatusCreated, w.Code, "body: %s", w.Body.String())
+	ops := decode[sessionFolderBody](t, w)
+
+	w = te.post(t, "/api/v1/session-folders",
+		fmt.Sprintf(`{"project":"alpha","name":"Bugs","parent_id":%d}`, work.ID))
+	require.Equal(t, http.StatusCreated, w.Code, "body: %s", w.Body.String())
+	bugs := decode[sessionFolderBody](t, w)
+	require.NotNil(t, bugs.ParentID)
+	assert.Equal(t, work.ID, *bugs.ParentID)
+	w = te.post(t, "/api/v1/session-folders",
+		fmt.Sprintf(`{"project":"alpha","name":"Other","parent_id":%d}`, ops.ID))
+	require.Equal(t, http.StatusBadRequest, w.Code, "a parent from another project: %s", w.Body.String())
+
+	workParent := fmt.Sprintf("/api/v1/session-folders/%d/parent", work.ID)
+	bugsParent := fmt.Sprintf("/api/v1/session-folders/%d/parent", bugs.ID)
+	w = te.put(t, workParent, fmt.Sprintf(`{"parent_id":%d}`, bugs.ID))
+	require.Equal(t, http.StatusBadRequest, w.Code, "a folder cannot go into its subfolder: %s", w.Body.String())
+	w = te.put(t, "/api/v1/session-folders/9999/parent", `{}`)
+	require.Equal(t, http.StatusNotFound, w.Code, "body: %s", w.Body.String())
+
+	w = te.put(t, bugsParent, `{}`)
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	assert.Nil(t, decode[sessionFolderBody](t, w).ParentID, "no parent_id moves it to the top level")
+	w = te.put(t, workParent, fmt.Sprintf(`{"parent_id":%d}`, bugs.ID))
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	moved := decode[sessionFolderBody](t, w)
+	require.NotNil(t, moved.ParentID)
+	assert.Equal(t, bugs.ID, *moved.ParentID)
+
+	// Deleting Bugs moves Work back to the top level.
+	w = te.del(t, fmt.Sprintf("/api/v1/session-folders/%d", bugs.ID))
+	require.Equal(t, http.StatusNoContent, w.Code, "body: %s", w.Body.String())
+	w = te.get(t, "/api/v1/session-folders")
+	require.Equal(t, http.StatusOK, w.Code, "body: %s", w.Body.String())
+	list := decode[sessionFoldersBody](t, w)
+	require.Len(t, list.Folders, 2)
+	for _, f := range list.Folders {
+		assert.Nil(t, f.ParentID, "folder %s", f.Name)
+	}
 }
 
 func TestSessionFolderWriteReturns503WhileWriterClosed(t *testing.T) {

@@ -1165,13 +1165,18 @@ func (d *DB) CopySessionMetadataFrom(
 		}
 	}
 
-	// Copy sidebar folders with their IDs, then the memberships of sessions
-	// the fresh DB still holds (tables may not exist in older DBs).
+	// Copy sidebar folders with their IDs and nesting, then the memberships
+	// of sessions the fresh DB still holds (tables may not exist in older
+	// DBs). Folders from before nesting sit at their project's top level.
 	if oldDBHasTable(ctx, tx, "session_folders") {
+		parentID := "NULL"
+		if oldDBHasColumn(ctx, tx, "session_folders", "parent_id") {
+			parentID = "parent_id"
+		}
 		if _, err := tx.ExecContext(ctx, `
 			INSERT OR IGNORE INTO main.session_folders
-				(id, project, name, created_at, updated_at)
-			SELECT id, project, name, created_at, updated_at
+				(id, project, name, parent_id, created_at, updated_at)
+			SELECT id, project, name, `+parentID+`, created_at, updated_at
 			FROM old_db.session_folders`); err != nil {
 			return fmt.Errorf("copying session folders: %w", err)
 		}

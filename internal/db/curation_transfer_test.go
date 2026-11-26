@@ -43,11 +43,11 @@ func curationSourceArchive(t *testing.T) *DB {
 		s.EndedAt = new("2026-03-02T09:00:00Z")
 	})
 
-	docs, err := d.CreateSessionFolder(ctx, "alpha", "Docs")
+	docs, err := d.CreateSessionFolder(ctx, "alpha", "Docs", nil)
 	require.NoError(t, err)
-	ops, err := d.CreateSessionFolder(ctx, "beta", "Ops")
+	ops, err := d.CreateSessionFolder(ctx, "beta", "Ops", nil)
 	require.NoError(t, err)
-	_, err = d.CreateSessionFolder(ctx, "alpha", "Empty")
+	_, err = d.CreateSessionFolder(ctx, "alpha", "Empty", nil)
 	require.NoError(t, err)
 	require.NoError(t, d.MoveSessionsToFolder(ctx, docs.ID, []string{"s1", "s2", "hidden"}))
 	require.NoError(t, d.MoveSessionsToFolder(ctx, ops.ID, []string{"s3"}))
@@ -195,11 +195,11 @@ func TestImportCurationKeepsCurationAlreadyHere(t *testing.T) {
 	_, ok, err := target.MarkSessionEnded(ctx, "k2", EndMarkBranch)
 	require.NoError(t, err)
 	require.True(t, ok)
-	mine, err := target.CreateSessionFolder(ctx, "alpha", "Mine")
+	mine, err := target.CreateSessionFolder(ctx, "alpha", "Mine", nil)
 	require.NoError(t, err)
-	docs, err := target.CreateSessionFolder(ctx, "alpha", "Docs")
+	docs, err := target.CreateSessionFolder(ctx, "alpha", "Docs", nil)
 	require.NoError(t, err)
-	old, err := target.CreateSessionFolder(ctx, "gamma", "Old")
+	old, err := target.CreateSessionFolder(ctx, "gamma", "Old", nil)
 	require.NoError(t, err)
 	require.NoError(t, target.MoveSessionsToFolder(ctx, mine.ID, []string{"k3"}))
 	require.NoError(t, target.MoveSessionsToFolder(ctx, docs.ID, []string{"k4"}))
@@ -406,6 +406,63 @@ func TestImportCurationStarTime(t *testing.T) {
 	}
 }
 
+func TestCurationTransferKeepsFolderNesting(t *testing.T) {
+	ctx := t.Context()
+	source := testDB(t)
+	insertSession(t, source, "s1", "alpha")
+	work, err := source.CreateSessionFolder(ctx, "alpha", "Work", nil)
+	require.NoError(t, err)
+	bugs, err := source.CreateSessionFolder(ctx, "alpha", "Bugs", &work.ID)
+	require.NoError(t, err)
+	triage, err := source.CreateSessionFolder(ctx, "alpha", "Triage", &bugs.ID)
+	require.NoError(t, err)
+	_, err = source.CreateSessionFolder(ctx, "alpha", "Notes", &work.ID)
+	require.NoError(t, err)
+	require.NoError(t, source.MoveSessionsToFolder(ctx, triage.ID, []string{"s1"}))
+
+	doc, err := source.ExportCuration(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, []CurationExportFolder{
+		{Project: "alpha", Name: "Bugs", Parent: "Work"},
+		{Project: "alpha", Name: "Notes", Parent: "Work"},
+		{Project: "alpha", Name: "Triage", Parent: "Bugs"},
+		{Project: "alpha", Name: "Work"},
+	}, doc.Folders)
+
+	t.Run("an empty archive gets the whole tree", func(t *testing.T) {
+		target := testDB(t)
+		insertSession(t, target, "s1", "alpha")
+
+		result, err := target.ImportCuration(ctx, doc, CurationImportOptions{})
+		require.NoError(t, err)
+		assert.Equal(t, 4, result.FoldersCreated)
+		assert.Equal(t, map[string]string{
+			"alpha/Work":   "",
+			"alpha/Bugs":   "Work",
+			"alpha/Triage": "Bugs",
+			"alpha/Notes":  "Work",
+		}, folderParents(t, target))
+		assert.Equal(t, []string{"s1"}, folderMembers(t, target)["alpha/Triage"])
+	})
+
+	t.Run("a folder already here stays where it is", func(t *testing.T) {
+		target := testDB(t)
+		insertSession(t, target, "s1", "alpha")
+		_, err := target.CreateSessionFolder(ctx, "alpha", "Bugs", nil)
+		require.NoError(t, err)
+
+		result, err := target.ImportCuration(ctx, doc, CurationImportOptions{})
+		require.NoError(t, err)
+		assert.Equal(t, 3, result.FoldersCreated)
+		assert.Equal(t, map[string]string{
+			"alpha/Work":   "",
+			"alpha/Bugs":   "",
+			"alpha/Triage": "Bugs",
+			"alpha/Notes":  "Work",
+		}, folderParents(t, target))
+	})
+}
+
 func TestValidateCurationExport(t *testing.T) {
 	valid := func() CurationExport {
 		return CurationExport{Format: CurationExportFormat, Version: CurationExportVersion}
@@ -435,6 +492,34 @@ func TestValidateCurationExport(t *testing.T) {
 		{name: "folder with a blank name", edit: func(d *CurationExport) {
 			d.Folders = []CurationExportFolder{{Project: "alpha", Name: "  "}}
 		}, wantErr: "name is required"},
+		{name: "folder with an unlisted parent", edit: func(d *CurationExport) {
+			d.Folders = []CurationExportFolder{{Project: "alpha", Name: "Docs", Parent: "Work"}}
+		}, wantErr: `has parent "Work", which is not listed`},
+		{name: "parent from another project", edit: func(d *CurationExport) {
+			d.Folders = []CurationExportFolder{
+				{Project: "alpha", Name: "Docs", Parent: "Work"},
+				{Project: "beta", Name: "Work"},
+			}
+		}, wantErr: `has parent "Work", which is not listed`},
+		{name: "folder inside itself", edit: func(d *CurationExport) {
+			d.Folders = []CurationExportFolder{{Project: "alpha", Name: "Docs", Parent: "Docs"}}
+		}, wantErr: "sits inside itself"},
+		{name: "folders inside each other", edit: func(d *CurationExport) {
+			d.Folders = []CurationExportFolder{
+				{Project: "alpha", Name: "Docs", Parent: "Work"},
+				{Project: "alpha", Name: "Work", Parent: "Docs"},
+			}
+		}, wantErr: "sits inside itself"},
+		{name: "folder listed with two parents", edit: func(d *CurationExport) {
+			d.Folders = []CurationExportFolder{
+				{Project: "alpha", Name: "Docs"},
+				{Project: "alpha", Name: "Docs", Parent: "Work"},
+				{Project: "alpha", Name: "Work"},
+			}
+		}, wantErr: "listed with two parents"},
+		{name: "parent with a control character", edit: func(d *CurationExport) {
+			d.Folders = []CurationExportFolder{{Project: "alpha", Name: "Docs", Parent: "a\nb"}}
+		}, wantErr: "folder 0 parent"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -449,10 +534,14 @@ func TestValidateCurationExport(t *testing.T) {
 	t.Run("folder names are trimmed", func(t *testing.T) {
 		doc := valid()
 		doc.Sessions = []CurationExportSession{{ID: "s1", Folder: " Docs "}}
-		doc.Folders = []CurationExportFolder{{Project: "alpha", Name: " Empty "}}
+		doc.Folders = []CurationExportFolder{
+			{Project: "alpha", Name: " Empty ", Parent: " Work "},
+			{Project: "alpha", Name: "Work"},
+		}
 		require.NoError(t, ValidateCurationExport(&doc))
 		assert.Equal(t, "Docs", doc.Sessions[0].Folder)
 		assert.Equal(t, "Empty", doc.Folders[0].Name)
+		assert.Equal(t, "Work", doc.Folders[0].Parent)
 	})
 }
 

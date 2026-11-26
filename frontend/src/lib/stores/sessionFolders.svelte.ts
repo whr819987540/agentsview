@@ -1,5 +1,6 @@
 import { SessionFoldersService, type DbSessionFolder } from "../api/generated/index";
 import { ApiError } from "../api/runtime.js";
+import { folderAncestorIds, folderSubtreeIds } from "../utils/folder-tree.js";
 
 export type SessionFolder = DbSessionFolder;
 
@@ -9,8 +10,9 @@ export class SessionFolderNameTakenError extends Error {}
 const nameCollator = new Intl.Collator(undefined, { numeric: true, sensitivity: "base" });
 
 /**
- * Sidebar folders for each project. Folders change only how the sidebar
- * lists sessions; the archive keeps sessions where they are.
+ * Sidebar folders for each project. A folder can sit inside another folder
+ * of its project. Folders change only how the sidebar lists sessions; the
+ * archive keeps sessions where they are.
  */
 class SessionFoldersStore {
   folders: SessionFolder[] = $state([]);
@@ -90,6 +92,23 @@ class SessionFoldersStore {
     return null;
   }
 
+  /** The folders that hold a folder, nearest first. */
+  ancestorIds(id: number): number[] {
+    const folder = this.folders.find((f) => f.id === id);
+    return folder ? folderAncestorIds(this.foldersFor(folder.project), id) : [];
+  }
+
+  /** The IDs of a folder and every folder inside it. */
+  subtreeIds(id: number): Set<number> {
+    const folder = this.folders.find((f) => f.id === id);
+    return folder ? folderSubtreeIds(this.foldersFor(folder.project), id) : new Set();
+  }
+
+  /** The folder that holds a folder, or null at its project's top level. */
+  parentId(id: number): number | null {
+    return this.ancestorIds(id)[0] ?? null;
+  }
+
   /** A name not yet used in the project: base, "base 2", "base 3", ... */
   availableName(project: string, base: string): string {
     const taken = new Set(this.foldersFor(project).map((f) => f.name));
@@ -99,9 +118,18 @@ class SessionFoldersStore {
     return `${base} ${n}`;
   }
 
-  async create(project: string, name: string): Promise<SessionFolder> {
+  /** Create a folder at the project's top level, or inside parentId. */
+  async create(
+    project: string,
+    name: string,
+    parentId: number | null = null,
+  ): Promise<SessionFolder> {
     const folder = await mapNameTaken(() =>
-      SessionFoldersService.postApiV1SessionFolders({ project, name }),
+      SessionFoldersService.postApiV1SessionFolders({
+        project,
+        name,
+        ...(parentId === null ? {} : { parent_id: parentId }),
+      }),
     );
     this.version++;
     this.folders = [...this.folders, folder];
@@ -117,10 +145,34 @@ class SessionFoldersStore {
     return folder;
   }
 
+  /** Move a folder, with everything inside it, into parentId or to the
+   *  project's top level. */
+  async moveFolder(id: number, parentId: number | null): Promise<SessionFolder> {
+    const folder = await SessionFoldersService.putApiV1SessionFoldersByIdParent(
+      { id },
+      parentId === null ? {} : { parent_id: parentId },
+    );
+    this.version++;
+    this.folders = this.folders.map((f) => (f.id === id ? folder : f));
+    return folder;
+  }
+
+  /** Delete a folder. As on the server, its sessions and subfolders move up
+   *  into the folder that held it, or to the project's top level. */
   async remove(id: number): Promise<void> {
     await SessionFoldersService.deleteApiV1SessionFoldersById({ id });
     this.version++;
-    this.folders = this.folders.filter((f) => f.id !== id);
+    const removed = this.folders.find((f) => f.id === id);
+    const parentId = removed?.parent_id;
+    this.folders = this.folders
+      .filter((f) => f.id !== id)
+      .map((f) => {
+        let next = f.parent_id === id ? { ...f, parent_id: parentId } : f;
+        if (removed && f.id === parentId) {
+          next = { ...next, session_ids: [...next.session_ids, ...removed.session_ids] };
+        }
+        return next;
+      });
   }
 
   /** Move sessions into a folder, taking them out of any other folder. */

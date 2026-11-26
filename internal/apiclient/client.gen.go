@@ -20564,6 +20564,9 @@ type DBCurationExportFolder struct {
 	// Name Folder name
 	Name string `json:"name" validate:"required"`
 
+	// Parent Name of the folder of the same project that holds this one; absent at the project's top level
+	Parent *string `json:"parent,omitempty"`
+
 	// Project Project the folder belongs to
 	Project string `json:"project" validate:"required"`
 }

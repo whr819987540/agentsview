@@ -6,6 +6,8 @@ export interface DbSessionFolder {
   created_at: string;
   id: number;
   name: string;
+  /** Folder that holds this one; absent at the project's top level */
+  parent_id?: number;
   project: string;
   session_ids: string[];
   updated_at: string;

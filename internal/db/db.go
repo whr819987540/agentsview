@@ -2690,6 +2690,12 @@ func schemaColumnMigrations() []schemaColumnMigration {
 			"session_end_marks", "kind",
 			"ALTER TABLE session_end_marks ADD COLUMN kind TEXT NOT NULL DEFAULT 'row'",
 		},
+		{
+			// Folders made before nested folders all sit at their
+			// project's top level.
+			"session_folders", "parent_id",
+			"ALTER TABLE session_folders ADD COLUMN parent_id INTEGER",
+		},
 	}
 }
 

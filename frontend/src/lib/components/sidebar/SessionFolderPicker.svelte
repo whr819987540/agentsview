@@ -7,27 +7,45 @@
     sessionFolders,
     SessionFolderNameTakenError,
   } from "../../stores/sessionFolders.svelte.js";
+  import { flattenFolderTree } from "../../utils/folder-tree.js";
 
   interface Props {
     /** Viewport position of the popover's top-left corner. */
     x: number;
     y: number;
     project: string;
-    /** The row's sessions, primary first. */
-    sessionIds: string[];
+    /** The row's sessions, primary first, when the picker files them. */
+    sessionIds?: string[];
+    /** The folder to move, with everything inside it, when the picker
+     *  moves a folder instead of sessions. */
+    folderId?: number;
     onclose: () => void;
   }
 
-  let { x, y, project, sessionIds, onclose }: Props = $props();
+  let { x, y, project, sessionIds = [], folderId, onclose }: Props = $props();
 
   let newName = $state("");
   let saving = $state(false);
   let error = $state("");
   let card: HTMLDivElement | undefined = $state(undefined);
 
-  let folders = $derived(sessionFolders.foldersFor(project));
+  let movingFolder = $derived(folderId !== undefined);
+  let folderName = $derived(
+    sessionFolders.folders.find((f) => f.id === folderId)?.name ?? "",
+  );
+  // A folder cannot move into itself or one of its subfolders.
+  let excluded = $derived(
+    folderId === undefined ? new Set<number>() : sessionFolders.subtreeIds(folderId),
+  );
+  let options = $derived(
+    flattenFolderTree(sessionFolders.foldersFor(project)).filter(
+      ({ folder }) => !excluded.has(folder.id),
+    ),
+  );
   let currentId = $derived(
-    sessionFolders.folderIdForSessions(project, sessionIds),
+    folderId === undefined
+      ? sessionFolders.folderIdForSessions(project, sessionIds)
+      : sessionFolders.parentId(folderId),
   );
 
   function mountOverlay(node: HTMLElement) {
@@ -75,27 +93,40 @@
         // A move hides the row at once, which can close this picker
         // before the request fails, so report it where it stays visible.
         onclose();
-        showFlash(m.sidebar_folder_move_failed(), { tone: "danger" });
+        showFlash(
+          movingFolder ? m.sidebar_folder_move_folder_failed() : m.sidebar_folder_move_failed(),
+          { tone: "danger" },
+        );
       }
     } finally {
       saving = false;
     }
   }
 
-  function moveTo(folderId: number, name: string) {
-    if (folderId === currentId) {
+  function moveTo(targetId: number, name: string) {
+    if (targetId === currentId) {
       onclose();
       return;
     }
     void run(async () => {
-      await sessionFolders.moveSessions(folderId, sessionIds);
+      if (folderId !== undefined) {
+        await sessionFolders.moveFolder(folderId, targetId);
+        return m.sidebar_folder_nested({ name: folderName, parent: name });
+      }
+      await sessionFolders.moveSessions(targetId, sessionIds);
       return m.sidebar_folder_moved({ name });
     });
   }
 
-  function removeFromFolder() {
-    const name = folders.find((f) => f.id === currentId)?.name ?? "";
+  /** Take the sessions out of their folder, or move the folder to the
+   *  project's top level. */
+  function moveToTopLevel() {
+    const name = sessionFolders.folders.find((f) => f.id === currentId)?.name ?? "";
     void run(async () => {
+      if (folderId !== undefined) {
+        await sessionFolders.moveFolder(folderId, null);
+        return m.sidebar_folder_unnested({ name: folderName });
+      }
       await sessionFolders.removeSessions(sessionIds);
       return m.sidebar_folder_removed({ name });
     });
@@ -117,34 +148,37 @@
   class="folder-picker kit-popover-card"
   use:mountOverlay
   role="dialog"
-  aria-label={m.sidebar_folder_picker_heading()}
+  aria-label={movingFolder ? m.sidebar_folder_move_heading() : m.sidebar_folder_picker_heading()}
   style="left: {Math.max(8, Math.min(x, window.innerWidth - 268))}px; top: {Math.max(8, Math.min(y, window.innerHeight - 320))}px;"
 >
   <div class="folder-picker-header">
-    <strong>{m.sidebar_folder_picker_heading()}</strong>
+    <strong>{movingFolder ? m.sidebar_folder_move_heading() : m.sidebar_folder_picker_heading()}</strong>
     <IconButton size="sm" ariaLabel={m.sidebar_folder_picker_close()} onclick={onclose}>
       <XIcon size="13" aria-hidden="true" />
     </IconButton>
   </div>
   <div class="folder-picker-project" title={project}>{project}</div>
 
-  {#if folders.length > 0 || currentId !== null}
+  {#if options.length > 0 || currentId !== null}
     <div class="folder-picker-list" role="list">
       {#if currentId !== null}
         <button
           type="button"
           class="folder-picker-option"
           disabled={saving}
-          onclick={removeFromFolder}
+          onclick={moveToTopLevel}
         >
           <span class="folder-picker-icon"></span>
-          <span class="folder-picker-name">{m.sidebar_folder_none()}</span>
+          <span class="folder-picker-name">
+            {movingFolder ? m.sidebar_folder_top_level() : m.sidebar_folder_none()}
+          </span>
         </button>
       {/if}
-      {#each folders as folder (folder.id)}
+      {#each options as { folder, depth } (folder.id)}
         <button
           type="button"
           class="folder-picker-option"
+          style:padding-left="{6 + depth * 14}px"
           class:current={folder.id === currentId}
           aria-current={folder.id === currentId ? "true" : undefined}
           disabled={saving}
@@ -162,34 +196,36 @@
     </div>
   {/if}
 
-  <div class="folder-picker-create">
-    <div class="folder-picker-input">
-      <TextInput
+  {#if !movingFolder}
+    <div class="folder-picker-create">
+      <div class="folder-picker-input">
+        <TextInput
+          size="sm"
+          block
+          autofocus
+          bind:value={newName}
+          placeholder={m.sidebar_folder_new_placeholder()}
+          ariaLabel={m.sidebar_folder_new_placeholder()}
+          invalid={!!error}
+          oninput={() => (error = "")}
+          onkeydown={(e) => {
+            if (e.key === "Enter") {
+              e.preventDefault();
+              createAndMove();
+            }
+          }}
+        />
+      </div>
+      <Button
         size="sm"
-        block
-        autofocus
-        bind:value={newName}
-        placeholder={m.sidebar_folder_new_placeholder()}
-        ariaLabel={m.sidebar_folder_new_placeholder()}
-        invalid={!!error}
-        oninput={() => (error = "")}
-        onkeydown={(e) => {
-          if (e.key === "Enter") {
-            e.preventDefault();
-            createAndMove();
-          }
-        }}
+        label={m.sidebar_folder_create_submit()}
+        disabled={!newName.trim() || saving}
+        onclick={createAndMove}
       />
     </div>
-    <Button
-      size="sm"
-      label={m.sidebar_folder_create_submit()}
-      disabled={!newName.trim() || saving}
-      onclick={createAndMove}
-    />
-  </div>
-  {#if error}
-    <p class="folder-picker-error" role="alert">{error}</p>
+    {#if error}
+      <p class="folder-picker-error" role="alert">{error}</p>
+    {/if}
   {/if}
 </div>
 

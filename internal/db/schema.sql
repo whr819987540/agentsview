@@ -744,10 +744,16 @@ CREATE TABLE IF NOT EXISTS starred_sessions (
 
 -- Session folders: user-made folders that group one project's sessions in
 -- the sidebar. They change how the sidebar lists sessions, not the sessions.
+-- parent_id names the folder that holds this one in the same project; NULL
+-- puts it at the project's top level. Names stay unique across the whole
+-- project, at every level. The code keeps parent_id pointing at a folder of
+-- the same project without cycles; it has no foreign key, so a rebuild can
+-- copy folders in any order.
 CREATE TABLE IF NOT EXISTS session_folders (
     id         INTEGER PRIMARY KEY,
     project    TEXT NOT NULL,
     name       TEXT NOT NULL,
+    parent_id  INTEGER,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
     UNIQUE(project, name)
