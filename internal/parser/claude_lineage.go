@@ -10,6 +10,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -310,10 +311,8 @@ type claudeLineageMarks struct {
 // namesChild reports whether the marks name stem as a session this
 // transcript handed off to or forked.
 func (m claudeLineageMarks) namesChild(stem string) bool {
-	for _, id := range m.continuedIn {
-		if id == stem {
-			return true
-		}
+	if m.continues(stem) {
+		return true
 	}
 	for _, prefix := range m.forkChildPrefixes {
 		if strings.HasPrefix(stem, prefix) {
@@ -325,12 +324,7 @@ func (m claudeLineageMarks) namesChild(stem string) bool {
 
 // continues reports whether a continued-in record names stem.
 func (m claudeLineageMarks) continues(stem string) bool {
-	for _, id := range m.continuedIn {
-		if id == stem {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(m.continuedIn, stem)
 }
 
 // forkSourceAfter reports whether a <fork-source> notification follows
