@@ -737,6 +737,58 @@ describe("SessionList visible hydration", () => {
     expect(document.body.textContent).not.toContain("Fork B");
   });
 
+  it("hides forks with no prompts of their own unless one is open", async () => {
+    const rows = () => [
+      makeSession({
+        id: "root",
+        display_name: "Fork root",
+        started_at: "2024-01-01T00:00:00Z",
+        ended_at: "2024-01-01T02:00:00Z",
+      }),
+      makeSession({
+        id: "unused",
+        parent_session_id: "root",
+        relationship_type: "fork",
+        display_name: "Unused fork",
+        user_message_count: 0,
+        started_at: "2024-01-01T03:00:00Z",
+        ended_at: "2024-01-01T03:00:01Z",
+      }),
+      makeSession({
+        id: "moved",
+        parent_session_id: "root",
+        relationship_type: "continuation",
+        display_name: "Moved on",
+        user_message_count: 0,
+        started_at: "2024-01-01T04:00:00Z",
+        ended_at: "2024-01-01T04:00:01Z",
+      }),
+    ];
+    sessions.sessions = rows();
+    vi.spyOn(sessions, "hydrateVisibleSessions").mockResolvedValue(undefined);
+
+    component = mount(SessionList, { target: document.body });
+    await tick();
+    document
+      .querySelector<HTMLButtonElement>(
+        `[data-session-id="root"] button[aria-label="${m.sidebar_row_expand()}"]`,
+      )!
+      .click();
+    await tick();
+
+    expect(document.querySelector('[data-session-id="moved"]')).not.toBeNull();
+    expect(document.querySelector('[data-session-id="unused"]')).toBeNull();
+
+    sessions.activeSessionId = "unused";
+    await tick();
+    await tick();
+    expect(document.querySelector('[data-session-id="unused"]')).not.toBeNull();
+    expect(
+      document.querySelector('[data-session-id="unused"] .fork-mark'),
+    ).not.toBeNull();
+    expect(document.querySelector('[data-session-id="moved"] .fork-mark')).toBeNull();
+  });
+
   it("reveals a directly opened fork once the first hydration resolves", async () => {
     // Opening a fork's URL makes it active before the sidebar has painted.
     // The fork is never its group's primary, so revealing it means

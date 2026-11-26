@@ -1,5 +1,6 @@
 import type { SessionGroup, SessionGroupInput } from "../../stores/sessions.svelte.js";
 import { sessionAncestryMatches } from "../../utils/session-ancestry.js";
+import { selectLiveId, selectPrimaryId } from "../../utils/session-primary.js";
 
 export const ITEM_HEIGHT = 42;
 const CHILD_ITEM_HEIGHT = 34;
@@ -12,6 +13,47 @@ export const STORAGE_KEY = "agentsview-group-by-agent";
 export const STORAGE_KEY_GROUP = "agentsview-group-mode";
 
 export type GroupMode = "none" | "agent" | "project";
+
+/**
+ * Keeps the sessions of each group that `keep` accepts and drops groups left
+ * empty. Each group keeps its full session list for ancestry walks, and its
+ * row and live sessions are re-chosen among the kept sessions when a filter
+ * removed them, by the same rules the store groups with.
+ */
+export function filterGroupSessions(
+  groups: SessionGroup[],
+  keep: (session: SessionGroupInput) => boolean,
+): SessionGroup[] {
+  return groups
+    .map((g) => {
+      const filtered = g.sessions.filter(keep);
+      if (filtered.length === g.sessions.length) return g;
+      const all = g.allSessions ?? g.sessions;
+      return {
+        ...g,
+        sessions: filtered,
+        allSessions: all,
+        primarySessionId: filtered.some((s) => s.id === g.primarySessionId)
+          ? g.primarySessionId
+          : selectPrimaryId(filtered, g.key, all),
+        liveSessionId: filtered.some((s) => s.id === g.liveSessionId)
+          ? g.liveSessionId
+          : selectLiveId(filtered, g.key, all),
+      };
+    })
+    .filter((g) => g.sessions.length > 0);
+}
+
+/**
+ * Reports a fork with no prompt of its own, such as one Claude Code's /fork
+ * created that was never used. The sidebar hides these; the session tree
+ * still lists them.
+ */
+export function isEmptyFork(session: SessionGroupInput): boolean {
+  return (
+    session.relationship_type === "fork" && session.user_message_count === 0
+  );
+}
 
 export interface GroupSection {
   label: string;

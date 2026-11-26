@@ -16,9 +16,9 @@ const virtualizerMock = vi.hoisted(() => ({
   options: { count: 0 },
   scrollOffset: 0,
   scrollRect: { height: 200 },
-  getVirtualItems: vi.fn<
-    () => Array<{ index: number; key: string; start: number; end: number }>
-  >(() => []),
+  getVirtualItems: vi.fn<() => Array<{ index: number; key: string; start: number; end: number }>>(
+    () => [],
+  ),
   getTotalSize: vi.fn(() => 120),
   measureElement: vi.fn(),
   scrollToIndex: vi.fn(),
@@ -45,11 +45,7 @@ vi.mock("../../api/branchPoints.js", () => branchPointsMock);
 // @ts-ignore
 import MessageList from "./MessageList.svelte";
 
-function message(
-  ordinal: number,
-  content: string,
-  extra: Partial<Message> = {},
-): Message {
+function message(ordinal: number, content: string, extra: Partial<Message> = {}): Message {
   return {
     id: ordinal + 100,
     session_id: "s1",
@@ -248,10 +244,7 @@ describe("MessageList branches", () => {
     component = mount(MessageList, { target: document.body });
     await settle();
 
-    expect(branchPointsMock.fetchBranchPoints).toHaveBeenCalledWith(
-      "s1",
-      expect.any(AbortSignal),
-    );
+    expect(branchPointsMock.fetchBranchPoints).toHaveBeenCalledWith("s1", expect.any(AbortSignal));
     const rows = rowTexts();
     expect(rows[0]).not.toContain("Continued in");
     expect(rows[1]).toContain(
@@ -262,9 +255,7 @@ describe("MessageList branches", () => {
     expect(rows[1]).toContain("second try");
     expect(rows[3]).toContain("Forked here: Side quest");
     expect(rows[3]).toContain("no turns yet");
-    const link = document.querySelector<HTMLAnchorElement>(
-      '[data-branch-kind="fork"] a',
-    );
+    const link = document.querySelector<HTMLAnchorElement>('[data-branch-kind="fork"] a');
     expect(link?.getAttribute("href")).toContain("/sessions/forked");
   });
 
@@ -288,9 +279,7 @@ describe("MessageList branches", () => {
 
     const first = rowTexts()[0]!;
     expect(first).toContain("Continues Parent work after turn 1");
-    expect(first).toContain(
-      "That session's 4 later turns are not part of this one.",
-    );
+    expect(first).toContain("That session's 4 later turns are not part of this one.");
     const open = document.querySelector<HTMLAnchorElement>(".leave-open");
     expect(open?.getAttribute("href")).toContain("/sessions/parent-1");
     expect(open?.getAttribute("href")).toContain("msg=19");

@@ -1,10 +1,7 @@
 import { describe, expect, it } from "vite-plus/test";
 import type { DbMessage as Message } from "../api/generated/index.js";
 import type { DisplayItem } from "./display-items.js";
-import {
-  countInheritedMessages,
-  hideInheritedRows,
-} from "./inherited-context.js";
+import { countInheritedMessages, hideInheritedRows } from "./inherited-context.js";
 
 function messageRow(ordinal: number): DisplayItem {
   return {

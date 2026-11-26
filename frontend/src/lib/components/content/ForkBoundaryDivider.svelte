@@ -115,7 +115,7 @@
     display: flex;
     flex-wrap: wrap;
     align-items: center;
-    gap: 6px 10px;
+    gap: var(--space-3) var(--space-5);
     margin: 4px 12px 6px;
     padding: 6px 10px;
     background: color-mix(

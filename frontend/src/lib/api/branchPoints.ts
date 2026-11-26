@@ -6,8 +6,5 @@ export async function fetchBranchPoints(
   sessionId: string,
   signal?: AbortSignal,
 ): Promise<ServiceBranchPoints> {
-  return SessionsService.getApiV1SessionsByIdBranchPoints(
-    { id: sessionId },
-    { signal },
-  );
+  return SessionsService.getApiV1SessionsByIdBranchPoints({ id: sessionId }, { signal });
 }

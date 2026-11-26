@@ -21,13 +21,8 @@ export function countInheritedMessages(items: readonly DisplayItem[]): number {
  * Drops rows that hold only inherited messages while the inherited context
  * is collapsed. The same array comes back when nothing is hidden.
  */
-export function hideInheritedRows(
-  items: DisplayItem[],
-  collapsed: boolean,
-): DisplayItem[] {
+export function hideInheritedRows(items: DisplayItem[], collapsed: boolean): DisplayItem[] {
   if (!collapsed) return items;
-  const kept = items.filter((item) =>
-    item.ordinals.some((o) => !isInheritedOrdinal(o)),
-  );
+  const kept = items.filter((item) => item.ordinals.some((o) => !isInheritedOrdinal(o)));
   return kept.length === items.length ? items : kept;
 }

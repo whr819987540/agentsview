@@ -266,6 +266,79 @@ describe("SessionRelationshipTree", () => {
     expect(getResizeHandle()).toBeNull();
   });
 
+  it("says where each branch left its parent and dims empty forks", async () => {
+    const root = makeSession("root", { relationship_type: "", message_count: 9 });
+    mocks.fetchSessionTree.mockResolvedValue({
+      active_session_id: "moved",
+      truncated: false,
+      root: {
+        session: root,
+        depth: 0,
+        is_active: false,
+        is_leaf: false,
+        is_branch_start: true,
+        children: [
+          {
+            session: makeSession("moved", {
+              relationship_type: "continuation",
+              user_message_count: 3,
+            }),
+            leaves: {
+              parent: root,
+              relationship_type: "continuation",
+              after_ordinal: 1,
+              after_turn: 1,
+              turns_after: 4,
+            },
+            depth: 1,
+            is_active: true,
+            is_leaf: true,
+            is_branch_start: false,
+            children: [],
+          },
+          {
+            session: makeSession("unused", {
+              relationship_type: "fork",
+              user_message_count: 0,
+            }),
+            leaves: {
+              parent: root,
+              relationship_type: "fork",
+              after_ordinal: 8,
+              after_turn: 5,
+              turns_after: 0,
+            },
+            depth: 1,
+            is_active: false,
+            is_leaf: true,
+            is_branch_start: false,
+            children: [],
+          },
+        ],
+      },
+    } satisfies SessionTreeResponse);
+
+    component = mount(SessionRelationshipTree, {
+      target: document.body,
+      props: { sessionId: "moved" },
+    });
+    await flush();
+
+    const moved = document.querySelector<HTMLAnchorElement>('a[href="/sessions/moved"]');
+    expect(moved?.textContent).toContain("after turn 1");
+    expect(moved?.textContent).toContain("4 later turns not carried over");
+    expect(moved?.classList.contains("empty-fork")).toBe(false);
+
+    const unused = document.querySelector<HTMLAnchorElement>('a[href="/sessions/unused"]');
+    expect(unused?.textContent).toContain("after turn 5");
+    expect(unused?.textContent).not.toContain("not carried over");
+    expect(unused?.textContent).toContain("no turns");
+    expect(unused?.classList.contains("empty-fork")).toBe(true);
+
+    const rootRow = document.querySelector<HTMLAnchorElement>('a[href="/sessions/root"]');
+    expect(rootRow?.textContent).not.toContain("after turn");
+  });
+
   it("renders active, leaf, branch, and localized labels", async () => {
     mocks.fetchSessionTree.mockResolvedValue(makeTree());
 

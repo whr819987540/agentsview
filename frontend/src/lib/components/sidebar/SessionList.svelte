@@ -39,10 +39,10 @@
     buildDisplayItems,
     bulkExpandKeys,
     computeTotalSize,
+    filterGroupSessions,
     findStart,
+    isEmptyFork,
     isSubagentDescendant,
-    selectLiveId,
-    selectPrimaryId,
   } from "./session-list-utils.js";
   import { endSessionDrag, sessionDragFor } from "./session-drag.js";
 
@@ -110,37 +110,17 @@
   });
 
   let groups = $derived.by(() => {
-    const all = sessions.groupedSessions;
-    if (!starred.filterOnly) return all;
-    return all
-      .map((g) => {
-        const filtered = g.sessions.filter((s) =>
-          starred.isStarred(s.id),
-        );
-        // Recompute primarySessionId and liveSessionId so they
-        // point to sessions that survived the filter, using the
-        // same rules as buildSessionGroups.
-        const primaryStillPresent = filtered.some(
-          (s) => s.id === g.primarySessionId,
-        );
-        const liveStillPresent = filtered.some(
-          (s) => s.id === g.liveSessionId,
-        );
-        return {
-          ...g,
-          sessions: filtered,
-          // Preserve full session list so ancestry helpers
-          // can still walk the parent chain correctly.
-          allSessions: g.sessions,
-          primarySessionId: primaryStillPresent
-            ? g.primarySessionId
-            : selectPrimaryId(filtered, g.key, g.sessions),
-          liveSessionId: liveStillPresent
-            ? g.liveSessionId
-            : selectLiveId(filtered, g.key, g.sessions),
-        };
-      })
-      .filter((g) => g.sessions.length > 0);
+    let out = sessions.groupedSessions;
+    if (starred.filterOnly) {
+      out = filterGroupSessions(out, (s) => starred.isStarred(s.id));
+    }
+    // An empty fork carries nothing to read. Keep the open one listed so
+    // the sidebar still shows where the reader is.
+    const active = sessions.activeSessionId;
+    return filterGroupSessions(
+      out,
+      (s) => !isEmptyFork(s) || s.id === active,
+    );
   });
 
   // Build grouped structure when groupMode is not "none".
