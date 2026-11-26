@@ -45,17 +45,6 @@ export function filterGroupSessions(
     .filter((g) => g.sessions.length > 0);
 }
 
-/**
- * Reports a fork with no prompt of its own, such as one Claude Code's /fork
- * created that was never used. The sidebar hides these; the session tree
- * still lists them.
- */
-export function isEmptyFork(session: SessionGroupInput): boolean {
-  return (
-    session.relationship_type === "fork" && session.user_message_count === 0
-  );
-}
-
 export interface GroupSection {
   label: string;
   groups: SessionGroup[];
