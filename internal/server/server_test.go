@@ -2203,6 +2203,80 @@ func sessionTreeMaxNodesForTest() int {
 	return 500
 }
 
+func TestGetSessionBranchPoints_PlacesForkAndTreeAnnotatesIt(t *testing.T) {
+	te := setup(t)
+	te.seedSession(t, "bp-root", "my-app", 4, func(s *db.Session) {
+		s.StartedAt = new("2025-01-15T10:00:00Z")
+	})
+	te.seedSession(t, "bp-fork", "my-app", 1, func(s *db.Session) {
+		s.ParentSessionID = new("bp-root")
+		s.RelationshipType = "fork"
+		s.StartedAt = new("2025-01-15T11:00:00Z")
+		s.ForkPointUUID = new("a1")
+	})
+	msg := func(sid string, ordinal int, role, uuid, ts string) db.Message {
+		return db.Message{
+			SessionID: sid, Ordinal: ordinal, Role: role,
+			Content: uuid, ContentLength: len(uuid),
+			SourceUUID: uuid, Timestamp: ts,
+		}
+	}
+	dbtest.SeedMessages(t, te.db,
+		msg("bp-root", 0, "user", "u1", "2025-01-15T10:00:00Z"),
+		msg("bp-root", 1, "assistant", "a1", "2025-01-15T10:01:00Z"),
+		msg("bp-root", 2, "user", "u2", "2025-01-15T10:05:00Z"),
+		msg("bp-root", 3, "assistant", "a2", "2025-01-15T10:06:00Z"),
+		msg("bp-fork", 0, "user", "f1", "2025-01-15T11:00:00Z"),
+	)
+
+	w := te.get(t, "/api/v1/sessions/bp-root/branch-points")
+	assertStatus(t, w, http.StatusOK)
+	var points struct {
+		SessionID string `json:"session_id"`
+		Points    []struct {
+			Kind         string     `json:"kind"`
+			AfterOrdinal int        `json:"after_ordinal"`
+			AfterTurn    int        `json:"after_turn"`
+			TurnsAfter   int        `json:"turns_after"`
+			Session      db.Session `json:"session"`
+		} `json:"points"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &points))
+	assert.Equal(t, "bp-root", points.SessionID)
+	require.Len(t, points.Points, 1)
+	assert.Equal(t, "fork", points.Points[0].Kind)
+	assert.Equal(t, 1, points.Points[0].AfterOrdinal)
+	assert.Equal(t, 1, points.Points[0].AfterTurn)
+	assert.Equal(t, 1, points.Points[0].TurnsAfter)
+	assert.Equal(t, "bp-fork", points.Points[0].Session.ID)
+
+	w = te.get(t, "/api/v1/sessions/missing/branch-points")
+	assertStatus(t, w, http.StatusNotFound)
+
+	w = te.get(t, "/api/v1/sessions/bp-fork/tree")
+	assertStatus(t, w, http.StatusOK)
+	var tree struct {
+		Root struct {
+			Leaves   any `json:"leaves"`
+			Children []struct {
+				Leaves struct {
+					AfterTurn  int `json:"after_turn"`
+					TurnsAfter int `json:"turns_after"`
+					Parent     struct {
+						ID string `json:"id"`
+					} `json:"parent"`
+				} `json:"leaves"`
+			} `json:"children"`
+		} `json:"root"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &tree))
+	assert.Nil(t, tree.Root.Leaves, "the root leaves no parent")
+	require.Len(t, tree.Root.Children, 1)
+	assert.Equal(t, "bp-root", tree.Root.Children[0].Leaves.Parent.ID)
+	assert.Equal(t, 1, tree.Root.Children[0].Leaves.AfterTurn)
+	assert.Equal(t, 1, tree.Root.Children[0].Leaves.TurnsAfter)
+}
+
 func TestGetSessionInputTree_MergesForkPrefix(t *testing.T) {
 	te := setup(t)
 	te.seedSession(t, "input-root", "my-app", 4, func(s *db.Session) {

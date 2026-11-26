@@ -6153,6 +6153,74 @@ components:
         - count
         - next
       type: object
+    ServiceBranchLeave:
+      additionalProperties: false
+      properties:
+        after_ordinal:
+          format: int64
+          type: integer
+        after_turn:
+          format: int64
+          type: integer
+        parent:
+          $ref: "#/components/schemas/DbSession"
+        relationship_type:
+          type: string
+        turns_after:
+          format: int64
+          type: integer
+      required:
+        - parent
+        - relationship_type
+        - after_ordinal
+        - after_turn
+        - turns_after
+      type: object
+    ServiceBranchPoint:
+      additionalProperties: false
+      properties:
+        after_ordinal:
+          format: int64
+          type: integer
+        after_turn:
+          format: int64
+          type: integer
+        inputs:
+          items:
+            type: string
+          type: array
+        kind:
+          enum:
+            - fork
+            - continuation
+            - rewind
+          type: string
+        session:
+          $ref: "#/components/schemas/DbSession"
+        turns_after:
+          format: int64
+          type: integer
+      required:
+        - kind
+        - after_ordinal
+        - after_turn
+        - turns_after
+      type: object
+    ServiceBranchPoints:
+      additionalProperties: false
+      properties:
+        leaves:
+          $ref: "#/components/schemas/ServiceBranchLeave"
+        points:
+          items:
+            $ref: "#/components/schemas/ServiceBranchPoint"
+          type: array
+        session_id:
+          type: string
+      required:
+        - session_id
+        - points
+      type: object
     ServiceContentSearchResult:
       additionalProperties: false
       properties:
@@ -7342,6 +7410,8 @@ components:
           type: boolean
         is_leaf:
           type: boolean
+        leaves:
+          $ref: "#/components/schemas/ServiceBranchLeave"
         session:
           $ref: "#/components/schemas/DbSession"
       required:
@@ -19618,6 +19688,93 @@ paths:
                 $ref: "#/components/schemas/ApiErrorResponse"
           description: Gateway Timeout
       summary: Get session activity
+      tags:
+        - Sessions
+  /api/v1/sessions/{id}/branch-points:
+    get:
+      operationId: get-api-v1-sessions-id-branch-points
+      parameters:
+        - description: Session ID
+          in: path
+          name: id
+          required: true
+          schema:
+            description: Session ID
+            type: string
+      responses:
+        "200":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ServiceBranchPoints"
+          description: OK
+        "400":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Bad Request
+        "401":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Unauthorized
+        "403":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Forbidden
+        "404":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Not Found
+        "409":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Conflict
+        "422":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Unprocessable Entity
+        "500":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Internal Server Error
+        "501":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Not Implemented
+        "502":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Bad Gateway
+        "503":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Service Unavailable
+        "504":
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ApiErrorResponse"
+          description: Gateway Timeout
+      summary: Get where conversations branch off a session
       tags:
         - Sessions
   /api/v1/sessions/{id}/children:

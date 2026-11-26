@@ -12,6 +12,7 @@ import type {
   EmptyTrashResponse,
   GetApiV1SessionIdsResolveParams,
   GetApiV1SessionsByIdActivityPathParameters,
+  GetApiV1SessionsByIdBranchPointsPathParameters,
   GetApiV1SessionsByIdChildrenPathParameters,
   GetApiV1SessionsByIdDirectoryPathParameters,
   GetApiV1SessionsByIdExportPathParameters,
@@ -50,6 +51,7 @@ import type {
   ResolveSessionIDsResponse,
   ResumeRequest,
   ResumeResponse,
+  ServiceBranchPoints,
   ServiceInputOutline,
   ServiceInputTree,
   ServiceMessageList,
@@ -292,6 +294,25 @@ export const getApiV1SessionsByIdActivity = async (
   options?: Parameters<typeof orvalFetch>[1],
 ): Promise<DbSessionActivityResponse> => {
   return orvalFetch<DbSessionActivityResponse>(getGetApiV1SessionsByIdActivityUrl({ id }), {
+    ...options,
+    method: "GET",
+  });
+};
+
+export const getGetApiV1SessionsByIdBranchPointsUrl = ({
+  id,
+}: GetApiV1SessionsByIdBranchPointsPathParameters) => {
+  return `/api/v1/sessions/${encodeURIComponent(String(id))}/branch-points`;
+};
+
+/**
+ * @summary Get where conversations branch off a session
+ */
+export const getApiV1SessionsByIdBranchPoints = async (
+  { id }: GetApiV1SessionsByIdBranchPointsPathParameters,
+  options?: Parameters<typeof orvalFetch>[1],
+): Promise<ServiceBranchPoints> => {
+  return orvalFetch<ServiceBranchPoints>(getGetApiV1SessionsByIdBranchPointsUrl({ id }), {
     ...options,
     method: "GET",
   });

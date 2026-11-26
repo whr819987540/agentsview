@@ -41,6 +41,7 @@ func (s *Server) registerSessionRoutes() {
 	s.get(group, "/sessions/{id}/tool-calls", "List session tool calls", s.humaToolCalls)
 	s.get(group, "/sessions/{id}/tree", "Get session relationship tree", s.humaGetSessionTree)
 	s.get(group, "/sessions/{id}/input-tree", "Get session input branch tree", s.humaGetSessionInputTree)
+	s.get(group, "/sessions/{id}/branch-points", "Get where conversations branch off a session", s.humaGetSessionBranchPoints)
 	s.get(group, "/sessions/{id}/tool-sequences", "Get session tool sequences", s.humaToolSequences)
 	s.get(group, "/sessions/{id}/children", "List child sessions", s.humaGetChildSessions)
 	s.get(group, "/sessions/{id}/activity", "Get session activity", s.humaGetSessionActivity)
@@ -205,6 +206,9 @@ type sessionTreeNode struct {
 	IsActive      bool              `json:"is_active"`
 	IsLeaf        bool              `json:"is_leaf"`
 	IsBranchStart bool              `json:"is_branch_start"`
+	// Leaves places where a fork or continuation leaves its parent, when
+	// the archive can place it.
+	Leaves *service.BranchLeave `json:"leaves,omitempty"`
 }
 
 func (in *sessionFilterInput) listFilter() (service.ListFilter, error) {
@@ -447,6 +451,24 @@ func (s *Server) humaGetSessionInputTree(
 	return &jsonOutput[*service.InputTree]{Body: tree}, nil
 }
 
+func (s *Server) humaGetSessionBranchPoints(
+	ctx context.Context,
+	in *idPathInput,
+) (*jsonOutput[*service.BranchPoints], error) {
+	reader, ok := s.sessions.(service.BranchPointReader)
+	if !ok {
+		return nil, apiError(http.StatusNotImplemented, "branch points not available")
+	}
+	points, err := reader.BranchPoints(ctx, in.ID)
+	if err != nil {
+		return nil, serverError(err)
+	}
+	if points == nil {
+		return nil, apiError(http.StatusNotFound, "session not found")
+	}
+	return &jsonOutput[*service.BranchPoints]{Body: points}, nil
+}
+
 func (s *Server) sessionTreeRoot(
 	ctx context.Context,
 	active *db.Session,
@@ -491,6 +513,15 @@ func (s *Server) buildSessionTreeNode(
 		Depth:    depth,
 		IsActive: session.ID == activeID,
 		Children: []sessionTreeNode{},
+	}
+	if depth > 0 {
+		if reader, ok := s.sessions.(service.BranchPointReader); ok {
+			leaves, err := reader.SessionLeave(ctx, session)
+			if err != nil {
+				return sessionTreeNode{}, false, err
+			}
+			node.Leaves = leaves
+		}
 	}
 	if *count >= sessionTreeMaxNodes {
 		node.IsLeaf = true
