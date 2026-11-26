@@ -20,6 +20,13 @@ The latest published release is
   skipped. The sidebar marks forks with an icon and hides forks that never got
   a prompt, and the session tree shows the turn each branch left after. See
   [Forks and Subagent Sessions](/docs/usage/#forks-and-subagent-sessions).
+- A Claude Code session you moved to the background now appears once in the
+  sidebar and the session tree, as it does in Claude Code's session list.
+  The transcript Claude Code continued in heads the group, and the forks you
+  made before and after the move list below it. The transcript from before
+  the move no longer shows as a separate session unless you open it, for
+  example from the card at the top of the session, which now says the session
+  was moved to the background and how many earlier turns were rewound.
 - Search Chinese, Japanese, and Korean text on Linux rolling builds without
   compiling anything. The rolling installer and `agentsview update` now install
   the CJK search extension in `~/.local/lib/agentsview/simple`, or beside
