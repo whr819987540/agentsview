@@ -212,7 +212,7 @@ func (b *directBackend) rewindPoints(
 		rewound[input.SourceUUID] = input.AfterUUID
 	}
 	anchorOf := func(after string) string {
-		for range len(inputs) {
+		for range inputs {
 			next, ok := rewound[after]
 			if !ok {
 				return after
