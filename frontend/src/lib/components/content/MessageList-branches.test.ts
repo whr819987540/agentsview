@@ -259,6 +259,68 @@ describe("MessageList branches", () => {
     expect(link?.getAttribute("href")).toContain("/sessions/forked");
   });
 
+  it("marks where Claude Code moved the session to the background", async () => {
+    messages.messages = [
+      message(0, "first prompt"),
+      message(1, "first answer"),
+      message(2, "second prompt"),
+      message(3, "second answer"),
+    ];
+    messages.messageCount = 4;
+    branchPointsMock.fetchBranchPoints.mockResolvedValue({
+      session_id: "s1",
+      points: [
+        {
+          kind: "continuation",
+          after_ordinal: 1,
+          after_turn: 1,
+          turns_after: 1,
+          session: {
+            ...session("moved", "Problem review", 3),
+            agent: "claude",
+            relationship_type: "continuation",
+            session_kind: "bg",
+          },
+        },
+      ],
+    });
+
+    component = mount(MessageList, { target: document.body });
+    await settle();
+
+    expect(rowTexts()[1]).toContain(
+      "Moved to the background, continuing in Problem review from here. The 1 later turn below was rewound.",
+    );
+  });
+
+  it("tells a session moved to the background which of its turns it continues from", async () => {
+    messages.messages = [message(0, "instead"), message(1, "answer")];
+    messages.messageCount = 2;
+    branchPointsMock.fetchBranchPoints.mockResolvedValue({
+      session_id: "s1",
+      leaves: {
+        parent: session("left-1", "Parent work", 5),
+        relationship_type: "continuation",
+        after_ordinal: 19,
+        after_turn: 1,
+        turns_after: 4,
+        handoff: true,
+      },
+      points: [],
+    });
+
+    component = mount(MessageList, { target: document.body });
+    await settle();
+
+    const first = rowTexts()[0]!;
+    expect(first).toContain("Moved to the background, continuing after turn 1");
+    expect(first).toContain("4 later turns from before the move were rewound.");
+    expect(first).not.toContain("Parent work");
+    const open = document.querySelector<HTMLAnchorElement>(".leave-open");
+    expect(open?.textContent?.trim()).toBe("Open the earlier transcript");
+    expect(open?.getAttribute("href")).toContain("/sessions/left-1");
+  });
+
   it("tells a continuation which parent turn it resumed from", async () => {
     messages.messages = [message(0, "instead"), message(1, "answer")];
     messages.messageCount = 2;

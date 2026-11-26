@@ -184,18 +184,31 @@ function isFamilyLink(node: SessionTreeNode): boolean {
   return relationship === "fork" || relationship === "continuation";
 }
 
+// Reports whether a node stands for the active session. A node for a
+// session Claude Code moved to the background also stands for the
+// transcripts it left.
+function standsFor(node: SessionTreeNode, activeId: string): boolean {
+  return (
+    node.session.id === activeId ||
+    (node.handoff_sources ?? []).some((source) => source.id === activeId)
+  );
+}
+
 // Reports whether the active session's fork family holds other sessions:
 // a fork or continuation links the session to its parent or to one of its
 // children. A family linked by continuations alone does not branch, but its
-// inputs still span every session in it.
+// inputs still span every session in it, including the transcripts a
+// session Claude Code moved to the background left.
 export function inForkFamily(root: SessionTreeNode, activeId: string): boolean {
-  if (root.session.id === activeId) return root.children.some(isFamilyLink);
+  const linked = (node: SessionTreeNode) =>
+    (node.handoff_sources?.length ?? 0) > 0 || node.children.some(isFamilyLink);
+  if (standsFor(root, activeId)) return linked(root);
   const stack = [root];
   while (stack.length > 0) {
     const node = stack.pop()!;
     for (const child of node.children) {
-      if (child.session.id === activeId) {
-        return isFamilyLink(child) || child.children.some(isFamilyLink);
+      if (standsFor(child, activeId)) {
+        return isFamilyLink(child) || linked(child);
       }
       stack.push(child);
     }

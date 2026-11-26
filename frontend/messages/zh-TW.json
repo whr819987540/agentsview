@@ -438,6 +438,23 @@
     }
   ],
   "branch_leave_open_parent": "在該處開啟",
+  "branch_leave_handoff": "已移到背景，從第 {turn} 輪之後繼續",
+  "branch_leave_handoff_rewound": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=other": "移到背景之前的後續 {countLabel} 輪已回退。"
+      }
+    }
+  ],
+  "branch_leave_open_handoff": "開啟移到背景前的記錄",
   "branch_marker_fork": "在此分叉：{title}",
   "branch_marker_continuation": "在「{title}」中繼續",
   "branch_marker_continuation_rewound": [
@@ -453,6 +470,23 @@
       ],
       "match": {
         "countPlural=other": "從此處在「{title}」中繼續。下方之後的 {countLabel} 輪不在其中。"
+      }
+    }
+  ],
+  "branch_marker_handoff": "在此移到背景，在「{title}」中繼續",
+  "branch_marker_handoff_rewound": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "input title",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=other": "從此處移到背景，在「{title}」中繼續。下方之後的 {countLabel} 輪已回退。"
       }
     }
   ],
@@ -490,6 +524,7 @@
   "sidebar_fork_marker": "分叉",
   "system_boundary_fork_source": "分叉通知",
   "session_tree_after_turn": "第 {turn} 輪後",
+  "session_tree_after_turn_before_background": "移到背景前第 {turn} 輪後",
   "session_tree_turns_not_carried": [
     {
       "declarations": [
@@ -506,6 +541,7 @@
     }
   ],
   "session_tree_no_turns": "無對話",
+  "session_tree_moved_to_background": "移到過背景",
   "sidebar_session_count": [
     {
       "declarations": ["input count", "input countLabel", "local countPlural = count: plural"],

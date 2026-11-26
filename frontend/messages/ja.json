@@ -515,6 +515,23 @@
     }
   ],
   "branch_leave_open_parent": "その位置を開く",
+  "branch_leave_handoff": "バックグラウンドに移り、ターン {turn} の後から継続",
+  "branch_leave_handoff_rewound": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=other": "バックグラウンドに移る前の後続 {countLabel} ターンは巻き戻されました。"
+      }
+    }
+  ],
+  "branch_leave_open_handoff": "移る前の記録を開く",
   "branch_marker_fork": "ここで分岐: {title}",
   "branch_marker_continuation": "{title} で継続",
   "branch_marker_continuation_rewound": [
@@ -530,6 +547,23 @@
       ],
       "match": {
         "countPlural=other": "ここから {title} で継続。下の後続 {countLabel} ターンは含まれません。"
+      }
+    }
+  ],
+  "branch_marker_handoff": "ここでバックグラウンドに移り、{title} で継続",
+  "branch_marker_handoff_rewound": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "input title",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=other": "ここでバックグラウンドに移り、{title} で継続。下の後続 {countLabel} ターンは巻き戻されました。"
       }
     }
   ],
@@ -567,6 +601,7 @@
   "sidebar_fork_marker": "分岐",
   "system_boundary_fork_source": "分岐の通知",
   "session_tree_after_turn": "ターン {turn} の後",
+  "session_tree_after_turn_before_background": "バックグラウンドに移る前のターン {turn} の後",
   "session_tree_turns_not_carried": [
     {
       "declarations": [
@@ -583,6 +618,7 @@
     }
   ],
   "session_tree_no_turns": "ターンなし",
+  "session_tree_moved_to_background": "バックグラウンドに移動済み",
   "sidebar_session_count": [
     {
       "declarations": [
