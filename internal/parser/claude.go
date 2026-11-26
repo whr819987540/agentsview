@@ -1818,6 +1818,8 @@ func parseDAG(
 	// fork branch when it carries more than forkThreshold user
 	// turns. A shorter one is dropped from the transcript, and its
 	// user turns are kept as rewound inputs of the owning session.
+	// A sibling without user turns is dropped too, unless it is a
+	// result of a parallel tool call, which stays on the path.
 	// ownerID is the session ID of the branch that owns this walk.
 	var walkBranch func(startIdx int, ownerID string) ([]int, error)
 	var forkBranches []branch
@@ -1854,6 +1856,13 @@ func parseDAG(
 					return nil, err
 				}
 				if turns == 0 {
+					// Each result of a parallel tool call parents to its
+					// own call, so the results hang side by side off the
+					// response and only one leads on. The others belong
+					// to this path, not to a branch a rewind abandoned.
+					if claudeAnswersToolCall(entries[current], entries[kid]) {
+						path = append(path, kid)
+					}
 					continue
 				}
 				if turns <= forkThreshold {
@@ -1988,6 +1997,39 @@ func parseDAG(
 	}
 
 	return results, nil
+}
+
+// claudeAnswersToolCall reports whether result is a tool result record for
+// one of the tool calls in call.
+func claudeAnswersToolCall(call, result dagEntry) bool {
+	if call.entryType != "assistant" || result.entryType != "user" {
+		return false
+	}
+	calls := make(map[string]struct{})
+	gjson.Get(call.line, "message.content").ForEach(
+		func(_, block gjson.Result) bool {
+			if block.Get("type").Str == "tool_use" {
+				if id := block.Get("id").Str; id != "" {
+					calls[id] = struct{}{}
+				}
+			}
+			return true
+		},
+	)
+	if len(calls) == 0 {
+		return false
+	}
+	answers := false
+	gjson.Get(result.line, "message.content").ForEach(
+		func(_, block gjson.Result) bool {
+			if block.Get("type").Str != "tool_result" {
+				return true
+			}
+			_, answers = calls[block.Get("tool_use_id").Str]
+			return !answers
+		},
+	)
+	return answers
 }
 
 // claudeRewoundEntry is a rewound input with the index of its entry.

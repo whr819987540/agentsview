@@ -601,6 +601,55 @@ func TestForkDetection_ToolResultsDoNotInflateAbandonedBranch(t *testing.T) {
 	assertMessage(t, msgs[3], RoleAssistant, "sure")
 }
 
+// claudeToolUseChunkLine builds one tool call of a streamed response:
+// Claude Code writes each tool_use block of a response as its own assistant
+// record, all sharing the response's message.id.
+func claudeToolUseChunkLine(ts, uuid, parentUuid, messageID, toolUseID string) string {
+	return `{"type":"assistant","timestamp":"` + ts +
+		`","uuid":"` + uuid + `","parentUuid":"` + parentUuid +
+		`","message":{"id":"` + messageID +
+		`","content":[{"type":"tool_use","id":"` + toolUseID +
+		`","name":"Bash","input":{}}]}}`
+}
+
+func TestForkDetection_ParallelToolResultsStayOnLivePath(t *testing.T) {
+	// Each tool result of a parallel call parents to its own tool_use
+	// record, so after the response's records merge, every result hangs
+	// off the merged response. Results land in completion order and only
+	// the last one written leads on; the others are leaves, not branches
+	// a rewind abandoned. A second response interleaves its calls and
+	// results, so its records stay unmerged.
+	content := testjsonl.NewSessionBuilder().
+		AddClaudeUserWithUUID("2024-01-01T10:00:00Z", "check the build", "a", "").
+		AddRaw(claudeToolUseChunkLine("2024-01-01T10:00:01Z", "b1", "a", "msg_tools", "tu1")).
+		AddRaw(claudeToolUseChunkLine("2024-01-01T10:00:02Z", "b2", "b1", "msg_tools", "tu2")).
+		AddRaw(claudeToolUseChunkLine("2024-01-01T10:00:03Z", "b3", "b2", "msg_tools", "tu3")).
+		AddRaw(claudeToolResultUserLine("2024-01-01T10:00:04Z", "r2", "b2", "tu2")).
+		AddRaw(claudeToolResultUserLine("2024-01-01T10:00:05Z", "r1", "b1", "tu1")).
+		AddRaw(claudeToolResultUserLine("2024-01-01T10:00:06Z", "r3", "b3", "tu3")).
+		AddRaw(claudeToolUseChunkLine("2024-01-01T10:00:07Z", "c1", "r3", "msg_more", "tu4")).
+		AddRaw(claudeToolResultUserLine("2024-01-01T10:00:08Z", "r4", "c1", "tu4")).
+		AddRaw(claudeToolUseChunkLine("2024-01-01T10:00:09Z", "c2", "c1", "msg_more", "tu5")).
+		AddRaw(claudeToolResultUserLine("2024-01-01T10:00:10Z", "r5", "c2", "tu5")).
+		AddClaudeAssistantWithUUID("2024-01-01T10:00:11Z", "all checks passed", "d", "r5").
+		String()
+
+	results := parseTestContent(t, "parallel-tools.jsonl", content, 1)
+
+	var resultIDs []string
+	for _, m := range results[0].Messages {
+		for _, r := range m.ToolResults {
+			resultIDs = append(resultIDs, r.ToolUseID)
+		}
+	}
+	assert.ElementsMatch(t, []string{"tu1", "tu2", "tu3", "tu4", "tu5"}, resultIDs)
+	require.NotNil(t, results[0].Session.ClaudeLinearParse)
+	assert.False(t, *results[0].Session.ClaudeLinearParse, "DAG parse")
+	last := results[0].Messages[len(results[0].Messages)-1]
+	assertMessage(t, last, RoleAssistant, "all checks passed")
+	assert.Equal(t, 1, results[0].Session.UserMessageCount)
+}
+
 // claudeForkedFromLine builds a replayed record as written by
 // Claude Code's /branch command: a copy of a parent-session entry
 // stamped with forkedFrom.
