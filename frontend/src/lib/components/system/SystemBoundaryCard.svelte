@@ -18,7 +18,16 @@
     peer_message: m.system_boundary_peer_message(),
   });
 
-  let label = $derived(LABELS[subtype] ?? subtype);
+  // Claude Code opens a /fork child with a task notification that says
+  // which session it was copied from.
+  let isForkSource = $derived(
+    subtype === "task_notification" && content.includes("<fork-source>"),
+  );
+  let label = $derived(
+    isForkSource
+      ? m.system_boundary_fork_source()
+      : (LABELS[subtype] ?? subtype),
+  );
   let preview = $derived.by(() => {
     const text = (content ?? "").trim();
     if (!text) return "";

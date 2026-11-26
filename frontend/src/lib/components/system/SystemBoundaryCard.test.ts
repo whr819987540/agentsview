@@ -35,6 +35,31 @@ describe("SystemBoundaryCard", () => {
     unmount(c);
   });
 
+  it("labels the notice a /fork child opens with, and only that notice", () => {
+    const fork = mount(SystemBoundaryCard, {
+      target: document.body,
+      props: {
+        subtype: "task_notification",
+        content: "<task-notification>\n<fork-source>\nThis session began as a fork.\n</fork-source>\n</task-notification>",
+        timestamp: "2026-04-18T12:00:00Z",
+      },
+    });
+    expect(document.body.textContent).toMatch(/Fork notice/);
+    expect(document.body.textContent).not.toMatch(/Task notification/);
+    unmount(fork);
+
+    const task = mount(SystemBoundaryCard, {
+      target: document.body,
+      props: {
+        subtype: "task_notification",
+        content: "<task-notification>\n<status>completed</status>\n</task-notification>",
+        timestamp: "2026-04-18T12:00:00Z",
+      },
+    });
+    expect(document.body.textContent).toMatch(/Task notification/);
+    unmount(task);
+  });
+
   it("falls back to the raw subtype when unknown", () => {
     const c = mount(SystemBoundaryCard, {
       target: document.body,

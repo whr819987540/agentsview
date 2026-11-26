@@ -480,6 +480,115 @@
   "fork_boundary_title": "Fork starts at this point",
   "fork_boundary_label": "Fork starts",
   "fork_boundary_note": "Messages above are inherited context from the parent session.",
+  "fork_boundary_show_inherited": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "Afficher {countLabel} message hérité",
+        "countPlural=other": "Afficher {countLabel} messages hérités"
+      }
+    }
+  ],
+  "fork_boundary_hide_inherited": "Masquer les messages hérités",
+  "fork_boundary_note_collapsed": "L'historique hérité de la session parente est masqué.",
+  "branch_leave_fork": "Bifurqué de {title} après le tour {turn}",
+  "branch_leave_continuation": "Poursuit {title} après le tour {turn}",
+  "branch_leave_skipped": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "{countLabel} tour ultérieur de cette session ne fait pas partie de celle-ci.",
+        "countPlural=other": "{countLabel} tours ultérieurs de cette session ne font pas partie de celle-ci."
+      }
+    }
+  ],
+  "branch_leave_open_parent": "Ouvrir à cet endroit",
+  "branch_marker_fork": "Bifurcation ici : {title}",
+  "branch_marker_continuation": "Poursuivie dans {title}",
+  "branch_marker_continuation_rewound": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "input title",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "Poursuivie dans {title} à partir d'ici. {countLabel} tour ultérieur ci-dessous n'en fait pas partie.",
+        "countPlural=other": "Poursuivie dans {title} à partir d'ici. {countLabel} tours ultérieurs ci-dessous n'en font pas partie."
+      }
+    }
+  ],
+  "branch_marker_rewind": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "Retour en arrière ici : {countLabel} saisie abandonnée",
+        "countPlural=other": "Retour en arrière ici : {countLabel} saisies abandonnées"
+      }
+    }
+  ],
+  "branch_marker_turns": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "{countLabel} tour",
+        "countPlural=other": "{countLabel} tours"
+      }
+    }
+  ],
+  "branch_marker_no_turns": "aucun tour pour l'instant",
+  "sidebar_fork_marker": "Bifurcation",
+  "system_boundary_fork_source": "Avis de bifurcation",
+  "session_tree_after_turn": "après le tour {turn}",
+  "session_tree_turns_not_carried": [
+    {
+      "declarations": [
+        "input count",
+        "input countLabel",
+        "local countPlural = count: plural"
+      ],
+      "selectors": [
+        "countPlural"
+      ],
+      "match": {
+        "countPlural=one": "{countLabel} tour ultérieur non repris",
+        "countPlural=other": "{countLabel} tours ultérieurs non repris"
+      }
+    }
+  ],
+  "session_tree_no_turns": "aucun tour",
   "sidebar_session_count": [
     {
       "declarations": [
