@@ -588,6 +588,9 @@ The conversation shows where it branched:
     the move were rewound, and **Open the earlier transcript** opens the
     transcript from before the move.
 
+A long session opens at its latest messages. Markers and the continuation
+card for earlier turns appear when you scroll up and those messages load.
+
 The session tree also shows which parent turn each fork or continuation left
 after. These markers come from the local archive, so a server reading a
 PostgreSQL or ClickHouse replica does not show them.

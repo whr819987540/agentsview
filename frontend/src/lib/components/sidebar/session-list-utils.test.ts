@@ -1049,6 +1049,23 @@ describe("selectPrimaryId", () => {
     });
     expect(selectPrimaryId([a, b], "root", [root, a, b])).toBe("a");
   });
+
+  it("heads the group with the later of two handoffs that start in one second", () => {
+    // Stored times drop trailing zeros, so the later one sorts first as text.
+    const handoff = (id: string, startedAt: string) =>
+      makeSession({
+        id,
+        agent: "claude",
+        parent_session_id: "root",
+        relationship_type: "continuation",
+        session_kind: "bg",
+        started_at: startedAt,
+      });
+    const root = makeSession({ id: "root", agent: "claude" });
+    const later = handoff("a-later", "2026-11-25T02:53:20.5Z");
+    const earlier = handoff("b-earlier", "2026-11-25T02:53:20Z");
+    expect(selectPrimaryId([root, later, earlier], "root")).toBe("a-later");
+  });
 });
 
 // ---------------------------------------------------------------------------

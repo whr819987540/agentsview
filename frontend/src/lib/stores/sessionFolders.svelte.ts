@@ -109,6 +109,16 @@ class SessionFoldersStore {
     return this.ancestorIds(id)[0] ?? null;
   }
 
+  /** Whether a folder has somewhere to move: the top level when it is
+   *  nested, or a folder outside it. */
+  moveTargetsExist(id: number): boolean {
+    const folder = this.folders.find((f) => f.id === id);
+    if (!folder) return false;
+    if (this.parentId(id) !== null) return true;
+    const inside = this.subtreeIds(id);
+    return this.foldersFor(folder.project).some((f) => !inside.has(f.id));
+  }
+
   /** A name not yet used in the project: base, "base 2", "base 3", ... */
   availableName(project: string, base: string): string {
     const taken = new Set(this.foldersFor(project).map((f) => f.name));

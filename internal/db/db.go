@@ -589,7 +589,13 @@ CREATE INDEX IF NOT EXISTS idx_provider_freshness_updated_at
 // own rewound inputs. Every result of a parallel tool call is stored, where
 // the parser used to keep only the last one written. Re-parse unchanged
 // Claude sources so existing sessions gain the links and tool results.)
-const dataVersion = 129
+// (130: A background handoff whose own tool output quotes the <fork-source>
+// marker stays a continuation instead of becoming a fork, a parent named by
+// a continued-in record is linked even when the copied block is split, and
+// a long abandoned branch that leaves at the end of the copied history hangs
+// off the parent the copy came from. Re-parse unchanged Claude sources so
+// existing sessions gain the corrected links and fork points.)
+const dataVersion = 130
 
 const tokenCoverageRepairStatsKey = "token_coverage_repair_v1"
 

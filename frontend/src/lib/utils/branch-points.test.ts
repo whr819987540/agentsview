@@ -57,6 +57,15 @@ describe("attachBranchPoints", () => {
     ]);
   });
 
+  it("leaves out points before the loaded rows while older messages are unloaded", () => {
+    // The latest page of a long transcript: rows 500 on are loaded.
+    const items = [messageRow(500), messageRow(501), messageRow(502)];
+    const points = [point("fork", 10), point("rewind", -1), point("fork", 501)];
+    expect(layout(attachBranchPoints(items, points, true))).toEqual([
+      { index: 1, before: [], after: ["fork@501"] },
+    ]);
+  });
+
   it("never attaches points to inherited rows", () => {
     // A fork view: inherited rows, the boundary at -1, then own rows.
     const items = [messageRow(-3), messageRow(-2), messageRow(-1), messageRow(0)];

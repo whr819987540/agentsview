@@ -1964,6 +1964,18 @@ func parseDAG(
 	)
 	branches = append(branches, forkBranches...)
 
+	// replayedUUIDs holds the uuids of the copied entries, where a branch
+	// can leave the copy.
+	var replayedUUIDs map[string]bool
+	if replayParentID != "" {
+		replayedUUIDs = make(map[string]bool)
+		for _, e := range entries {
+			if e.replayed {
+				replayedUUIDs[e.uuid] = true
+			}
+		}
+	}
+
 	// Build results for each branch.
 	var results []ParseResult
 
@@ -2032,13 +2044,18 @@ func parseDAG(
 			firstEntry := entries[b.indices[0]]
 			sid = sessionID + "-" + firstEntry.uuid
 			relType = RelFork
-			forkPoint = new(strings.Clone(resolvedParents[b.indices[0]]))
-			// A branch that leaves inside the copy hangs off the
-			// session the copy came from: its own records continue
-			// that session's history, not this file's main branch.
-			if copied >= 0 {
+			leave := resolvedParents[b.indices[0]]
+			forkPoint = new(strings.Clone(leave))
+			// A branch that leaves inside the copy, or at its last
+			// entry, hangs off the session the copy came from: its own
+			// records continue that session's history, not this file's
+			// main branch, which stores none of the copy.
+			switch {
+			case copied >= 0:
 				pSID = replayParentID
 				forkPoint = new(strings.Clone(entries[copied].uuid))
+			case replayedUUIDs[leave]:
+				pSID = replayParentID
 			}
 		}
 

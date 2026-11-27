@@ -55,6 +55,10 @@
   let folderPicker: { x: number; y: number } | null = $state(null);
   let indent = $derived(`${8 + inset * 14}px`);
 
+  // Somewhere to move the folder: the top level when it is nested, or a
+  // folder outside it.
+  let canMove = $derived(sessionFolders.moveTargetsExist(folder.id));
+
   let toggleLabel = $derived(
     expanded
       ? m.sidebar_collapse_folder({ name: folder.name })
@@ -224,9 +228,11 @@
     >
       {m.sidebar_folder_create_subfolder()}
     </button>
-    <button class="context-menu-item" onclick={openFolderPicker}>
-      {m.sidebar_row_move_to_folder()}
-    </button>
+    {#if canMove}
+      <button class="context-menu-item" onclick={openFolderPicker}>
+        {m.sidebar_row_move_to_folder()}
+      </button>
+    {/if}
     <button
       class="context-menu-item"
       onclick={() => {

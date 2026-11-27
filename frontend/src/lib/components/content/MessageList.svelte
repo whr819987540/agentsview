@@ -170,17 +170,23 @@
 
   // Branch markers by ascending display index. A fork or continuation
   // whose inherited context is not shown says where it came from above its
-  // first own row.
+  // first own row. A long transcript opens at its latest page, so markers
+  // before the loaded rows and the leave card wait for older history.
   let rowMarkers = $derived.by(() => {
     const points = branchPoints && branchPoints.session_id === messages.sessionId
       ? branchPoints.points
       : [];
-    return attachBranchPoints(displayItemsAsc, points);
+    return attachBranchPoints(displayItemsAsc, points, messages.hasOlder);
   });
 
   let leaveRowIndex = $derived.by(() => {
     const leave = branchPoints?.leaves;
-    if (!leave || hasForkBoundary || branchPoints?.session_id !== messages.sessionId) {
+    if (
+      !leave ||
+      hasForkBoundary ||
+      messages.hasOlder ||
+      branchPoints?.session_id !== messages.sessionId
+    ) {
       return -1;
     }
     return displayItemsAsc.findIndex((item) => item.ordinals.some((o) => o >= 0));
