@@ -2467,7 +2467,7 @@ func TestGetSessionTree_HandoffChainCountsTowardNodeLimit(t *testing.T) {
 	}
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
 	assert.True(t, resp.Truncated)
-	assert.Equal(t, sessionTreeMaxNodesForTest()-1, len(resp.Root.HandoffSources))
+	assert.Len(t, sessionIDs(resp.Root.HandoffSources), sessionTreeMaxNodesForTest()-1)
 }
 
 func sessionIDs(sessions []db.Session) []string {
