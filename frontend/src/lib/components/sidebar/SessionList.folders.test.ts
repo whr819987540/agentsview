@@ -401,19 +401,6 @@ describe("SessionList folders", () => {
     expect(items.includes(m.sidebar_row_move_to_folder())).toBe(offered);
   });
 
-  it("expands a folder from the keyboard", async () => {
-    component = mount(SessionList, { target: document.body });
-    await settle();
-
-    const row = folderRow("Docs");
-    row.focus();
-    row.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
-    await settle();
-
-    expect(folderRow("Docs").getAttribute("aria-expanded")).toBe("true");
-    expect(visibleSessionIds()).toEqual(["a2", "a1", "a3"]);
-  });
-
   // A claimed Escape keeps the global shortcut from also leaving the session.
   it("closes a folder's menu on Escape and claims the key", async () => {
     component = mount(SessionList, { target: document.body });

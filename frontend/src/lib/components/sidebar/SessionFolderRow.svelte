@@ -177,13 +177,11 @@
     />
   </div>
 {:else}
-  <!-- A div, not a button: Firefox starts no drag from a button. -->
-  <div
+  <button
+    type="button"
     class="folder-row"
     class:drop-active={dropActive}
     style:padding-left={indent}
-    role="button"
-    tabindex="0"
     draggable={editable ? "true" : undefined}
     ondragstart={(e) => startFolderDrag(e, { project: folder.project, folderId: folder.id })}
     ondragend={endSidebarDrag}
@@ -191,13 +189,6 @@
     title={toggleLabel}
     aria-label={toggleLabel}
     onclick={onToggle}
-    onkeydown={(e) => {
-      if (e.target !== e.currentTarget) return;
-      if (e.key === "Enter" || e.key === " ") {
-        e.preventDefault();
-        onToggle();
-      }
-    }}
     ondblclick={(e) => {
       if (!editable) return;
       e.preventDefault();
@@ -219,7 +210,7 @@
     {/if}
     <span class="folder-name">{folder.name}</span>
     <span class="folder-count">{count}</span>
-  </div>
+  </button>
 {/if}
 
 {#if contextMenu}
@@ -280,15 +271,10 @@
     color: var(--text-secondary);
     text-align: left;
     user-select: none;
-    cursor: pointer;
     transition: color 0.1s, background 0.1s, box-shadow 0.1s;
   }
 
-  .folder-row.editing {
-    cursor: default;
-  }
-
-  .folder-row:not(.editing):hover {
+  button.folder-row:hover {
     color: var(--text-primary);
     background: var(--bg-surface-hover);
   }
