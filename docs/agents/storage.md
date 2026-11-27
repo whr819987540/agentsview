@@ -400,7 +400,9 @@ session reads do not load it.
 
 `GET /api/v1/sessions/{id}/branch-points` and the session tree place forks,
 continuations, and rewinds with `DB.LocateBranch` and `DB.LocateRewind`, which
-read this column and `rewound_inputs`.
+read this column and `rewound_inputs`. Both count turns as
+`user_message_count` does, so a row that only carries tool output is not a
+turn.
 
 Only the SQLite archive stores the column, which is an active exception like
 rewound inputs: replicas and mirrors serve fork context cut by timestamp and

@@ -21,8 +21,11 @@ type BranchPlacement struct {
 }
 
 // userPromptPredicate selects the messages counted as user turns, the same
-// ones user_message_count counts.
-const userPromptPredicate = "role = 'user' AND is_system = 0"
+// ones user_message_count counts. Tool output is not a turn: Claude stores a
+// record that only carries tool results as a user row with no text, and
+// other agents mark such rows with the tool_result subtype.
+const userPromptPredicate = "role = 'user' AND is_system = 0 AND content <> ''" +
+	" AND source_subtype <> 'tool_result'"
 
 // LocateBranch places a branch that leaves sessionID. A non-empty
 // forkPointUUID places it after the message with that source UUID. When the
