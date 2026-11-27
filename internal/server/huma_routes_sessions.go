@@ -535,7 +535,7 @@ func (s *Server) buildSessionTreeNode(
 		}
 	}
 
-	chain, children, err := s.sessionTreeHandoffChain(ctx, session, visited)
+	chain, children, err := s.sessionTreeHandoffChain(ctx, session, visited, count)
 	if err != nil {
 		return sessionTreeNode{}, false, err
 	}
@@ -593,11 +593,14 @@ func (s *Server) buildSessionTreeNode(
 // took over session. It returns session followed by each transcript that
 // took over the one before, and the other children of all of them in start
 // order. When a transcript was handed off more than once, the latest
-// handoff carries the chain and the earlier ones stay its children.
+// handoff carries the chain and the earlier ones stay its children. Each
+// transcript added to the chain counts toward the tree's node limit, and
+// the chain stops at that limit.
 func (s *Server) sessionTreeHandoffChain(
 	ctx context.Context,
 	session *db.Session,
 	visited map[string]bool,
+	count *int,
 ) ([]db.Session, []db.Session, error) {
 	chain := []db.Session{*session}
 	var children []db.Session
@@ -621,9 +624,10 @@ func (s *Server) sessionTreeHandoffChain(
 				children = append(children, kids[i])
 			}
 		}
-		if next < 0 {
+		if next < 0 || *count >= sessionTreeMaxNodes {
 			break
 		}
+		(*count)++
 		visited[kids[next].ID] = true
 		chain = append(chain, kids[next])
 	}
@@ -633,12 +637,23 @@ func (s *Server) sessionTreeHandoffChain(
 	return chain, children, nil
 }
 
-// compareSessionStart orders sessions by start time, then by ID.
+// compareSessionStart orders sessions by start time, then by ID. Stored
+// times drop trailing zeros from their fractional seconds, so they are
+// compared as times; a value that does not parse falls back to text order.
 func compareSessionStart(a, b db.Session) int {
 	return cmp.Or(
-		cmp.Compare(derefString(a.StartedAt), derefString(b.StartedAt)),
+		compareTimestamps(derefString(a.StartedAt), derefString(b.StartedAt)),
 		cmp.Compare(a.ID, b.ID),
 	)
+}
+
+func compareTimestamps(a, b string) int {
+	ta, errA := time.Parse(time.RFC3339Nano, a)
+	tb, errB := time.Parse(time.RFC3339Nano, b)
+	if errA != nil || errB != nil {
+		return cmp.Compare(a, b)
+	}
+	return ta.Compare(tb)
 }
 
 func (s *Server) humaGetMessages(

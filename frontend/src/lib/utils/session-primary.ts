@@ -88,9 +88,17 @@ function handoffHead<T extends PrimaryCandidate>(
 }
 
 // Matches the server's session tree, which orders handoffs by start time.
+// Stored times drop trailing zeros from their fractional seconds, so they
+// are compared as times; a value that does not parse falls back to text
+// order.
 function startedLater(a: PrimaryCandidate, b: PrimaryCandidate): boolean {
   const ka = a.started_at ?? "";
   const kb = b.started_at ?? "";
+  const ta = Date.parse(ka);
+  const tb = Date.parse(kb);
+  if (!Number.isNaN(ta) && !Number.isNaN(tb)) {
+    return ta !== tb ? ta > tb : a.id > b.id;
+  }
   return ka !== kb ? ka > kb : a.id > b.id;
 }
 

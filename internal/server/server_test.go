@@ -2415,6 +2415,69 @@ func TestGetSessionTree_OtherContinuationsKeepTheirRoot(t *testing.T) {
 	)
 }
 
+func TestGetSessionTree_LatestHandoffComparesStartTimes(t *testing.T) {
+	te := setup(t)
+	te.seedSession(t, "lt-orig", "my-app", 4, func(s *db.Session) {
+		s.StartedAt = new("2025-01-15T10:00:00Z")
+	})
+	// Two handoffs of the same transcript within one second. Stored times
+	// drop trailing zeros, so the later one sorts first as text.
+	for id, started := range map[string]string{
+		"lt-later":   "2025-01-15T11:00:20.5Z",
+		"lt-earlier": "2025-01-15T11:00:20Z",
+	} {
+		te.seedSession(t, id, "my-app", 2, func(s *db.Session) {
+			s.ParentSessionID = new("lt-orig")
+			s.RelationshipType = "continuation"
+			s.SessionKind = "bg"
+			s.StartedAt = new(started)
+		})
+	}
+
+	w := te.get(t, "/api/v1/sessions/lt-orig/tree")
+	assertStatus(t, w, http.StatusOK)
+	var resp struct {
+		Root handoffTreeNode `json:"root"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Equal(t, "lt-later", resp.Root.Session.ID)
+	assert.Equal(t, []string{"lt-orig"}, sessionIDs(resp.Root.HandoffSources))
+	assert.Equal(t, []string{"lt-earlier"}, treeNodeIDs(resp.Root.Children))
+}
+
+func TestGetSessionTree_HandoffChainCountsTowardNodeLimit(t *testing.T) {
+	te := setup(t)
+	te.seedSession(t, "chain-000", "my-app", 2)
+	for i := 1; i <= 505; i++ {
+		id := fmt.Sprintf("chain-%03d", i)
+		parent := fmt.Sprintf("chain-%03d", i-1)
+		te.seedSession(t, id, "my-app", 2, func(s *db.Session) {
+			s.ParentSessionID = new(parent)
+			s.RelationshipType = "continuation"
+			s.SessionKind = "bg"
+			s.StartedAt = new(fmt.Sprintf("2025-01-15T10:%02d:%02dZ", i/60, i%60))
+		})
+	}
+
+	w := te.get(t, "/api/v1/sessions/chain-000/tree")
+	assertStatus(t, w, http.StatusOK)
+	var resp struct {
+		Root      handoffTreeNode `json:"root"`
+		Truncated bool            `json:"truncated"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.True(t, resp.Truncated)
+	assert.Equal(t, sessionTreeMaxNodesForTest()-1, len(resp.Root.HandoffSources))
+}
+
+func sessionIDs(sessions []db.Session) []string {
+	ids := make([]string, 0, len(sessions))
+	for _, s := range sessions {
+		ids = append(ids, s.ID)
+	}
+	return ids
+}
+
 func TestGetSessionInputTree_MergesForkPrefix(t *testing.T) {
 	te := setup(t)
 	te.seedSession(t, "input-root", "my-app", 4, func(s *db.Session) {
