@@ -321,6 +321,51 @@ describe("MessageList branches", () => {
     expect(open?.getAttribute("href")).toContain("/sessions/left-1");
   });
 
+  it("places nothing above the latest page of a long transcript until older messages load", async () => {
+    messages.messages = [
+      message(500, "late prompt"),
+      message(501, "late answer"),
+      message(502, "last prompt"),
+      message(503, "last answer"),
+    ];
+    messages.messageCount = 504;
+    messages.hasOlder = true;
+    branchPointsMock.fetchBranchPoints.mockResolvedValue({
+      session_id: "s1",
+      leaves: {
+        parent: session("parent-1", "Parent work", 5),
+        relationship_type: "continuation",
+        after_ordinal: 19,
+        after_turn: 1,
+        turns_after: 4,
+      },
+      points: [
+        {
+          kind: "fork",
+          after_ordinal: 10,
+          after_turn: 5,
+          turns_after: 245,
+          session: session("early", "Early fork", 1),
+        },
+        {
+          kind: "fork",
+          after_ordinal: 501,
+          after_turn: 250,
+          turns_after: 1,
+          session: session("late", "Late fork", 1),
+        },
+      ],
+    });
+
+    component = mount(MessageList, { target: document.body });
+    await settle();
+
+    const rows = rowTexts();
+    expect(rows.join(" | ")).not.toContain("Early fork");
+    expect(rows.join(" | ")).not.toContain("Continues Parent work");
+    expect(rows[1]).toContain("Forked here: Late fork");
+  });
+
   it("tells a continuation which parent turn it resumed from", async () => {
     messages.messages = [message(0, "instead"), message(1, "answer")];
     messages.messageCount = 2;

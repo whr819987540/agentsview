@@ -19,14 +19,17 @@ export interface RowBranchMarkers {
  * of the session's own messages that starts at or before the point's
  * message. When rows hide that message (a filtered system row, say), the
  * point stays with the row before it. A point that comes before every own
- * row attaches before the first one. Inherited rows, which have negative
- * ordinals, never carry points.
+ * row attaches before the first one, unless `hasOlder` says older messages
+ * are not loaded yet: the point then belongs among them and is left out
+ * until they load. Inherited rows, which have negative ordinals, never
+ * carry points.
  *
  * Returns the markers by ascending display index.
  */
 export function attachBranchPoints(
   items: readonly DisplayItem[],
   points: readonly BranchPoint[],
+  hasOlder = false,
 ): Map<number, RowBranchMarkers> {
   const own: { index: number; start: number }[] = [];
   items.forEach((item, index) => {
@@ -52,6 +55,7 @@ export function attachBranchPoints(
       row = candidate.index;
     }
     if (row < 0) {
+      if (hasOlder) continue;
       markersAt(own[0]!.index).before.push(point);
     } else {
       markersAt(row).after.push(point);
