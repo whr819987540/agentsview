@@ -367,6 +367,53 @@ describe("SessionList folders", () => {
     expect(visibleSessionIds()).toEqual(["a1"]);
   });
 
+  it.each([
+    {
+      place: "the project's only folder",
+      folders: () => [folder(1, "Docs", ["a2"])],
+      offered: false,
+    },
+    {
+      place: "a folder that holds every other folder",
+      folders: () => [folder(1, "Docs", ["a2"]), folder(2, "Specs", [], "alpha", 1)],
+      offered: false,
+    },
+    {
+      place: "a folder beside another",
+      folders: () => [folder(1, "Docs", ["a2"]), folder(2, "Specs", [])],
+      offered: true,
+    },
+  ])("offers to move $place only when it has somewhere to go", async ({ folders, offered }) => {
+    const listed = { folders: folders(), editable: true };
+    folderService.getApiV1SessionFolders.mockResolvedValue(listed);
+    sessionFolders.folders = listed.folders;
+    component = mount(SessionList, { target: document.body });
+    await settle();
+
+    folderRow("Docs").dispatchEvent(
+      new MouseEvent("contextmenu", { bubbles: true, clientX: 12, clientY: 12 }),
+    );
+    await tick();
+    const items = Array.from(document.querySelectorAll(".context-menu-item")).map((item) =>
+      item.textContent?.trim(),
+    );
+    expect(items).toContain(m.sidebar_folder_rename());
+    expect(items.includes(m.sidebar_row_move_to_folder())).toBe(offered);
+  });
+
+  it("expands a folder from the keyboard", async () => {
+    component = mount(SessionList, { target: document.body });
+    await settle();
+
+    const row = folderRow("Docs");
+    row.focus();
+    row.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
+    await settle();
+
+    expect(folderRow("Docs").getAttribute("aria-expanded")).toBe("true");
+    expect(visibleSessionIds()).toEqual(["a2", "a1", "a3"]);
+  });
+
   // A claimed Escape keeps the global shortcut from also leaving the session.
   it("closes a folder's menu on Escape and claims the key", async () => {
     component = mount(SessionList, { target: document.body });

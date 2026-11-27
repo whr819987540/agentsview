@@ -55,6 +55,10 @@
   let folderPicker: { x: number; y: number } | null = $state(null);
   let indent = $derived(`${8 + inset * 14}px`);
 
+  // Somewhere to move the folder: the top level when it is nested, or a
+  // folder outside it.
+  let canMove = $derived(sessionFolders.moveTargetsExist(folder.id));
+
   let toggleLabel = $derived(
     expanded
       ? m.sidebar_collapse_folder({ name: folder.name })
@@ -173,11 +177,13 @@
     />
   </div>
 {:else}
-  <button
-    type="button"
+  <!-- A div, not a button: Firefox starts no drag from a button. -->
+  <div
     class="folder-row"
     class:drop-active={dropActive}
     style:padding-left={indent}
+    role="button"
+    tabindex="0"
     draggable={editable ? "true" : undefined}
     ondragstart={(e) => startFolderDrag(e, { project: folder.project, folderId: folder.id })}
     ondragend={endSidebarDrag}
@@ -185,6 +191,13 @@
     title={toggleLabel}
     aria-label={toggleLabel}
     onclick={onToggle}
+    onkeydown={(e) => {
+      if (e.target !== e.currentTarget) return;
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        onToggle();
+      }
+    }}
     ondblclick={(e) => {
       if (!editable) return;
       e.preventDefault();
@@ -206,7 +219,7 @@
     {/if}
     <span class="folder-name">{folder.name}</span>
     <span class="folder-count">{count}</span>
-  </button>
+  </div>
 {/if}
 
 {#if contextMenu}
@@ -224,9 +237,11 @@
     >
       {m.sidebar_folder_create_subfolder()}
     </button>
-    <button class="context-menu-item" onclick={openFolderPicker}>
-      {m.sidebar_row_move_to_folder()}
-    </button>
+    {#if canMove}
+      <button class="context-menu-item" onclick={openFolderPicker}>
+        {m.sidebar_row_move_to_folder()}
+      </button>
+    {/if}
     <button
       class="context-menu-item"
       onclick={() => {
@@ -265,10 +280,15 @@
     color: var(--text-secondary);
     text-align: left;
     user-select: none;
+    cursor: pointer;
     transition: color 0.1s, background 0.1s, box-shadow 0.1s;
   }
 
-  button.folder-row:hover {
+  .folder-row.editing {
+    cursor: default;
+  }
+
+  .folder-row:not(.editing):hover {
     color: var(--text-primary);
     background: var(--bg-surface-hover);
   }
