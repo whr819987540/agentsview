@@ -696,3 +696,229 @@ func TestClaudeForkRewoundIntoCopiedHistoryKeepsLongBranch(t *testing.T) {
 		userContents(results[1].Messages),
 	)
 }
+
+// ptrToolCall returns a reply that runs one tool and the user record that
+// carries the tool's output back.
+func ptrToolCall(callUUID, resultUUID, parent, ts, sid, kind, msgID, toolID, output string) []string {
+	return []string{
+		fmt.Sprintf(
+			`{"parentUuid":%q,"type":"assistant","message":{"id":%q,"role":"assistant","content":[{"type":"tool_use","id":%q,"name":"Bash","input":{}}]},"uuid":%q,"timestamp":%q,%s"sessionId":%q}`,
+			parent, msgID, toolID, callUUID, ts, ptrKind(kind), sid,
+		),
+		fmt.Sprintf(
+			`{"parentUuid":%q,"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":%q,"content":%q}]},"uuid":%q,"timestamp":%q,%s"sessionId":%q}`,
+			callUUID, toolID, output, resultUUID, ts, ptrKind(kind), sid,
+		),
+	}
+}
+
+// A handoff's own tool output can quote the <fork-source> marker, for example
+// when it searches this parser for it. Only the notice a /fork child opens
+// with makes a transcript a fork, so the handoff stays a continuation, with
+// or without the parent's continued-in record. A continued-in record naming
+// the transcript settles it as a handoff even next to a fork notice.
+func TestClaudeHandoffWithForkSourceTextStaysContinuation(t *testing.T) {
+	t.Parallel()
+	const (
+		o = ptrOrigID
+		c = ptrContID
+	)
+	queued := "<task-notification>\n<fork-source>\nquoted from a queued prompt\n</fork-source>\n</task-notification>"
+	tests := []struct {
+		name        string
+		continuedIn bool
+		quote       []string
+	}{
+		{
+			name:        "tool output with the parent's continued-in record",
+			continuedIn: true,
+			quote: ptrToolCall("t2", "r2", "u2", "2026-11-25T03:04:10Z", c, "bg", "msg_2", "tu1",
+				`claude_lineage.go:334:var claudeForkSourceMarker = []byte("<fork-source>")`),
+		},
+		{
+			name: "tool output without a continued-in record",
+			quote: ptrToolCall("t2", "r2", "u2", "2026-11-25T03:04:10Z", c, "bg", "msg_2", "tu1",
+				`claude_lineage.go:334:var claudeForkSourceMarker = []byte("<fork-source>")`),
+		},
+		{
+			name: "a prompt the user queued that quotes the notice",
+			quote: []string{
+				fmt.Sprintf(
+					`{"type":"queue-operation","operation":"enqueue","timestamp":"2026-11-25T03:04:10Z","sessionId":%q,"content":%q}`,
+					c, "Why does this fail?\n"+queued,
+				),
+				ptrAssistant("t2", "u2", "2026-11-25T03:04:10Z", c, "bg", "msg_2", "looking"),
+				ptrUser("r2", "t2", "2026-11-25T03:04:20Z", c, "bg", "Why does this fail?\n"+queued),
+			},
+		},
+		{
+			name:        "a fork notice in a transcript the parent names as its continuation",
+			continuedIn: true,
+			quote:       ptrForkSource("r2", "u2", "2026-11-25T03:04:10Z", c),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			orig := joinLines([]string{
+				ptrUser("u1", "", "2026-11-25T01:50:00Z", o, "", "first question"),
+				ptrAssistant("a1", "u1", "2026-11-25T01:51:00Z", o, "", "msg_1", "first answer"),
+				ptrTurnEnd("s1", "a1", "2026-11-25T01:51:01Z", o, ""),
+				ptrUUIDLess("last-prompt", "", o),
+			})
+			if tt.continuedIn {
+				orig += ptrContinuedIn("2026-11-25T02:53:20Z", o, c) + "\n"
+			}
+			cont := joinLines(
+				[]string{
+					ptrUser("u1", "", "2026-11-25T01:50:00Z", c, "bg", "first question"),
+					ptrAssistant("a1", "u1", "2026-11-25T01:51:00Z", c, "bg", "msg_1", "first answer"),
+					ptrTurnEnd("s1", "a1", "2026-11-25T01:51:01Z", c, "bg"),
+					ptrUUIDLess("last-prompt", "", c),
+					ptrUser("u2", "s1", "2026-11-25T03:04:00Z", c, "bg", "where is the fork marker read?"),
+				},
+				tt.quote,
+				[]string{
+					ptrAssistant("a2", "r2", "2026-11-25T03:05:00Z", c, "bg", "msg_3", "in claude_lineage.go"),
+				},
+			)
+			dir := t.TempDir()
+			require.NoError(t, os.WriteFile(filepath.Join(dir, o+".jsonl"), []byte(orig), 0o644))
+			contPath := filepath.Join(dir, c+".jsonl")
+			require.NoError(t, os.WriteFile(contPath, []byte(cont), 0o644))
+
+			results, excluded, err := claudeParseFile(
+				contPath, "my_app", "local",
+				claudeParseOptions{siblingLineage: true},
+			)
+			require.NoError(t, err)
+			assert.Empty(t, excluded)
+			require.Len(t, results, 1)
+			sess := results[0].Session
+			assert.Equal(t, o, sess.ParentSessionID)
+			assert.Equal(t, RelContinuation, sess.RelationshipType)
+			require.NotNil(t, sess.ForkPointUUID)
+			assert.Equal(t, "a1", *sess.ForkPointUUID)
+		})
+	}
+}
+
+// Claude Code writes a replay as one uninterrupted block, but a parent whose
+// continued-in record names the transcript is its parent even when something
+// splits the copied block.
+func TestClaudeHandoffNamedByContinuedInLinksDespiteSplitReplay(t *testing.T) {
+	t.Parallel()
+	const (
+		o = ptrOrigID
+		c = ptrContID
+	)
+	orig := joinLines([]string{
+		ptrUser("u1", "", "2026-11-25T01:50:00Z", o, "", "first question"),
+		ptrAssistant("a1", "u1", "2026-11-25T01:51:00Z", o, "", "msg_1", "first answer"),
+		ptrUser("u2", "a1", "2026-11-25T02:00:00Z", o, "", "second question"),
+		ptrAssistant("a2", "u2", "2026-11-25T02:10:00Z", o, "", "msg_2", "second answer"),
+		ptrUUIDLess("last-prompt", "", o),
+		ptrContinuedIn("2026-11-25T02:53:20Z", o, c),
+	})
+	cont := joinLines([]string{
+		ptrUser("u1", "", "2026-11-25T01:50:00Z", c, "bg", "first question"),
+		ptrAssistant("a1", "u1", "2026-11-25T01:51:00Z", c, "bg", "msg_1", "first answer"),
+		ptrUUIDLess("mode", "", c),
+		ptrUser("u2", "a1", "2026-11-25T02:00:00Z", c, "bg", "second question"),
+		ptrAssistant("a2", "u2", "2026-11-25T02:10:00Z", c, "bg", "msg_2", "second answer"),
+		ptrUser("u3", "a2", "2026-11-25T03:00:00Z", c, "bg", "third question"),
+		ptrAssistant("a3", "u3", "2026-11-25T03:01:00Z", c, "bg", "msg_3", "third answer"),
+	})
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, o+".jsonl"), []byte(orig), 0o644))
+	contPath := filepath.Join(dir, c+".jsonl")
+	require.NoError(t, os.WriteFile(contPath, []byte(cont), 0o644))
+
+	results, excluded, err := claudeParseFile(
+		contPath, "my_app", "local",
+		claudeParseOptions{siblingLineage: true},
+	)
+	require.NoError(t, err)
+	assert.Empty(t, excluded)
+	require.Len(t, results, 1)
+	sess := results[0].Session
+	assert.Equal(t, o, sess.ParentSessionID)
+	assert.Equal(t, RelContinuation, sess.RelationshipType)
+	require.NotNil(t, sess.ForkPointUUID)
+	assert.Equal(t, "a2", *sess.ForkPointUUID)
+	assert.Equal(t, []string{"third question"}, userContents(results[0].Messages))
+}
+
+// A handoff that the user rewound to its first own prompt can abandon a long
+// branch that left at the end of the copied history. That branch continues
+// the parent's history, as the handoff does, so it hangs off the parent at
+// the last copied message, where the parent can place it.
+func TestClaudeHandoffBranchLeavingAtCopyEndHangsOffParent(t *testing.T) {
+	t.Parallel()
+	const (
+		o = ptrOrigID
+		c = ptrContID
+	)
+	orig := joinLines([]string{
+		ptrUser("u1", "", "2026-11-25T01:50:00Z", o, "", "first question"),
+		ptrAssistant("a1", "u1", "2026-11-25T01:51:00Z", o, "", "msg_1", "first answer"),
+		ptrTurnEnd("s1", "a1", "2026-11-25T01:51:01Z", o, ""),
+		ptrUUIDLess("last-prompt", "", o),
+		ptrContinuedIn("2026-11-25T02:53:20Z", o, c),
+	})
+	var branchTurns []string
+	parent := "s1"
+	for i := range 4 {
+		n := i + 2
+		ts := fmt.Sprintf("2026-11-25T03:%02d:00Z", 10*i)
+		branchTurns = append(branchTurns,
+			ptrUser(fmt.Sprintf("u%d", n), parent, ts, c, "bg", fmt.Sprintf("branch question %d", n)),
+			ptrAssistant(fmt.Sprintf("a%d", n), fmt.Sprintf("u%d", n), ts, c, "bg", fmt.Sprintf("msg_%d", n), "branch answer"),
+		)
+		parent = fmt.Sprintf("a%d", n)
+	}
+	cont := joinLines(
+		[]string{
+			ptrUser("u1", "", "2026-11-25T01:50:00Z", c, "bg", "first question"),
+			ptrAssistant("a1", "u1", "2026-11-25T01:51:00Z", c, "bg", "msg_1", "first answer"),
+			ptrTurnEnd("s1", "a1", "2026-11-25T01:51:01Z", c, "bg"),
+			ptrUUIDLess("last-prompt", "", c),
+		},
+		branchTurns,
+		[]string{
+			ptrUser("u9", "s1", "2026-11-25T04:00:00Z", c, "bg", "rewound question"),
+			ptrAssistant("a9", "u9", "2026-11-25T04:01:00Z", c, "bg", "msg_9", "rewound answer"),
+		},
+	)
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, o+".jsonl"), []byte(orig), 0o644))
+	contPath := filepath.Join(dir, c+".jsonl")
+	require.NoError(t, os.WriteFile(contPath, []byte(cont), 0o644))
+
+	results, excluded, err := claudeParseFile(
+		contPath, "my_app", "local",
+		claudeParseOptions{siblingLineage: true},
+	)
+	require.NoError(t, err)
+	assert.Empty(t, excluded)
+	require.Len(t, results, 2)
+
+	main := results[0].Session
+	assert.Equal(t, c, main.ID)
+	assert.Equal(t, o, main.ParentSessionID)
+	assert.Equal(t, RelContinuation, main.RelationshipType)
+	require.NotNil(t, main.ForkPointUUID)
+	assert.Equal(t, "a1", *main.ForkPointUUID)
+	assert.Equal(t, []string{"rewound question"}, userContents(results[0].Messages))
+
+	branch := results[1].Session
+	assert.Equal(t, c+"-u2", branch.ID)
+	assert.Equal(t, o, branch.ParentSessionID)
+	assert.Equal(t, RelFork, branch.RelationshipType)
+	require.NotNil(t, branch.ForkPointUUID)
+	assert.Equal(t, "a1", *branch.ForkPointUUID)
+	assert.Equal(t,
+		[]string{"branch question 2", "branch question 3", "branch question 4", "branch question 5"},
+		userContents(results[1].Messages),
+	)
+}

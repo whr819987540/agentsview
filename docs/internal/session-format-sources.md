@@ -457,7 +457,21 @@ fixtures retain this field; missing identities remain source-local.
   as one `assistant` record per `tool_use` block, sharing `message.id`, with
   each `tool_result` record parented to its own call and written in
   completion order; only the last one written leads on, and the parser now
-  keeps the others too. Reverified 2026-08-16 with Claude Code
+  keeps the others too. Reverified 2026-11-27 against the same local
+  transcripts and later ones: a `/fork` child's notice is a `queue-operation`
+  enqueue and a `user` record with `origin.kind: "task-notification"`, both
+  opening with `<task-notification>` and then `<fork-source>`, while
+  `tool_result` records and typed or pasted prompts quote the marker
+  anywhere in their text. Lineage now counts only records of the notice's
+  shape, so a handoff whose tool output quotes the marker stays a
+  continuation, and a parent's `continued-in` record naming a transcript
+  makes it a continuation whatever else it holds. By the rewind behavior
+  above, a handoff rewound to its first own prompt hangs both that prompt and
+  its replacement off the last copied record, so a long abandoned branch
+  that leaves there is a fork of the parent the copy came from, like one
+  that leaves earlier in the copy; before this, it stayed under the handoff,
+  which stores none of the copy, and could not be placed. Reverified
+  2026-08-16 with Claude Code
   2.1.233 using a controlled `claude -p --session-id <uuid>` probe under an
   isolated `CLAUDE_CONFIG_DIR`. Before the deliberately bounded probe was
   terminated during its API retry, Claude had created the exact UUID

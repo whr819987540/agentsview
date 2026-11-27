@@ -333,6 +333,37 @@ func (m claudeLineageMarks) forkSourceAfter(n int) bool {
 // receives first.
 var claudeForkSourceMarker = []byte("<fork-source>")
 
+// claudeIsForkSourceNotice reports whether a line is the <fork-source> task
+// notification a /fork child opens with: the queue record that enqueues it,
+// or the user record that delivers it. Other lines can quote the marker,
+// such as a tool result showing a search for it, so the notification must
+// be the record's own content rather than text anywhere on the line.
+func claudeIsForkSourceNotice(lineBytes []byte, entryType string) bool {
+	if !bytes.Contains(lineBytes, claudeForkSourceMarker) {
+		return false
+	}
+	var body string
+	switch entryType {
+	case "queue-operation":
+		body = gjson.GetBytes(lineBytes, "content").Str
+	case "user":
+		if gjson.GetBytes(lineBytes, "origin.kind").Str != "task-notification" {
+			return false
+		}
+		content := gjson.GetBytes(lineBytes, "message.content")
+		if content.IsArray() {
+			content = content.Get("0.text")
+		}
+		body = content.Str
+	default:
+		return false
+	}
+	body, ok := strings.CutPrefix(strings.TrimSpace(body), "<task-notification>")
+	return ok && strings.HasPrefix(
+		strings.TrimSpace(body), string(claudeForkSourceMarker),
+	)
+}
+
 // claudeForkChildPrefix returns the child session id prefix at the end of
 // a /fork stdout line, such as "session waiting for a prompt · <name> ·
 // 1a2b3c4d". It returns "" for any other shape.
@@ -383,8 +414,7 @@ func claudeScanUUIDs(
 		}
 		uuid := gjson.GetBytes(lineBytes, "uuid").Str
 		entryType := gjson.GetBytes(lineBytes, "type").Str
-		if bytes.Contains(lineBytes, claudeForkSourceMarker) &&
-			(entryType == "user" || entryType == "queue-operation") {
+		if claudeIsForkSourceNotice(lineBytes, entryType) {
 			marks.forkSourceAt = append(marks.forkSourceAt, uuidLines)
 		}
 		if uuid == "" {
@@ -589,17 +619,19 @@ func claudeResolveSiblingLineage(
 			}
 			run++
 		}
-		if run > selfMarks.contiguous {
-			continue
-		}
 		if c.bg && run == len(forkSeq) &&
 			(len(set) != len(forkUUIDs) || forkStem < c.stem) {
 			continue
 		}
 		cur := &scored{stem: c.stem, set: set, marks: marks, run: run, bg: c.bg}
-		if run > 0 && marks.continues(forkStem) &&
-			(handedOff == nil || run > handedOff.run) {
-			handedOff = cur
+		if run > 0 && marks.continues(forkStem) {
+			if handedOff == nil || run > handedOff.run {
+				handedOff = cur
+			}
+			continue
+		}
+		if run > selfMarks.contiguous {
+			continue
 		}
 		switch {
 		case best == nil || run > best.run:
@@ -618,9 +650,11 @@ func claudeResolveSiblingLineage(
 	} else if best == nil || bestTied {
 		return nil, nil
 	}
+	// A continued-in record makes the transcript a handoff, whatever else
+	// it holds.
 	relationship := RelContinuation
-	if selfMarks.forkSourceAfter(best.run) ||
-		(!best.marks.continues(forkStem) && best.marks.namesChild(forkStem)) {
+	if !best.marks.continues(forkStem) &&
+		(selfMarks.forkSourceAfter(best.run) || best.marks.namesChild(forkStem)) {
 		relationship = RelFork
 	}
 	return &claudeLineagePlan{
