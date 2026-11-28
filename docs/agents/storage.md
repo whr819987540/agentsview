@@ -13,6 +13,13 @@ parser change that needs a full resync must build a fresh database, sync source
 files, copy orphaned sessions from the old database, and swap the files
 atomically. Preserve sessions even when their source files no longer exist.
 
+Apart from the legacy schema repair in `Open`, which marks its own archive
+stale, only `agentsview switch` lowers an archive's `user_version`, through
+`db.PrepareArchiveForDataVersion`. It sets the version one below an older target
+build's data version with the server stopped and the write lock held, after
+backing up the archive, so that build runs its non-destructive full resync
+instead of refusing the archive. Do not lower it anywhere else.
+
 The replacement archive's writer raises `wal_autocheckpoint` to 128 MiB of pages
 for the bulk load; the live writer keeps SQLite's 1,000-page default. The
 threshold only triggers a passive checkpoint after a commit, so a large

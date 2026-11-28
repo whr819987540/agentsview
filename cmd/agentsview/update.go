@@ -205,6 +205,14 @@ func restartDaemonAfterUpdate(ctx context.Context,
 	if err != nil {
 		return fmt.Errorf("finding current executable: %w", err)
 	}
+	return restartDaemonWithExecutable(ctx, exe, cfg, stopResult)
+}
+
+// restartDaemonWithExecutable starts the agentsview at exe as a background
+// daemon with the settings the stopped daemon ran with, and waits for it.
+func restartDaemonWithExecutable(ctx context.Context,
+	exe string, cfg config.Config, stopResult updateDaemonStopResult,
+) error {
 	cmd := exec.CommandContext(ctx, exe, restartDaemonAfterUpdateArgs(cfg, stopResult)...)
 	cmd.Env = append(os.Environ(), "AGENTSVIEW_DATA_DIR="+cfg.DataDir)
 	out, err := cmd.CombinedOutput()

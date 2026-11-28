@@ -312,6 +312,7 @@ func TestVersionJSONContractDoesNotRequireRuntimeState(t *testing.T) {
 		Version       string `json:"version"`
 		Commit        string `json:"commit"`
 		BuildDate     string `json:"build_date"`
+		DataVersion   int    `json:"data_version"`
 	}
 	require.NoError(t, json.Unmarshal([]byte(got), &doc))
 	assert.Equal(t, 1, doc.SchemaVersion)
@@ -319,6 +320,7 @@ func TestVersionJSONContractDoesNotRequireRuntimeState(t *testing.T) {
 	assert.Equal(t, "v1.2.3", doc.Version)
 	assert.Equal(t, "abc1234", doc.Commit)
 	assert.Equal(t, "2026-07-12T14:30:00Z", doc.BuildDate)
+	assert.Equal(t, db.CurrentDataVersion(), doc.DataVersion)
 }
 
 func TestNormalizeLegacyLongFlags(t *testing.T) {
