@@ -9,14 +9,17 @@ import {
   adjacentVisibleSessionId,
   assignGroupFolders,
   buildGroupSections,
+  branchSubagentGroupKeys,
   buildDisplayItems,
   bulkExpandKeys,
   computeTotalSize,
+  filterGroupSessions,
   findStart,
   isBranchChild,
   isSubagentDescendant,
   selectLiveId,
   selectPrimaryId,
+  subagentGroupKeyOf,
 } from "./session-list-utils.js";
 import type { DisplayItem, FolderView, SidebarFolder } from "./session-list-utils.js";
 
@@ -902,7 +905,7 @@ describe("child classification precedence", () => {
       first_message: "<teammate-message>hi</teammate-message>",
     });
     const [group] = buildSessionGroups([root, fork, cont, forkSub, teammate]);
-    const expanded = new Set(["root", "subagent:root", "team:root"]);
+    const expanded = new Set(["root", "subagent:root", "subagent:root:fork", "team:root"]);
     const items = buildDisplayItems([group!], [], "none", new Set(), expanded);
 
     const rows = items
@@ -920,6 +923,127 @@ describe("child classification precedence", () => {
       expect(isBranchChild(s, group!), id).toBe(branch);
     }
     expect(isBranchChild(root, group!)).toBe(false);
+  });
+
+  describe("subagents follow the session that started them", () => {
+    // A root with two forks. The root ran two subagents; fork-b ran one,
+    // which ran one of its own.
+    const family = () => [
+      makeSession({ id: "root", ended_at: "2026-11-27T03:06:10Z" }),
+      makeSession({
+        id: "fork-a",
+        parent_session_id: "root",
+        relationship_type: "fork",
+        ended_at: "2026-11-27T02:35:44Z",
+      }),
+      makeSession({
+        id: "root-sub-1",
+        parent_session_id: "root",
+        relationship_type: "subagent",
+        ended_at: "2026-11-27T03:04:33Z",
+      }),
+      makeSession({
+        id: "root-sub-2",
+        parent_session_id: "root",
+        relationship_type: "subagent",
+        ended_at: "2026-11-27T03:04:17Z",
+      }),
+      makeSession({
+        id: "fork-b",
+        parent_session_id: "root",
+        relationship_type: "fork",
+        ended_at: "2026-11-27T04:17:59Z",
+      }),
+      makeSession({
+        id: "fork-b-sub",
+        parent_session_id: "fork-b",
+        relationship_type: "subagent",
+        ended_at: "2026-11-27T03:17:04Z",
+      }),
+      makeSession({
+        id: "fork-b-sub-sub",
+        parent_session_id: "fork-b-sub",
+        relationship_type: "subagent",
+        ended_at: "2026-11-27T03:16:00Z",
+      }),
+    ];
+
+    const layout = (items: DisplayItem[]) =>
+      items.map((i) =>
+        i.type === "subagent-group"
+          ? ["subagents", i.memberSessionIds!.join(","), i.depth]
+          : [i.type, i.session?.id ?? i.group?.primarySessionId, i.depth],
+      );
+
+    it("lists a fork's subagents under the fork, not under the group's row", () => {
+      const [group] = buildSessionGroups(family());
+      const expanded = new Set(["root", "subagent:root", "subagent:root:fork-b"]);
+      const items = buildDisplayItems([group!], [], "none", new Set(), expanded);
+
+      expect(layout(items)).toEqual([
+        ["session", "root", 0],
+        ["session", "fork-b", 1],
+        ["subagents", "fork-b-sub,fork-b-sub-sub", 2],
+        ["session", "fork-b-sub", 3],
+        ["session", "fork-b-sub-sub", 3],
+        ["session", "fork-a", 1],
+        ["subagents", "root-sub-1,root-sub-2", 1],
+        ["session", "root-sub-1", 2],
+        ["session", "root-sub-2", 2],
+      ]);
+    });
+
+    it("opens a fork's Subagents group on its own key", () => {
+      const [group] = buildSessionGroups(family());
+      const items = buildDisplayItems(
+        [group!],
+        [],
+        "none",
+        new Set(),
+        new Set(["root", "subagent:root"]),
+      );
+
+      expect(layout(items)).toEqual([
+        ["session", "root", 0],
+        ["session", "fork-b", 1],
+        ["subagents", "fork-b-sub,fork-b-sub-sub", 2],
+        ["session", "fork-a", 1],
+        ["subagents", "root-sub-1,root-sub-2", 1],
+        ["session", "root-sub-1", 2],
+        ["session", "root-sub-2", 2],
+      ]);
+      expect(items.filter((i) => i.type === "subagent-group").map((i) => i.expandKey)).toEqual([
+        "subagent:root:fork-b",
+        "subagent:root",
+      ]);
+    });
+
+    it("keeps subagents under the group's row when their caller is not listed", () => {
+      // A filter hid fork-b, so its subagents have no row to sit under.
+      const [group] = buildSessionGroups(family());
+      const [filtered] = filterGroupSessions([group!], (s) => s.id !== "fork-b");
+      const expanded = new Set(["root", "subagent:root", "subagent:root:fork-b"]);
+      const items = buildDisplayItems([filtered!], [], "none", new Set(), expanded);
+
+      expect(layout(items)).toEqual([
+        ["session", "root", 0],
+        ["session", "fork-a", 1],
+        ["subagents", "fork-b-sub,fork-b-sub-sub,root-sub-1,root-sub-2", 1],
+        ["session", "fork-b-sub", 2],
+        ["session", "fork-b-sub-sub", 2],
+        ["session", "root-sub-1", 2],
+        ["session", "root-sub-2", 2],
+      ]);
+    });
+
+    it("reports the Subagents group that lists a session", () => {
+      const [group] = buildSessionGroups(family());
+
+      expect(subagentGroupKeyOf(group!, "fork-b-sub-sub")).toBe("subagent:root:fork-b");
+      expect(subagentGroupKeyOf(group!, "root-sub-1")).toBe("subagent:root");
+      expect(subagentGroupKeyOf(group!, "fork-b")).toBeUndefined();
+      expect(branchSubagentGroupKeys(group!)).toEqual(["subagent:root:fork-b"]);
+    });
   });
 
   it("isSubagentDescendant returns true for child of subagent", () => {

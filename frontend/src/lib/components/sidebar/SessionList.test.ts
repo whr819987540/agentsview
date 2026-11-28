@@ -1026,6 +1026,43 @@ describe("SessionList visible hydration", () => {
     ).not.toBeNull();
   });
 
+  it("reveals an open subagent inside its fork's Subagents group", async () => {
+    sessions.sessions = [
+      makeSession({
+        id: "root",
+        first_message: "root transcript",
+        started_at: "2024-01-01T00:00:00Z",
+        ended_at: "2024-01-01T02:00:00Z",
+      }),
+      makeSession({
+        id: "fork",
+        parent_session_id: "root",
+        relationship_type: "fork",
+        first_message: "fork transcript",
+        started_at: "2024-01-01T03:00:00Z",
+        ended_at: "2024-01-01T04:00:00Z",
+      }),
+      makeSession({
+        id: "fork-sub",
+        parent_session_id: "fork",
+        relationship_type: "subagent",
+        first_message: "subagent prompt",
+        started_at: "2024-01-01T03:10:00Z",
+        ended_at: "2024-01-01T03:20:00Z",
+      }),
+    ];
+    sessions.activeSessionId = "fork-sub";
+    vi.spyOn(sessions, "hydrateVisibleSessions").mockResolvedValue(undefined);
+
+    component = mount(SessionList, { target: document.body });
+    await tick();
+    await tick();
+
+    expect(
+      document.querySelector('[data-session-id="fork-sub"]')?.getAttribute("aria-current"),
+    ).toBe("page");
+  });
+
   it("keeps a starred fork's descendant off the main line", async () => {
     sessions.sessions = [
       makeSession({
