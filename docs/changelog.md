@@ -365,6 +365,12 @@ The latest published release is
 
 **Bug fixes**
 
+- A subagent that a fork or continuation started now lists under that session
+  in the sidebar, in its own **Subagents** group, as the session tree shows
+  it. The sidebar used to put every subagent of a group under the group's
+  first row, so the session there seemed to have started subagents it never
+  ran. Subagents whose session is hidden, for example by the starred filter,
+  still list under the group's first row.
 - A Claude Code fork that you rewound past the point where you forked it now
   shows as a fork of the session it came from. AgentsView used to store it as
   an unrelated session that repeated the parent's earlier turns, and it listed

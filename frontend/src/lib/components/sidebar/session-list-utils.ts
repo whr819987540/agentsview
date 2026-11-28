@@ -97,6 +97,8 @@ export interface DisplayItem {
   sectionGroups?: SessionGroup[];
   /** Sessions represented by a collapsible child-group header. */
   memberSessionIds?: string[];
+  /** The expandedGroups key that opens a Subagents or Team header. */
+  expandKey?: string;
   /** For child items within an expanded continuation chain. */
   session?: SessionGroupInput;
   /** True when this is a child session inside an expanded group. */
@@ -105,7 +107,8 @@ export interface DisplayItem {
    *  a continuation, rather than a subagent or teammate. A branch row holds
    *  its own star and end mark. */
   branch?: boolean;
-  /** Nesting depth: 0 = root, 1 = child/team-group, 2 = teammate. */
+  /** Nesting depth: 0 = root, 1 = child or sub-group header, 2 = sub-group
+   *  member or a branch row's Subagents header, 3 = a branch's subagent. */
   depth?: number;
   /** True when this is the last sibling at its depth level. */
   isLastChild?: boolean;
@@ -235,24 +238,70 @@ export function isBranchChild(s: SessionGroupInput, g: SessionGroup): boolean {
 }
 
 interface GroupChildren {
+  /** Subagents listed under the group's row: its own, and those whose
+   *  caller has no row of its own in the group. */
   subagents: SessionGroupInput[];
+  /** Subagents listed under a branch row, keyed by the ID of the branch
+   *  that started them. */
+  branchSubagents: Map<string, SessionGroupInput[]>;
   teammates: SessionGroupInput[];
   continuations: SessionGroupInput[];
+}
+
+/** The expandedGroups key that opens a group row's Subagents header, or
+ *  the one under the branch row `branchId`. */
+function subagentGroupKey(groupKey: string, branchId?: string): string {
+  return branchId === undefined ? `subagent:${groupKey}` : `subagent:${groupKey}:${branchId}`;
+}
+
+/**
+ * Find the session that started a subagent: its nearest ancestor that is
+ * neither a subagent nor a branch of one, so a subagent that another
+ * subagent started belongs to the same caller. Returns undefined when that
+ * ancestor is not loaded or a session on the way has several loaded
+ * parents.
+ */
+function subagentCaller(
+  s: SessionGroupInput,
+  pool: SessionGroupInput[],
+): SessionGroupInput | undefined {
+  const seen = new Set([s.id]);
+  let current = s;
+  for (;;) {
+    const parentIds = current.parent_session_id
+      ? [current.parent_session_id]
+      : (current.parent_session_ids ?? []);
+    const parents = pool.filter((candidate) => parentIds.includes(candidate.id));
+    if (parents.length !== 1) return undefined;
+    const parent = parents[0]!;
+    if (seen.has(parent.id)) return undefined;
+    if (!isSubagentDescendant(parent, pool)) return parent;
+    seen.add(parent.id);
+    current = parent;
+  }
 }
 
 /**
  * Separate a group's children into subagents, teammates, and
  * continuations. Use allSessions (unfiltered) for ancestry
  * classification so that filtered-out ancestors don't break the
- * parent-chain walk.
+ * parent-chain walk. A subagent that a listed fork or continuation
+ * started goes with that branch row, as in the session tree; the rest
+ * stay under the group's row.
  */
 function classifyChildren(g: SessionGroup): GroupChildren {
   const ancestryPool = g.allSessions ?? g.sessions;
-  const out: GroupChildren = { subagents: [], teammates: [], continuations: [] };
+  const out: GroupChildren = {
+    subagents: [],
+    branchSubagents: new Map(),
+    teammates: [],
+    continuations: [],
+  };
+  const subagents: SessionGroupInput[] = [];
   for (const s of g.sessions) {
     if (s.id === g.primarySessionId) continue;
     if (isSubagentDescendant(s, ancestryPool)) {
-      out.subagents.push(s);
+      subagents.push(s);
     } else if (isTeammate(s, ancestryPool)) {
       out.teammates.push(s);
     } else {
@@ -260,7 +309,35 @@ function classifyChildren(g: SessionGroup): GroupChildren {
       out.continuations.push(s);
     }
   }
+  const branchIds = new Set(out.continuations.map((s) => s.id));
+  for (const s of subagents) {
+    const caller = subagentCaller(s, ancestryPool);
+    if (!caller || !branchIds.has(caller.id)) {
+      out.subagents.push(s);
+      continue;
+    }
+    const members = out.branchSubagents.get(caller.id);
+    if (members) members.push(s);
+    else out.branchSubagents.set(caller.id, [s]);
+  }
   return out;
+}
+
+/** The expandedGroups keys of the Subagents headers under the group's
+ *  branch rows. */
+export function branchSubagentGroupKeys(g: SessionGroup): string[] {
+  return [...classifyChildren(g).branchSubagents.keys()].map((id) => subagentGroupKey(g.key, id));
+}
+
+/** The expandedGroups key of the Subagents header that lists a session, or
+ *  undefined when no Subagents header lists it. */
+export function subagentGroupKeyOf(g: SessionGroup, sessionId: string): string | undefined {
+  const { subagents, branchSubagents } = classifyChildren(g);
+  if (subagents.some((s) => s.id === sessionId)) return subagentGroupKey(g.key);
+  for (const [branchId, members] of branchSubagents) {
+    if (members.some((s) => s.id === sessionId)) return subagentGroupKey(g.key, branchId);
+  }
+  return undefined;
 }
 
 /**
@@ -276,15 +353,70 @@ export function bulkExpandKeys(g: SessionGroup): string[] {
 }
 
 /**
+ * Emit a "Subagents (N)" header at `depth` and, when its key is in
+ * expandedGroups, its members one level deeper. `branchId` names the
+ * branch row the header sits under; without it the header belongs to the
+ * group's row.
+ */
+function emitSubagentGroup(
+  g: SessionGroup,
+  label: string,
+  members: SessionGroupInput[],
+  depth: number,
+  branchId: string | undefined,
+  isLastChild: boolean,
+  expandedGroups: Set<string>,
+  items: DisplayItem[],
+  y: { value: number },
+): void {
+  const expandKey = subagentGroupKey(g.key, branchId);
+  items.push({
+    id: branchId === undefined ? `subagent-group:${g.key}` : `subagent-group:${g.key}:${branchId}`,
+    type: "subagent-group",
+    label: "Subagents",
+    count: members.length,
+    group: g,
+    memberSessionIds: members.map((session) => session.id),
+    expandKey,
+    depth,
+    isLastChild,
+    height: TEAM_HEADER_HEIGHT,
+    top: y.value,
+  });
+  y.value += TEAM_HEADER_HEIGHT;
+
+  if (!expandedGroups.has(expandKey)) return;
+  for (let i = 0; i < members.length; i++) {
+    const s = members[i]!;
+    items.push({
+      id: `child:${g.key}:${s.id}`,
+      type: "session",
+      label,
+      count: 0,
+      group: g,
+      session: s,
+      isChild: true,
+      depth: depth + 1,
+      isLastChild: i === members.length - 1,
+      height: CHILD_ITEM_HEIGHT,
+      top: y.value,
+    });
+    y.value += CHILD_ITEM_HEIGHT;
+  }
+}
+
+/**
  * Emit display items for a single SessionGroup, expanding
  * child sessions when the group key is in expandedGroups.
  *
  * When a group contains teammate sessions, they are placed
  * under a synthetic "Team (N)" expandable node at depth 1,
- * and the teammates themselves render at depth 2. Regular
- * subagents remain at depth 1. This gives the 3-level tree:
- *   Session (depth 0) > Subagent (depth 1)
+ * and the teammates themselves render at depth 2. Subagents
+ * list under a "Subagents (N)" node of the session that
+ * started them. This gives the tree:
+ *   Session (depth 0) > Subagents (depth 1) > Subagent (depth 2)
  *   Session (depth 0) > Team (depth 1) > Teammate (depth 2)
+ *   Session (depth 0) > Fork (depth 1) > Subagents (depth 2) > Subagent (depth 3)
  */
 function emitGroupItems(
   g: SessionGroup,
@@ -311,7 +443,7 @@ function emitGroupItems(
 
   if (!isExpanded) return;
 
-  const { subagents, teammates, continuations } = classifyChildren(g);
+  const { subagents, branchSubagents, teammates, continuations } = classifyChildren(g);
 
   // Sort each child group most-recent-first so the sidebar
   // matches the main session list ordering convention.
@@ -323,8 +455,11 @@ function emitGroupItems(
   continuations.sort(byRecencyDesc);
   subagents.sort(byRecencyDesc);
   teammates.sort(byRecencyDesc);
+  for (const members of branchSubagents.values()) members.sort(byRecencyDesc);
 
-  // Continuations render inline at depth 1 (no sub-group header).
+  // Continuations render inline at depth 1 (no sub-group header). A
+  // branch that started subagents lists them in its own Subagents
+  // header at depth 2.
   for (let i = 0; i < continuations.length; i++) {
     const s = continuations[i]!;
     // Determine if this is the last depth-1 sibling (accounting
@@ -346,6 +481,11 @@ function emitGroupItems(
       top: y.value,
     });
     y.value += CHILD_ITEM_HEIGHT;
+
+    const branchMembers = branchSubagents.get(s.id);
+    if (branchMembers) {
+      emitSubagentGroup(g, label, branchMembers, 2, s.id, true, expandedGroups, items, y);
+    }
   }
 
   // Count depth-1 group headers (subagents + team).
@@ -356,43 +496,18 @@ function emitGroupItems(
 
   // Emit "Subagents (N)" group header + children at depth 2.
   if (hasSubagentGroup) {
-    const subKey = `subagent:${g.key}`;
-    const subExpanded = expandedGroups.has(subKey);
-
-    items.push({
-      id: `subagent-group:${g.key}`,
-      type: "subagent-group",
-      label: "Subagents",
-      count: subagents.length,
-      group: g,
-      memberSessionIds: subagents.map((session) => session.id),
-      depth: 1,
-      isLastChild: depth1Idx === depth1Count - 1,
-      height: TEAM_HEADER_HEIGHT,
-      top: y.value,
-    });
-    y.value += TEAM_HEADER_HEIGHT;
+    emitSubagentGroup(
+      g,
+      label,
+      subagents,
+      1,
+      undefined,
+      depth1Idx === depth1Count - 1,
+      expandedGroups,
+      items,
+      y,
+    );
     depth1Idx++;
-
-    if (subExpanded) {
-      for (let i = 0; i < subagents.length; i++) {
-        const s = subagents[i]!;
-        items.push({
-          id: `child:${g.key}:${s.id}`,
-          type: "session",
-          label,
-          count: 0,
-          group: g,
-          session: s,
-          isChild: true,
-          depth: 2,
-          isLastChild: i === subagents.length - 1,
-          height: CHILD_ITEM_HEIGHT,
-          top: y.value,
-        });
-        y.value += CHILD_ITEM_HEIGHT;
-      }
-    }
   }
 
   // Emit "Team (N)" group header + children at depth 2.
@@ -407,6 +522,7 @@ function emitGroupItems(
       count: teammates.length,
       group: g,
       memberSessionIds: teammates.map((session) => session.id),
+      expandKey: teamKey,
       depth: 1,
       isLastChild: depth1Idx === depth1Count - 1,
       height: TEAM_HEADER_HEIGHT,

@@ -37,11 +37,13 @@
     assignGroupFolders,
     buildGroupSections,
     buildDisplayItems,
+    branchSubagentGroupKeys,
     bulkExpandKeys,
     computeTotalSize,
     filterGroupSessions,
     findStart,
     isSubagentDescendant,
+    subagentGroupKeyOf,
   } from "./session-list-utils.js";
   import { handedOffIds, handoffSourceIds } from "../../utils/session-primary.js";
   import { endSidebarDrag, isFolderDrag, sidebarDragFor } from "./session-drag.js";
@@ -401,20 +403,25 @@
 
   function toggleChainExpand(groupKey: string) {
     const next = new Set(expandedGroups);
+    // A parent's sub-groups: its Subagents and Team headers, and the
+    // Subagents header of each branch that started subagents.
+    const isParent = !groupKey.includes(":");
+    const group = isParent ? groups.find((g) => g.key === groupKey) : undefined;
+    const subKeys = isParent
+      ? [
+          `subagent:${groupKey}`,
+          `team:${groupKey}`,
+          ...(group ? branchSubagentGroupKeys(group) : []),
+        ]
+      : [];
     if (next.has(groupKey)) {
       next.delete(groupKey);
       // When collapsing a parent, also remove sub-group keys.
-      if (!groupKey.includes(":")) {
-        next.delete(`subagent:${groupKey}`);
-        next.delete(`team:${groupKey}`);
-      }
+      for (const key of subKeys) next.delete(key);
     } else {
       next.add(groupKey);
       // When expanding a parent, auto-expand sub-groups.
-      if (!groupKey.includes(":")) {
-        next.add(`subagent:${groupKey}`);
-        next.add(`team:${groupKey}`);
-      }
+      for (const key of subKeys) next.add(key);
     }
     expandedGroups = next;
   }
@@ -743,6 +750,9 @@
         if (!match) continue;
         if (match.id === g.primarySessionId) break; // already primary
         const keys = [g.key, `subagent:${g.key}`, `team:${g.key}`];
+        // A branch's subagent sits under the branch's own header.
+        const subagentKey = subagentGroupKeyOf(g, match.id);
+        if (subagentKey && !keys.includes(subagentKey)) keys.push(subagentKey);
         // Write only when a key is new. This effect reads
         // expandedGroups, and until the first hydration the
         // rows are the painted snapshot, so expanding cannot
@@ -1006,7 +1016,7 @@
             <span class="group-count">{item.count}</span>
           </button>
         {:else if item.type === "subagent-group" && item.group}
-          {@const subKey = `subagent:${item.group.key}`}
+          {@const subKey = item.expandKey ?? `subagent:${item.group.key}`}
           {@const subExpanded = expandedGroups.has(subKey)}
           <button
             class="sub-group-header"
@@ -1025,7 +1035,7 @@
             <span class="sub-group-count">({item.count})</span>
           </button>
         {:else if item.type === "team-group" && item.group}
-          {@const teamKey = `team:${item.group.key}`}
+          {@const teamKey = item.expandKey ?? `team:${item.group.key}`}
           {@const teamExpanded = expandedGroups.has(teamKey)}
           <button
             class="sub-group-header"

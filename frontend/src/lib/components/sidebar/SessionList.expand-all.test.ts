@@ -231,6 +231,49 @@ describe("SessionList expand all and collapse all", () => {
     expect(visibleSessionIds()).toEqual(["root-a", "cont-a", "sub-a", "root-b", "single"]);
   });
 
+  it("opens a fork's Subagents group with its chain and closes it on its own", async () => {
+    sessions.sessions = [
+      makeSession({ id: "root", ended_at: "2026-10-05T01:00:00Z" }),
+      makeSession({
+        id: "fork",
+        parent_session_id: "root",
+        relationship_type: "fork",
+        ended_at: "2026-10-05T04:00:00Z",
+      }),
+      makeSession({
+        id: "root-sub",
+        parent_session_id: "root",
+        relationship_type: "subagent",
+        ended_at: "2026-10-05T02:00:00Z",
+      }),
+      makeSession({
+        id: "fork-sub",
+        parent_session_id: "fork",
+        relationship_type: "subagent",
+        ended_at: "2026-10-05T03:00:00Z",
+      }),
+    ];
+    component = mount(SessionList, { target: document.body });
+    await settle();
+
+    await toggleRow("root");
+    const close = m.sidebar_collapse_group({ name: m.sidebar_subagents() });
+    const open = m.sidebar_expand_group({ name: m.sidebar_subagents() });
+    expect(visibleSessionIds()).toEqual(["root", "fork", "fork-sub", "root-sub"]);
+    expect(subGroupHeaders()).toEqual([close, close]);
+
+    // Closing the fork's group leaves the row's own group open.
+    document.querySelector<HTMLButtonElement>(".sub-group-header")!.click();
+    await settle();
+    expect(visibleSessionIds()).toEqual(["root", "fork", "root-sub"]);
+    expect(subGroupHeaders()).toEqual([open, close]);
+
+    // Closing and reopening the chain opens every Subagents group again.
+    await toggleRow("root");
+    await toggleRow("root");
+    expect(visibleSessionIds()).toEqual(["root", "fork", "fork-sub", "root-sub"]);
+  });
+
   it("offers Collapse all for an open chain whose only children are subagents", async () => {
     sessions.sessions = chainSessions().filter((s) => !s.id.endsWith("-a"));
     component = mount(SessionList, { target: document.body });
