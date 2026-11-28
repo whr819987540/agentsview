@@ -173,26 +173,16 @@ func TestBuildCommit(t *testing.T) {
 func TestInstallPathFor(t *testing.T) {
 	prefix := t.TempDir()
 	installed := filepath.Join(prefix, "bin", binaryName())
-	require.NoError(t, os.MkdirAll(filepath.Dir(installed), 0o755))
-	require.NoError(t, os.WriteFile(installed, []byte("installed"), 0o755))
 	kept := filepath.Join(BuildsDir(installed), olderTag, rollingAssetName(runtime.GOOS, runtime.GOARCH))
 
-	got, err := InstallPathFor(installed)
-	require.NoError(t, err)
-	assert.Equal(t, installed, got, "the installed binary switches itself")
-
-	got, err = InstallPathFor(kept)
-	require.NoError(t, err)
-	assert.Equal(t, installed, got, "a kept build switches the install it belongs to")
+	assert.Equal(t, installed, InstallPathFor(installed), "the installed binary switches itself")
+	assert.Equal(t, installed, InstallPathFor(kept), "a kept build switches the install it belongs to")
 
 	elsewhere := filepath.Join(prefix, "lib", "agentsview", "builds", "not-a-tag", "agentsview")
-	got, err = InstallPathFor(elsewhere)
-	require.NoError(t, err)
-	assert.Equal(t, elsewhere, got, "a directory that is not a build tag is not a kept build")
+	assert.Equal(t, elsewhere, InstallPathFor(elsewhere), "a directory that is not a build tag is not a kept build")
 
-	require.NoError(t, os.Remove(installed))
-	_, err = InstallPathFor(kept)
-	require.Error(t, err, "a kept build with no install beside it must not guess")
+	other := filepath.Join(prefix, "opt", "builds", olderTag, "agentsview")
+	assert.Equal(t, other, InstallPathFor(other), "only lib/agentsview/builds holds kept builds")
 }
 
 func TestBuildsDirSitsBesideTheSidecar(t *testing.T) {

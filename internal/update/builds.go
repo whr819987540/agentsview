@@ -132,8 +132,9 @@ func BuildsDir(installPath string) string {
 // exe. A kept build, at <prefix>/lib/agentsview/builds/<tag>/<asset>,
 // switches <prefix>/bin/agentsview, so a kept build can switch an install
 // whose own binary predates the switch command. Any other executable is
-// the install, as it is for agentsview update.
-func InstallPathFor(exe string) (string, error) {
+// the install, as it is for agentsview update. It does not check that the
+// install exists.
+func InstallPathFor(exe string) string {
 	tagDir := filepath.Dir(exe)
 	builds := filepath.Dir(tagDir)
 	appDir := filepath.Dir(builds)
@@ -142,17 +143,9 @@ func InstallPathFor(exe string) (string, error) {
 		filepath.Base(builds) != buildsDirName ||
 		filepath.Base(appDir) != "agentsview" ||
 		filepath.Base(libDir) != "lib" {
-		return exe, nil
+		return exe
 	}
-	install := filepath.Join(filepath.Dir(libDir), "bin", binaryName())
-	if _, err := os.Stat(install); err != nil {
-		return "", fmt.Errorf(
-			"%s is a kept build, but no install was found at %s; "+
-				"run switch from the installed agentsview: %w",
-			exe, install, err,
-		)
-	}
-	return install, nil
+	return filepath.Join(filepath.Dir(libDir), "bin", binaryName())
 }
 
 // KeptBuild is a build in the builds directory.

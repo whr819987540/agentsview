@@ -81,10 +81,7 @@ func runSwitch(ctx context.Context, cfg SwitchConfig, in io.Reader, out io.Write
 	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
 		exe = resolved
 	}
-	installPath, err := update.InstallPathFor(exe)
-	if err != nil {
-		return err
-	}
+	installPath := update.InstallPathFor(exe)
 	sw, err := update.NewSwitcher(installPath)
 	if err != nil {
 		return err
@@ -92,6 +89,13 @@ func runSwitch(ctx context.Context, cfg SwitchConfig, in io.Reader, out io.Write
 	if cfg.List {
 		printKeptBuilds(out, sw, installPath)
 		return nil
+	}
+	if _, err := os.Stat(installPath); err != nil {
+		return fmt.Errorf(
+			"%s is a kept build, but no install was found at %s; "+
+				"run switch from the installed agentsview: %w",
+			exe, installPath, err,
+		)
 	}
 
 	appCfg, err := loadDaemonConfigForUpdate()
