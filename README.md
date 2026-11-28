@@ -78,6 +78,13 @@ Every build stays available as a `build-YYYYMMDD-<commit>` entry on the
 and download everything from that entry, so a push in the middle of an install
 cannot mix two builds.
 
+To go back to an earlier build, or forward again, run
+`agentsview switch <build>` with a build tag, a commit hash, or `latest`. It
+keeps each build it installs or replaces in `~/.local/lib/agentsview/builds`,
+so switching back needs no download. When the two builds read different data
+versions, it backs up `sessions.db` and has the new build re-parse your
+sessions. See [agentsview switch](docs/commands.md#agentsview-switch).
+
 Other branches are built only on request. A maintainer builds the tip of a
 branch with `gh workflow run rolling-release.yml --ref <branch>`, which makes
 the same kind of entry. Only `main` updates the rolling release, so installs

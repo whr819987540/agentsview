@@ -113,6 +113,7 @@ func newRootCommand() *cobra.Command {
 	root.AddCommand(newPruneCommand())
 	root.AddCommand(newDBCommand())
 	root.AddCommand(newUpdateCommand())
+	root.AddCommand(newSwitchCommand())
 	root.AddCommand(newTokenUseCommand())
 	root.AddCommand(newImportCommand())
 	root.AddCommand(newExportCommand())
@@ -807,6 +808,7 @@ func newVersionCommand() *cobra.Command {
 					Version:       version,
 					Commit:        commit,
 					BuildDate:     buildDate,
+					DataVersion:   db.CurrentDataVersion(),
 				})
 			}
 			printVersion(cmd.OutOrStdout())
@@ -823,6 +825,9 @@ type versionJSON struct {
 	Version       string `json:"version"`
 	Commit        string `json:"commit"`
 	BuildDate     string `json:"build_date"`
+	// DataVersion is the parser data version this build opens archives at.
+	// agentsview switch reads it to decide whether a switch needs a re-parse.
+	DataVersion int `json:"data_version"`
 }
 
 func printVersion(w io.Writer) {

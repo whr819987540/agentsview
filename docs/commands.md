@@ -708,6 +708,78 @@ decoded image bytes are content measurements, not reclaimed disk space.
 
 ______________________________________________________________________
 
+### `agentsview switch`
+
+Switch the installed rolling build to another one, for example back to an
+earlier build while a problem in a newer one gets fixed, and forward again
+later. Only rolling builds can switch. Installs that follow the upstream stable
+releases have no per-commit builds to switch between.
+
+```bash
+agentsview switch latest                    # the newest rolling build
+agentsview switch build-20261126-ae921ad3   # a build tag from the releases page
+agentsview switch ae921ad3                  # a commit hash, 7+ characters
+agentsview switch --list                    # builds kept on this machine
+```
+
+`<build>` is `latest`, a `build-YYYYMMDD-<commit>` tag, a commit hash of at
+least 7 characters, or a rolling version such as `v0.44.0-426-gae921ad3`.
+
+| Flag          | Default | Description                                             |
+| ------------- | ------- | ------------------------------------------------------- |
+| `--list`      | `false` | List kept builds and exit                               |
+| `--yes`       | `false` | Switch without a confirmation prompt                    |
+| `--no-backup` | `false` | Do not back up the archive before a data version change |
+
+A switch runs these steps:
+
+1. It keeps the installed build in `lib/agentsview/builds/<tag>/` beside the
+   install directory, which is `~/.local/lib/agentsview/builds/` for an
+   install in `~/.local/bin`. It first checks the binary against its release's
+   `SHA256SUMS`. A binary that matches no published build is not kept, and the
+   plan says that switch cannot bring it back.
+1. It takes the target build from that directory, or downloads it the way
+   `agentsview update` does and checks it against `SHA256SUMS`.
+1. It prints the plan and asks for confirmation. `--yes` skips the prompt.
+1. It stops the server. A server that is the main process of a systemd service
+   is stopped and started again with `systemctl` (`systemctl --user` for a user
+   unit), so the unit's restart policy cannot bring back the old build. Any
+   other server restarts with the settings it ran with, as it does after
+   `agentsview update`.
+1. While it holds the archive's write lock, it backs up `sessions.db` and its
+   WAL files to `<data dir>/backups/switch-<timestamp>/` when the data version
+   changes, marks the archive when the target build is older, and installs the
+   build with the CJK search extension that build publishes.
+1. It starts the server, waits until the server answers, and checks that the
+   archive reached the target build's data version.
+
+Each build reads archives at one parser data version, which
+`agentsview version --json` reports as `data_version`. A build refuses an
+archive written at a newer data version. When the target build is older, switch
+sets the archive's data version one below the target's. The target then runs a
+full re-parse on its first start: it rebuilds the archive from your session
+files with its own parser and keeps sessions whose files are gone. A newer
+target re-parses by itself. Builds with the same data version switch without a
+backup or a re-parse.
+
+Builds published before the switch command cannot run it. After you switch to
+one, switch back by running the kept copy of a newer build, which switch prints
+when it finishes. A kept build run from its directory switches the install in
+the `bin` directory beside `lib`:
+
+```bash
+~/.local/lib/agentsview/builds/<newer-build>/agentsview-linux-amd64 switch <newer-build>
+```
+
+When stopping the server, taking the write lock, the backup, or the install
+fails, switch starts the server again on the build that is still installed. When
+the started build does not reach its data version, for example because it found
+no session files and abandoned the re-parse, switch reports it; the build tries
+again on its next start. Switch never deletes backups. Remove old
+`backups/switch-*` directories when you no longer need them.
+
+______________________________________________________________________
+
 ### `agentsview version`
 
 Print the version, git commit, and build date. Use `--json` for a stable,
@@ -730,19 +802,21 @@ agentsview v0.38.0 (commit 5b42bf1c, built 2026-07-13T15:37:17Z)
   "name": "agentsview",
   "version": "v0.38.0",
   "commit": "5b42bf1c",
-  "build_date": "2026-07-13T15:37:17Z"
+  "build_date": "2026-07-13T15:37:17Z",
+  "data_version": 130
 }
 ```
 
 The JSON contract uses these fields:
 
-| Field            | Type    | Meaning                                      |
-| ---------------- | ------- | -------------------------------------------- |
-| `schema_version` | integer | Version of this JSON contract; currently `1` |
-| `name`           | string  | Canonical tool name, always `agentsview`     |
-| `version`        | string  | Build version                                |
-| `commit`         | string  | Source commit recorded at build time         |
-| `build_date`     | string  | UTC build timestamp, or an empty string      |
+| Field            | Type    | Meaning                                         |
+| ---------------- | ------- | ----------------------------------------------- |
+| `schema_version` | integer | Version of this JSON contract; currently `1`    |
+| `name`           | string  | Canonical tool name, always `agentsview`        |
+| `version`        | string  | Build version                                   |
+| `commit`         | string  | Source commit recorded at build time            |
+| `build_date`     | string  | UTC build timestamp, or an empty string         |
+| `data_version`   | integer | Parser data version the build opens archives at |
 
 Consumers should require the expected `schema_version` and ignore unknown
 fields. Adding an optional field does not require a schema bump; removing or

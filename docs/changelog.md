@@ -11,6 +11,19 @@ The latest published release is
 
 **New features**
 
+- Go back to an earlier rolling build, and forward again, with one command.
+  `agentsview switch <build>` takes a build tag such as
+  `build-20261126-ae921ad3`, a commit hash, or `latest`, and downloads the
+  build when this machine does not have it. It keeps that build and the one it
+  replaces in `~/.local/lib/agentsview/builds`, so switching back needs no
+  download. It stops and restarts the server, through `systemctl` when a
+  systemd service runs it. When the builds read different data versions, it
+  backs up `sessions.db` first and has the new build re-parse your sessions,
+  so an older build opens the archive instead of refusing it.
+  `agentsview version --json` now reports that `data_version`. Builds published
+  before this one have no switch command; to leave one, run the kept copy of a
+  newer build, which switch prints. See
+  [agentsview switch](/docs/commands/#agentsview-switch).
 - See where a conversation branched without leaving it. A session that was
   forked, continued, or rewound now shows a marker after the message where it
   happened, with a link to the fork or continuation or the prompts the rewind
