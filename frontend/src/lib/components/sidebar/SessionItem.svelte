@@ -38,6 +38,7 @@
   import { sync } from "../../stores/sync.svelte.js";
   import ProjectTypeahead from "../layout/ProjectTypeahead.svelte";
   import SessionFolderPicker from "./SessionFolderPicker.svelte";
+  import TreeGuides from "./TreeGuides.svelte";
   import { endSidebarDrag, startSessionDrag } from "./session-drag.js";
 
   interface Props {
@@ -79,8 +80,9 @@
     onToggleExpand?: () => void;
     /** Nesting depth: 0 = root, 1 = child, 2 = grandchild. */
     depth?: number;
-    /** Whether this is the last sibling at its depth level. */
-    isLastChild?: boolean;
+    /** Tree lines that join a child row to its parent, one entry per level
+     * from 1 to `depth`; see `DisplayItem.guides`. */
+    guides?: readonly boolean[];
     /** Whether the group contains subagent children. */
     hasSubagents?: boolean;
     /** Whether the group contains teammate children. */
@@ -114,7 +116,7 @@
     expanded = false,
     onToggleExpand,
     depth = 0,
-    isLastChild = false,
+    guides,
     hasSubagents = false,
     hasTeammates = false,
     selectMode = false,
@@ -548,6 +550,10 @@
   }}
   oncontextmenu={handleContextMenu}
 >
+  {#if guides?.length}
+    <!-- The elbow stops just before the status dot, past the 16 px spacer. -->
+    <TreeGuides {guides} offset={inset * 14} reach={18} />
+  {/if}
   <!-- Tree expand/collapse or connector -->
   {#if hasChildren}
     <button

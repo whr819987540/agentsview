@@ -274,6 +274,54 @@ describe("SessionList expand all and collapse all", () => {
     expect(visibleSessionIds()).toEqual(["root", "fork", "fork-sub", "root-sub"]);
   });
 
+  it("draws the tree lines that join each child row to its parent", async () => {
+    sessions.sessions = [
+      makeSession({ id: "root", ended_at: "2026-10-05T01:00:00Z" }),
+      makeSession({
+        id: "fork",
+        parent_session_id: "root",
+        relationship_type: "fork",
+        ended_at: "2026-10-05T04:00:00Z",
+      }),
+      makeSession({
+        id: "root-sub",
+        parent_session_id: "root",
+        relationship_type: "subagent",
+        ended_at: "2026-10-05T02:00:00Z",
+      }),
+      makeSession({
+        id: "fork-sub",
+        parent_session_id: "fork",
+        relationship_type: "subagent",
+        ended_at: "2026-10-05T03:00:00Z",
+      }),
+    ];
+    component = mount(SessionList, { target: document.body });
+    await settle();
+    await toggleRow("root");
+
+    const rows = Array.from(
+      document.querySelectorAll<HTMLElement>(".session-item, .sub-group-header"),
+    ).map((row) => [
+      row.dataset.sessionId ?? row.textContent!.replace(/\s+/g, " ").trim(),
+      Array.from(row.querySelectorAll<HTMLElement>(".tree-guide")).map(
+        (line) =>
+          `${line.classList.contains("end") ? "end" : line.classList[1]}@${line.style.left}`,
+      ),
+    ]);
+    expect(rows).toEqual([
+      ["root", []],
+      // ├ from the root's line.
+      ["fork", ["rail@16px", "elbow@16px"]],
+      // The root's line runs on; └ from the fork's line.
+      ["Subagents (1)", ["rail@16px", "end@32px", "elbow@32px"]],
+      ["fork-sub", ["rail@16px", "end@48px", "elbow@48px"]],
+      // └ from the root's line: nothing follows at that level.
+      ["Subagents (1)", ["end@16px", "elbow@16px"]],
+      ["root-sub", ["end@32px", "elbow@32px"]],
+    ]);
+  });
+
   it("offers Collapse all for an open chain whose only children are subagents", async () => {
     sessions.sessions = chainSessions().filter((s) => !s.id.endsWith("-a"));
     component = mount(SessionList, { target: document.body });

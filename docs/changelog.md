@@ -233,6 +233,10 @@ The latest published release is
 
 **Improvements**
 
+- See at a glance which session each row of an expanded sidebar group belongs
+  to. Tree lines now join every fork, continuation, subagent, teammate, and
+  **Subagents** or **Team** group to the row above it that it belongs under,
+  so a fork's subagents read as the fork's, not as the original session's.
 - Tabs you are not looking at stay quiet. A tab in the background no longer
   refetches its session and session list on every change while agents run, and
   pages that refresh on a timer skip those refreshes while hidden; the tab

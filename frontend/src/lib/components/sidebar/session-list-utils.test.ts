@@ -1044,6 +1044,55 @@ describe("child classification precedence", () => {
       expect(subagentGroupKeyOf(group!, "fork-b")).toBeUndefined();
       expect(branchSubagentGroupKeys(group!)).toEqual(["subagent:root:fork-b"]);
     });
+
+    it("gives each row the guide lines that join it to its parent", () => {
+      // An entry per level from 1 to the row's depth: below the row's own
+      // level, whether that level's line runs past the row; at its own
+      // level, whether a sibling follows (├) or not (└).
+      const [group] = buildSessionGroups(family());
+      const expanded = new Set(["root", "subagent:root", "subagent:root:fork-b"]);
+      const items = buildDisplayItems([group!], [], "none", new Set(), expanded);
+
+      expect(
+        items.map((i) => [i.session?.id ?? i.memberSessionIds?.join(",") ?? "row", i.guides]),
+      ).toEqual([
+        ["row", undefined],
+        ["fork-b", [true]],
+        ["fork-b-sub,fork-b-sub-sub", [true, false]],
+        ["fork-b-sub", [true, false, true]],
+        ["fork-b-sub-sub", [true, false, false]],
+        ["fork-a", [true]],
+        ["root-sub-1,root-sub-2", [false]],
+        ["root-sub-1", [false, true]],
+        ["root-sub-2", [false, false]],
+      ]);
+    });
+
+    it("ends a group's last line at its own last row", () => {
+      // The next group's rows start a new tree.
+      const [group] = buildSessionGroups(family());
+      const other = buildSessionGroups([
+        makeSession({ id: "other" }),
+        makeSession({ id: "other-fork", parent_session_id: "other", relationship_type: "fork" }),
+      ])[0]!;
+      const items = buildDisplayItems(
+        [group!, other],
+        [],
+        "none",
+        new Set(),
+        new Set(["root", "other"]),
+      );
+
+      expect(items.map((i) => [i.session?.id ?? i.type, i.guides])).toEqual([
+        ["session", undefined],
+        ["fork-b", [true]],
+        ["subagent-group", [true, false]],
+        ["fork-a", [true]],
+        ["subagent-group", [false]],
+        ["session", undefined],
+        ["other-fork", [false]],
+      ]);
+    });
   });
 
   it("isSubagentDescendant returns true for child of subagent", () => {

@@ -110,11 +110,11 @@ export interface DisplayItem {
   /** Nesting depth: 0 = root, 1 = child or sub-group header, 2 = sub-group
    *  member or a branch row's Subagents header, 3 = a branch's subagent. */
   depth?: number;
-  /** True when this is the last sibling at its depth level. */
-  isLastChild?: boolean;
-  /** True when this depth-1 item has a following depth-1 sibling
-   *  (used to draw the vertical connector line through this row). */
-  hasNextSiblingAtDepth1?: boolean;
+  /** Tree lines to the left of a row below a group's row, one entry per
+   *  level from 1 to `depth`. Below the row's own level, an entry says
+   *  whether that level's line runs past the row; at its own level, whether
+   *  a sibling follows, so the row joins with ├ rather than └. */
+  guides?: boolean[];
   height: number;
   top: number;
 }
@@ -364,7 +364,6 @@ function emitSubagentGroup(
   members: SessionGroupInput[],
   depth: number,
   branchId: string | undefined,
-  isLastChild: boolean,
   expandedGroups: Set<string>,
   items: DisplayItem[],
   y: { value: number },
@@ -379,7 +378,6 @@ function emitSubagentGroup(
     memberSessionIds: members.map((session) => session.id),
     expandKey,
     depth,
-    isLastChild,
     height: TEAM_HEADER_HEIGHT,
     top: y.value,
   });
@@ -397,7 +395,6 @@ function emitSubagentGroup(
       session: s,
       isChild: true,
       depth: depth + 1,
-      isLastChild: i === members.length - 1,
       height: CHILD_ITEM_HEIGHT,
       top: y.value,
     });
@@ -462,10 +459,6 @@ function emitGroupItems(
   // header at depth 2.
   for (let i = 0; i < continuations.length; i++) {
     const s = continuations[i]!;
-    // Determine if this is the last depth-1 sibling (accounting
-    // for subsequent sub-group headers).
-    const hasFollowingGroup = subagents.length > 0 || teammates.length > 0;
-    const isLast = i === continuations.length - 1 && !hasFollowingGroup;
     items.push({
       id: `child:${g.key}:${s.id}`,
       type: "session",
@@ -476,7 +469,6 @@ function emitGroupItems(
       isChild: true,
       branch: true,
       depth: 1,
-      isLastChild: isLast,
       height: CHILD_ITEM_HEIGHT,
       top: y.value,
     });
@@ -484,34 +476,17 @@ function emitGroupItems(
 
     const branchMembers = branchSubagents.get(s.id);
     if (branchMembers) {
-      emitSubagentGroup(g, label, branchMembers, 2, s.id, true, expandedGroups, items, y);
+      emitSubagentGroup(g, label, branchMembers, 2, s.id, expandedGroups, items, y);
     }
   }
 
-  // Count depth-1 group headers (subagents + team).
-  const hasSubagentGroup = subagents.length > 0;
-  const hasTeamGroup = teammates.length > 0;
-  const depth1Count = (hasSubagentGroup ? 1 : 0) + (hasTeamGroup ? 1 : 0);
-  let depth1Idx = 0;
-
   // Emit "Subagents (N)" group header + children at depth 2.
-  if (hasSubagentGroup) {
-    emitSubagentGroup(
-      g,
-      label,
-      subagents,
-      1,
-      undefined,
-      depth1Idx === depth1Count - 1,
-      expandedGroups,
-      items,
-      y,
-    );
-    depth1Idx++;
+  if (subagents.length > 0) {
+    emitSubagentGroup(g, label, subagents, 1, undefined, expandedGroups, items, y);
   }
 
   // Emit "Team (N)" group header + children at depth 2.
-  if (hasTeamGroup) {
+  if (teammates.length > 0) {
     const teamKey = `team:${g.key}`;
     const teamExpanded = expandedGroups.has(teamKey);
 
@@ -524,7 +499,6 @@ function emitGroupItems(
       memberSessionIds: teammates.map((session) => session.id),
       expandKey: teamKey,
       depth: 1,
-      isLastChild: depth1Idx === depth1Count - 1,
       height: TEAM_HEADER_HEIGHT,
       top: y.value,
     });
@@ -542,7 +516,6 @@ function emitGroupItems(
           session: s,
           isChild: true,
           depth: 2,
-          isLastChild: i === teammates.length - 1,
           height: CHILD_ITEM_HEIGHT,
           top: y.value,
         });
@@ -550,6 +523,27 @@ function emitGroupItems(
       }
     }
   }
+}
+
+/**
+ * Set the tree lines of every row below a group's row. Walking up from the
+ * end, `follows[level]` records whether a row at that level comes later
+ * with no shallower row between, which is when that level's line runs on.
+ * Rows without a depth, such as section headers and folders, end every
+ * line, as a group's own row does.
+ */
+function withGuides(items: DisplayItem[]): DisplayItem[] {
+  const follows: boolean[] = [];
+  for (let i = items.length - 1; i >= 0; i--) {
+    const item = items[i]!;
+    const depth = item.depth ?? 0;
+    if (depth > 0) {
+      item.guides = Array.from({ length: depth }, (_, k) => follows[k + 1] ?? false);
+    }
+    follows.length = depth;
+    follows[depth] = true;
+  }
+  return items;
 }
 
 /**
@@ -561,7 +555,8 @@ function emitGroupItems(
  * apply, a project's folders come first, each followed when expanded by
  * its subfolders and then its own sessions, then the project's unfiled
  * sessions. At every level, a gap row separates an open last folder's
- * rows from the sessions that follow it.
+ * rows from the sessions that follow it. Rows below a group's row carry
+ * the tree lines that join them to their parent.
  */
 export function buildDisplayItems(
   groups: SessionGroup[],
@@ -577,12 +572,12 @@ export function buildDisplayItems(
     const items: DisplayItem[] = [];
     if (folders?.project) {
       emitFolderedGroups(groups, folders.project, "", folders, expandedGroups, items, y);
-      return items;
+      return withGuides(items);
     }
     for (const g of groups) {
       emitGroupItems(g, "", expandedGroups, items, y);
     }
-    return items;
+    return withGuides(items);
   }
 
   const items: DisplayItem[] = [];
@@ -616,7 +611,7 @@ export function buildDisplayItems(
       }
     }
   }
-  return items;
+  return withGuides(items);
 }
 
 /** Placement of a session group's rows in a folder-aware list. */
