@@ -558,9 +558,10 @@ In the sidebar, a group of related sessions starts with the original
 session, as in the session tree. Expand the group to see its continuations,
 forks, and subagents below it. Forks carry a fork icon. Subagents list in a
 **Subagents** group under the session that started them, so a fork's
-subagents sit under the fork. A fork with no prompt of its own, such as one
-Claude Code's `/fork` created that you never used, is listed too, as it is in
-Claude Code; the session tree dims it.
+subagents sit under the fork. Tree lines join each row to the row it belongs
+under. A fork with no prompt of its own, such as one Claude Code's `/fork`
+created that you never used, is listed too, as it is in Claude Code; the
+session tree dims it.
 
 A Claude Code session you moved to the background appears once, as in Claude
 Code's own session list. Claude Code keeps the session going in a new

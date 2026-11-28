@@ -47,6 +47,7 @@
   } from "./session-list-utils.js";
   import { handedOffIds, handoffSourceIds } from "../../utils/session-primary.js";
   import { endSidebarDrag, isFolderDrag, sidebarDragFor } from "./session-drag.js";
+  import TreeGuides from "./TreeGuides.svelte";
 
   const EXPANDED_FOLDERS_KEY = "agentsview-sidebar-expanded-folders";
 
@@ -1025,6 +1026,9 @@
             title={groupToggleLabel(subExpanded, m.sidebar_subagents())}
             aria-label={groupToggleLabel(subExpanded, m.sidebar_subagents())}
           >
+            {#if item.guides}
+              <TreeGuides guides={item.guides} offset={(item.inset ?? 0) * 14} reach={3} />
+            {/if}
             {#if subExpanded}
               <ChevronDownIcon class="sub-group-arrow" size="10" strokeWidth="2.5" aria-hidden="true" />
             {:else}
@@ -1044,6 +1048,9 @@
             title={groupToggleLabel(teamExpanded, m.sidebar_team())}
             aria-label={groupToggleLabel(teamExpanded, m.sidebar_team())}
           >
+            {#if item.guides}
+              <TreeGuides guides={item.guides} offset={(item.inset ?? 0) * 14} reach={3} />
+            {/if}
             {#if teamExpanded}
               <ChevronDownIcon class="sub-group-arrow" size="10" strokeWidth="2.5" aria-hidden="true" />
             {:else}
@@ -1066,7 +1073,7 @@
             branch={item.branch ?? false}
             depth={item.depth ?? 1}
             inset={item.inset ?? 0}
-            isLastChild={item.isLastChild ?? false}
+            guides={item.guides}
             selectMode={sessions.selectMode}
             selected={sessions.selectedIds.has(item.session.id)}
             onRangeSelect={selectRangeTo}
@@ -1320,8 +1327,9 @@
     line-height: 16px;
   }
 
-  /* Sub-group headers (Subagents, Team) at depth 1 */
+  /* Sub-group headers (Subagents, Team) below a group's row */
   .sub-group-header {
+    position: relative;
     display: flex;
     align-items: center;
     gap: var(--space-2);
@@ -1340,8 +1348,11 @@
     background: var(--bg-surface-hover);
   }
 
+  /* Centre the 10 px arrow in a 16 px column, as a row's toggle is, so the
+     tree line of the header's members runs down from its middle. */
   :global(.sub-group-arrow) {
     flex-shrink: 0;
+    margin: 0 3px;
     color: var(--text-muted);
     opacity: 0.5;
   }
